@@ -58,10 +58,18 @@
   #define _LIBUNWIND_HIDDEN
 #else
   #if !defined(__ELF__) && !defined(__MACH__)
-    #define _LIBUNWIND_EXPORT __declspec(dllexport)
+    #ifdef LIBUNWIND_NODEFAULTVISIBILITY
+      #define _LIBUNWIND_EXPORT
+    #else
+      #define _LIBUNWIND_EXPORT __declspec(dllexport)
+    #endif
     #define _LIBUNWIND_HIDDEN
   #else
-    #define _LIBUNWIND_EXPORT __attribute__((visibility("default")))
+    #ifdef LIBUNWIND_NODEFAULTVISIBILITY
+      #define _LIBUNWIND_EXPORT
+    #else
+      #define _LIBUNWIND_EXPORT __attribute__((visibility("default")))
+    #endif
     #define _LIBUNWIND_HIDDEN __attribute__((visibility("hidden")))
   #endif
 #endif
