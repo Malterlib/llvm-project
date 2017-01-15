@@ -24,6 +24,8 @@
 #  define _THROW_BAD_ALLOC
 #endif
 
+#ifndef _LIBCPP_DISABLE_NEW_DELETE
+
 #if defined(_LIBCPP_ABI_VCRUNTIME)
 #  include <new.h>
 #else
@@ -66,5 +68,7 @@ _LIBCPP_OVERRIDABLE_FUNC_VIS void operator delete[](void* __p, std::size_t __sz,
 #    endif
 #  endif
 #endif
+
+#endif // _LIBCPP_DISABLE_NEW_DELETE
 
 #endif // _LIBCPP___NEW_GLOBAL_NEW_DELETE_H
