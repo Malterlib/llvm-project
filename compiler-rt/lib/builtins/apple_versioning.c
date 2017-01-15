@@ -9,7 +9,10 @@
 #if __APPLE__
 #include <Availability.h>
 
-#if __IPHONE_OS_VERSION_MIN_REQUIRED
+#if defined(COMPILER_RT_NODEFAULTVISIBILITY)
+  #define NOT_HERE_BEFORE_10_6(sym)
+  #define NOT_HERE_IN_10_8_AND_EARLIER(sym)
+#elif __IPHONE_OS_VERSION_MIN_REQUIRED
 #define NOT_HERE_BEFORE_10_6(sym)
 #define NOT_HERE_IN_10_8_AND_EARLIER(sym)                                      \
   extern const char sym##_tmp61 __asm("$ld$hide$os6.1$_" #sym);                \
