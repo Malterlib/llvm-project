@@ -84,12 +84,15 @@ static Lock locks[SPINLOCK_COUNT] = {[0 ... SPINLOCK_COUNT - 1] = {0, 1, 0}};
 
 #elif defined(__APPLE__)
 #include <libkern/OSAtomic.h>
+_Pragma("clang diagnostic push");
+_Pragma("clang diagnostic ignored \"-Wdeprecated-declarations\"");
 typedef OSSpinLock Lock;
 __inline static void unlock(Lock *l) { OSSpinLockUnlock(l); }
 /// Locks a lock.  In the current implementation, this is potentially
 /// unbounded in the contended case.
 __inline static void lock(Lock *l) { OSSpinLockLock(l); }
 static Lock locks[SPINLOCK_COUNT]; // initialized to OS_SPINLOCK_INIT which is 0
+_Pragma("clang diagnostic pop");
 
 #else
 typedef _Atomic(uintptr_t) Lock;
