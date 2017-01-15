@@ -179,6 +179,8 @@ inline constexpr destroying_delete_t destroying_delete{};
 
 } // namespace std
 
+#ifndef _LIBCPP_DISABLE_NEW_DELETE
+
 #if defined(_LIBCPP_CXX03_LANG)
 #define _THROW_BAD_ALLOC throw(std::bad_alloc)
 #else
@@ -225,6 +227,7 @@ _LIBCPP_NODISCARD_AFTER_CXX17 inline _LIBCPP_INLINE_VISIBILITY void* operator ne
 _LIBCPP_NODISCARD_AFTER_CXX17 inline _LIBCPP_INLINE_VISIBILITY void* operator new[](std::size_t, void* __p) _NOEXCEPT {return __p;}
 inline _LIBCPP_INLINE_VISIBILITY void  operator delete  (void*, void*) _NOEXCEPT {}
 inline _LIBCPP_INLINE_VISIBILITY void  operator delete[](void*, void*) _NOEXCEPT {}
+#endif
 
 #endif // !_LIBCPP_ABI_VCRUNTIME
 
