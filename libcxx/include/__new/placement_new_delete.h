@@ -16,6 +16,8 @@
 #  pragma GCC system_header
 #endif
 
+#ifndef _LIBCPP_DISABLE_NEW_DELETE
+
 #if defined(_LIBCPP_ABI_VCRUNTIME)
 #  include <new.h>
 #else
@@ -29,6 +31,8 @@ operator new[](std::size_t, void* __p) _NOEXCEPT {
 }
 inline _LIBCPP_HIDE_FROM_ABI void operator delete(void*, void*) _NOEXCEPT {}
 inline _LIBCPP_HIDE_FROM_ABI void operator delete[](void*, void*) _NOEXCEPT {}
+#endif
+
 #endif
 
 #endif // _LIBCPP___NEW_PLACEMENT_NEW_DELETE_H
