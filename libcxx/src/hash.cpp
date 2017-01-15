@@ -54,14 +54,22 @@ const unsigned indices[] = {
 
 template <size_t _Sz = sizeof(size_t)>
 inline _LIBCPP_HIDE_FROM_ABI typename enable_if<_Sz == 4, void>::type __check_for_overflow(size_t N) {
+#ifndef _LIBCPP_NO_EXCEPTIONS
   if (N > 0xFFFFFFFB)
     __throw_overflow_error("__next_prime overflow");
+#else
+    (void)abort();
+#endif
 }
 
 template <size_t _Sz = sizeof(size_t)>
 inline _LIBCPP_HIDE_FROM_ABI typename enable_if<_Sz == 8, void>::type __check_for_overflow(size_t N) {
+#ifndef _LIBCPP_NO_EXCEPTIONS
   if (N > 0xFFFFFFFFFFFFFFC5ull)
     __throw_overflow_error("__next_prime overflow");
+#else
+    (void)abort();
+#endif
 }
 
 size_t __next_prime(size_t n) {
