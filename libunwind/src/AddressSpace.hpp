@@ -57,7 +57,7 @@ namespace libunwind {
   };
   #if (defined(__MAC_OS_X_VERSION_MIN_REQUIRED) \
                                  && (__MAC_OS_X_VERSION_MIN_REQUIRED >= 1070)) \
-      || defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+      || defined(__IPHONE_OS_VERSION_MIN_REQUIRED) || defined(_LIBUNWIND_DYLD_FIND_UNWIND_SECTIONS_PROVIDED)
     // In 10.7.0 or later, libSystem.dylib implements this function.
     extern "C" bool _dyld_find_unwind_sections(void *, dyld_unwind_sections *);
   #else
