@@ -170,6 +170,9 @@ void tools::MinGW::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   Args.AddAllArgs(CmdArgs, options::OPT_u_Group);
   Args.AddLastArg(CmdArgs, options::OPT_Z_Flag);
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles)) {
     if (Args.hasArg(options::OPT_shared) || Args.hasArg(options::OPT_mdll)) {
       CmdArgs.push_back(Args.MakeArgString(TC.GetFilePath("dllcrt2.o")));
