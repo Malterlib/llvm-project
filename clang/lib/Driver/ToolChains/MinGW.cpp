@@ -202,6 +202,9 @@ void tools::MinGW::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   Args.AddLastArg(CmdArgs, options::OPT_t);
   Args.AddAllArgs(CmdArgs, options::OPT_u_Group);
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   // Add asan_dynamic as the first import lib before other libs. This allows
   // asan to be initialized as early as possible to increase its instrumentation
   // coverage to include other user DLLs which has not been built with asan.
