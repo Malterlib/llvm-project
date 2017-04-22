@@ -285,6 +285,9 @@ void msp430::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                                options::OPT_u,
                            });
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (UseStartAndEndFiles)
     AddStartFiles(UseExceptions, Args, CmdArgs);
 

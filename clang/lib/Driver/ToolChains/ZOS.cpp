@@ -124,6 +124,9 @@ void zos::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Output.getFilename());
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   SmallString<128> LinkerOptions;
   LinkerOptions = "AMODE=";
   LinkerOptions += "64";

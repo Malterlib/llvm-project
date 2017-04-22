@@ -160,6 +160,9 @@ void CSKY::Linker::ConstructJob(Compilation &C, const JobAction &JA,
         ToolChain.getCompilerRTArgString(Args, "crtend", ToolChain::FT_Object);
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (WantCRTs) {
     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crt0.o")));
     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crti.o")));

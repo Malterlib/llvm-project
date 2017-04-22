@@ -190,6 +190,9 @@ void aix::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Output.getFilename());
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   // Set linking mode (i.e., 32/64-bit) and the address of
   // text and data sections based on arch bit width.
   if (IsArch32Bit) {
