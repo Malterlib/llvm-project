@@ -4229,6 +4229,9 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     Args.AddLastArg(CmdArgs, options::OPT_nobuiltininc);
   }
 
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    Args.AddLastArg(CmdArgs, options::OPT_nostdlibcxx);
+
   // Pass the path to compiler resource files.
   CmdArgs.push_back("-resource-dir");
   CmdArgs.push_back(D.ResourceDir.c_str());
