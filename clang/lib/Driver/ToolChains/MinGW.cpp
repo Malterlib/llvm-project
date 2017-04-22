@@ -541,8 +541,10 @@ void toolchains::MinGW::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
 void toolchains::MinGW::AddClangCXXStdlibIncludeArgs(
     const ArgList &DriverArgs, ArgStringList &CC1Args) const {
   if (DriverArgs.hasArg(options::OPT_nostdlibinc) ||
-      DriverArgs.hasArg(options::OPT_nostdincxx))
+      DriverArgs.hasArg(options::OPT_nostdincxx)) {
+    GetCXXStdlibType(DriverArgs);
     return;
+  }
 
   StringRef Slash = llvm::sys::path::get_separator();
 

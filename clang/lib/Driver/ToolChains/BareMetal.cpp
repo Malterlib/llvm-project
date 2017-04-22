@@ -99,8 +99,10 @@ void BareMetal::AddClangCXXStdlibIncludeArgs(
     const ArgList &DriverArgs, ArgStringList &CC1Args) const {
   if (DriverArgs.hasArg(options::OPT_nostdinc) ||
       DriverArgs.hasArg(options::OPT_nostdlibinc) ||
-      DriverArgs.hasArg(options::OPT_nostdincxx))
+      DriverArgs.hasArg(options::OPT_nostdincxx)) {
+    GetCXXStdlibType(DriverArgs);
     return;
+  }
 
   StringRef SysRoot = getDriver().SysRoot;
   if (SysRoot.empty())
@@ -142,7 +144,12 @@ void BareMetal::AddClangCXXStdlibIncludeArgs(
 
 void BareMetal::AddCXXStdlibLibArgs(const ArgList &Args,
                                     ArgStringList &CmdArgs) const {
-  switch (GetCXXStdlibType(Args)) {
+  CXXStdlibType Type = GetCXXStdlibType(Args);
+
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
+
+  switch (Type) {
   case ToolChain::CST_Libcxx:
     CmdArgs.push_back("-lc++");
     CmdArgs.push_back("-lc++abi");

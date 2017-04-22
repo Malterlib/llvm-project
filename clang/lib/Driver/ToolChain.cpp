@@ -764,6 +764,9 @@ void ToolChain::AddCXXStdlibLibArgs(const ArgList &Args,
          "should not have called this");
   CXXStdlibType Type = GetCXXStdlibType(Args);
 
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
+
   switch (Type) {
   case ToolChain::CST_Libcxx:
     CmdArgs.push_back("-lc++");

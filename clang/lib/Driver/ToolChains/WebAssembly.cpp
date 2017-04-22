@@ -158,17 +158,21 @@ void WebAssembly::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
 
 void WebAssembly::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
                                                ArgStringList &CC1Args) const {
-  if (!DriverArgs.hasArg(options::OPT_nostdlibinc) &&
-      !DriverArgs.hasArg(options::OPT_nostdincxx)) {
-    if (getTriple().getOS() != llvm::Triple::UnknownOS) {
-      const std::string MultiarchTriple =
-          getMultiarchTriple(getDriver(), getTriple(), getDriver().SysRoot);
-      addSystemInclude(DriverArgs, CC1Args,
-                       getDriver().SysRoot + "/include/" + MultiarchTriple + "/c++/v1");
-    }
-    addSystemInclude(DriverArgs, CC1Args,
-                     getDriver().SysRoot + "/include/c++/v1");
+  if (DriverArgs.hasArg(options::OPT_nostdlibinc) ||
+      DriverArgs.hasArg(options::OPT_nostdincxx)) {
+    GetCXXStdlibType(DriverArgs);
+    return;
   }
+
+  if (getTriple().getOS() != llvm::Triple::UnknownOS) {
+    const std::string MultiarchTriple =
+        getMultiarchTriple(getDriver(), getTriple(), getDriver().SysRoot);
+    addSystemInclude(DriverArgs, CC1Args,
+                     getDriver().SysRoot + "/include/" + MultiarchTriple + "/c++/v1");
+  }
+
+  addSystemInclude(DriverArgs, CC1Args,
+                   getDriver().SysRoot + "/include/c++/v1");
 }
 
 void WebAssembly::AddCXXStdlibLibArgs(const llvm::opt::ArgList &Args,

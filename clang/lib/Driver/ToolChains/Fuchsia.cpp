@@ -255,8 +255,10 @@ void Fuchsia::AddClangSystemIncludeArgs(const ArgList &DriverArgs,
 void Fuchsia::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
                                            ArgStringList &CC1Args) const {
   if (DriverArgs.hasArg(options::OPT_nostdlibinc) ||
-      DriverArgs.hasArg(options::OPT_nostdincxx))
+      DriverArgs.hasArg(options::OPT_nostdincxx)) {
+    GetCXXStdlibType(DriverArgs);
     return;
+  }
 
   switch (GetCXXStdlibType(DriverArgs)) {
   case ToolChain::CST_Libcxx: {
@@ -273,7 +275,12 @@ void Fuchsia::AddClangCXXStdlibIncludeArgs(const ArgList &DriverArgs,
 
 void Fuchsia::AddCXXStdlibLibArgs(const ArgList &Args,
                                   ArgStringList &CmdArgs) const {
-  switch (GetCXXStdlibType(Args)) {
+  CXXStdlibType Type = GetCXXStdlibType(Args);
+
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
+
+  switch (Type) {
   case ToolChain::CST_Libcxx:
     CmdArgs.push_back("-lc++");
     break;

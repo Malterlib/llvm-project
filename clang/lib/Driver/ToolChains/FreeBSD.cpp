@@ -372,6 +372,9 @@ void FreeBSD::AddCXXStdlibLibArgs(const ArgList &Args,
   CXXStdlibType Type = GetCXXStdlibType(Args);
   bool Profiling = Args.hasArg(options::OPT_pg);
 
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
+
   switch (Type) {
   case ToolChain::CST_Libcxx:
     CmdArgs.push_back(Profiling ? "-lc++_p" : "-lc++");

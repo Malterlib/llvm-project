@@ -109,7 +109,6 @@ void nacltools::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   if (const Arg *A = Args.getLastArg(options::OPT_first_object))
     CmdArgs.push_back(A->getValue());
-  
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles)) {
     if (!Args.hasArg(options::OPT_shared))
       CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath("crt1.o")));
@@ -310,6 +309,10 @@ void NaClToolChain::AddCXXStdlibLibArgs(const ArgList &Args,
   // Check for -stdlib= flags. We only support libc++ but this consumes the arg
   // if the value is libc++, and emits an error for other values.
   GetCXXStdlibType(Args);
+
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
+
   CmdArgs.push_back("-lc++");
 }
 

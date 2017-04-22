@@ -109,8 +109,14 @@ void MipsLLVMToolChain::addLibCxxIncludePaths(
 
 void MipsLLVMToolChain::AddCXXStdlibLibArgs(const ArgList &Args,
                                             ArgStringList &CmdArgs) const {
-  assert((GetCXXStdlibType(Args) == ToolChain::CST_Libcxx) &&
+  CXXStdlibType Type = GetCXXStdlibType(Args);
+  (void)Type;
+
+  assert((Type == ToolChain::CST_Libcxx) &&
          "Only -lc++ (aka libxx) is supported in this toolchain.");
+
+  if (Args.hasArg(options::OPT_nostdlibcxx))
+    return;
 
   CmdArgs.push_back("-lc++");
   CmdArgs.push_back("-lc++abi");

@@ -133,8 +133,11 @@ void XCoreToolChain::AddClangCXXStdlibIncludeArgs(
     const ArgList &DriverArgs, ArgStringList &CC1Args) const {
   if (DriverArgs.hasArg(clang::driver::options::OPT_nostdinc) ||
       DriverArgs.hasArg(options::OPT_nostdlibinc) ||
-      DriverArgs.hasArg(options::OPT_nostdincxx))
+      DriverArgs.hasArg(options::OPT_nostdincxx)) {
+    GetCXXStdlibType(DriverArgs);
     return;
+  }
+
   if (const char *cl_include_dir = getenv("XCC_CPLUS_INCLUDE_PATH")) {
     SmallVector<StringRef, 4> Dirs;
     const char EnvPathSeparatorStr[] = {llvm::sys::EnvPathSeparator, '\0'};
