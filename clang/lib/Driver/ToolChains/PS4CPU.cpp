@@ -154,6 +154,9 @@ void tools::PS4cpu::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Output.getFilename());
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   const bool UseJMC =
       Args.hasFlag(options::OPT_fjmc, options::OPT_fno_jmc, false);
 
@@ -332,6 +335,9 @@ void tools::PS5cpu::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-o");
     CmdArgs.push_back(Output.getFilename());
   }
+
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
 
   const bool UseJMC =
       Args.hasFlag(options::OPT_fjmc, options::OPT_fno_jmc, false);
