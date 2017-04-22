@@ -75,6 +75,9 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   Args.AddAllArgs(CmdArgs, options::OPT_u);
   ToolChain.AddFilePathLibArgs(Args, CmdArgs);
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   const char *Crt1 = "crt1.o";
   const char *Entry = nullptr;
 

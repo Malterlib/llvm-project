@@ -347,6 +347,9 @@ constructHexagonLinkArgs(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (HTC.getTriple().isMusl()) {
     if (!Args.hasArg(options::OPT_shared, options::OPT_static))
       CmdArgs.push_back("-dynamic-linker=/lib/ld-musl-hexagon.so.1");
