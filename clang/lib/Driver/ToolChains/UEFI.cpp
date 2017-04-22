@@ -61,6 +61,9 @@ void tools::uefi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(
         Args.MakeArgString(std::string("/out:") + Output.getFilename()));
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   CmdArgs.push_back("/nologo");
 
   // Default entry function name according to the TianoCore reference
