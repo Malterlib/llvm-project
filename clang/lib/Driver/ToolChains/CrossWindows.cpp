@@ -149,6 +149,9 @@ void tools::CrossWindows::Linker::ConstructJob(
     // FIXME: handle subsystem
   }
 
+  if (const auto *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   // NOTE: deal with multiple definitions on Windows (e.g. COMDAT)
   CmdArgs.push_back("--allow-multiple-definition");
 
