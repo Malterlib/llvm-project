@@ -117,7 +117,14 @@ const std::string &CIndexer::getClangResourcesPath() {
   // This silly cast below avoids a C++ warning.
   if (dladdr((void *)(uintptr_t)clang_createTranslationUnit, &info) != 0) {
     // We now have the CIndex directory, locate clang relative to it.
-    LibClangPath += info.dli_fname;
+    int FD;
+    SmallString<128> RealPath;
+    if (!llvm::sys::fs::openFileForRead(info.dli_fname, FD,
+                                        llvm::sys::fs::OF_None, &RealPath))
+      llvm::sys::fs::closeFile(FD);
+    else
+      RealPath = info.dli_fname;
+    LibClangPath += RealPath;
     PathFound = true;
   }
 #endif
