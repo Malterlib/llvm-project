@@ -74,6 +74,9 @@ void visualstudio::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(
         Args.MakeArgString(std::string("-out:") + Output.getFilename()));
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (Args.hasArg(options::OPT_marm64x))
     CmdArgs.push_back("-machine:arm64x");
   else if (TC.getTriple().isWindowsArm64EC())

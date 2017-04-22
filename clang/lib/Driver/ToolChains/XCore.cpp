@@ -69,6 +69,9 @@ void tools::XCore::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Output.getFilename());
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (Args.hasArg(options::OPT_v))
     CmdArgs.push_back("-v");
 

@@ -11,6 +11,7 @@
 #include "clang/Driver/CommonArgs.h"
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/SanitizerArgs.h"
+#include "clang/Options/Options.h"
 #include "llvm/Support/Path.h"
 
 using namespace clang::driver;
@@ -73,6 +74,9 @@ void haiku::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-o");
     CmdArgs.push_back(Output.getFilename());
   }
+
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
 
   if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles,
                    options::OPT_r)) {
