@@ -170,8 +170,17 @@ void PrettyStackTraceFormat::print(raw_ostream &OS) const { OS << Str << "\n"; }
 void PrettyStackTraceProgram::print(raw_ostream &OS) const {
   OS << "Program arguments: ";
   // Print the argument list.
-  for (unsigned i = 0, e = ArgC; i != e; ++i)
-    OS << ArgV[i] << ' ';
+  for (unsigned i = 0, e = ArgC; i != e; ++i) {
+    StringRef Arg(ArgV[i]);
+    if (Arg.find_first_of(" \"\\") != StringRef::npos) {
+      OS << '\"';
+      OS.write_escaped(Arg);
+      OS << '\"';
+    }
+    else
+      OS << Arg;
+    OS << ' ';
+  }
   OS << '\n';
 }
 
