@@ -94,6 +94,9 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   ToolChain.AddFilePathLibArgs(Args, CmdArgs);
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   bool IsCommand = true;
   const char *Crt1;
   const char *Entry = nullptr;

@@ -4287,6 +4287,7 @@ def verify_pch : Flag<["-"], "verify-pch">, Group<Action_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Load and verify that a pre-compiled header file is not stale">;
 def init : Separate<["-"], "init">;
+def first_object : Separate<["-"], "first_object">;
 def install__name : Separate<["-"], "install_name">;
 def iprefix : JoinedOrSeparate<["-"], "iprefix">, Group<clang_i_Group>,
   Visibility<[ClangOption, CC1Option]>,
