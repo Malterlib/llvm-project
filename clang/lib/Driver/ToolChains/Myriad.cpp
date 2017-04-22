@@ -154,6 +154,9 @@ void tools::Myriad::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());
 
+  if (const Arg *A = Args.getLastArg(options::OPT_first_object))
+    CmdArgs.push_back(A->getValue());
+
   if (UseStartfiles) {
     // If you want startfiles, it means you want the builtin crti and crtbegin,
     // but not crt0. Myriad link commands provide their own crt0.o as needed.
