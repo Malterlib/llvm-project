@@ -176,6 +176,7 @@ def DeleteNonVirtualDtor : DiagGroup<"delete-non-virtual-dtor",
 def AbstractFinalClass : DiagGroup<"abstract-final-class">;
 def FinalDtorNonFinalClass : DiagGroup<"final-dtor-non-final-class">;
 def GNUOffsetofExtensions : DiagGroup<"gnu-offsetof-extensions">;
+def AlignedAllocationUnavailable : DiagGroup<"aligned-allocation-unavailable">;
 
 def CXX11CompatDeprecatedWritableStr :
   DiagGroup<"c++11-compat-deprecated-writable-strings">;
