@@ -215,6 +215,7 @@ def DeleteNonVirtualDtor : DiagGroup<"delete-non-virtual-dtor",
 def AbstractFinalClass : DiagGroup<"abstract-final-class">;
 def FinalDtorNonFinalClass : DiagGroup<"final-dtor-non-final-class">;
 def GNUOffsetofExtensions : DiagGroup<"gnu-offsetof-extensions">;
+def AlignedAllocationUnavailable : DiagGroup<"aligned-allocation-unavailable">;
 
 def InitializerOverrides : DiagGroup<"initializer-overrides">;
 // For compatibility with GCC; -Woverride-init = -Winitializer-overrides
