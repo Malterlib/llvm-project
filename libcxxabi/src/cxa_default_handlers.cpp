@@ -84,11 +84,11 @@ static void demangling_unexpected_handler()
     std::terminate();
 }
 
-static std::terminate_handler default_terminate_handler = demangling_terminate_handler;
-static std::terminate_handler default_unexpected_handler = demangling_unexpected_handler;
+constexpr static std::terminate_handler default_terminate_handler = demangling_terminate_handler;
+constexpr static std::terminate_handler default_unexpected_handler = demangling_unexpected_handler;
 #else
-static std::terminate_handler default_terminate_handler = std::abort;
-static std::terminate_handler default_unexpected_handler = std::terminate;
+constexpr static std::terminate_handler default_terminate_handler = std::abort;
+constexpr static std::terminate_handler default_unexpected_handler = std::terminate;
 #endif
 
 //
