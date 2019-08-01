@@ -40,30 +40,26 @@ static void insertCall(Function &CurFn, StringRef Func,
     return;
   }
 
-  if (Func == "__cyg_profile_func_enter" || Func == "__cyg_profile_func_exit") {
-    Type *ArgTypes[] = {Type::getInt8PtrTy(C), Type::getInt8PtrTy(C)};
+  // Assume same as __cyg_profile_func_enter or __cyg_profile_func_exit.
 
-    FunctionCallee Fn = M.getOrInsertFunction(
-        Func, FunctionType::get(Type::getVoidTy(C), ArgTypes, false));
+  Type *ArgTypes[] = {Type::getInt8PtrTy(C), Type::getInt8PtrTy(C)};
 
-    Instruction *RetAddr = CallInst::Create(
-        Intrinsic::getDeclaration(&M, Intrinsic::returnaddress),
-        ArrayRef<Value *>(ConstantInt::get(Type::getInt32Ty(C), 0)), "",
-        InsertionPt);
-    RetAddr->setDebugLoc(DL);
+  FunctionCallee Fn = M.getOrInsertFunction(
+      Func, FunctionType::get(Type::getVoidTy(C), ArgTypes, false));
 
-    Value *Args[] = {ConstantExpr::getBitCast(&CurFn, Type::getInt8PtrTy(C)),
-                     RetAddr};
+  Instruction *RetAddr = CallInst::Create(
+      Intrinsic::getDeclaration(&M, Intrinsic::returnaddress),
+      ArrayRef<Value *>(ConstantInt::get(Type::getInt32Ty(C), 0)), "",
+      InsertionPt);
+  RetAddr->setDebugLoc(DL);
 
-    CallInst *Call =
-        CallInst::Create(Fn, ArrayRef<Value *>(Args), "", InsertionPt);
-    Call->setDebugLoc(DL);
-    return;
-  }
+  Value *Args[] = {ConstantExpr::getBitCast(&CurFn, Type::getInt8PtrTy(C)),
+                   RetAddr};
 
-  // We only know how to call a fixed set of instrumentation functions, because
-  // they all expect different arguments, etc.
-  report_fatal_error(Twine("Unknown instrumentation function: '") + Func + "'");
+  CallInst *Call =
+      CallInst::Create(Fn, ArrayRef<Value *>(Args), "", InsertionPt);
+  Call->setDebugLoc(DL);
+  return;
 }
 
 static bool runOnFunction(Function &F, bool PostInlining) {
