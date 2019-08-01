@@ -1011,6 +1011,33 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
                           CurFuncIsThunk);
   }
 
+  if (CGM.getCodeGenOpts().InstrumentNonCoroFunctions &&
+    CurFuncDecl && !CurFuncDecl->hasAttr<
+    InstrumentNonCoroutineFunctionEnterDisableAttr>()) {
+    if (auto RecordDecl = RetTy->getAsRecordDecl()) {
+      if (RecordDecl->hasAttr<InstrumentNonCoroutineFunctionEnterAttr>()) {
+        const auto *Body = D->getBody();
+
+        bool InstrumentRoutine = true;
+        if (Body && isa<CoroutineBodyStmt>(Body))
+          InstrumentRoutine = false;
+        else if (auto *FD = dyn_cast_or_null<FunctionDecl>(D)) {
+          if (FD->getType()->hasAttr(attr::
+            InstrumentNonCoroutineFunctionEnterDisable)) {
+            InstrumentRoutine = false;
+          }
+        }
+
+        if (InstrumentRoutine) {
+          const InstrumentNonCoroutineFunctionEnterAttr *Attribute =
+          RecordDecl->getAttr<InstrumentNonCoroutineFunctionEnterAttr>();
+          CurFn->addFnAttr("instrument-function-entry",
+          Attribute->getFunctionNameStr());
+        }
+      }
+    }
+  }
+
   if (ShouldInstrumentFunction()) {
     if (CGM.getCodeGenOpts().InstrumentFunctions)
       CurFn->addFnAttr("instrument-function-entry", "__cyg_profile_func_enter");

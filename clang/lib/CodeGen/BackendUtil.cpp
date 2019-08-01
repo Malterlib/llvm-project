@@ -844,6 +844,7 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
   if (CodeGenOpts.InstrumentFunctions ||
       CodeGenOpts.InstrumentFunctionEntryBare ||
       CodeGenOpts.InstrumentFunctionsAfterInlining ||
+      CodeGenOpts.InstrumentNonCoroFunctions ||
       CodeGenOpts.InstrumentForProfiling) {
     PMBuilder.addExtension(PassManagerBuilder::EP_EarlyAsPossible,
                            addEntryExitInstrumentationPass);
@@ -1392,6 +1393,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     if (CodeGenOpts.InstrumentFunctions ||
         CodeGenOpts.InstrumentFunctionEntryBare ||
         CodeGenOpts.InstrumentFunctionsAfterInlining ||
+        CodeGenOpts.InstrumentNonCoroFunctions ||
         CodeGenOpts.InstrumentForProfiling) {
       PB.registerPipelineStartEPCallback(
           [](ModulePassManager &MPM, OptimizationLevel Level) {
