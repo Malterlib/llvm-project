@@ -1673,6 +1673,11 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
     OS << " [[clang::lifetimebound]]";
     return;
   }
+  if (T->getAttrKind() == attr::InstrumentNonCoroutineFunctionEnterDisable) {
+    OS << " [[clang::instrument_non_coroutine_function_enter_disable]]";
+    return;
+  }
+
 
   // The printing of the address_space attribute is handled by the qualifier
   // since it is still stored in the qualifier. Return early to prevent printing
