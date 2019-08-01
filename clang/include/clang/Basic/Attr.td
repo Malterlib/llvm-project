@@ -2587,6 +2587,18 @@ def PreserveAll : DeclOrTypeAttr {
   let Documentation = [PreserveAllDocs];
 }
 
+def InstrumentNonCoroutineFunctionEnterDisable : InheritableAttr {
+  let Spellings = [Clang<"instrument_non_coroutine_function_enter_disable">];
+  let Subjects = SubjectList<[Record, Type, Function]>;
+  let Documentation = [Undocumented];
+}
+
+def InstrumentNonCoroutineFunctionEnter : InheritableAttr {
+  let Spellings = [Clang<"instrument_non_coroutine_function_enter">];
+  let Args = [StringArgument<"functionNameStr">];
+  let Documentation = [Undocumented];
+}
+
 def Target : InheritableAttr {
   let Spellings = [GCC<"target">];
   let Args = [StringArgument<"featuresStr">];

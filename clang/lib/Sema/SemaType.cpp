@@ -8113,6 +8113,20 @@ static bool isAddressSpaceKind(const ParsedAttr &attr) {
          attrKind == ParsedAttr::AT_OpenCLGenericAddressSpace;
 }
 
+static void HandleInstrumentNonCoroutineFunctionEnterDisable(
+  TypeProcessingState &State,
+  QualType &CurType,
+  ParsedAttr &Attr) {
+  if (State.getDeclarator().isDeclarationOfFunction()) {
+    CurType = State.getAttributedType(
+        createSimpleAttr<InstrumentNonCoroutineFunctionEnterDisableAttr
+          >(State.getSema().Context, Attr),
+          CurType, CurType);
+  } else {
+    Attr.diagnoseAppertainsTo(State.getSema(), (Decl const *)nullptr);
+  }
+}
+
 static void processTypeAttrs(TypeProcessingState &state, QualType &type,
                              TypeAttrLocation TAL,
                              ParsedAttributesView &attrs) {
@@ -8241,6 +8255,12 @@ static void processTypeAttrs(TypeProcessingState &state, QualType &type,
     case ParsedAttr::AT_LifetimeBound:
       if (TAL == TAL_DeclChunk)
         HandleLifetimeBoundAttr(state, type, attr);
+      break;
+    case ParsedAttr::AT_InstrumentNonCoroutineFunctionEnterDisable:
+      if (TAL == TAL_DeclChunk) {
+        HandleInstrumentNonCoroutineFunctionEnterDisable(state, type, attr);
+      	attr.setUsedAsTypeAttr();
+      }
       break;
 
     case ParsedAttr::AT_NoDeref: {
