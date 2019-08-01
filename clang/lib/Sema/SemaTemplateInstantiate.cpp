@@ -1738,10 +1738,15 @@ QualType TemplateInstantiator::TransformFunctionProtoType(TypeLocBuilder &TLB,
                                  CXXRecordDecl *ThisContext,
                                  Qualifiers ThisTypeQuals,
                                  Fn TransformExceptionSpec) {
-  // We need a local instantiation scope for this function prototype.
-  LocalInstantiationScope Scope(SemaRef, /*CombineWithOuterScope=*/true);
-  return inherited::TransformFunctionProtoType(
-      TLB, TL, ThisContext, ThisTypeQuals, TransformExceptionSpec);
+  if (UseNewScope) {
+    // We need a local instantiation scope for this function prototype.
+    LocalInstantiationScope Scope(SemaRef, /*CombineWithOuterScope=*/true);
+    return inherited::TransformFunctionProtoType(
+        TLB, TL, ThisContext, ThisTypeQuals, TransformExceptionSpec);
+  } else {
+    return inherited::TransformFunctionProtoType(
+        TLB, TL, ThisContext, ThisTypeQuals, TransformExceptionSpec);
+  }
 }
 
 ParmVarDecl *
