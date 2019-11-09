@@ -338,8 +338,11 @@ Error RawCoverageMappingReader::readMappingRegionsSubArray(
     auto CMR = CounterMappingRegion(C, C2, InferredFileID, ExpandedFileID,
                                     LineStart, ColumnStart,
                                     LineStart + NumLines, ColumnEnd, Kind);
-    if (CMR.startLoc() > CMR.endLoc())
-      return make_error<CoverageMapError>(coveragemap_error::malformed);
+    if (CMR.startLoc() > CMR.endLoc()) {
+       CMR.ColumnEnd = CMR.ColumnStart;
+       CMR.LineEnd = CMR.LineStart;
+       //return make_error<CoverageMapError>(coveragemap_error::malformed);
+    }
     MappingRegions.push_back(CMR);
   }
   return Error::success();
