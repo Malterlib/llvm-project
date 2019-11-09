@@ -377,10 +377,13 @@ Error RawCoverageMappingReader::readMappingRegionsSubArray(
             static_cast<unsigned>(FID)},
         InferredFileID, ExpandedFileID, LineStart, ColumnStart,
         LineStart + NumLines, ColumnEnd, Kind);
-    if (CMR.startLoc() > CMR.endLoc())
-      return make_error<CoverageMapError>(
-          coveragemap_error::malformed,
-          "counter mapping region locations are incorrect");
+    if (CMR.startLoc() > CMR.endLoc()) {
+       CMR.ColumnEnd = CMR.ColumnStart;
+       CMR.LineEnd = CMR.LineStart;
+      //return make_error<CoverageMapError>(
+      //    coveragemap_error::malformed,
+      //    "counter mapping region locations are incorrect");
+    }
     MappingRegions.push_back(CMR);
   }
   return Error::success();
