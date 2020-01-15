@@ -2074,9 +2074,10 @@ bool Driver::DiagnoseInputExistence(const DerivedArgList &Args, StringRef Value,
 
 Arg *Driver::ConvertFileList(InputList &Inputs, const DerivedArgList &Args,
                              Compilation &C, const char *FileList) const {
+  const llvm::opt::OptTable &Opts = getOpts();
   std::string TmpName = GetTemporaryPath("filelist", "temp");
   C.addTempFile(Args.MakeArgString(TmpName.c_str()));
-  
+
   {
     std::ifstream In(FileList);
     std::ofstream OutFile(TmpName.c_str());
@@ -2085,7 +2086,7 @@ Arg *Driver::ConvertFileList(InputList &Inputs, const DerivedArgList &Args,
       Diag(clang::diag::err_drv_no_such_file) << FileList;
       return 0;
     }
-    
+
     while (In) {
       std::string InputFile;
       In >> InputFile;
@@ -2096,12 +2097,12 @@ Arg *Driver::ConvertFileList(InputList &Inputs, const DerivedArgList &Args,
       }
     }
   }
-  
+
   std::string ArgFile = "@";
-  ArgFile += TmpName; 
+  ArgFile += TmpName;
 
   unsigned Index = Args.getBaseArgs().MakeIndex(ArgFile);
-  Arg *A = Opts->ParseOneArg(Args, Index);
+  Arg *A = Opts.ParseOneArg(Args, Index);
   A->claim();
   return A;
 }
@@ -2246,7 +2247,7 @@ void Driver::BuildInputs(const ToolChain &TC, DerivedArgList &Args,
       }
       A->claim();
     } else if (A->getOption().hasFlag(options::LinkerInput)) {
-      if (A->getOption().matches(options::OPT_filelist) 
+      if (A->getOption().matches(options::OPT_filelist)
           && !TC.getTriple().isOSDarwin()) {
         A->claim();
         Arg *NewArg = ConvertFileList(Inputs, Args, C, A->getValue());

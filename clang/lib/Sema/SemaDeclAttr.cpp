@@ -3087,10 +3087,9 @@ static void handleInstrumentNonCoroutineFunctionEnterAttr(Sema &S,
   if (!S.checkStringLiteralArgumentAttr(AL, 0, Str, &LiteralLoc))
     return;
 
-  unsigned Index = AL.getAttributeSpellingListIndex();
   InstrumentNonCoroutineFunctionEnterAttr *NewAttr =
       ::new (S.Context) InstrumentNonCoroutineFunctionEnterAttr(
-        AL.getRange(), S.Context, Str, Index);
+        S.Context, AL, Str);
   D->addAttr(NewAttr);
 }
 
