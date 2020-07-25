@@ -2719,6 +2719,7 @@ void Darwin::CheckObjCARC() const {
 
 SanitizerMask Darwin::getSupportedSanitizers() const {
   const bool IsX86_64 = getTriple().getArch() == llvm::Triple::x86_64;
+  const bool IsAArch64 = getTriple().getArch() == llvm::Triple::aarch64;
   SanitizerMask Res = ToolChain::getSupportedSanitizers();
   Res |= SanitizerKind::Address;
   Res |= SanitizerKind::PointerCompare;
@@ -2736,9 +2737,8 @@ SanitizerMask Darwin::getSupportedSanitizers() const {
       && !(isTargetIPhoneOS() && isIPhoneOSVersionLT(5, 0)))
     Res |= SanitizerKind::Vptr;
 
-  if (isTargetMacOS()) {
-    if (IsX86_64)
-      Res |= SanitizerKind::Thread;
+  if ((IsX86_64 || IsAArch64) && isTargetMacOS()) {
+    Res |= SanitizerKind::Thread;
   } else if (isTargetIOSSimulator() || isTargetTvOSSimulator()) {
     if (IsX86_64)
       Res |= SanitizerKind::Thread;
