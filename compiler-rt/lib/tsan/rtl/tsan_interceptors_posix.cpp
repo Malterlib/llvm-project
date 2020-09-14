@@ -1022,7 +1022,7 @@ extern "C" void *__tsan_thread_start_func(void *arg) {
   // Prevent the callback from being tail called,
   // it mixes up stack traces.
   volatile int foo = 42;
-  foo++;
+  foo = foo + 1;
   return res;
 }
 
