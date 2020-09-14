@@ -176,7 +176,10 @@ void StackDepotBase<Node, kReservedBits, kTabSizeLog>::LockBeforeFork() {
 template <class Node, int kReservedBits, int kTabSizeLog>
 void StackDepotBase<Node, kReservedBits, kTabSizeLog>::UnlockAfterFork(
     bool fork_child) {
-  nodes.Unlock();
+  if (fork_child)
+    nodes.ForkedChild();
+  else
+    nodes.Unlock();
 
   // Only unlock in child process to avoid deadlock. See `LockBeforeFork`.
   if (!fork_child)

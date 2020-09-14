@@ -201,6 +201,7 @@ struct alignas(SANITIZER_CACHE_LINE_SIZE) ThreadState {
 #endif
   MutexSet mset;
   bool is_dead;
+  bool is_forking;
   const Tid tid;
   uptr stk_addr;
   uptr stk_size;
@@ -212,7 +213,7 @@ struct alignas(SANITIZER_CACHE_LINE_SIZE) ThreadState {
 
   TidSlot *slot;
   uptr slot_epoch;
-  bool slot_locked;
+  uptr slot_locked;
 
   // Current wired Processor, or nullptr. Required to handle any events.
   Processor *proc1;
@@ -314,7 +315,7 @@ struct Context {
 
   MetaMap metamap;
 
-  Mutex report_mtx;
+  __sanitizer::Mutex report_mtx;
   int nreported;
   atomic_uint64_t last_symbolize_time_ns;
 
