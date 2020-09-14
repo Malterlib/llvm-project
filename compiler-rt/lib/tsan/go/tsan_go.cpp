@@ -290,7 +290,7 @@ void __tsan_go_ignore_sync_end(ThreadState *thr) {
 }
 
 void __tsan_report_count(u64 *pn) {
-  Lock lock(&ctx->report_mtx);
+  BlockingMutexLock lock(&ctx->report_mtx);
   *pn = ctx->nreported;
 }
 

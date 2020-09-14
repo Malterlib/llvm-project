@@ -73,10 +73,11 @@ class SpinMutex : public StaticSpinMutex {
 class BlockingMutex {
  public:
   explicit constexpr BlockingMutex(LinkerInitialized)
-      : opaque_storage_ {0, }, owner_ {0} {}
+      : opaque_storage_ {0, }, owner_ {0}, recursive_count_ {0} {}
   BlockingMutex();
   void Lock();
   void Unlock();
+  void ForkedChild();
 
   // This function does not guarantee an explicit check that the calling thread
   // is the thread which owns the mutex. This behavior, while more strictly
@@ -91,6 +92,7 @@ class BlockingMutex {
   // Solaris mutex_t has a member that requires 64-bit alignment.
   ALIGNED(8) uptr opaque_storage_[10];
   uptr owner_;  // for debugging
+  uptr recursive_count_;
 };
 
 // Reader-writer spin mutex.
