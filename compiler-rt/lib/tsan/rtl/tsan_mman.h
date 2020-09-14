@@ -28,6 +28,7 @@ void AllocatorLockBeforeFork();
 void AllocatorUnlockAfterFork(bool child);
 void GlobalProcessorLock();
 void GlobalProcessorUnlock();
+void GlobalProcessorForkedChild();
 
 // For user allocations.
 void *user_alloc_internal(ThreadState *thr, uptr pc, uptr sz,

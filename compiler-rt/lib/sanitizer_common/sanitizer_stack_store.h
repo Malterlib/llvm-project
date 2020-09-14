@@ -48,6 +48,7 @@ class StackStore {
 
   void LockAll();
   void UnlockAll();
+  void ForkedChildAll();
 
   void TestOnlyUnmap();
 
@@ -111,6 +112,7 @@ class StackStore {
     bool IsPacked() const;
     void Lock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS { mtx_.Lock(); }
     void Unlock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS { mtx_.Unlock(); }
+    void ForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS { mtx_.ForkedChild(); }
   };
 
   BlockInfo blocks_[kBlockCount] = {};

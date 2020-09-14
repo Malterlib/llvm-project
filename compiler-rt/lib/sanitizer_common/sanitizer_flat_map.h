@@ -113,6 +113,8 @@ class TwoLevelMap {
 
   void Unlock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS { mu_.Unlock(); }
 
+  void ForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS { mu_.ForkedChild(); }
+
  private:
   constexpr uptr MmapSize() const {
     return RoundUpTo(kSize2 * sizeof(T), GetPageSizeCached());
