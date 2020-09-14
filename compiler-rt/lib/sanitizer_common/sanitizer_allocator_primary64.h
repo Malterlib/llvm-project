@@ -366,6 +366,12 @@ class SizeClassAllocator64 {
     }
   }
 
+  void ForceForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+    for (int i = (int)kNumClasses - 1; i >= 0; i--) {
+      GetRegionInfo(i)->mutex.ForkedChild();
+    }
+  }
+
   // Iterate over all existing chunks.
   // The allocator must be locked when calling this function.
   void ForEachChunk(ForEachChunkCallback callback, void *arg) {

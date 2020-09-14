@@ -98,6 +98,7 @@ class CompressThread {
   void Stop();
   void LockAndStop() SANITIZER_NO_THREAD_SAFETY_ANALYSIS;
   void Unlock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS;
+  void ForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS;
 
  private:
   enum class State {
@@ -185,6 +186,7 @@ void CompressThread::LockAndStop() {
 }
 
 void CompressThread::Unlock() { mutex_.Unlock(); }
+void CompressThread::ForkedChild() { mutex_.ForkedChild(); }
 
 }  // namespace
 
@@ -222,8 +224,13 @@ void StackDepotLockBeforeFork() {
 }
 
 void StackDepotUnlockAfterFork(bool fork_child) {
-  stackStore.UnlockAll();
-  compress_thread.Unlock();
+  if (fork_child) {
+    stackStore.ForkedChildAll();
+    compress_thread.ForkedChild();
+  } else {
+    stackStore.UnlockAll();
+    compress_thread.Unlock();
+  }
   theDepot.UnlockAfterFork(fork_child);
 }
 
