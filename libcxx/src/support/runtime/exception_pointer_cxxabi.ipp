@@ -54,7 +54,7 @@ exception_ptr current_exception() noexcept {
   return ptr;
 }
 
-void rethrow_exception(exception_ptr p) {
+void _LIBCPP_NO_SANITIZE("thread") rethrow_exception(exception_ptr p) {
   abi::__cxa_rethrow_primary_exception(p.__ptr_);
   // if p.__ptr_ is NULL, above returns so we terminate
   terminate();

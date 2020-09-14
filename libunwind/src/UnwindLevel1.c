@@ -108,7 +108,9 @@ static _Unwind_Personality_Fn get_handler_function(unw_proc_info_t *frameInfo) {
 }
 
 static _Unwind_Reason_Code
-unwind_phase1(unw_context_t *uc, unw_cursor_t *cursor, _Unwind_Exception *exception_object) {
+__attribute__((no_sanitize("address", "thread")))
+unwind_phase1(unw_context_t *uc, unw_cursor_t *cursor,
+              _Unwind_Exception *exception_object) {
   __unw_init_local(cursor, uc);
 
   // Walk each frame looking for a place to stop.
@@ -208,6 +210,7 @@ __attribute__((target("+gcs")))
 _LIBUNWIND_TRACE_NO_INLINE
 #endif
 static _Unwind_Reason_Code
+__attribute__((no_sanitize("address", "thread")))
 unwind_phase2(unw_context_t *uc, unw_cursor_t *cursor,
               _Unwind_Exception *exception_object) {
   __unw_init_local(cursor, uc);
@@ -354,6 +357,7 @@ __attribute__((target("+gcs")))
 _LIBUNWIND_TRACE_NO_INLINE
 #endif
 static _Unwind_Reason_Code
+__attribute__((no_sanitize("address", "thread")))
 unwind_phase2_forced(unw_context_t *uc, unw_cursor_t *cursor,
                      _Unwind_Exception *exception_object, _Unwind_Stop_Fn stop,
                      void *stop_parameter) {
@@ -463,7 +467,7 @@ unwind_phase2_forced(unw_context_t *uc, unw_cursor_t *cursor,
 
 /// Called by __cxa_throw.  Only returns if there is a fatal error.
 _LIBUNWIND_EXPORT _Unwind_Reason_Code
-_Unwind_RaiseException(_Unwind_Exception *exception_object) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_RaiseException(_Unwind_Exception *exception_object) {
   _LIBUNWIND_TRACE_API("_Unwind_RaiseException(ex_obj=%p)",
                        (void *)exception_object);
   unw_context_t uc;
@@ -497,7 +501,7 @@ _Unwind_RaiseException(_Unwind_Exception *exception_object) {
 /// Note: re-throwing an exception (as opposed to continuing the unwind)
 /// is implemented by having the code call __cxa_rethrow() which
 /// in turn calls _Unwind_Resume_or_Rethrow().
-_LIBUNWIND_EXPORT void
+__attribute__((no_sanitize("undefined", "address", "thread"))) _LIBUNWIND_EXPORT void
 _Unwind_Resume(_Unwind_Exception *exception_object) {
   _LIBUNWIND_TRACE_API("_Unwind_Resume(ex_obj=%p)", (void *)exception_object);
   unw_context_t uc;
@@ -521,7 +525,7 @@ _Unwind_Resume(_Unwind_Exception *exception_object) {
 /// Unwinds stack, calling "stop" function at each frame.
 /// Could be used to implement longjmp().
 _LIBUNWIND_EXPORT _Unwind_Reason_Code
-_Unwind_ForcedUnwind(_Unwind_Exception *exception_object,
+__attribute__((no_sanitize("address", "thread"))) _Unwind_ForcedUnwind(_Unwind_Exception *exception_object,
                      _Unwind_Stop_Fn stop, void *stop_parameter) {
   _LIBUNWIND_TRACE_API("_Unwind_ForcedUnwind(ex_obj=%p, stop=%p)",
                        (void *)exception_object, (void *)(uintptr_t)stop);
@@ -541,7 +545,7 @@ _Unwind_ForcedUnwind(_Unwind_Exception *exception_object,
 
 /// Called by personality handler during phase 2 to get LSDA for current frame.
 _LIBUNWIND_EXPORT uintptr_t
-_Unwind_GetLanguageSpecificData(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_GetLanguageSpecificData(struct _Unwind_Context *context) {
   unw_cursor_t *cursor = (unw_cursor_t *)context;
   unw_proc_info_t frameInfo;
   uintptr_t result = 0;
@@ -564,7 +568,7 @@ _Unwind_GetLanguageSpecificData(struct _Unwind_Context *context) {
 /// Called by personality handler during phase 2 to find the start of the
 /// function.
 _LIBUNWIND_EXPORT uintptr_t
-_Unwind_GetRegionStart(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_GetRegionStart(struct _Unwind_Context *context) {
   unw_cursor_t *cursor = (unw_cursor_t *)context;
   unw_proc_info_t frameInfo;
   uintptr_t result = 0;
@@ -580,7 +584,7 @@ _Unwind_GetRegionStart(struct _Unwind_Context *context) {
 /// Called by personality handler during phase 2 if a foreign exception
 // is caught.
 _LIBUNWIND_EXPORT void
-_Unwind_DeleteException(_Unwind_Exception *exception_object) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_DeleteException(_Unwind_Exception *exception_object) {
   _LIBUNWIND_TRACE_API("_Unwind_DeleteException(ex_obj=%p)",
                        (void *)exception_object);
   if (exception_object->exception_cleanup != NULL)
@@ -590,7 +594,7 @@ _Unwind_DeleteException(_Unwind_Exception *exception_object) {
 
 /// Called by personality handler during phase 2 to get register values.
 _LIBUNWIND_EXPORT uintptr_t
-_Unwind_GetGR(struct _Unwind_Context *context, int index) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_GetGR(struct _Unwind_Context *context, int index) {
   unw_cursor_t *cursor = (unw_cursor_t *)context;
   unw_word_t result;
   __unw_get_reg(cursor, index, &result);
@@ -600,7 +604,7 @@ _Unwind_GetGR(struct _Unwind_Context *context, int index) {
 }
 
 /// Called by personality handler during phase 2 to alter register values.
-_LIBUNWIND_EXPORT void _Unwind_SetGR(struct _Unwind_Context *context, int index,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void _Unwind_SetGR(struct _Unwind_Context *context, int index,
                                      uintptr_t value) {
   _LIBUNWIND_TRACE_API("_Unwind_SetGR(context=%p, reg=%d, value=0x%0" PRIxPTR
                        ")",
@@ -610,7 +614,7 @@ _LIBUNWIND_EXPORT void _Unwind_SetGR(struct _Unwind_Context *context, int index,
 }
 
 /// Called by personality handler during phase 2 to get instruction pointer.
-_LIBUNWIND_EXPORT uintptr_t _Unwind_GetIP(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT uintptr_t _Unwind_GetIP(struct _Unwind_Context *context) {
   unw_cursor_t *cursor = (unw_cursor_t *)context;
   unw_word_t result;
   __unw_get_reg(cursor, UNW_REG_IP, &result);
@@ -634,7 +638,7 @@ _LIBUNWIND_EXPORT uintptr_t _Unwind_GetIP(struct _Unwind_Context *context) {
 /// Called by personality handler during phase 2 to alter instruction pointer,
 /// such as setting where the landing pad is, so _Unwind_Resume() will
 /// start executing in the landing pad.
-_LIBUNWIND_EXPORT void _Unwind_SetIP(struct _Unwind_Context *context,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void _Unwind_SetIP(struct _Unwind_Context *context,
                                      uintptr_t value) {
   _LIBUNWIND_TRACE_API("_Unwind_SetIP(context=%p, value=0x%0" PRIxPTR ")",
                        (void *)context, value);

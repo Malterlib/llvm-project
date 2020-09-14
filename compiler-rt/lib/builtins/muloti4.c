@@ -22,7 +22,7 @@
 #define fixuint_t tu_int
 #include "int_mulo_impl.inc"
 
-COMPILER_RT_ABI ti_int __muloti4(ti_int a, ti_int b, int *overflow) {
+__attribute__((no_sanitize("undefined"))) COMPILER_RT_ABI ti_int __muloti4(ti_int a, ti_int b, int *overflow) {
   return __muloXi4(a, b, overflow);
 }
 
