@@ -138,6 +138,8 @@ option(COMPILER_RT_EXTERNALIZE_DEBUGINFO
 # COMPILER_RT_DEBUG_PYBOOL is used by lit.common.configured.in.
 pythonize_bool(COMPILER_RT_DEBUG)
 
+option(COMPILER_RT_USE_ASM_LANGUAGE
+  "Use ASM Language instead of C for assembler files" OFF)
 option(COMPILER_RT_INTERCEPT_LIBDISPATCH
   "Support interception of libdispatch (GCD). Requires '-fblocks'" OFF)
 option(COMPILER_RT_LIBDISPATCH_INSTALL_PATH

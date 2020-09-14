@@ -113,7 +113,9 @@ function(add_asm_sources output)
   # MinGW didn't work correctly with assembly prior to CMake 3.17. https://gitlab.kitware.com/cmake/cmake/-/merge_requests/4287 and https://reviews.llvm.org/rGb780df052dd2b246a760d00e00f7de9ebdab9d09
   # Workaround these two issues by compiling as C.
   # Same workaround used in libunwind. Also update there if changed here.
-  if((APPLE AND CMAKE_VERSION VERSION_LESS 3.19) OR (MINGW AND CMAKE_VERSION VERSION_LESS 3.17))
+  if (COMPILER_RT_USE_ASM_LANGUAGE)
+     enable_language(ASM)
+  elseif((APPLE AND CMAKE_VERSION VERSION_LESS 3.19) OR (MINGW AND CMAKE_VERSION VERSION_LESS 3.17))
     set_source_files_properties(${ARGN} PROPERTIES LANGUAGE C)
   endif()
 endfunction()
@@ -375,7 +377,7 @@ function(add_compiler_rt_runtime name type)
       if(APPLE)
         # Ad-hoc sign the dylibs
         add_custom_command(TARGET ${libname}
-          POST_BUILD  
+          POST_BUILD
           COMMAND codesign --sign - $<TARGET_FILE:${libname}>
           WORKING_DIRECTORY ${COMPILER_RT_OUTPUT_LIBRARY_DIR}
         )
