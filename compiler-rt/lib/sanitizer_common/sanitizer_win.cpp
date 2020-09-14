@@ -801,6 +801,10 @@ BlockingMutex::BlockingMutex() {
   internal_memset(this, 0, sizeof(*this));
 }
 
+void BlockingMutex::ForkedChild() {
+  this->Unlock();
+}
+
 void BlockingMutex::Lock() {
   AcquireSRWLockExclusive((PSRWLOCK)opaque_storage_);
   CHECK_EQ(owner_, 0);

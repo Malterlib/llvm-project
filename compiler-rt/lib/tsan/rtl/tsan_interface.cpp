@@ -28,6 +28,14 @@ void __tsan_init() {
   Initialize(cur_thread());
 }
 
+void __tsan_forked_child() {
+  ForkChildAfter(cur_thread(), CALLERPC);
+}
+
+void __tsan_forked_parent() {
+  ForkParentAfter(cur_thread(), CALLERPC);
+}
+
 void __tsan_flush_memory() {
   FlushShadowMemory();
 }

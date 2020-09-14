@@ -76,6 +76,7 @@ extern "C" {
 #include <sys/wait.h>
 #include <unistd.h>
 #include <util.h>
+#include <os/lock.h>
 
 // From <crt_externs.h>, but we don't have that file on iOS.
 extern "C" {
@@ -496,19 +497,44 @@ BlockingMutex::BlockingMutex() {
   internal_memset(this, 0, sizeof(*this));
 }
 
+void BlockingMutex::ForkedChild() {
+  CHECK_EQ(recursive_count_, 1);
+  (*(os_unfair_lock_s*)&opaque_storage_) = OS_UNFAIR_LOCK_INIT;
+  recursive_count_ = 0;
+  owner_ = 0;
+}
+
 void BlockingMutex::Lock() {
-  CHECK(sizeof(OSSpinLock) <= sizeof(opaque_storage_));
-  CHECK_EQ(OS_SPINLOCK_INIT, 0);
+  CHECK(sizeof(os_unfair_lock_s) <= sizeof(opaque_storage_));
+  CHECK(sizeof(pthread_t) <= sizeof(owner_));
+  CHECK_EQ(os_unfair_lock(OS_UNFAIR_LOCK_INIT)._os_unfair_lock_opaque, 0);
+
+  uptr thread_self = (uptr)pthread_self();
+  if (owner_ == thread_self) {
+    ++recursive_count_;
+    return;
+  }
+
+  os_unfair_lock_lock((os_unfair_lock_s*)&opaque_storage_);
+
+  CHECK_EQ(recursive_count_, 0);
   CHECK_EQ(owner_, 0);
-  OSSpinLockLock((OSSpinLock*)&opaque_storage_);
+  owner_ = thread_self;
+  ++recursive_count_;
 }
 
 void BlockingMutex::Unlock() {
-  OSSpinLockUnlock((OSSpinLock*)&opaque_storage_);
+  uptr thread_self = (uptr)pthread_self();
+  CHECK_EQ(owner_, thread_self);
+  if (--recursive_count_ > 0)
+    return;
+
+  owner_ = 0;
+  os_unfair_lock_unlock((os_unfair_lock_s*)&opaque_storage_);
 }
 
 void BlockingMutex::CheckLocked() {
-  CHECK_NE(*(OSSpinLock*)&opaque_storage_, 0);
+  CHECK_NE(((os_unfair_lock_s*)&opaque_storage_)->_os_unfair_lock_opaque, 0);
 }
 
 u64 NanoTime() {

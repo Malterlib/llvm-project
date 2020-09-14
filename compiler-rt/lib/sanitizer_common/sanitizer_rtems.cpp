@@ -119,6 +119,10 @@ BlockingMutex::BlockingMutex() {
   internal_memset(this, 0, sizeof(*this));
 }
 
+void BlockingMutex::ForkedChild() {
+  this->Unlock();
+}
+
 void BlockingMutex::Lock() {
   CHECK_EQ(owner_, 0);
   atomic_uint32_t *m = reinterpret_cast<atomic_uint32_t *>(&opaque_storage_);
