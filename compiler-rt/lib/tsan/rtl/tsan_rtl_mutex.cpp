@@ -84,6 +84,8 @@ static void RecordMutexUnlock(ThreadState *thr, uptr addr) {
 }
 
 void MutexCreate(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexCreate %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (!(flagz & MutexFlagLinkerInit) && pc && IsAppMem(addr))
     MemoryAccess(thr, pc, addr, 1, kAccessWrite);
@@ -96,6 +98,8 @@ void MutexCreate(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexDestroy(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexDestroy %zx\n", thr->tid, addr);
   bool unlock_locked = false;
   StackID creation_stack_id;
@@ -137,6 +141,8 @@ void MutexDestroy(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPreLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPreLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (flagz & MutexFlagTryLock)
     return;
@@ -155,6 +161,8 @@ void MutexPreLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPostLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz, int rec) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPostLock %zx flag=0x%x rec=%d\n",
       thr->tid, addr, flagz, rec);
   if (flagz & MutexFlagRecursiveLock)
@@ -213,6 +221,8 @@ void MutexPostLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz, int rec) {
 }
 
 int MutexUnlock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return 0;
   DPrintf("#%d: MutexUnlock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (pc && IsAppMem(addr))
     MemoryAccess(thr, pc, addr, 1, kAccessRead | kAccessAtomic);
@@ -263,6 +273,8 @@ int MutexUnlock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPreReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPreReadLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if ((flagz & MutexFlagTryLock) || !common_flags()->detect_deadlocks)
     return;
@@ -278,6 +290,8 @@ void MutexPreReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPostReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPostReadLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (pc && IsAppMem(addr))
     MemoryAccess(thr, pc, addr, 1, kAccessRead | kAccessAtomic);
@@ -321,6 +335,8 @@ void MutexPostReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexReadUnlock(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexReadUnlock %zx\n", thr->tid, addr);
   if (pc && IsAppMem(addr))
     MemoryAccess(thr, pc, addr, 1, kAccessRead | kAccessAtomic);
@@ -362,6 +378,8 @@ void MutexReadUnlock(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexReadOrWriteUnlock %zx\n", thr->tid, addr);
   if (pc && IsAppMem(addr))
     MemoryAccess(thr, pc, addr, 1, kAccessRead | kAccessAtomic);
@@ -416,6 +434,8 @@ void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexRepair(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexRepair %zx\n", thr->tid, addr);
   SlotLocker locker(thr);
   auto s = ctx->metamap.GetSyncOrCreate(thr, pc, addr, true);
@@ -425,6 +445,8 @@ void MutexRepair(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexInvalidAccess(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexInvalidAccess %zx\n", thr->tid, addr);
   StackID creation_stack_id = kInvalidStackID;
   {
