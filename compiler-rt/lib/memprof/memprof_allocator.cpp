@@ -574,6 +574,11 @@ struct Allocator {
     fallback_mutex.Unlock();
     allocator.ForceUnlock();
   }
+
+  void ForceForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+    fallback_mutex.ForkedChild();
+    allocator.ForceForkedChild();
+  }
 };
 
 static Allocator instance(LINKER_INITIALIZED);
