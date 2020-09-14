@@ -52,6 +52,9 @@ bool operator==(const VersionBase<VersionType> &self,
 
 struct MacosVersion : VersionBase<MacosVersion> {
   MacosVersion(u16 major, u16 minor) : VersionBase(major, minor) {}
+  bool operator==(const MacosVersion &other) const {
+    return major == other.major && minor == other.minor;
+  }
 };
 
 struct DarwinKernelVersion : VersionBase<DarwinKernelVersion> {
