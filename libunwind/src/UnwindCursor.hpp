@@ -265,17 +265,17 @@ public:
   UnwindSectionIndexArray(A &addressSpace, typename A::pint_t addr)
       : _addressSpace(addressSpace), _addr(addr) {}
 
-  uint32_t functionOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t functionOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_section_header_index_entry, index,
                               functionOffset));
   }
-  uint32_t secondLevelPagesSectionOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t secondLevelPagesSectionOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_section_header_index_entry, index,
                               secondLevelPagesSectionOffset));
   }
-  uint32_t lsdaIndexArraySectionOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t lsdaIndexArraySectionOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_section_header_index_entry, index,
                               lsdaIndexArraySectionOffset));
@@ -316,12 +316,12 @@ public:
   UnwindSectionRegularArray(A &addressSpace, typename A::pint_t addr)
       : _addressSpace(addressSpace), _addr(addr) {}
 
-  uint32_t functionOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t functionOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_regular_second_level_entry, index,
                               functionOffset));
   }
-  uint32_t encoding(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t encoding(uint32_t index) const {
     return _addressSpace.get32(
         _addr +
         arrayoffsetof(unwind_info_regular_second_level_entry, index, encoding));
@@ -392,12 +392,12 @@ public:
   UnwindSectionLsdaArray(A &addressSpace, typename A::pint_t addr)
       : _addressSpace(addressSpace), _addr(addr) {}
 
-  uint32_t functionOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t functionOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_section_header_lsda_index_entry,
                               index, functionOffset));
   }
-  uint32_t lsdaOffset(uint32_t index) const {
+  __attribute__((no_sanitize("undefined"))) uint32_t lsdaOffset(uint32_t index) const {
     return _addressSpace.get32(
         _addr + arrayoffsetof(unwind_info_section_header_lsda_index_entry,
                               index, lsdaOffset));
@@ -1349,13 +1349,13 @@ struct EHABISectionIterator {
 
   typename A::pint_t operator*() const { return functionAddress(); }
 
-  typename A::pint_t functionAddress() const {
+  __attribute__((no_sanitize("undefined"))) typename A::pint_t functionAddress() const {
     typename A::pint_t indexAddr = _sects->arm_section + arrayoffsetof(
         EHABIIndexEntry, _i, functionOffset);
     return indexAddr + signExtendPrel31(_addressSpace->get32(indexAddr));
   }
 
-  typename A::pint_t dataAddress() {
+  __attribute__((no_sanitize("undefined"))) typename A::pint_t dataAddress() {
     typename A::pint_t indexAddr = _sects->arm_section + arrayoffsetof(
         EHABIIndexEntry, _i, data);
     return indexAddr;

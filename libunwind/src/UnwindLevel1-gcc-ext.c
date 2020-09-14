@@ -34,7 +34,7 @@
 
 ///  Called by __cxa_rethrow().
 _LIBUNWIND_EXPORT _Unwind_Reason_Code
-_Unwind_Resume_or_Rethrow(_Unwind_Exception *exception_object) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_Resume_or_Rethrow(_Unwind_Exception *exception_object) {
   _LIBUNWIND_TRACE_API(
       "_Unwind_Resume_or_Rethrow(ex_obj=%p), private_1=%" PRIdPTR,
       (void *)exception_object, (intptr_t)exception_object->PRIVATE_1);
@@ -58,7 +58,7 @@ _Unwind_Resume_or_Rethrow(_Unwind_Exception *exception_object) {
 /// Called by personality handler during phase 2 to get base address for data
 /// relative encodings.
 _LIBUNWIND_EXPORT uintptr_t
-_Unwind_GetDataRelBase(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_GetDataRelBase(struct _Unwind_Context *context) {
   (void)context;
   _LIBUNWIND_TRACE_API("_Unwind_GetDataRelBase(context=%p)", (void *)context);
   _LIBUNWIND_ABORT("_Unwind_GetDataRelBase() not implemented");
@@ -68,7 +68,7 @@ _Unwind_GetDataRelBase(struct _Unwind_Context *context) {
 /// Called by personality handler during phase 2 to get base address for text
 /// relative encodings.
 _LIBUNWIND_EXPORT uintptr_t
-_Unwind_GetTextRelBase(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_GetTextRelBase(struct _Unwind_Context *context) {
   (void)context;
   _LIBUNWIND_TRACE_API("_Unwind_GetTextRelBase(context=%p)", (void *)context);
   _LIBUNWIND_ABORT("_Unwind_GetTextRelBase() not implemented");
@@ -77,7 +77,7 @@ _Unwind_GetTextRelBase(struct _Unwind_Context *context) {
 
 /// Scans unwind information to find the function that contains the
 /// specified code address "pc".
-_LIBUNWIND_EXPORT void *_Unwind_FindEnclosingFunction(void *pc) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void *_Unwind_FindEnclosingFunction(void *pc) {
   _LIBUNWIND_TRACE_API("_Unwind_FindEnclosingFunction(pc=%p)", pc);
   // This is slow, but works.
   // We create an unwind cursor then alter the IP to be pc
@@ -96,7 +96,7 @@ _LIBUNWIND_EXPORT void *_Unwind_FindEnclosingFunction(void *pc) {
 /// Walk every frame and call trace function at each one.  If trace function
 /// returns anything other than _URC_NO_REASON, then walk is terminated.
 _LIBUNWIND_EXPORT _Unwind_Reason_Code
-_Unwind_Backtrace(_Unwind_Trace_Fn callback, void *ref) {
+__attribute__((no_sanitize("address", "thread"))) _Unwind_Backtrace(_Unwind_Trace_Fn callback, void *ref) {
   unw_cursor_t cursor;
   unw_context_t uc;
   __unw_getcontext(&uc);
@@ -175,7 +175,7 @@ _Unwind_Backtrace(_Unwind_Trace_Fn callback, void *ref) {
 
 
 /// Find DWARF unwind info for an address 'pc' in some function.
-_LIBUNWIND_EXPORT const void *_Unwind_Find_FDE(const void *pc,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT const void *_Unwind_Find_FDE(const void *pc,
                                                struct dwarf_eh_bases *bases) {
   // This is slow, but works.
   // We create an unwind cursor then alter the IP to be pc
@@ -196,7 +196,7 @@ _LIBUNWIND_EXPORT const void *_Unwind_Find_FDE(const void *pc,
 
 /// Returns the CFA (call frame area, or stack pointer at start of function)
 /// for the current context.
-_LIBUNWIND_EXPORT uintptr_t _Unwind_GetCFA(struct _Unwind_Context *context) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT uintptr_t _Unwind_GetCFA(struct _Unwind_Context *context) {
   unw_cursor_t *cursor = (unw_cursor_t *)context;
   unw_word_t result;
   __unw_get_reg(cursor, UNW_REG_SP, &result);
@@ -209,7 +209,7 @@ _LIBUNWIND_EXPORT uintptr_t _Unwind_GetCFA(struct _Unwind_Context *context) {
 /// Called by personality handler during phase 2 to get instruction pointer.
 /// ipBefore is a boolean that says if IP is already adjusted to be the call
 /// site address.  Normally IP is the return address.
-_LIBUNWIND_EXPORT uintptr_t _Unwind_GetIPInfo(struct _Unwind_Context *context,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT uintptr_t _Unwind_GetIPInfo(struct _Unwind_Context *context,
                                               int *ipBefore) {
   _LIBUNWIND_TRACE_API("_Unwind_GetIPInfo(context=%p)", (void *)context);
   int isSignalFrame = __unw_is_signal_frame((unw_cursor_t *)context);
@@ -229,7 +229,7 @@ _LIBUNWIND_EXPORT uintptr_t _Unwind_GetIPInfo(struct _Unwind_Context *context,
 /// to register a dynamically generated FDE.
 /// This function has existed on Mac OS X since 10.4, but
 /// was broken until 10.6.
-_LIBUNWIND_EXPORT void __register_frame(const void *fde) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame(const void *fde) {
   _LIBUNWIND_TRACE_API("__register_frame(%p)", fde);
   __unw_add_dynamic_fde((unw_word_t)(uintptr_t)fde);
 }
@@ -239,7 +239,7 @@ _LIBUNWIND_EXPORT void __register_frame(const void *fde) {
 /// to unregister a dynamically generated FDE.
 /// This function has existed on Mac OS X since 10.4, but
 /// was broken until 10.6.
-_LIBUNWIND_EXPORT void __deregister_frame(const void *fde) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __deregister_frame(const void *fde) {
   _LIBUNWIND_TRACE_API("__deregister_frame(%p)", fde);
   __unw_remove_dynamic_fde((unw_word_t)(uintptr_t)fde);
 }
@@ -254,7 +254,7 @@ _LIBUNWIND_EXPORT void __deregister_frame(const void *fde) {
 // application won't be able to use them.
 
 #if defined(_LIBUNWIND_SUPPORT_FRAME_APIS)
-_LIBUNWIND_EXPORT void __register_frame_info_bases(const void *fde, void *ob,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame_info_bases(const void *fde, void *ob,
                                                    void *tb, void *db) {
   (void)fde;
   (void)ob;
@@ -265,14 +265,14 @@ _LIBUNWIND_EXPORT void __register_frame_info_bases(const void *fde, void *ob,
   // do nothing, this function never worked in Mac OS X
 }
 
-_LIBUNWIND_EXPORT void __register_frame_info(const void *fde, void *ob) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame_info(const void *fde, void *ob) {
   (void)fde;
   (void)ob;
   _LIBUNWIND_TRACE_API("__register_frame_info(%p, %p)", fde, ob);
   // do nothing, this function never worked in Mac OS X
 }
 
-_LIBUNWIND_EXPORT void __register_frame_info_table_bases(const void *fde,
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame_info_table_bases(const void *fde,
                                                          void *ob, void *tb,
                                                          void *db) {
   (void)fde;
@@ -284,27 +284,27 @@ _LIBUNWIND_EXPORT void __register_frame_info_table_bases(const void *fde,
   // do nothing, this function never worked in Mac OS X
 }
 
-_LIBUNWIND_EXPORT void __register_frame_info_table(const void *fde, void *ob) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame_info_table(const void *fde, void *ob) {
   (void)fde;
   (void)ob;
   _LIBUNWIND_TRACE_API("__register_frame_info_table(%p, %p)", fde, ob);
   // do nothing, this function never worked in Mac OS X
 }
 
-_LIBUNWIND_EXPORT void __register_frame_table(const void *fde) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void __register_frame_table(const void *fde) {
   (void)fde;
   _LIBUNWIND_TRACE_API("__register_frame_table(%p)", fde);
   // do nothing, this function never worked in Mac OS X
 }
 
-_LIBUNWIND_EXPORT void *__deregister_frame_info(const void *fde) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void *__deregister_frame_info(const void *fde) {
   (void)fde;
   _LIBUNWIND_TRACE_API("__deregister_frame_info(%p)", fde);
   // do nothing, this function never worked in Mac OS X
   return NULL;
 }
 
-_LIBUNWIND_EXPORT void *__deregister_frame_info_bases(const void *fde) {
+__attribute__((no_sanitize("address", "thread"))) _LIBUNWIND_EXPORT void *__deregister_frame_info_bases(const void *fde) {
   (void)fde;
   _LIBUNWIND_TRACE_API("__deregister_frame_info_bases(%p)", fde);
   // do nothing, this function never worked in Mac OS X
