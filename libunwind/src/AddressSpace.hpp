@@ -149,32 +149,32 @@ class _LIBUNWIND_HIDDEN LocalAddressSpace {
 public:
   typedef uintptr_t pint_t;
   typedef intptr_t  sint_t;
-  uint8_t         get8(pint_t addr) {
+  __attribute__((no_sanitize("address"))) uint8_t         get8(pint_t addr) {
     uint8_t val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
   }
-  uint16_t         get16(pint_t addr) {
+  __attribute__((no_sanitize("address"))) uint16_t         get16(pint_t addr) {
     uint16_t val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
   }
-  uint32_t         get32(pint_t addr) {
+  __attribute__((no_sanitize("address"))) uint32_t         get32(pint_t addr) {
     uint32_t val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
   }
-  uint64_t         get64(pint_t addr) {
+  __attribute__((no_sanitize("address"))) uint64_t         get64(pint_t addr) {
     uint64_t val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
   }
-  double           getDouble(pint_t addr) {
+  __attribute__((no_sanitize("address"))) double           getDouble(pint_t addr) {
     double val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
   }
-  v128             getVector(pint_t addr) {
+  __attribute__((no_sanitize("address"))) v128             getVector(pint_t addr) {
     v128 val;
     memcpy(&val, (void *)addr, sizeof(val));
     return val;
