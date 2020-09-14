@@ -93,7 +93,8 @@ void __tsan_java_alloc(jptr ptr, jptr size) {
   DCHECK_GE(ptr, jctx->heap_begin);
   DCHECK_LE(ptr + size, jctx->heap_begin + jctx->heap_size);
 
-  OnUserAlloc(thr, 0, ptr, size, false);
+  if (!ctx->after_multithreaded_fork)
+    OnUserAlloc(thr, 0, ptr, size, false);
 }
 
 void __tsan_java_free(jptr ptr, jptr size) {
