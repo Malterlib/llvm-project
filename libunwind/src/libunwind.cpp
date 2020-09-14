@@ -253,8 +253,8 @@ _LIBUNWIND_WEAK_ALIAS(__unw_get_proc_info, unw_get_proc_info)
 /// Rebalance the execution flow by injecting the right amount of `ret`
 /// instruction relatively to the amount of `walkedFrames` then resume execution
 /// at cursor position (aka longjump).
-_LIBUNWIND_HIDDEN int __unw_resume_with_frames_walked(unw_cursor_t *cursor,
-                                                      unsigned walkedFrames) {
+__attribute__((no_sanitize("thread"))) _LIBUNWIND_HIDDEN int
+__unw_resume_with_frames_walked(unw_cursor_t *cursor, unsigned walkedFrames) {
   _LIBUNWIND_TRACE_API("__unw_resume(cursor=%p, walkedFrames=%u)",
                        static_cast<void *>(cursor), walkedFrames);
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
@@ -271,7 +271,8 @@ _LIBUNWIND_WEAK_ALIAS(__unw_resume_with_frames_walked,
                       unw_resume_with_frames_walked)
 
 /// Legacy function. Resume execution at cursor position (aka longjump).
-_LIBUNWIND_HIDDEN int __unw_resume(unw_cursor_t *cursor) {
+__attribute__((no_sanitize("thread"))) _LIBUNWIND_HIDDEN int
+__unw_resume(unw_cursor_t *cursor) {
   _LIBUNWIND_TRACE_API("__unw_resume(cursor=%p)", static_cast<void *>(cursor));
 #if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
   // Inform the ASan runtime that now might be a good time to clean stuff up.
@@ -572,4 +573,3 @@ bool logDWARF() {
 }
 
 #endif // NDEBUG
-
