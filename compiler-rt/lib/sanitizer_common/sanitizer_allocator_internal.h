@@ -51,6 +51,7 @@ void* InternalCalloc(uptr count, uptr size,
 void InternalFree(void *p, InternalAllocatorCache *cache = nullptr);
 void InternalAllocatorLock();
 void InternalAllocatorUnlock();
+void InternalAllocatorForkedChild();
 InternalAllocator *internal_allocator();
 } // namespace __sanitizer
 
