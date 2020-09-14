@@ -335,7 +335,10 @@ void SlotDetach(ThreadState* thr) {
 }
 
 void SlotLock(ThreadState* thr) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
-  DCHECK(!thr->slot_locked);
+  if (thr->slot_locked) {
+    ++thr->slot_locked;
+    return;
+  }
 #if SANITIZER_DEBUG
   // Check these mutexes are not locked.
   // We can call DoReset from SlotAttachAndLock, which will lock
@@ -348,6 +351,7 @@ void SlotLock(ThreadState* thr) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   thr->slot_locked = true;
   if (LIKELY(thr == slot->thr && thr->fast_state.epoch() != kEpochLast))
     return;
+
   SlotDetachImpl(thr, false);
   thr->slot_locked = false;
   slot->mtx.Unlock();
@@ -356,8 +360,15 @@ void SlotLock(ThreadState* thr) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
 
 void SlotUnlock(ThreadState* thr) {
   DCHECK(thr->slot_locked);
-  thr->slot_locked = false;
+  if (--thr->slot_locked)
+    return;
   thr->slot->mtx.Unlock();
+}
+
+void SlotForkedChild(ThreadState* thr) {
+  CHECK(thr->slot_locked == 1);
+  thr->slot_locked = 0;
+  thr->slot->mtx.ForkedChild();
 }
 
 Context::Context()
@@ -488,7 +499,7 @@ static void *BackgroundThread(void *arg) {
       u64 last = atomic_load(&ctx->last_symbolize_time_ns,
                              memory_order_relaxed);
       if (last != 0 && last + flags()->flush_symbolizer_ms * kMs2Ns < now) {
-        Lock l(&ctx->report_mtx);
+        __sanitizer::Lock l(&ctx->report_mtx);
         ScopedErrorReportLock l2;
         SymbolizeFlush();
         atomic_store(&ctx->last_symbolize_time_ns, 0, memory_order_relaxed);
@@ -758,49 +769,63 @@ int Finalize(ThreadState *thr) {
 #if !SANITIZER_GO
 void ForkBefore(ThreadState* thr, uptr pc) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   GlobalProcessorLock();
-  // Detaching from the slot makes OnUserFree skip writing to the shadow.
-  // The slot will be locked so any attempts to use it will deadlock anyway.
-  SlotDetach(thr);
-  for (auto& slot : ctx->slots) slot.mtx.Lock();
+  SlotLock(thr);
+  for (auto& slot : ctx->slots) {
+    if (&slot != thr->slot)
+      slot.mtx.Lock();
+  }
   ctx->thread_registry.Lock();
   ctx->slot_mtx.Lock();
+  thr->is_forking = true;
   ScopedErrorReportLock::Lock();
   AllocatorLock();
-  // Suppress all reports in the pthread_atfork callbacks.
-  // Reports will deadlock on the report_mtx.
-  // We could ignore sync operations as well,
-  // but so far it's unclear if it will do more good or harm.
-  // Unnecessarily ignoring things can lead to false positives later.
-  thr->suppress_reports++;
-  // On OS X, REAL(fork) can call intercepted functions (OSSpinLockLock), and
-  // we'll assert in CheckNoLocks() unless we ignore interceptors.
-  // On OS X libSystem_atfork_prepare/parent/child callbacks are called
-  // after/before our callbacks and they call free.
-  thr->ignore_interceptors++;
-  // Disables memory write in OnUserAlloc/Free.
-  thr->ignore_reads_and_writes++;
 
   __tsan_test_only_on_fork();
+
+  CHECK(thr->slot_locked);
 }
 
-static void ForkAfter(ThreadState* thr) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
-  thr->suppress_reports--;  // Enabled in ForkBefore.
-  thr->ignore_interceptors--;
-  thr->ignore_reads_and_writes--;
+void ForkParentAfter(ThreadState* thr, uptr pc) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+  if (!thr->is_forking)
+    return;
+  thr->is_forking = false;
+
+  CHECK(thr->slot_locked);
+
   AllocatorUnlock();
   ScopedErrorReportLock::Unlock();
   ctx->slot_mtx.Unlock();
   ctx->thread_registry.Unlock();
-  for (auto& slot : ctx->slots) slot.mtx.Unlock();
-  SlotAttachAndLock(thr);
+  for (auto& slot : ctx->slots) {
+    if (&slot != thr->slot)
+      slot.mtx.Unlock();
+  }
   SlotUnlock(thr);
   GlobalProcessorUnlock();
 }
 
-void ForkParentAfter(ThreadState* thr, uptr pc) { ForkAfter(thr); }
+void ForkChildAfter(ThreadState* thr, uptr pc, bool start_thread) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+  if (!thr->is_forking)
+    return;
+  thr->is_forking = false;
 
-void ForkChildAfter(ThreadState* thr, uptr pc, bool start_thread) {
-  ForkAfter(thr);
+  CHECK(thr->slot_locked);
+
+  AllocatorForkedChild();
+  ScopedErrorReportLock::ForkedChild();
+  ctx->slot_mtx.ForkedChild();
+  ctx->thread_registry.ForkedChild();
+  for (auto& slot : ctx->slots) {
+    if (&slot != thr->slot)
+      slot.mtx.ForkedChild();
+  }
+
+  SlotForkedChild(thr);
+  SlotDetach(thr);
+  SlotAttachAndLock(thr);
+  SlotUnlock(thr);
+  GlobalProcessorForkedChild();
+
   u32 nthread = ctx->thread_registry.OnFork(thr->tid);
   VPrintf(1,
           "ThreadSanitizer: forked new process with pid %d,"

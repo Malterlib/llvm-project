@@ -243,6 +243,7 @@ class ScopedErrorReportLock {
 
   static void Lock() SANITIZER_ACQUIRE(mutex_);
   static void Unlock() SANITIZER_RELEASE(mutex_);
+  static void ForkedChild() SANITIZER_RELEASE(mutex_);
   static void CheckLocked() SANITIZER_CHECK_LOCKED(mutex_);
 
  private:

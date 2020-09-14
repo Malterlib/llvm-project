@@ -283,7 +283,7 @@ void __tsan_go_ignore_sync_begin(ThreadState *thr) {
 void __tsan_go_ignore_sync_end(ThreadState *thr) { ThreadIgnoreSyncEnd(thr); }
 
 void __tsan_report_count(u64 *pn) {
-  Lock lock(&ctx->report_mtx);
+  __sanitizer::Lock lock(&ctx->report_mtx);
   *pn = ctx->nreported;
 }
 

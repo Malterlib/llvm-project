@@ -23,8 +23,13 @@ void StaticSpinMutex::LockSlow() {
     else
       internal_sched_yield();
     if (atomic_load(&state_, memory_order_relaxed) == 0 &&
-        atomic_exchange(&state_, 1, memory_order_acquire) == 0)
+        atomic_exchange(&state_, 1, memory_order_acquire) == 0) {
+      DCHECK_EQ(recursive_count_, 0);
+      DCHECK_EQ(owner_, 0);
+      owner_ = GetThreadSelf();
+      ++recursive_count_;
       return;
+	}
   }
 }
 
@@ -46,6 +51,10 @@ void Semaphore::Post(u32 count) {
   CHECK_NE(count, 0);
   atomic_fetch_add(&state_, count, memory_order_release);
   FutexWake(&state_, count);
+}
+
+void Semaphore::ForkedChild() {
+  atomic_exchange(&state_, 0, memory_order_seq_cst);
 }
 
 #if SANITIZER_CHECK_DEADLOCKS
@@ -194,6 +203,12 @@ struct InternalDeadlockDetector {
     locked[type].pc = 0;
   }
 
+  void ForkedChild() {
+    initialized = false;
+    mutex_type_count = -1;
+    mutex_meta_mtx.ForkedChild();
+  }
+
   void CheckNoLocks() {
     for (int i = 0; i < mutex_type_count; i++) CHECK_EQ(locked[i].recursion, 0);
   }
@@ -218,7 +233,7 @@ static THREADLOCAL InternalDeadlockDetector deadlock_detector;
 void CheckedMutex::LockImpl(uptr pc) { deadlock_detector.Lock(type_, pc); }
 
 void CheckedMutex::UnlockImpl() { deadlock_detector.Unlock(type_); }
-
+void CheckedMutex::ForkedChildImpl() { deadlock_detector.ForkedChild(); }
 void CheckedMutex::CheckNoLocksImpl() { deadlock_detector.CheckNoLocks(); }
 #endif
 

@@ -130,6 +130,12 @@ void AllocatorLock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   InternalAllocatorLock();
 }
 
+void AllocatorForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+  InternalAllocatorForkedChild();
+  global_proc()->internal_alloc_mtx.ForkedChild();
+  global_proc()->mtx.ForkedChild();
+}
+
 void AllocatorUnlock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   InternalAllocatorUnlock();
   global_proc()->internal_alloc_mtx.Unlock();

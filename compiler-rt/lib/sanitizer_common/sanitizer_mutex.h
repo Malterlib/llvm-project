@@ -20,15 +20,30 @@
 
 namespace __sanitizer {
 
+uptr GetThreadSelf();
+
 class SANITIZER_MUTEX StaticSpinMutex {
  public:
   void Init() {
     atomic_store(&state_, 0, memory_order_relaxed);
+    owner_ = 0;
+    recursive_count_ = 0;
   }
 
   void Lock() SANITIZER_ACQUIRE() {
-    if (LIKELY(TryLock()))
+    uptr thread_self = GetThreadSelf();
+    if (owner_ == thread_self) {
+      ++recursive_count_;
       return;
+    }
+
+    if (LIKELY(TryLock())) {
+      DCHECK_EQ(recursive_count_, 0);
+      DCHECK_EQ(owner_, 0);
+      owner_ = thread_self;
+      ++recursive_count_;
+      return;
+    }
     LockSlow();
   }
 
@@ -37,7 +52,18 @@ class SANITIZER_MUTEX StaticSpinMutex {
   }
 
   void Unlock() SANITIZER_RELEASE() {
+    DCHECK_EQ(owner_, GetThreadSelf());
+    if (--recursive_count_ > 0)
+      return;
+    owner_ = 0;
+
     atomic_store(&state_, 0, memory_order_release);
+  }
+
+  void ForkedChild() SANITIZER_RELEASE() {
+    atomic_store(&state_, 0, memory_order_release);
+    owner_ = 0;
+    recursive_count_ = 0;
   }
 
   void CheckLocked() const SANITIZER_CHECK_LOCKED() {
@@ -46,6 +72,8 @@ class SANITIZER_MUTEX StaticSpinMutex {
 
  private:
   atomic_uint8_t state_;
+  uptr owner_;
+  uptr recursive_count_;
 
   void LockSlow();
 };
@@ -71,6 +99,7 @@ class Semaphore {
 
   void Wait();
   void Post(u32 count = 1);
+  void ForkedChild();
 
  private:
   atomic_uint32_t state_ = {0};
@@ -136,6 +165,12 @@ class CheckedMutex {
 #endif
   }
 
+  ALWAYS_INLINE void ForkedChild() {
+#if SANITIZER_CHECK_DEADLOCKS
+    ForkedChildImpl();
+#endif
+  }
+
   // Checks that the current thread does not hold any mutexes
   // (e.g. when returning from a runtime function to user code).
   static void CheckNoLocks() {
@@ -150,6 +185,7 @@ class CheckedMutex {
 
   void LockImpl(uptr pc);
   void UnlockImpl();
+  void ForkedChildImpl();
   static void CheckNoLocksImpl();
 #endif
 };
@@ -164,6 +200,11 @@ class SANITIZER_MUTEX Mutex : CheckedMutex {
       : CheckedMutex(type) {}
 
   void Lock() SANITIZER_ACQUIRE() {
+    uptr thread_self = GetThreadSelf();
+    if (owner_ == thread_self) {
+      ++recursive_count_;
+      return;
+    }
     CheckedMutex::Lock();
     u64 reset_mask = ~0ull;
     u64 state = atomic_load_relaxed(&state_);
@@ -189,8 +230,13 @@ class SANITIZER_MUTEX Mutex : CheckedMutex {
       if (UNLIKELY(!atomic_compare_exchange_weak(&state_, &state, new_state,
                                                  memory_order_acquire)))
         continue;
-      if (LIKELY(!locked))
+      if (LIKELY(!locked)) {
+        DCHECK_EQ(recursive_count_, 0);
+        DCHECK_EQ(owner_, 0);
+        owner_ = thread_self;
+        ++recursive_count_;
         return;  // We've locked the mutex.
+      }
       if (spin_iters > kMaxSpinIters) {
         // We've incremented waiting writers, so now block.
         writers_.Wait();
@@ -208,7 +254,21 @@ class SANITIZER_MUTEX Mutex : CheckedMutex {
     }
   }
 
+  void ForkedChild() {
+    state_ = {0};
+    writers_.ForkedChild();
+    readers_.ForkedChild();
+    recursive_count_ = 0;
+    owner_ = 0;
+  }
+
   void Unlock() SANITIZER_RELEASE() {
+    DCHECK_EQ(owner_, GetThreadSelf());
+    if (--recursive_count_ > 0)
+      return;
+
+    owner_ = 0;
+
     CheckedMutex::Unlock();
     bool wake_writer;
     u64 wake_readers;
@@ -313,6 +373,8 @@ class SANITIZER_MUTEX Mutex : CheckedMutex {
   atomic_uint64_t state_ = {0};
   Semaphore writers_;
   Semaphore readers_;
+  uptr owner_ = 0;
+  uptr recursive_count_ = 0;
 
   // The state has 3 counters:
   //  - number of readers holding the lock,
