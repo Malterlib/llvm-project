@@ -185,6 +185,11 @@ class CombinedAllocator {
     primary_.ForceUnlock();
   }
 
+  void ForceForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+    secondary_.ForceForkedChild();
+    primary_.ForceForkedChild();
+  }
+
   // Iterate over all existing chunks.
   // The allocator must be locked when calling this function.
   void ForEachChunk(ForEachChunkCallback callback, void *arg) {

@@ -194,6 +194,26 @@ TSAN_INTERCEPTOR(void, OSSpinLockLock, volatile OSSpinLock *lock) {
   Acquire(thr, pc, (uptr)lock);
 }
 
+/*
+TSAN_INTERCEPTOR(void, _malloc_fork_prepare) {
+    SCOPED_TSAN_INTERCEPTOR(_malloc_fork_prepare);
+    ForkBefore(thr, pc);
+    REAL(_malloc_fork_prepare)();
+}
+*/
+
+TSAN_INTERCEPTOR(void, _malloc_fork_child) {
+    SCOPED_TSAN_INTERCEPTOR(_malloc_fork_child);
+    ForkChildAfter(thr, pc, true);
+    REAL(_malloc_fork_child)();
+}
+
+/*TSAN_INTERCEPTOR(void, _malloc_fork_parent) {
+    SCOPED_TSAN_INTERCEPTOR(_malloc_fork_parent);
+    ForkParentAfter(thr, pc);
+    REAL(_malloc_fork_parent)();
+}*/
+
 TSAN_INTERCEPTOR(bool, OSSpinLockTry, volatile OSSpinLock *lock) {
   CHECK(!cur_thread()->is_dead);
   if (!cur_thread()->is_inited) {

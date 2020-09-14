@@ -136,6 +136,11 @@ void InternalAllocatorUnlock() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   internal_allocator_cache_mu.Unlock();
 }
 
+void InternalAllocatorForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+  internal_allocator()->ForceForkedChild();
+  internal_allocator_cache_mu.ForkedChild();
+}
+
 // LowLevelAllocator
 constexpr uptr kLowLevelAllocatorDefaultAlignment = 8;
 static uptr low_level_alloc_min_alignment = kLowLevelAllocatorDefaultAlignment;

@@ -22,6 +22,14 @@ using namespace __tsan;
 
 void __tsan_init() { Initialize(cur_thread_init()); }
 
+void __tsan_forked_child() {
+  ForkChildAfter(cur_thread(), CALLERPC, true);
+}
+
+void __tsan_forked_parent() {
+  ForkParentAfter(cur_thread(), CALLERPC);
+}
+
 void __tsan_flush_memory() {
   FlushShadowMemory();
 }
