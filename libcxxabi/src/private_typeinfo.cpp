@@ -51,7 +51,7 @@
 #endif
 
 static inline
-bool
+__attribute__((no_sanitize("undefined"))) bool
 is_equal(const std::type_info* x, const std::type_info* y, bool use_strcmp)
 {
     // Use std::type_info's default comparison unless we've explicitly asked
@@ -619,7 +619,7 @@ bool __pointer_to_member_type_info::can_catch_nested(
 //    (static_ptr, static_type), then return dynamic_ptr.
 // Else return nullptr.
 
-extern "C" _LIBCXXABI_FUNC_VIS void *
+extern "C" __attribute__((no_sanitize("undefined"))) _LIBCXXABI_FUNC_VIS void *
 __dynamic_cast(const void *static_ptr, const __class_type_info *static_type,
                const __class_type_info *dst_type,
                std::ptrdiff_t src2dst_offset) {
@@ -922,7 +922,7 @@ __class_type_info::process_static_type_below_dst(__dynamic_cast_info* info,
 //     }
 // }
 void
-__vmi_class_type_info::search_below_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __vmi_class_type_info::search_below_dst(__dynamic_cast_info* info,
                                         const void* current_ptr,
                                         int path_below,
                                         bool use_strcmp) const
@@ -1095,7 +1095,7 @@ __vmi_class_type_info::search_below_dst(__dynamic_cast_info* info,
 // This is the same algorithm as __vmi_class_type_info::search_below_dst but
 //   simplified to the case that there is only a single base class.
 void
-__si_class_type_info::search_below_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __si_class_type_info::search_below_dst(__dynamic_cast_info* info,
                                        const void* current_ptr,
                                        int path_below,
                                        bool use_strcmp) const
@@ -1172,7 +1172,7 @@ __si_class_type_info::search_below_dst(__dynamic_cast_info* info,
 // This is the same algorithm as __vmi_class_type_info::search_below_dst but
 //   simplified to the case that there is no base class.
 void
-__class_type_info::search_below_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __class_type_info::search_below_dst(__dynamic_cast_info* info,
                                     const void* current_ptr,
                                     int path_below,
                                     bool use_strcmp) const
@@ -1241,7 +1241,7 @@ __class_type_info::search_below_dst(__dynamic_cast_info* info,
 //     }
 // }
 void
-__vmi_class_type_info::search_above_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __vmi_class_type_info::search_above_dst(__dynamic_cast_info* info,
                                         const void* dst_ptr,
                                         const void* current_ptr,
                                         int path_below,
@@ -1315,7 +1315,7 @@ __vmi_class_type_info::search_above_dst(__dynamic_cast_info* info,
 // This is the same algorithm as __vmi_class_type_info::search_above_dst but
 //   simplified to the case that there is only a single base class.
 void
-__si_class_type_info::search_above_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __si_class_type_info::search_above_dst(__dynamic_cast_info* info,
                                        const void* dst_ptr,
                                        const void* current_ptr,
                                        int path_below,
@@ -1330,7 +1330,7 @@ __si_class_type_info::search_above_dst(__dynamic_cast_info* info,
 // This is the same algorithm as __vmi_class_type_info::search_above_dst but
 //   simplified to the case that there is no base class.
 void
-__class_type_info::search_above_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __class_type_info::search_above_dst(__dynamic_cast_info* info,
                                     const void* dst_ptr,
                                     const void* current_ptr,
                                     int path_below,
@@ -1345,7 +1345,7 @@ __class_type_info::search_above_dst(__dynamic_cast_info* info,
 //   passed up to the base class node.
 
 void
-__base_class_type_info::search_above_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __base_class_type_info::search_above_dst(__dynamic_cast_info* info,
                                          const void* dst_ptr,
                                          const void* current_ptr,
                                          int path_below,
@@ -1366,7 +1366,7 @@ __base_class_type_info::search_above_dst(__dynamic_cast_info* info,
 }
 
 void
-__base_class_type_info::search_below_dst(__dynamic_cast_info* info,
+__attribute__((no_sanitize("undefined"))) __base_class_type_info::search_below_dst(__dynamic_cast_info* info,
                                          const void* current_ptr,
                                          int path_below,
                                          bool use_strcmp) const
