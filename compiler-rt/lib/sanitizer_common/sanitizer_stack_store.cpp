@@ -121,6 +121,10 @@ void StackStore::UnlockAll() {
   for (BlockInfo &b : blocks_) b.Unlock();
 }
 
+void StackStore::ForkedChildAll() {
+  for (BlockInfo &b : blocks_) b.ForkedChild();
+}
+
 void StackStore::TestOnlyUnmap() {
   for (BlockInfo &b : blocks_) b.TestOnlyUnmap(this);
   internal_memset(this, 0, sizeof(*this));
