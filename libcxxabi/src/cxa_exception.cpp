@@ -266,7 +266,7 @@ handler, _Unwind_RaiseException may return. In that case, __cxa_throw
 will call terminate, assuming that there was no handler for the
 exception.
 */
-void
+__attribute__((no_sanitize("thread"))) void
 #ifdef __USING_WASM_EXCEPTIONS__
 // In Wasm, a destructor returns its argument
 __cxa_throw(void *thrown_object, std::type_info *tinfo, void *(_LIBCXXABI_DTOR_FUNC *dest)(void *)) {
@@ -740,7 +740,7 @@ dependent_exception_cleanup(_Unwind_Reason_Code reason, _Unwind_Exception* unwin
     If thrown_object is not null, allocate, initialize and throw a dependent
     exception.
 */
-void
+__attribute__((no_sanitize("thread"))) void
 __cxa_rethrow_primary_exception(void* thrown_object)
 {
     if ( thrown_object != NULL )
