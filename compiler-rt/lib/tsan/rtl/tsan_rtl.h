@@ -411,6 +411,7 @@ struct ThreadState {
   bool is_dead;
   bool is_freeing;
   bool is_vptr_access;
+  bool is_forking;
   const uptr stk_addr;
   const uptr stk_size;
   const uptr tls_addr;
@@ -528,7 +529,7 @@ struct Context {
 
   MetaMap metamap;
 
-  Mutex report_mtx;
+  BlockingMutex report_mtx;
   int nreported;
   int nmissed_expected;
   atomic_uint64_t last_symbolize_time_ns;

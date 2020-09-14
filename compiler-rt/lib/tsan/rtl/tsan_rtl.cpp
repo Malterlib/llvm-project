@@ -115,7 +115,7 @@ static const u32 kThreadQuarantineSize = 64;
 
 Context::Context()
     : initialized(),
-      report_mtx(MutexTypeReport, StatMtxReport),
+      report_mtx{},
       nreported(),
       nmissed_expected(),
       thread_registry(new (thread_registry_placeholder) ThreadRegistry(
@@ -236,7 +236,7 @@ static void *BackgroundThread(void *arg) {
       u64 last = atomic_load(&ctx->last_symbolize_time_ns,
                              memory_order_relaxed);
       if (last != 0 && last + flags()->flush_symbolizer_ms * kMs2Ns < now) {
-        Lock l(&ctx->report_mtx);
+        BlockingMutexLock l(&ctx->report_mtx);
         ScopedErrorReportLock l2;
         SymbolizeFlush();
         atomic_store(&ctx->last_symbolize_time_ns, 0, memory_order_relaxed);
@@ -531,32 +531,41 @@ int Finalize(ThreadState *thr) {
 }
 
 #if !SANITIZER_GO
+
 void ForkBefore(ThreadState *thr, uptr pc) {
   ctx->thread_registry->Lock();
   ctx->report_mtx.Lock();
+  thr->is_forking = true;
   // Suppress all reports in the pthread_atfork callbacks.
   // Reports will deadlock on the report_mtx.
   // We could ignore sync operations as well,
   // but so far it's unclear if it will do more good or harm.
   // Unnecessarily ignoring things can lead to false positives later.
-  thr->suppress_reports++;
+  //thr->suppress_reports++;
   // On OS X, REAL(fork) can call intercepted functions (OSSpinLockLock), and
   // we'll assert in CheckNoLocks() unless we ignore interceptors.
-  thr->ignore_interceptors++;
+  //thr->ignore_interceptors++;
 }
 
 void ForkParentAfter(ThreadState *thr, uptr pc) {
-  thr->suppress_reports--;  // Enabled in ForkBefore.
-  thr->ignore_interceptors--;
+  if (!thr->is_forking)
+    return;
+  //thr->suppress_reports--;  // Enabled in ForkBefore.
+  //thr->ignore_interceptors--;
+  thr->is_forking = false;
   ctx->report_mtx.Unlock();
   ctx->thread_registry->Unlock();
 }
 
 void ForkChildAfter(ThreadState *thr, uptr pc) {
-  thr->suppress_reports--;  // Enabled in ForkBefore.
-  thr->ignore_interceptors--;
-  ctx->report_mtx.Unlock();
-  ctx->thread_registry->Unlock();
+  if (!thr->is_forking)
+    return;
+  //thr->suppress_reports--;  // Enabled in ForkBefore.
+  //thr->ignore_interceptors--;
+  thr->is_forking = false;
+  
+  ctx->report_mtx.ForkedChild();
+  ctx->thread_registry->ForkedChild();
 
   uptr nthread = 0;
   ctx->thread_registry->GetNumberOfThreads(0, 0, &nthread /* alive threads */);

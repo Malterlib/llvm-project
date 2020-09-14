@@ -1,4 +1,6 @@
 __tsan_init
+__tsan_forked_child
+__tsan_forked_parent
 __tsan_flush_memory
 __tsan_read*
 __tsan_write*
