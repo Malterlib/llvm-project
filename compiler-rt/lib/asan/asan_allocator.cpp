@@ -849,6 +849,11 @@ struct Allocator {
     fallback_mutex.Unlock();
     allocator.ForceUnlock();
   }
+
+  void ForceForkedChild() SANITIZER_RELEASE(fallback_mutex) {
+    fallback_mutex.ForkedChild();
+    allocator.ForceForkedChild();
+  }
 };
 
 static Allocator instance(LINKER_INITIALIZED);

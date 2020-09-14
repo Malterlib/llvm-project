@@ -1007,8 +1007,17 @@ extern "C" void *__tsan_thread_start_func(void *arg) {
     Processor *proc = ProcCreate();
     ProcWire(proc, thr);
     ThreadStart(thr, p->tid, GetTid(), ThreadType::Regular);
+    if (ctx->after_multithreaded_fork) {
+      thr->ignore_interceptors++;
+      const uptr pc = StackTrace::GetCurrentPc();
+      ThreadIgnoreBegin(thr, pc);
+      ThreadIgnoreSyncBegin(thr, pc);
+    }
+    
     p->started.Post();
   }
+
+
   void *res = callback(param);
   // Prevent the callback from being tail called,
   // it mixes up stack traces.
@@ -1023,19 +1032,6 @@ TSAN_INTERCEPTOR(int, pthread_create,
 
   MaybeSpawnBackgroundThread();
 
-  if (ctx->after_multithreaded_fork) {
-    if (flags()->die_after_fork) {
-      Report("ThreadSanitizer: starting new threads after multi-threaded "
-          "fork is not supported. Dying (set die_after_fork=0 to override)\n");
-      Die();
-    } else {
-      VPrintf(1,
-              "ThreadSanitizer: starting new threads after multi-threaded "
-              "fork is not supported (pid %lu). Continuing because of "
-              "die_after_fork=0, but you are on your own\n",
-              internal_getpid());
-    }
-  }
   __sanitizer_pthread_attr_t myattr;
   if (attr == 0) {
     pthread_attr_init(&myattr);
@@ -1072,6 +1068,7 @@ TSAN_INTERCEPTOR(int, pthread_create,
   }
   if (attr == &myattr)
     pthread_attr_destroy(&myattr);
+
   return res;
 }
 

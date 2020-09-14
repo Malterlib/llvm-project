@@ -293,6 +293,11 @@ void ScopedErrorReportLock::Unlock() {
   atomic_store_relaxed(&reporting_thread_, 0);
 }
 
+void ScopedErrorReportLock::ForkedChild() {
+  mutex_.ForkedChild();
+  atomic_store_relaxed(&reporting_thread_, 0);
+}
+
 void ScopedErrorReportLock::CheckLocked() { mutex_.CheckLocked(); }
 
 }  // namespace __sanitizer
