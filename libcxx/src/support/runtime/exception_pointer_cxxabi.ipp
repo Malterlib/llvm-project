@@ -55,7 +55,7 @@ exception_ptr current_exception() noexcept {
   return ptr;
 }
 
-void rethrow_exception(exception_ptr p) {
+void __attribute__((no_sanitize("thread"))) rethrow_exception(exception_ptr p) {
   __cxa_rethrow_primary_exception(p.__ptr_);
   // if p.__ptr_ is NULL, above returns so we terminate
   terminate();
