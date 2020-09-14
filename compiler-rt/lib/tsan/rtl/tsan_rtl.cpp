@@ -95,7 +95,7 @@ static const u32 kThreadQuarantineSize = 64;
 
 Context::Context()
   : initialized()
-  , report_mtx(MutexTypeReport, StatMtxReport)
+  , report_mtx{}
   , nreported()
   , nmissed_expected()
   , thread_registry(new(thread_registry_placeholder) ThreadRegistry(
@@ -213,7 +213,7 @@ static void *BackgroundThread(void *arg) {
       u64 last = atomic_load(&ctx->last_symbolize_time_ns,
                              memory_order_relaxed);
       if (last != 0 && last + flags()->flush_symbolizer_ms * kMs2Ns < now) {
-        Lock l(&ctx->report_mtx);
+        BlockingMutexLock l(&ctx->report_mtx);
         ScopedErrorReportLock l2;
         SymbolizeFlush();
         atomic_store(&ctx->last_symbolize_time_ns, 0, memory_order_relaxed);
@@ -492,28 +492,36 @@ int Finalize(ThreadState *thr) {
 }
 
 #if !SANITIZER_GO
+
 void ForkBefore(ThreadState *thr, uptr pc) {
   ctx->thread_registry->Lock();
   ctx->report_mtx.Lock();
+  thr->is_forking = true;
   // Ignore memory accesses in the pthread_atfork callbacks.
   // If any of them triggers a data race we will deadlock
   // on the report_mtx.
   // We could ignore interceptors and sync operations as well,
   // but so far it's unclear if it will do more good or harm.
   // Unnecessarily ignoring things can lead to false positives later.
-  ThreadIgnoreBegin(thr, pc);
+  // ThreadIgnoreBegin(thr, pc);
 }
 
 void ForkParentAfter(ThreadState *thr, uptr pc) {
-  ThreadIgnoreEnd(thr, pc);  // Begin is in ForkBefore.
+  if (!thr->is_forking)
+    return;
+  //ThreadIgnoreEnd(thr, pc);  // Begin is in ForkBefore.
+  thr->is_forking = false;
   ctx->report_mtx.Unlock();
   ctx->thread_registry->Unlock();
 }
 
 void ForkChildAfter(ThreadState *thr, uptr pc) {
-  ThreadIgnoreEnd(thr, pc);  // Begin is in ForkBefore.
-  ctx->report_mtx.Unlock();
-  ctx->thread_registry->Unlock();
+  if (!thr->is_forking)
+    return;
+  //ThreadIgnoreEnd(thr, pc);  // Begin is in ForkBefore.
+  thr->is_forking = false;
+  ctx->report_mtx.ForkedChild();
+  ctx->thread_registry->ForkedChild();
 
   uptr nthread = 0;
   ctx->thread_registry->GetNumberOfThreads(0, 0, &nthread /* alive threads */);

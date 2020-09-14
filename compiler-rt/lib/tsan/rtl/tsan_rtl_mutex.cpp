@@ -62,6 +62,8 @@ static void ReportMutexMisuse(ThreadState *thr, uptr pc, ReportType typ,
 }
 
 void MutexCreate(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexCreate %zx flagz=0x%x\n", thr->tid, addr, flagz);
   StatInc(thr, StatMutexCreate);
   if (!(flagz & MutexFlagLinkerInit) && IsAppMem(addr)) {
@@ -78,6 +80,8 @@ void MutexCreate(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexDestroy(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexDestroy %zx\n", thr->tid, addr);
   StatInc(thr, StatMutexDestroy);
   SyncVar *s = ctx->metamap.GetIfExistsAndLock(addr, true);
@@ -140,6 +144,8 @@ void MutexDestroy(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPreLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPreLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (!(flagz & MutexFlagTryLock) && common_flags()->detect_deadlocks) {
     SyncVar *s = ctx->metamap.GetOrCreateAndLock(thr, pc, addr, false);
@@ -156,6 +162,8 @@ void MutexPreLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPostLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz, int rec) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPostLock %zx flag=0x%x rec=%d\n",
       thr->tid, addr, flagz, rec);
   if (flagz & MutexFlagRecursiveLock)
@@ -211,6 +219,8 @@ void MutexPostLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz, int rec) {
 }
 
 int MutexUnlock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return 0;
   DPrintf("#%d: MutexUnlock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (IsAppMem(addr))
     MemoryReadAtomic(thr, pc, addr, kSizeLog1);
@@ -254,6 +264,8 @@ int MutexUnlock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPreReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPreReadLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   if (!(flagz & MutexFlagTryLock) && common_flags()->detect_deadlocks) {
     SyncVar *s = ctx->metamap.GetOrCreateAndLock(thr, pc, addr, false);
@@ -266,6 +278,8 @@ void MutexPreReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexPostReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexPostReadLock %zx flagz=0x%x\n", thr->tid, addr, flagz);
   StatInc(thr, StatMutexReadLock);
   if (IsAppMem(addr))
@@ -306,6 +320,8 @@ void MutexPostReadLock(ThreadState *thr, uptr pc, uptr addr, u32 flagz) {
 }
 
 void MutexReadUnlock(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexReadUnlock %zx\n", thr->tid, addr);
   StatInc(thr, StatMutexReadUnlock);
   if (IsAppMem(addr))
@@ -338,6 +354,8 @@ void MutexReadUnlock(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexReadOrWriteUnlock %zx\n", thr->tid, addr);
   if (IsAppMem(addr))
     MemoryReadAtomic(thr, pc, addr, kSizeLog1);
@@ -385,6 +403,8 @@ void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexRepair(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexRepair %zx\n", thr->tid, addr);
   SyncVar *s = ctx->metamap.GetOrCreateAndLock(thr, pc, addr, true);
   s->owner_tid = SyncVar::kInvalidTid;
@@ -393,6 +413,8 @@ void MutexRepair(ThreadState *thr, uptr pc, uptr addr) {
 }
 
 void MutexInvalidAccess(ThreadState *thr, uptr pc, uptr addr) {
+  if (ctx->after_multithreaded_fork)
+    return;
   DPrintf("#%d: MutexInvalidAccess %zx\n", thr->tid, addr);
   SyncVar *s = ctx->metamap.GetOrCreateAndLock(thr, pc, addr, true);
   u64 mid = s->GetId();

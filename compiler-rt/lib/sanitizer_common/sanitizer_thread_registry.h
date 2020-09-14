@@ -97,6 +97,7 @@ class ThreadRegistry {
   void Lock() { mtx_.Lock(); }
   void CheckLocked() { mtx_.CheckLocked(); }
   void Unlock() { mtx_.Unlock(); }
+  void ForkedChild() { mtx_.ForkedChild(); }
 
   // Should be guarded by ThreadRegistryLock.
   ThreadContextBase *GetThreadLocked(u32 tid) {

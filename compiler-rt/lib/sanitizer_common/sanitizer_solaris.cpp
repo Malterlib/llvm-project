@@ -207,6 +207,10 @@ BlockingMutex::BlockingMutex() {
   CHECK_EQ(mutex_init((mutex_t *)&opaque_storage_, USYNC_THREAD, NULL), 0);
 }
 
+void BlockingMutex::ForkedChild() {
+  this->Unlock();
+}
+
 void BlockingMutex::Lock() {
   CHECK(sizeof(mutex_t) <= sizeof(opaque_storage_));
   CHECK_NE(owner_, (uptr)thr_self());

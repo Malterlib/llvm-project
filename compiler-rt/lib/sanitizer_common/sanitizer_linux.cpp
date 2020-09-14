@@ -650,24 +650,50 @@ BlockingMutex::BlockingMutex() {
   internal_memset(this, 0, sizeof(*this));
 }
 
+void BlockingMutex::ForkedChild() {
+  CHECK_EQ(recursive_count_, 1);
+  uptr thread_self = (uptr)pthread_self();
+  owner_ = thread_self;
+  this->Unlock();
+}
+
 void BlockingMutex::Lock() {
-  CHECK_EQ(owner_, 0);
-  atomic_uint32_t *m = reinterpret_cast<atomic_uint32_t *>(&opaque_storage_);
-  if (atomic_exchange(m, MtxLocked, memory_order_acquire) == MtxUnlocked)
+  CHECK(sizeof(pthread_t) <= sizeof(owner_));
+
+  uptr thread_self = (uptr)pthread_self();
+  if (owner_ == thread_self) {
+    ++recursive_count_;
     return;
-  while (atomic_exchange(m, MtxSleeping, memory_order_acquire) != MtxUnlocked) {
-#if SANITIZER_FREEBSD
-    _umtx_op(m, UMTX_OP_WAIT_UINT, MtxSleeping, 0, 0);
-#elif SANITIZER_NETBSD
-    sched_yield(); /* No userspace futex-like synchronization */
-#else
-    internal_syscall(SYSCALL(futex), (uptr)m, FUTEX_WAIT_PRIVATE, MtxSleeping,
-                     0, 0, 0);
-#endif
   }
+
+  atomic_uint32_t *m = reinterpret_cast<atomic_uint32_t *>(&opaque_storage_);
+  if (atomic_exchange(m, MtxLocked, memory_order_acquire) != MtxUnlocked) {
+    while (atomic_exchange(m, MtxSleeping, memory_order_acquire) != MtxUnlocked) {
+  #if SANITIZER_FREEBSD
+      _umtx_op(m, UMTX_OP_WAIT_UINT, MtxSleeping, 0, 0);
+  #elif SANITIZER_NETBSD
+      sched_yield(); /* No userspace futex-like synchronization */
+  #else
+      internal_syscall(SYSCALL(futex), (uptr)m, FUTEX_WAIT_PRIVATE, MtxSleeping,
+                       0, 0, 0);
+  #endif
+    }
+  }
+
+  CHECK_EQ(recursive_count_, 0);
+  CHECK_EQ(owner_, 0);
+  owner_ = thread_self;
+  ++recursive_count_;
 }
 
 void BlockingMutex::Unlock() {
+  uptr thread_self = (uptr)pthread_self();
+  CHECK_EQ(owner_, thread_self);
+  if (--recursive_count_ > 0)
+    return;
+
+  owner_ = 0;
+
   atomic_uint32_t *m = reinterpret_cast<atomic_uint32_t *>(&opaque_storage_);
   u32 v = atomic_exchange(m, MtxUnlocked, memory_order_release);
   CHECK_NE(v, MtxUnlocked);
