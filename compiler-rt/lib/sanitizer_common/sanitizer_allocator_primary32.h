@@ -250,6 +250,12 @@ class SizeClassAllocator32 {
     }
   }
 
+  void ForceForkedChild() SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
+    for (int i = kNumClasses - 1; i >= 0; i--) {
+      GetSizeClassInfo(i)->mutex.ForkedChild();
+    }
+  }
+
   // Iterate over all existing chunks.
   // The allocator must be locked when calling this function.
   void ForEachChunk(ForEachChunkCallback callback, void *arg) const {

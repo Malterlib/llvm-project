@@ -19,6 +19,12 @@
 extern "C" {
 #endif
 
+// Report forking in child and parent.
+// This can be useful in lower level machinery where tsan fork handling needs
+// to happen before the fork function returns.
+void __tsan_forked_child();
+void __tsan_forked_parent();
+
 // __tsan_release establishes a happens-before relation with a preceding
 // __tsan_acquire on the same address.
 void __tsan_acquire(void *addr);
