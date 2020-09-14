@@ -87,6 +87,7 @@ extern char ***_NSGetArgv(void);
 #  include <sys/wait.h>
 #  include <unistd.h>
 #  include <util.h>
+#  include <os/lock.h>
 
 // From <crt_externs.h>, but we don't have that file on iOS.
 extern "C" {

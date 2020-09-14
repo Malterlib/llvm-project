@@ -271,6 +271,8 @@ class LargeMmapAllocator {
 
   void ForceUnlock() SANITIZER_RELEASE(mutex_) { mutex_.Unlock(); }
 
+  void ForceForkedChild() SANITIZER_RELEASE(mutex_) { mutex_.ForkedChild(); }
+
   // Iterate over all existing chunks.
   // The allocator must be locked when calling this function.
   void ForEachChunk(ForEachChunkCallback callback, void *arg) {
