@@ -180,7 +180,7 @@ _LIBUNWIND_HIDDEN int __unw_get_proc_info(unw_cursor_t *cursor,
 _LIBUNWIND_WEAK_ALIAS(__unw_get_proc_info, unw_get_proc_info)
 
 /// Resume execution at cursor position (aka longjump).
-_LIBUNWIND_HIDDEN int __unw_resume(unw_cursor_t *cursor) {
+__attribute__((no_sanitize("thread"))) _LIBUNWIND_HIDDEN int __unw_resume(unw_cursor_t *cursor) {
   _LIBUNWIND_TRACE_API("__unw_resume(cursor=%p)", static_cast<void *>(cursor));
   AbstractUnwindCursor *co = (AbstractUnwindCursor *)cursor;
   co->jumpto();
