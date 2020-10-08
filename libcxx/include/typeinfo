@@ -308,7 +308,7 @@ class _LIBCPP_EXCEPTION_ABI type_info
     explicit type_info(const char* __n)
       : __type_name(__impl::__string_to_type_name(__n)) {}
 
-public:
+ public:
     _LIBCPP_AVAILABILITY_TYPEINFO_VTABLE
     virtual ~type_info();
 
@@ -339,6 +339,11 @@ public:
     _LIBCPP_INLINE_VISIBILITY
     bool operator!=(const type_info& __arg) const _NOEXCEPT
     { return !operator==(__arg); }
+
+    _LIBCPP_INLINE_VISIBILITY __attribute__((no_sanitize("undefined"))) bool __is_equal_no_sanitizer(const type_info& __arg) const _NOEXCEPT
+    {
+      return __impl::__eq(__type_name, __arg.__type_name);
+    }
 };
 #endif // defined(_LIBCPP_ABI_MICROSOFT)
 
