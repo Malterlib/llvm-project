@@ -56,7 +56,7 @@ is_equal(const std::type_info* x, const std::type_info* y, bool use_strcmp)
     // Use std::type_info's default comparison unless we've explicitly asked
     // for strcmp.
     if (!use_strcmp)
-        return *x == *y;
+        return x->__is_equal_no_sanitizer(*y);
     // Still allow pointer equality to short circut.
     return x == y || strcmp(x->name(), y->name()) == 0;
 }
