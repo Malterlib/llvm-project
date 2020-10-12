@@ -507,6 +507,7 @@ public:
   }
 
   virtual std::string getCompilerRTPath() const;
+  virtual std::string getCompilerRTPathForResourceDir(StringRef ResourceDir) const;
 
   virtual std::string getCompilerRT(const llvm::opt::ArgList &Args,
                                     StringRef Component,
