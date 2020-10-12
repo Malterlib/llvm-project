@@ -708,7 +708,11 @@ StringRef ToolChain::getOSLibName() const {
 }
 
 std::string ToolChain::getCompilerRTPath() const {
-  SmallString<128> Path(getDriver().ResourceDir);
+  return getCompilerRTPathForResourceDir(getDriver().ResourceDir);
+}
+
+std::string ToolChain::getCompilerRTPathForResourceDir(StringRef ResourceDir) const {
+  SmallString<128> Path(ResourceDir);
   if (isBareMetal()) {
     llvm::sys::path::append(Path, "lib", getOSLibName());
     if (!SelectedMultilibs.empty()) {
@@ -785,6 +789,17 @@ std::string ToolChain::getCompilerRT(const ArgList &Args, StringRef Component,
       buildCompilerRTBasename(Args, Component, Type, /*AddArch=*/true);
   SmallString<128> OldPath(getCompilerRTPath());
   llvm::sys::path::append(OldPath, CRTBasename);
+
+  if (!getVFS().exists(OldPath)) {
+    auto ResourceDir = getDriver().GetResourcesPath(computeSysRoot() + "/bin/clang");
+
+    SmallString<128> FallbackPath(getCompilerRTPathForResourceDir(ResourceDir));
+    llvm::sys::path::append(FallbackPath, CRTBasename);
+
+    if (getVFS().exists(FallbackPath))
+      OldPath = std::move(FallbackPath);
+  }
+
   if (Path.empty() || getVFS().exists(OldPath))
     return std::string(OldPath);
 
@@ -895,6 +910,17 @@ std::optional<std::string> ToolChain::getRuntimePath() const {
   if (Triple.isOSDarwin() || Triple.isOSAIX())
     return {};
   llvm::sys::path::append(P, Triple.str());
+  if (!getVFS().exists(P)) {
+    SmallString<128> FallbackPath(D.ResourceDir);
+    llvm::sys::path::append(FallbackPath, "lib");
+
+    auto TypeNameTriple = Triple;
+    TypeNameTriple.setArchName(llvm::Triple::getArchTypeName(Triple.getArch()));
+    llvm::sys::path::append(FallbackPath, TypeNameTriple.str());
+
+    if (getVFS().exists(FallbackPath))
+      return std::string(FallbackPath);
+  }
   return std::string(P);
 }
 
