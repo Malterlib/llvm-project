@@ -487,6 +487,23 @@ std::string ToolChain::getCompilerRT(const ArgList &Args, StringRef Component,
       buildCompilerRTBasename(Args, Component, Type, /*AddArch=*/true);
   SmallString<128> Path(getCompilerRTPath());
   llvm::sys::path::append(Path, CRTBasename);
+
+  if (!getVFS().exists(Path)) {
+    auto ResourceDir = getDriver().GetResourcesPath(computeSysRoot() + "/bin/clang", CLANG_RESOURCE_DIR);
+    SmallString<128> FallbackPath(ResourceDir);
+
+    if (Triple.isOSUnknown()) {
+      llvm::sys::path::append(FallbackPath, "lib");
+    } else {
+      llvm::sys::path::append(FallbackPath, "lib", getOSLibName());
+    }
+
+    llvm::sys::path::append(FallbackPath, CRTBasename);
+
+    if (getVFS().exists(FallbackPath))
+      Path = std::move(FallbackPath);
+  }
+
   return std::string(Path.str());
 }
 
