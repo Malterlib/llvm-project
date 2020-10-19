@@ -274,6 +274,8 @@ ScopedErrorReportLock::ScopedErrorReportLock() {
       static const char msg[] = ": nested bug in the same thread, aborting.\n";
       CatastrophicErrorWrite(msg, sizeof(msg) - 1);
 
+      __builtin_trap();
+
       internal__exit(common_flags()->exitcode);
     }
 
