@@ -58,7 +58,7 @@ is_equal(const std::type_info* x, const std::type_info* y, bool use_strcmp)
     if (!use_strcmp)
         return x->__is_equal_no_sanitizer(*y);
     // Still allow pointer equality to short circut.
-    return x == y || strcmp(x->name(), y->name()) == 0;
+    return x == y || strcmp(x->__name_no_sanitizer(), y->__name_no_sanitizer()) == 0;
 }
 
 static inline ptrdiff_t update_offset_to_base(const char* vtable,
