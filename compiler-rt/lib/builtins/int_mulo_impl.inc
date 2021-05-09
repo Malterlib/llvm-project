@@ -16,7 +16,7 @@
 
 // Effects: sets *overflow to 1  if a * b overflows
 
-static __inline fixint_t __muloXi4(fixint_t a, fixint_t b, int *overflow) {
+__attribute__((no_sanitize("undefined"))) static __inline fixint_t __muloXi4(fixint_t a, fixint_t b, int *overflow) {
   const int N = (int)(sizeof(fixint_t) * CHAR_BIT);
   const fixint_t MIN = (fixint_t)1 << (N - 1);
   const fixint_t MAX = ~MIN;
