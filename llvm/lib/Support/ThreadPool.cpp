@@ -21,6 +21,8 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <optional>
+
 using namespace llvm;
 
 ThreadPoolInterface::~ThreadPoolInterface() = default;
@@ -46,9 +48,10 @@ void StdThreadPool::grow(int requested) {
   if (Threads.size() >= MaxThreadCount)
     return; // Already hit the max thread pool size.
   int newThreadCount = std::min<int>(requested, MaxThreadCount);
+  const std::optional<unsigned> WorkerStackSize = 8 * 1024 * 1024;
   while (static_cast<int>(Threads.size()) < newThreadCount) {
     int ThreadID = Threads.size();
-    Threads.emplace_back([this, ThreadID] {
+    Threads.emplace_back(WorkerStackSize, [this, ThreadID] {
       set_thread_name(formatv("llvm-worker-{0}", ThreadID));
       Strategy.apply_thread_strategy(ThreadID);
       // Note on jobserver deadlock avoidance:
