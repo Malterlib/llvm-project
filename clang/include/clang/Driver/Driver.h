@@ -307,6 +307,12 @@ private:
   bool getCrashDiagnosticFile(StringRef ReproCrashFilename,
                               SmallString<128> &CrashDiagDir);
 
+  /// ConvertFileList - Create a command line file instead of an apple
+  /// type -filelist file
+  std::unique_ptr<llvm::opt::Arg> ConvertFileList(InputList &Inputs,
+                                  const llvm::opt::DerivedArgList &Args, 
+                                  Compilation &C, const char *FileList) const;
+  
 public:
 
   /// Takes the path to a binary that's either in bin/ or lib/ and returns
@@ -396,9 +402,10 @@ public:
   /// \param TC - The default host tool chain.
   /// \param Args - The input arguments.
   /// \param Inputs - The list to store the resulting compilation
+  /// \param C - The compilation that is being built.
   /// inputs onto.
   void BuildInputs(const ToolChain &TC, llvm::opt::DerivedArgList &Args,
-                   InputList &Inputs) const;
+                   InputList &Inputs, Compilation &C) const;
 
   /// BuildActions - Construct the list of actions to perform for the
   /// given arguments, which are only done for a single architecture.
