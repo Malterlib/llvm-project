@@ -91,6 +91,8 @@
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/raw_os_ostream.h"
+#include <fstream>
 #include <map>
 #include <memory>
 #include <utility>
@@ -1260,7 +1262,7 @@ Compilation *Driver::BuildCompilation(ArrayRef<const char *> ArgList) {
 
   // Construct the list of inputs.
   InputList Inputs;
-  BuildInputs(C->getDefaultToolChain(), *TranslatedArgs, Inputs);
+  BuildInputs(C->getDefaultToolChain(), *TranslatedArgs, Inputs, *C);
 
   // Populate the tool chains for the offloading devices, if any.
   CreateOffloadingDeviceToolChains(*C, Inputs);
@@ -1422,7 +1424,7 @@ void Driver::generateCompilationDiagnostics(
 
   // Construct the list of inputs.
   InputList Inputs;
-  BuildInputs(C.getDefaultToolChain(), C.getArgs(), Inputs);
+  BuildInputs(C.getDefaultToolChain(), C.getArgs(), Inputs, C);
 
   for (InputList::iterator it = Inputs.begin(), ie = Inputs.end(); it != ie;) {
     bool IgnoreInput = false;
@@ -2272,9 +2274,44 @@ bool Driver::DiagnoseInputExistence(const DerivedArgList &Args, StringRef Value,
   return false;
 }
 
+std::unique_ptr<llvm::opt::Arg> Driver::ConvertFileList(InputList &Inputs, const DerivedArgList &Args,
+                             Compilation &C, const char *FileList) const {
+  const llvm::opt::OptTable &Opts = getOpts();
+  std::string TmpName = GetTemporaryPath("filelist", "temp");
+  C.addTempFile(Args.MakeArgString(TmpName.c_str()));
+
+  {
+    std::ifstream In(FileList);
+    std::ofstream OutFile(TmpName.c_str());
+    llvm::raw_os_ostream Out(OutFile);
+    if (!In.good()) {
+      Diag(clang::diag::err_drv_no_such_file) << FileList;
+      return 0;
+    }
+
+    while (In) {
+      std::string InputFile;
+      In >> InputFile;
+      if (!InputFile.empty()) {
+        Out << "\"";
+        Out.write_escaped(InputFile);
+        Out << "\" ";
+      }
+    }
+  }
+
+  std::string ArgFile = "@";
+  ArgFile += TmpName;
+
+  unsigned Index = Args.getBaseArgs().MakeIndex(ArgFile);
+  auto A = Opts.ParseOneArg(Args, Index);
+  A->claim();
+  return A;
+}
+
 // Construct a the list of inputs and their types.
 void Driver::BuildInputs(const ToolChain &TC, DerivedArgList &Args,
-                         InputList &Inputs) const {
+                         InputList &Inputs, Compilation &C) const {
   const llvm::opt::OptTable &Opts = getOpts();
   // Track the current user specified (-x) input. We also explicitly track the
   // argument used to set the type; we only want to claim the type when we
@@ -2418,10 +2455,19 @@ void Driver::BuildInputs(const ToolChain &TC, DerivedArgList &Args,
       }
       A->claim();
     } else if (A->getOption().hasFlag(options::LinkerInput)) {
-      // Just treat as object type, we could make a special type for this if
-      // necessary.
-      Inputs.push_back(std::make_pair(types::TY_Object, A));
-
+      if (A->getOption().matches(options::OPT_filelist)
+          && !TC.getTriple().isOSDarwin()) {
+        A->claim();
+        auto NewArg = ConvertFileList(Inputs, Args, C, A->getValue());
+        if (NewArg) {
+          Arg *InputArg = MakeInputArg(Args, Opts, NewArg->getValue());
+          Inputs.push_back(std::make_pair(types::TY_Object, InputArg));
+        }
+      } else {
+        // Just treat as object type, we could make a special type for this if
+        // necessary.
+        Inputs.push_back(std::make_pair(types::TY_Object, A));
+      }
     } else if (A->getOption().matches(options::OPT_x)) {
       InputTypeArg = A;
       InputType = types::lookupTypeForTypeSpecifier(A->getValue());
