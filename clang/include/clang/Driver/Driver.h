@@ -405,6 +405,12 @@ private:
   bool getCrashDiagnosticFile(StringRef ReproCrashFilename,
                               SmallString<128> &CrashDiagDir);
 
+  /// ConvertFileList - Create a command line file instead of an Apple
+  /// -filelist file.
+  std::unique_ptr<llvm::opt::Arg>
+  ConvertFileList(const llvm::opt::DerivedArgList &Args, Compilation &C,
+                  const char *FileList) const;
+
 public:
   Driver(StringRef ClangExecutable, StringRef TargetTriple,
          DiagnosticsEngine &Diags, std::string Title = "clang LLVM compiler",
@@ -502,8 +508,9 @@ public:
   /// \param Args - The input arguments.
   /// \param Inputs - The list to store the resulting compilation
   /// inputs onto.
+  /// \param C - The compilation that is being built.
   void BuildInputs(const ToolChain &TC, llvm::opt::DerivedArgList &Args,
-                   InputList &Inputs) const;
+                   InputList &Inputs, Compilation &C) const;
 
   /// BuildActions - Construct the list of actions to perform for the
   /// given arguments, which are only done for a single architecture.
