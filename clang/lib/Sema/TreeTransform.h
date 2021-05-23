@@ -124,8 +124,6 @@ protected:
   /// rather than in the subclass (e.g., lambda closure types).
   llvm::DenseMap<Decl *, Decl *> TransformedLocalDecls;
 
-  bool UseNewScope = true;
-
 public:
   /// Initializes a new tree transformer.
   TreeTransform(Sema &SemaRef) : SemaRef(SemaRef) { }
@@ -12705,61 +12703,24 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
   // it introduces a mapping of the original to the newly created
   // transformed parameters.
   TypeSourceInfo *NewCallOpTSI = nullptr;
-  ArrayRef<ParmVarDecl *> Params;
   {
     TypeSourceInfo *OldCallOpTSI = E->getCallOperator()->getTypeSourceInfo();
+    FunctionProtoTypeLoc OldCallOpFPTL =
+        OldCallOpTSI->getTypeLoc().getAs<FunctionProtoTypeLoc>();
 
-    TypeLocBuilder NewCallBuilder;
-    TypeLoc OldCallTL = OldCallOpTSI->getTypeLoc();
-    QualType NewType;
-
-    bool OldUseNewScope = UseNewScope;
-    UseNewScope = false;
-
-    if (FunctionProtoTypeLoc SpecificTL =
-      OldCallTL.getAs<FunctionProtoTypeLoc>()) {
-      NewType = getDerived().TransformFunctionProtoType(
-        NewCallBuilder, SpecificTL);
-      if (NewType.isNull())
-        return ExprError();
-      NewCallOpTSI = NewCallBuilder.getTypeSourceInfo(
-        getSema().Context, NewType);
-      Params = NewCallOpTSI->getTypeLoc()
-        .castAs<FunctionProtoTypeLoc>()
-        .getParams();
-    } else if (AttributedTypeLoc SpecificTL =
-      OldCallTL.getAs<AttributedTypeLoc>()) {
-      NewType = TransformAttributedType(NewCallBuilder, SpecificTL);
-      if (NewType.isNull())
-        return ExprError();
-      NewCallOpTSI = NewCallBuilder.getTypeSourceInfo(
-        getSema().Context, NewType);
-      Params = NewCallOpTSI->getTypeLoc()
-        .castAs<AttributedTypeLoc>()
-        .getModifiedLoc()
-        .castAs<FunctionProtoTypeLoc>()
-        .getParams();
-    } else if (MacroQualifiedTypeLoc SpecificTL =
-      OldCallTL.getAs<MacroQualifiedTypeLoc>()) {
-      NewType = TransformMacroQualifiedType(
-        NewCallBuilder, SpecificTL);
-      if (NewType.isNull())
-        return ExprError();
-      NewCallOpTSI = NewCallBuilder.getTypeSourceInfo(
-        getSema().Context, NewType);
-      Params = NewCallOpTSI->getTypeLoc()
-        .castAs<MacroQualifiedTypeLoc>()
-        .getInnerLoc()
-        .castAs<AttributedTypeLoc>()
-        .getModifiedLoc()
-        .castAs<FunctionProtoTypeLoc>()
-        .getParams();
-    }
-
-    UseNewScope = OldUseNewScope;
-
-    if (NewType.isNull())
+    TypeLocBuilder NewCallOpTLBuilder;
+    SmallVector<QualType, 4> ExceptionStorage;
+    TreeTransform *This = this; // Work around gcc.gnu.org/PR56135.
+    QualType NewCallOpType = TransformFunctionProtoType(
+        NewCallOpTLBuilder, OldCallOpFPTL, nullptr, Qualifiers(),
+        [&](FunctionProtoType::ExceptionSpecInfo &ESI, bool &Changed) {
+          return This->TransformExceptionSpec(OldCallOpFPTL.getBeginLoc(), ESI,
+                                              ExceptionStorage, Changed);
+        });
+    if (NewCallOpType.isNull())
       return ExprError();
+    NewCallOpTSI = NewCallOpTLBuilder.getTypeSourceInfo(getSema().Context,
+                                                        NewCallOpType);
   }
 
   // Transform the trailing requires clause
@@ -12791,7 +12752,7 @@ TreeTransform<Derived>::TransformLambdaExpr(LambdaExpr *E) {
   CXXMethodDecl *NewCallOperator = getSema().startLambdaDefinition(
       Class, E->getIntroducerRange(), NewCallOpTSI,
       E->getCallOperator()->getEndLoc(),
-      Params,
+      NewCallOpTSI->getTypeLoc().castAs<FunctionProtoTypeLoc>().getParams(),
       E->getCallOperator()->getConstexprKind(),
       NewTrailingRequiresClause.get());
 
