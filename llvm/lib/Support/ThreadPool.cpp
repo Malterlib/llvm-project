@@ -43,7 +43,7 @@ void ThreadPool::grow(int requested) {
   int newThreadCount = std::min<int>(requested, MaxThreadCount);
   while (static_cast<int>(Threads.size()) < newThreadCount) {
     int ThreadID = Threads.size();
-    Threads.emplace_back([this, ThreadID] {
+    Threads.emplace_back(std::optional<unsigned>(8*1024*1024), [this, ThreadID] {
       set_thread_name(formatv("llvm-worker-{0}", ThreadID));
       Strategy.apply_thread_strategy(ThreadID);
       processTasks(nullptr);
