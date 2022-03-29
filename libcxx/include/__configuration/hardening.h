@@ -9,7 +9,9 @@
 #ifndef _LIBCPP___CONFIGURATION_HARDENING_H
 #define _LIBCPP___CONFIGURATION_HARDENING_H
 
-#include <__config_site>
+#if __has_include("__config_site")
+#  include <__config_site>
+#endif
 #include <__configuration/experimental.h>
 #include <__configuration/language.h>
 
@@ -118,8 +120,7 @@
 #ifndef _LIBCPP_HARDENING_MODE
 
 #  ifndef _LIBCPP_HARDENING_MODE_DEFAULT
-#    error _LIBCPP_HARDENING_MODE_DEFAULT is not defined. This definition should be set at configuration time in the \
-`__config_site` header, please make sure your installation of libc++ is not broken.
+#    define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
 #  endif
 
 #  define _LIBCPP_HARDENING_MODE _LIBCPP_HARDENING_MODE_DEFAULT
@@ -184,8 +185,7 @@ _LIBCPP_HARDENING_MODE_DEBUG
 #ifndef _LIBCPP_ASSERTION_SEMANTIC
 
 #  ifndef _LIBCPP_ASSERTION_SEMANTIC_DEFAULT
-#    error _LIBCPP_ASSERTION_SEMANTIC_DEFAULT is not defined. This definition should be set at configuration time in \
-the `__config_site` header, please make sure your installation of libc++ is not broken.
+#    define _LIBCPP_ASSERTION_SEMANTIC_DEFAULT _LIBCPP_ASSERTION_SEMANTIC_HARDENING_DEPENDENT
 #  endif
 
 #  if _LIBCPP_ASSERTION_SEMANTIC_DEFAULT != _LIBCPP_ASSERTION_SEMANTIC_HARDENING_DEPENDENT
