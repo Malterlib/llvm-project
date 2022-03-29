@@ -9,7 +9,9 @@
 #ifndef _LIBCPP___CONFIGURATION_EXPERIMENTAL_H
 #define _LIBCPP___CONFIGURATION_EXPERIMENTAL_H
 
-#include <__config_site>
+#if __has_include("__config_site")
+#  include <__config_site>
+#endif
 
 #ifndef _LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER
 #  pragma GCC system_header
