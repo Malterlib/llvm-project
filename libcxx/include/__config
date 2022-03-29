@@ -10,7 +10,9 @@
 #ifndef _LIBCPP___CONFIG
 #define _LIBCPP___CONFIG
 
-#include <__config_site>
+#if __has_include("__config_site")
+#  include <__config_site>
+#endif
 
 #ifndef _LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER
 #  pragma GCC system_header
