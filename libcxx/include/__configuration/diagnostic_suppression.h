@@ -10,7 +10,9 @@
 #ifndef _LIBCPP___CONFIGURATION_DIAGNOSTIC_SUPPRESSION_H
 #define _LIBCPP___CONFIGURATION_DIAGNOSTIC_SUPPRESSION_H
 
-#include <__config_site>
+#if __has_include("__config_site")
+#  include <__config_site>
+#endif
 #include <__configuration/compiler.h>
 #include <__configuration/utility.h>
 

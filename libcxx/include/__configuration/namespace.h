@@ -10,7 +10,9 @@
 #ifndef _LIBCPP___CONFIGURATION_NAMESPACE_H
 #define _LIBCPP___CONFIGURATION_NAMESPACE_H
 
-#include <__config_site>
+#if __has_include("__config_site")
+#  include <__config_site>
+#endif
 #include <__configuration/attributes.h>
 #include <__configuration/diagnostic_suppression.h>
 #include <__configuration/utility.h>
