@@ -841,20 +841,19 @@ void EmitAssemblyHelper::CreatePasses(legacy::PassManager &MPM,
                            addDataFlowSanitizerPass);
   }
 
-  if (CodeGenOpts.InstrumentFunctions ||
+/*  if (CodeGenOpts.InstrumentFunctions ||
       CodeGenOpts.InstrumentFunctionEntryBare ||
       CodeGenOpts.InstrumentFunctionsAfterInlining ||
-      CodeGenOpts.InstrumentNonCoroFunctions ||
-      CodeGenOpts.InstrumentForProfiling) {
-    PMBuilder.addExtension(PassManagerBuilder::EP_EarlyAsPossible,
-                           addEntryExitInstrumentationPass);
-    PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
-                           addEntryExitInstrumentationPass);
-    PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
-                           addPostInlineEntryExitInstrumentationPass);
-    PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
-                           addPostInlineEntryExitInstrumentationPass);
-  }
+      CodeGenOpts.InstrumentForProfiling) {*/
+  PMBuilder.addExtension(PassManagerBuilder::EP_EarlyAsPossible,
+                         addEntryExitInstrumentationPass);
+  PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
+                         addEntryExitInstrumentationPass);
+  PMBuilder.addExtension(PassManagerBuilder::EP_OptimizerLast,
+                         addPostInlineEntryExitInstrumentationPass);
+  PMBuilder.addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0,
+                         addPostInlineEntryExitInstrumentationPass);
+//  }
 
   // Set up the per-function pass manager.
   FPM.add(new TargetLibraryInfoWrapperPass(*TLII));
@@ -1390,22 +1389,21 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
                                            /*DropTypeTests=*/true));
           });
 
-    if (CodeGenOpts.InstrumentFunctions ||
+/*    if (CodeGenOpts.InstrumentFunctions ||
         CodeGenOpts.InstrumentFunctionEntryBare ||
         CodeGenOpts.InstrumentFunctionsAfterInlining ||
-        CodeGenOpts.InstrumentNonCoroFunctions ||
-        CodeGenOpts.InstrumentForProfiling) {
-      PB.registerPipelineStartEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level) {
-            MPM.addPass(createModuleToFunctionPassAdaptor(
-                EntryExitInstrumenterPass(/*PostInlining=*/false)));
-          });
-      PB.registerOptimizerLastEPCallback(
-          [](ModulePassManager &MPM, OptimizationLevel Level) {
-            MPM.addPass(createModuleToFunctionPassAdaptor(
-                EntryExitInstrumenterPass(/*PostInlining=*/true)));
-          });
-    }
+        CodeGenOpts.InstrumentForProfiling) {*/
+    PB.registerPipelineStartEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+          MPM.addPass(createModuleToFunctionPassAdaptor(
+              EntryExitInstrumenterPass(/*PostInlining=*/false)));
+        });
+    PB.registerOptimizerLastEPCallback(
+        [](ModulePassManager &MPM, OptimizationLevel Level) {
+          MPM.addPass(createModuleToFunctionPassAdaptor(
+              EntryExitInstrumenterPass(/*PostInlining=*/true)));
+        });
+    //}
 
     // Register callbacks to schedule sanitizer passes at the appropriate part
     // of the pipeline.

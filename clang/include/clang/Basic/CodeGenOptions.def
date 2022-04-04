@@ -103,8 +103,6 @@ CODEGENOPT(InstrumentFunctionsAfterInlining , 1, 0) ///< Set when
                           ///< -finstrument-functions-after-inlining is enabled.
 CODEGENOPT(InstrumentFunctionEntryBare , 1, 0) ///< Set when
                                ///< -finstrument-function-entry-bare is enabled.
-CODEGENOPT(InstrumentNonCoroFunctions , 1, 0) ///< Set when -finstrument-non-coro-functions is
-                                       ///< enabled.
 CODEGENOPT(CFProtectionReturn , 1, 0) ///< if -fcf-protection is
                                       ///< set to full or return.
 CODEGENOPT(CFProtectionBranch , 1, 0) ///< if -fcf-protection is

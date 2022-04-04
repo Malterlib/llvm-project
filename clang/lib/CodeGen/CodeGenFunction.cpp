@@ -1011,8 +1011,7 @@ void CodeGenFunction::StartFunction(GlobalDecl GD, QualType RetTy,
                           CurFuncIsThunk);
   }
 
-  if (CGM.getCodeGenOpts().InstrumentNonCoroFunctions &&
-    CurFuncDecl && !CurFuncDecl->hasAttr<
+  if (CurFuncDecl && !CurFuncDecl->hasAttr<
     InstrumentNonCoroutineFunctionEnterDisableAttr>()) {
     if (auto RecordDecl = RetTy->getAsRecordDecl()) {
       if (RecordDecl->hasAttr<InstrumentNonCoroutineFunctionEnterAttr>()) {
