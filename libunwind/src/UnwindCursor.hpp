@@ -1764,12 +1764,15 @@ bool UnwindCursor<A, R>::getInfoFromDwarfSection(
   typename CFI_Parser<A>::FDE_Info fdeInfo;
   typename CFI_Parser<A>::CIE_Info cieInfo;
   bool foundFDE = false;
+  bool foundFromHint = false;
   bool foundInCache = false;
   // If compact encoding table gave offset into dwarf section, go directly there
   if (fdeSectionOffsetHint != 0) {
     foundFDE = CFI_Parser<A>::template findFDE<R>(
         _addressSpace, pc, sects.dwarf_section, sects.dwarf_section_length,
         sects.dwarf_section + fdeSectionOffsetHint, &fdeInfo, &cieInfo);
+    if (foundFDE)
+      foundFromHint = true;
   }
 #if defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)
   if (!foundFDE && (sects.dwarf_index_section != 0)) {
@@ -1799,7 +1802,7 @@ bool UnwindCursor<A, R>::getInfoFromDwarfSection(
     if (getInfoFromFdeCie(fdeInfo, cieInfo, pc, sects.dso_base)) {
       // Add to cache (to make next lookup faster) if we had no hint
       // and there was no index.
-      if (!foundInCache && (fdeSectionOffsetHint == 0)) {
+      if (!foundInCache && (fdeSectionOffsetHint == 0 || !foundFromHint)) {
   #if defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)
         if (sects.dwarf_index_section == 0)
   #endif
