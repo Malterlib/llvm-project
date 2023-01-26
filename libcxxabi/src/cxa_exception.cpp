@@ -16,6 +16,7 @@
 #include <string.h>         // for memset
 #include "cxa_exception.h"
 #include "cxa_handlers.h"
+#include "private_typeinfo.h"
 #include "fallback_malloc.h"
 #include "include/atomic_support.h" // from libc++
 
@@ -294,6 +295,27 @@ __cxa_throw(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FU
     failed_throw(exception_header);
 }
 
+__attribute__((no_sanitize("thread"))) void
+__cxa_make_exception_ptr(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FUNC *dest)(void *)) {
+    //__cxa_eh_globals *globals = __cxa_get_globals();
+    __cxa_exception* exception_header = cxa_exception_from_thrown_object(thrown_object);
+
+    exception_header->unexpectedHandler = std::get_unexpected();
+    exception_header->terminateHandler  = std::get_terminate();
+    exception_header->exceptionType = tinfo;
+    exception_header->exceptionDestructor = dest;
+    setOurExceptionClass(&exception_header->unwindHeader);
+    exception_header->referenceCount = 1;  // This is a newly allocated exception, no need for thread safety.
+    exception_header->unwindHeader.exception_cleanup = exception_cleanup_func;
+}
+
+__attribute__((no_sanitize("thread"))) bool
+__cxa_can_catch(void *thrown_object, std::type_info *tinfo) {
+    __cxa_exception* exception_header = cxa_exception_from_thrown_object(thrown_object);
+		const __shim_type_info* thrown_type = static_cast<const __shim_type_info*>(exception_header->exceptionType);
+    const __shim_type_info* catch_type = static_cast<const __shim_type_info*>(tinfo);
+    return catch_type->can_catch(thrown_type, thrown_object);
+}
 
 // 2.5.3 Exception Handlers
 /*
