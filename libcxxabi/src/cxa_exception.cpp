@@ -16,6 +16,7 @@
 #include <string.h>         // for memset
 #include "cxa_exception.h"
 #include "cxa_handlers.h"
+#include "private_typeinfo.h"
 #include "fallback_malloc.h"
 #include "include/atomic_support.h" // from libc++
 
@@ -301,6 +302,30 @@ __cxa_throw(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FU
     failed_throw(exception_header);
 }
 
+__attribute__((no_sanitize("thread"))) void
+#ifdef __wasm__
+// In Wasm, a destructor returns its argument
+__cxa_make_exception_ptr(void *thrown_object, std::type_info *tinfo, void *(_LIBCXXABI_DTOR_FUNC *dest)(void *)) {
+#else
+__cxa_make_exception_ptr(void *thrown_object, std::type_info *tinfo, void (_LIBCXXABI_DTOR_FUNC *dest)(void *)) {
+#endif
+  __cxa_exception* exception_header = __cxa_init_primary_exception(thrown_object, tinfo, dest);
+  exception_header->referenceCount = 1; // This is a newly allocated exception, no need for thread safety.
+}
+
+__attribute__((no_sanitize("thread"))) bool
+__cxa_can_catch(void *thrown_object, std::type_info *tinfo) {
+  if (!thrown_object || !tinfo)
+    return false;
+
+  __cxa_exception* exception_header = cxa_exception_from_thrown_object(thrown_object);
+  if (!__isOurExceptionClass(&exception_header->unwindHeader))
+    return false;
+
+  const __shim_type_info* thrown_type = static_cast<const __shim_type_info*>(exception_header->exceptionType);
+  const __shim_type_info* catch_type = static_cast<const __shim_type_info*>(tinfo);
+  return catch_type->can_catch(thrown_type, thrown_object);
+}
 
 // 2.5.3 Exception Handlers
 /*
