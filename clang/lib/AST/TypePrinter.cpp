@@ -1959,6 +1959,11 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
     return;
   }
 
+  if (T->getAttrKind() == attr::InstrumentNonCoroutineFunctionEnterDisable) {
+    OS << " [[clang::instrument_non_coroutine_function_enter_disable]]";
+    return;
+  }
+
   // The printing of the address_space attribute is handled by the qualifier
   // since it is still stored in the qualifier. Return early to prevent printing
   // this twice.
@@ -2069,6 +2074,7 @@ void TypePrinter::printAttributedAfter(const AttributedType *T,
   case attr::PreserveMost:
   case attr::PreserveNone:
   case attr::OverflowBehavior:
+  case attr::InstrumentNonCoroutineFunctionEnterDisable:
     llvm_unreachable("This attribute should have been handled already");
 
   case attr::NSReturnsRetained:

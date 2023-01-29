@@ -3594,6 +3594,18 @@ def RISCVVLSCC: DeclOrTypeAttr, TargetSpecificAttr<TargetRISCV> {
  let Documentation = [RISCVVLSCCDocs];
 }
 
+def InstrumentNonCoroutineFunctionEnterDisable : DeclOrTypeAttr {
+  let Spellings = [Clang<"instrument_non_coroutine_function_enter_disable">];
+  let Subjects = SubjectList<[Record, Type, Function]>;
+  let Documentation = [InstrumentNonCoroutineFunctionEnterDocs];
+}
+
+def InstrumentNonCoroutineFunctionEnter : InheritableAttr {
+  let Spellings = [Clang<"instrument_non_coroutine_function_enter">];
+  let Args = [StringArgument<"functionNameStr">];
+  let Documentation = [InstrumentNonCoroutineFunctionEnterDocs];
+}
+
 def Target : InheritableAttr {
   let Spellings = [GCC<"target">];
   let Args = [StringArgument<"featuresStr">];

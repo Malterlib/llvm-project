@@ -7013,6 +7013,38 @@ provided with the regular ``visibility`` attribute.
   }];
 }
 
+def InstrumentNonCoroutineFunctionEnterDocs : Documentation {
+  let Category = DocCatFunction;
+  let Heading = "instrument_non_coroutine_function_enter, instrument_non_coroutine_function_enter_disable";
+  let Content = [{
+``[[clang::instrument_non_coroutine_function_enter("name")]]`` on a class makes
+each function that returns the class by value and isn't a coroutine call the
+function ``name`` when it is entered, like ``-finstrument-functions`` calls
+``__cyg_profile_func_enter``: ``name`` is called with the address of the
+function and the address it returns to, and must be declared as
+``extern "C" void name(void *, void *)``. A coroutine that returns the class is
+not instrumented. This lets a library tell when a function that returns its
+coroutine type, like a future, is called without being a coroutine.
+
+``[[clang::instrument_non_coroutine_function_enter_disable]]`` on a function,
+a lambda or a function type turns the instrumentation off for it.
+
+.. code-block:: c++
+
+  extern "C" void fg_FutureFunctionEnter(void *, void *);
+
+  struct [[clang::instrument_non_coroutine_function_enter("fg_FutureFunctionEnter")]] CFuture {
+    // ...
+  };
+
+  CFuture fg_Ready();       // Calls fg_FutureFunctionEnter when entered.
+  CFuture fg_Coroutine() {  // A coroutine: not instrumented.
+    co_return;
+  }
+  [[clang::instrument_non_coroutine_function_enter_disable]] CFuture fg_Wrapper();
+  }];
+}
+
 def XRayDocs : Documentation {
   let Category = DocCatFunction;
   let Heading = "xray_always_instrument, xray_never_instrument, xray_log_args";
