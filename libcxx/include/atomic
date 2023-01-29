@@ -534,13 +534,16 @@ template <class T>
 #include <__type_traits/remove_const.h>
 #include <__type_traits/remove_pointer.h>
 #include <__type_traits/underlying_type.h>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
 #include <version>
+#include <cstring>
 
 #ifndef _LIBCPP_HAS_NO_THREADS
 # include <__threading_support>
+#endif
+
+#if !defined(_LIBCPP_REMOVE_TRANSITIVE_INCLUDES) && _LIBCPP_STD_VER <= 20
+#  include <cstddef>
+#  include <cstdint>
 #endif
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
