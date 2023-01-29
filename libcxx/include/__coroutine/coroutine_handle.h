@@ -14,7 +14,7 @@
 #include <__functional/hash.h>
 #include <__memory/addressof.h>
 #include <__type_traits/remove_cv.h>
-#include <compare>
+#include <__compare/strong_order.h>
 #include <cstddef>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)

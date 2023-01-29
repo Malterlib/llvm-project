@@ -15,6 +15,7 @@
 #include <__config>
 #include <__type_traits/conditional.h>
 #include <__type_traits/decay.h>
+#include <__type_traits/is_floating_point.h>
 #include <__utility/forward.h>
 #include <__utility/priority_tag.h>
 #include <cmath>
