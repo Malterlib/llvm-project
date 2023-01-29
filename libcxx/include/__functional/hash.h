@@ -34,6 +34,8 @@
 
 _LIBCPP_BEGIN_NAMESPACE_STD
 
+template <class _Tp> struct _LIBCPP_TEMPLATE_VIS hash;
+
 template <class _Size>
 inline _LIBCPP_HIDE_FROM_ABI _Size __loadword(const void* __p) {
   _Size __r;
