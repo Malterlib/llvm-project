@@ -336,6 +336,7 @@ set(files
   __expected/expected.h
   __expected/unexpect.h
   __expected/unexpected.h
+  __exception/exception.h
   __filesystem/copy_options.h
   __filesystem/directory_entry.h
   __filesystem/directory_iterator.h
@@ -562,6 +563,7 @@ set(files
   __mutex/tag_types.h
   __mutex/unique_lock.h
   __node_handle
+  __new/new.h
   __numeric/accumulate.h
   __numeric/adjacent_difference.h
   __numeric/exclusive_scan.h
