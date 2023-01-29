@@ -12,6 +12,8 @@
 #include <__config>
 #include <__functional/unary_function.h>
 #include <__tuple>
+#include <__type_traits/is_enum.h>
+#include <__type_traits/underlying_type.h>
 #include <__utility/forward.h>
 #include <__utility/move.h>
 #include <__utility/pair.h>
@@ -20,13 +22,17 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
-#include <type_traits>
+
+#include "invoke.h"
+
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
 #endif
 
 _LIBCPP_BEGIN_NAMESPACE_STD
+
+template <class _Tp> struct _LIBCPP_TEMPLATE_VIS hash;
 
 template <class _Size>
 inline _LIBCPP_INLINE_VISIBILITY

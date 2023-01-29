@@ -13,8 +13,7 @@
 #include <__config>
 #include <__functional/hash.h>
 #include <__memory/addressof.h>
-#include <compare>
-#include <type_traits>
+#include <__compare/strong_order.h>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header

@@ -6,12 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
-#define _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
+#ifndef _LIBCPP___TYPE_TRAITS___MAYBE_CONST_H
+#define _LIBCPP___TYPE_TRAITS___MAYBE_CONST_H
 
 #include <__config>
-#include <__utility/declval.h>
-#include <__type_traits/is_convertible.h>
+#include "conditional.h"
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
@@ -19,19 +18,9 @@
 
 _LIBCPP_BEGIN_NAMESPACE_STD
 
-#if _LIBCPP_STD_VER > 17
-
-// [concept.convertible]
-
-template<class _From, class _To>
-concept convertible_to =
-  is_convertible_v<_From, _To> &&
-  requires {
-    static_cast<_To>(declval<_From>());
-  };
-
-#endif // _LIBCPP_STD_VER > 17
+template<bool _Const, class _Tp>
+using __maybe_const = typename conditional<_Const, const _Tp, _Tp>::type;
 
 _LIBCPP_END_NAMESPACE_STD
 
-#endif // _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
+#endif // _LIBCPP___TYPE_TRAITS___MAYBE_CONST_H

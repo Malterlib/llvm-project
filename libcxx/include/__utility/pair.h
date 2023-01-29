@@ -14,11 +14,20 @@
 #include <__config>
 #include <__functional/unwrap_ref.h>
 #include <__tuple>
+#include <__type_traits/__is_implicitly_default_constructible.h>
+#include <__type_traits/is_copy_assignable.h>
+#include <__type_traits/is_default_constructible.h>
+#include <__type_traits/is_nothrow_default_constructible.h>
+#include <__type_traits/is_nothrow_copy_constructible.h>
+#include <__type_traits/is_nothrow_copy_assignable.h>
+#include <__type_traits/is_move_assignable.h>
+#include <__type_traits/is_nothrow_move_assignable.h>
+#include <__type_traits/is_swappable.h>
+#include <__type_traits/nat.h>
 #include <__utility/forward.h>
 #include <__utility/move.h>
 #include <__utility/piecewise_construct.h>
 #include <cstddef>
-#include <type_traits>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header

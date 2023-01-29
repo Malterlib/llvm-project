@@ -264,6 +264,7 @@ set(files
   __debug
   __debug_utils/randomize_range.h
   __errc
+  __exception/exception.h
   __filesystem/copy_options.h
   __filesystem/directory_entry.h
   __filesystem/directory_iterator.h
@@ -400,6 +401,7 @@ set(files
   __memory/voidify.h
   __mutex_base
   __node_handle
+  __new/new.h
   __numeric/accumulate.h
   __numeric/adjacent_difference.h
   __numeric/exclusive_scan.h
@@ -508,6 +510,10 @@ set(files
   __threading_support
   __tree
   __tuple
+  __type_traits/__convert_to_integral.h
+  __type_traits/__is_implicitly_default_constructible.h
+  __type_traits/__make_const_lvalue_ref.h
+  __type_traits/__maybe_const.h
   __type_traits/add_const.h
   __type_traits/add_cv.h
   __type_traits/add_lvalue_reference.h
@@ -587,6 +593,7 @@ set(files
   __type_traits/is_signed.h
   __type_traits/is_signed_integer.h
   __type_traits/is_standard_layout.h
+  __type_traits/is_swappable.h
   __type_traits/is_trivial.h
   __type_traits/is_trivially_assignable.h
   __type_traits/is_trivially_constructible.h

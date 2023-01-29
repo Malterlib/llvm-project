@@ -13,7 +13,9 @@
 #include <__config>
 #include <__memory/uses_allocator.h>
 #include <__utility/forward.h>
-#include <type_traits>
+#include <__type_traits/integral_constant.h>
+#include <__type_traits/is_constructible.h>
+
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header

@@ -308,7 +308,6 @@ extern "C++" {
 #include <__type_traits/promote.h>
 #include <limits>
 #include <stdlib.h>
-#include <type_traits>
 
 // signbit
 

@@ -14,7 +14,7 @@
 #include <__config>
 #include <__utility/forward.h>
 #include <__utility/priority_tag.h>
-#include <type_traits>
+#include <__type_traits/is_same.h>
 
 #ifndef _LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER
 #  pragma GCC system_header

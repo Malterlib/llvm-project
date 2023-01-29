@@ -13,7 +13,8 @@
 #include <__config>
 #include <limits>
 #include <ratio>
-#include <type_traits>
+#include <__type_traits/common_type.h>
+#include <__type_traits/is_convertible.h>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header

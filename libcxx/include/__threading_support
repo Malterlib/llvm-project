@@ -600,6 +600,8 @@ _LIBCPP_INLINE_VISIBILITY __thread_id get_id() _NOEXCEPT;
 
 } // namespace this_thread
 
+template <class _Tp> struct _LIBCPP_TEMPLATE_VIS hash;
+
 template<> struct hash<__thread_id>;
 
 class _LIBCPP_TEMPLATE_VIS __thread_id

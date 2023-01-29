@@ -6,12 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
-#define _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
+#ifndef _LIBCPP___TYPE_TRAITS___MAKE_CONST_LVALUE_REF_H
+#define _LIBCPP___TYPE_TRAITS___MAKE_CONST_LVALUE_REF_H
 
 #include <__config>
-#include <__utility/declval.h>
-#include <__type_traits/is_convertible.h>
+
+#include "remove_reference.h"
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
@@ -19,19 +19,9 @@
 
 _LIBCPP_BEGIN_NAMESPACE_STD
 
-#if _LIBCPP_STD_VER > 17
-
-// [concept.convertible]
-
-template<class _From, class _To>
-concept convertible_to =
-  is_convertible_v<_From, _To> &&
-  requires {
-    static_cast<_To>(declval<_From>());
-  };
-
-#endif // _LIBCPP_STD_VER > 17
+template<class _Tp>
+using __make_const_lvalue_ref = const typename remove_reference<_Tp>::type&;
 
 _LIBCPP_END_NAMESPACE_STD
 
-#endif // _LIBCPP___CONCEPTS_CONVERTIBLE_TO_H
+#endif // _LIBCPP___TYPE_TRAITS___MAKE_CONST_LVALUE_REF_H

@@ -524,11 +524,12 @@ template <class T>
 #include <__config>
 #include <__thread/poll_with_backoff.h>
 #include <__thread/timed_backoff_policy.h>
-#include <cstddef>
-#include <cstdint>
+#include <__type_traits/underlying_type.h>
+#include <__type_traits/is_trivially_copyable.h>
+#include <__type_traits/remove_pointer.h>
+#include <__type_traits/is_nothrow_default_constructible.h>
+
 #include <cstring>
-#include <type_traits>
-#include <version>
 
 #ifndef _LIBCPP_HAS_NO_THREADS
 # include <__threading_support>
@@ -536,6 +537,10 @@ template <class T>
 
 #ifndef _LIBCPP_REMOVE_TRANSITIVE_INCLUDES
 #  include <chrono>
+#  include <cstddef>
+#  include <cstdint>
+#  include <type_traits>
+#  include <version>
 #endif
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)

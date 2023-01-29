@@ -12,7 +12,18 @@
 
 #include <__config>
 #include <cstddef>
-#include <type_traits>
+#include <__type_traits/add_const.h>
+#include <__type_traits/add_cv.h>
+#include <__type_traits/add_volatile.h>
+#include <__type_traits/is_assignable.h>
+#include <__type_traits/is_const.h>
+#include <__type_traits/is_constructible.h>
+#include <__type_traits/is_convertible.h>
+#include <__type_traits/is_reference.h>
+#include <__type_traits/is_same.h>
+#include <__type_traits/is_volatile.h>
+#include <__type_traits/remove_cvref.h>
+#include <__type_traits/remove_reference.h>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
@@ -20,6 +31,8 @@
 
 
 _LIBCPP_BEGIN_NAMESPACE_STD
+
+template <class _T1, class _T2> struct _LIBCPP_TEMPLATE_VIS pair;
 
 template <class _Tp> struct _LIBCPP_TEMPLATE_VIS tuple_size;
 

@@ -13,7 +13,6 @@
 #include <__chrono/duration.h>
 #include <__config>
 #include <limits>
-#include <type_traits>
 
 #if !defined(_LIBCPP_HAS_NO_PRAGMA_SYSTEM_HEADER)
 #  pragma GCC system_header
