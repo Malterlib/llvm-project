@@ -9111,7 +9111,9 @@ static TypedefDecl *CreateVaListDecl(const ASTContext *Context,
 
 TypedefDecl *ASTContext::getBuiltinVaListDecl() const {
   if (!BuiltinVaListDecl) {
-    BuiltinVaListDecl = CreateVaListDecl(this, Target->getBuiltinVaListKind());
+    auto *NewDecl = CreateVaListDecl(this, Target->getBuiltinVaListKind());
+    if (!BuiltinVaListDecl) // Protect against recursive ASTReader
+      BuiltinVaListDecl = NewDecl;
     assert(BuiltinVaListDecl->isImplicit());
   }
 
