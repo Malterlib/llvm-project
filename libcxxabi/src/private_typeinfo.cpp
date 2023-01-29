@@ -51,6 +51,25 @@
 #include <atomic>
 #endif
 
+#ifdef _LIBCXXABI_UBSAN_HELPERS
+extern "C" {
+	__attribute__((no_sanitize("undefined"))) __attribute__((used)) __attribute__ ((__visibility__("default")))
+	const __cxxabiv1::__si_class_type_info *__overidable_ubsan_get_dyncast_si(__cxxabiv1::__class_type_info const *ptr) {
+		return dynamic_cast<const __cxxabiv1::__si_class_type_info*>(ptr);
+	}
+
+	__attribute__((no_sanitize("undefined"))) __attribute__((used)) __attribute__ ((__visibility__("default")))
+	const __cxxabiv1::__vmi_class_type_info *__overidable_ubsan_get_dyncast_wmi(__cxxabiv1::__class_type_info const *ptr) {
+		return dynamic_cast<const __cxxabiv1::__vmi_class_type_info*>(ptr);
+	}
+
+	__attribute__((no_sanitize("undefined"))) __attribute__((used)) __attribute__ ((__visibility__("default")))
+	__cxxabiv1::__class_type_info *__overidable_ubsan_get_dyncast_class(std::type_info *ptr) {
+		return dynamic_cast<__cxxabiv1::__class_type_info*>(ptr);
+	}
+}
+#endif
+
 static inline
 __attribute__((no_sanitize("undefined"))) bool
 is_equal(const std::type_info* x, const std::type_info* y, bool use_strcmp)
