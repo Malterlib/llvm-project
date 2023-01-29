@@ -582,10 +582,16 @@ typedef __char32_t char32_t;
 
 // Inline namespaces are available in Clang/GCC/MSVC regardless of C++ dialect.
 // clang-format off
-#  define _LIBCPP_BEGIN_NAMESPACE_STD _LIBCPP_PUSH_EXTENSION_DIAGNOSTICS                                               \
+#  ifdef _LIBCPP_ABI_NO_NAMESPACE
+#    define _LIBCPP_BEGIN_NAMESPACE_STD _LIBCPP_PUSH_EXTENSION_DIAGNOSTICS                                             \
+                                      namespace _LIBCPP_TYPE_VISIBILITY_DEFAULT std {
+#    define _LIBCPP_END_NAMESPACE_STD } _LIBCPP_POP_EXTENSION_DIAGNOSTICS
+#  else
+#    define _LIBCPP_BEGIN_NAMESPACE_STD _LIBCPP_PUSH_EXTENSION_DIAGNOSTICS                                             \
                                       namespace _LIBCPP_TYPE_VISIBILITY_DEFAULT std {                                  \
                                inline namespace _LIBCPP_ABI_NAMESPACE {
-#  define _LIBCPP_END_NAMESPACE_STD }} _LIBCPP_POP_EXTENSION_DIAGNOSTICS
+#    define _LIBCPP_END_NAMESPACE_STD }} _LIBCPP_POP_EXTENSION_DIAGNOSTICS
+#  endif
 
 #define _LIBCPP_BEGIN_NAMESPACE_EXPERIMENTAL namespace std { namespace experimental {
 #define _LIBCPP_END_NAMESPACE_EXPERIMENTAL }}
