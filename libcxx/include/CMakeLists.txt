@@ -284,6 +284,7 @@ set(files
   __expected/expected.h
   __expected/unexpect.h
   __expected/unexpected.h
+  __exception/exception.h
   __filesystem/copy_options.h
   __filesystem/directory_entry.h
   __filesystem/directory_iterator.h
@@ -448,6 +449,7 @@ set(files
   __memory_resource/unsynchronized_pool_resource.h
   __mutex_base
   __node_handle
+  __new/new.h
   __numeric/accumulate.h
   __numeric/adjacent_difference.h
   __numeric/exclusive_scan.h
