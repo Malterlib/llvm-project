@@ -23,6 +23,10 @@ typedef __builtin_va_list va_list;
 #define _VA_LIST
 #endif
 
+#if !defined(_VA_LIST_DEFINED)
+#define _VA_LIST_DEFINED 1
+#endif
+
 /* FIXME: This is using the placeholder dates Clang produces for these macros
    in C2x mode; switch to the correct values once they've been published. */
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202000L
