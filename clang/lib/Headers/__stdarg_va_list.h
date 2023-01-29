@@ -11,3 +11,7 @@
 #define _VA_LIST
 typedef __builtin_va_list va_list;
 #endif
+
+#if !defined(_VA_LIST_DEFINED)
+#define _VA_LIST_DEFINED 1
+#endif
