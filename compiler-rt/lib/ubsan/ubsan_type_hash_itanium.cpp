@@ -85,6 +85,20 @@ public:
 
 namespace abi = __cxxabiv1;
 
+extern "C" {
+	__attribute__ ((__visibility__("default"))) __attribute__((weak)) const abi::__si_class_type_info *__overidable_ubsan_get_dyncast_si(const abi::__class_type_info *ptr) {
+		return dynamic_cast<const abi::__si_class_type_info*>(ptr);
+	}
+
+	__attribute__ ((__visibility__("default"))) __attribute__((weak)) const abi::__vmi_class_type_info *__overidable_ubsan_get_dyncast_wmi(const abi::__class_type_info *ptr) {
+		return dynamic_cast<const abi::__vmi_class_type_info*>(ptr);
+	}
+
+	__attribute__ ((__visibility__("default"))) __attribute__((weak)) abi::__class_type_info *__overidable_ubsan_get_dyncast_class(std::type_info *ptr) {
+		return dynamic_cast<abi::__class_type_info*>(ptr);
+	}
+}
+
 using namespace __sanitizer;
 
 // We implement a simple two-level cache for type-checking results. For each
@@ -134,11 +148,11 @@ static bool isDerivedFromAtOffset(const abi::__class_type_info *Derived,
     return Offset == 0;
 
   if (const abi::__si_class_type_info *SI =
-        dynamic_cast<const abi::__si_class_type_info*>(Derived))
+        __overidable_ubsan_get_dyncast_si(Derived))
     return isDerivedFromAtOffset(SI->__base_type, Base, Offset);
 
   const abi::__vmi_class_type_info *VTI =
-    dynamic_cast<const abi::__vmi_class_type_info*>(Derived);
+    __overidable_ubsan_get_dyncast_wmi(Derived);
   if (!VTI)
     // No base class subobjects.
     return false;
@@ -171,11 +185,11 @@ static const abi::__class_type_info *findBaseAtOffset(
     return Derived;
 
   if (const abi::__si_class_type_info *SI =
-        dynamic_cast<const abi::__si_class_type_info*>(Derived))
+        __overidable_ubsan_get_dyncast_si(Derived))
     return findBaseAtOffset(SI->__base_type, Offset);
 
   const abi::__vmi_class_type_info *VTI =
-    dynamic_cast<const abi::__vmi_class_type_info*>(Derived);
+    __overidable_ubsan_get_dyncast_wmi(Derived);
   if (!VTI)
     // No base class subobjects.
     return nullptr;
@@ -242,7 +256,7 @@ bool __ubsan::checkDynamicType(void *Object, void *Type, HashValue Hash) {
 
   // Check that this is actually a type_info object for a class type.
   abi::__class_type_info *Derived =
-    dynamic_cast<abi::__class_type_info*>(Vtable->TypeInfo);
+    __overidable_ubsan_get_dyncast_class(Vtable->TypeInfo);
   if (!Derived)
     return false;
 
