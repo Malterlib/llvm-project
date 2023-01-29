@@ -3537,6 +3537,19 @@ static void handleTargetVersionAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   }
 }
 
+static void handleInstrumentNonCoroutineFunctionEnterAttr(Sema &S,
+  Decl *D, const ParsedAttr &AL) {
+  StringRef Str;
+  SourceLocation LiteralLoc;
+  if (!S.checkStringLiteralArgumentAttr(AL, 0, Str, &LiteralLoc))
+    return;
+
+  InstrumentNonCoroutineFunctionEnterAttr *NewAttr =
+      ::new (S.Context) InstrumentNonCoroutineFunctionEnterAttr(
+        S.Context, AL, Str);
+  D->addAttr(NewAttr);
+}
+
 static void handleTargetAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
   StringRef Str;
   SourceLocation LiteralLoc;
@@ -9469,6 +9482,13 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
     break;
   case ParsedAttr::AT_CodeSeg:
     handleCodeSegAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_InstrumentNonCoroutineFunctionEnter:
+    handleInstrumentNonCoroutineFunctionEnterAttr(S, D, AL);
+    break;
+  case ParsedAttr::AT_InstrumentNonCoroutineFunctionEnterDisable:
+    handleSimpleAttribute<InstrumentNonCoroutineFunctionEnterDisableAttr
+                          >(S, D, AL);
     break;
   case ParsedAttr::AT_Target:
     handleTargetAttr(S, D, AL);
