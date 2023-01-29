@@ -53,28 +53,23 @@ static void insertCall(Function &CurFn, StringRef Func,
     return;
   }
 
-  if (Func == "__cyg_profile_func_enter" || Func == "__cyg_profile_func_exit") {
-    Type *ArgTypes[] = {PointerType::getUnqual(C), PointerType::getUnqual(C)};
+  // Assume same as __cyg_profile_func_enter or __cyg_profile_func_exit.
+  Type *ArgTypes[] = {PointerType::getUnqual(C), PointerType::getUnqual(C)};
 
-    FunctionCallee Fn = M.getOrInsertFunction(
-        Func, FunctionType::get(Type::getVoidTy(C), ArgTypes, false));
+  FunctionCallee Fn = M.getOrInsertFunction(
+      Func, FunctionType::get(Type::getVoidTy(C), ArgTypes, false));
 
-    Instruction *RetAddr = CallInst::Create(
-        Intrinsic::getDeclaration(&M, Intrinsic::returnaddress),
-        ArrayRef<Value *>(ConstantInt::get(Type::getInt32Ty(C), 0)), "",
-        InsertionPt);
-    RetAddr->setDebugLoc(DL);
+  Instruction *RetAddr = CallInst::Create(
+      Intrinsic::getDeclaration(&M, Intrinsic::returnaddress),
+      ArrayRef<Value *>(ConstantInt::get(Type::getInt32Ty(C), 0)), "",
+      InsertionPt);
+  RetAddr->setDebugLoc(DL);
 
-    Value *Args[] = {&CurFn, RetAddr};
-    CallInst *Call =
-        CallInst::Create(Fn, ArrayRef<Value *>(Args), "", InsertionPt);
-    Call->setDebugLoc(DL);
-    return;
-  }
-
-  // We only know how to call a fixed set of instrumentation functions, because
-  // they all expect different arguments, etc.
-  report_fatal_error(Twine("Unknown instrumentation function: '") + Func + "'");
+  Value *Args[] = {&CurFn, RetAddr};
+  CallInst *Call =
+      CallInst::Create(Fn, ArrayRef<Value *>(Args), "", InsertionPt);
+  Call->setDebugLoc(DL);
+  return;
 }
 
 static bool runOnFunction(Function &F, bool PostInlining) {
