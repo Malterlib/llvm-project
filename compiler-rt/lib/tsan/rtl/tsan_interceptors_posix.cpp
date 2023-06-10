@@ -1008,7 +1008,7 @@ extern "C" void *__tsan_thread_start_func(void *arg) {
     Processor *proc = ProcCreate();
     ProcWire(proc, thr);
     ThreadStart(thr, p->tid, GetTid(), ThreadType::Regular);
-    if (ctx->after_multithreaded_fork) {
+    if (ctx->afterMultithreadedFork()) {
       thr->ignore_interceptors++;
       const uptr pc = StackTrace::GetCurrentPc();
       ThreadIgnoreBegin(thr, pc);
@@ -2080,7 +2080,7 @@ static void CallUserSignalHandler(ThreadState *thr, bool sync, bool acquire,
   // in_symbolizer we can get memory allocated with one being
   // feed with another, which can cause more crashes.
   int in_symbolizer = thr->in_symbolizer;
-  if (!ctx->after_multithreaded_fork) {
+  if (!ctx->afterMultithreadedFork()) {
     thr->ignore_reads_and_writes = 0;
     thr->fast_state.ClearIgnoreBit();
     thr->ignore_interceptors = 0;
@@ -2102,7 +2102,7 @@ static void CallUserSignalHandler(ThreadState *thr, bool sync, bool acquire,
     // additional arguments to sa_handler works and is harmless.
     ((__sanitizer_sigactionhandler_ptr)pc)(sig, info, uctx);
   }
-  if (!ctx->after_multithreaded_fork) {
+  if (!ctx->afterMultithreadedFork()) {
     thr->ignore_reads_and_writes = ignore_reads_and_writes;
     if (ignore_reads_and_writes)
       thr->fast_state.SetIgnoreBit();

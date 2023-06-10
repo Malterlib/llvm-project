@@ -72,7 +72,7 @@ static void ReportIgnoresEnabled(ThreadContext *tctx, IgnoreSet *set) {
 }
 
 static void ThreadCheckIgnore(ThreadState *thr) {
-  if (ctx->after_multithreaded_fork)
+  if (ctx->afterMultithreadedFork())
     return;
   if (thr->ignore_reads_and_writes)
     ReportIgnoresEnabled(thr->tctx, &thr->mop_ignore_set);
@@ -175,7 +175,7 @@ void ThreadStart(ThreadState *thr, Tid tid, tid_t os_id,
   thr->tls_size = tls_size;
 
 #if !SANITIZER_GO
-  if (ctx->after_multithreaded_fork) {
+  if (ctx->afterMultithreadedFork()) {
     thr->ignore_interceptors++;
     ThreadIgnoreBegin(thr, 0);
     ThreadIgnoreSyncBegin(thr, 0);
