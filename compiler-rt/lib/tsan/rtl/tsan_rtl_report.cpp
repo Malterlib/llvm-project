@@ -152,7 +152,7 @@ bool ShouldReport(ThreadState *thr, ReportType typ) {
 #if !SANITIZER_GO
       // It's impossible to join phantom threads
       // in the child after fork.
-      if (ctx->after_multithreaded_fork)
+      if (ctx->afterMultithreadedFork())
         return false;
 #endif
       return flags()->report_thread_leaks;
