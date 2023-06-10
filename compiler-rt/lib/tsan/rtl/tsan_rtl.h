@@ -304,6 +304,7 @@ struct Context {
   bool initialized;
 #if !SANITIZER_GO
   bool after_multithreaded_fork;
+  bool afterMultithreadedFork();
 #endif
 
   MetaMap metamap;
