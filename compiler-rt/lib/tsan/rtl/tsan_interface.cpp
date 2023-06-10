@@ -26,6 +26,9 @@ void __tsan_forked_child() {
   ForkChildAfter(cur_thread(), CALLERPC, true);
 }
 
+void __attribute__((weak)) __tsan_check_forked_parent_or_child() {
+}
+
 void __tsan_forked_parent() {
   ForkParentAfter(cur_thread(), CALLERPC);
 }

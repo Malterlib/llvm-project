@@ -40,6 +40,10 @@ SANITIZER_WEAK_DEFAULT_IMPL
 void __tsan_test_only_on_fork() {}
 #endif
 
+#if !SANITIZER_GO
+void __tsan_check_forked_parent_or_child();
+#endif
+
 namespace __tsan {
 
 #if !SANITIZER_GO
@@ -817,6 +821,13 @@ int Finalize(ThreadState *thr) {
 }
 
 #if !SANITIZER_GO
+
+bool Context::afterMultithreadedFork() {
+  ScopedIgnoreInterceptors ignore;
+  __tsan_check_forked_parent_or_child();
+  return after_multithreaded_fork;
+}
+
 void ForkBefore(ThreadState* thr, uptr pc) SANITIZER_NO_THREAD_SAFETY_ANALYSIS {
   VReport(2, "BeforeFork tid: %llu\n", GetTid());
   GlobalProcessorLock();
@@ -976,7 +987,7 @@ void TraceSwitchPart(ThreadState* thr) {
   if (TraceSkipGap(thr))
     return;
 #if !SANITIZER_GO
-  if (ctx->after_multithreaded_fork) {
+  if (ctx->afterMultithreadedFork()) {
     // We just need to survive till exec.
     TracePart* part = thr->tctx->trace.parts.Back();
     if (part) {
@@ -1071,7 +1082,7 @@ void ThreadIgnoreBegin(ThreadState* thr, uptr pc) {
   CHECK_GT(thr->ignore_reads_and_writes, 0);
   thr->fast_state.SetIgnoreBit();
 #if !SANITIZER_GO
-  if (pc && !ctx->after_multithreaded_fork)
+  if (pc && !ctx->afterMultithreadedFork())
     thr->mop_ignore_set.Add(CurrentStackId(thr, pc));
 #endif
 }
@@ -1101,7 +1112,7 @@ void ThreadIgnoreSyncBegin(ThreadState *thr, uptr pc) {
   thr->ignore_sync++;
   CHECK_GT(thr->ignore_sync, 0);
 #if !SANITIZER_GO
-  if (pc && !ctx->after_multithreaded_fork)
+  if (pc && !ctx->afterMultithreadedFork())
     thr->sync_ignore_set.Add(CurrentStackId(thr, pc));
 #endif
 }
