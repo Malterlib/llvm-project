@@ -128,6 +128,7 @@ static ReportStack *SymbolizeStack(StackTrace trace) {
 }
 
 bool ShouldReport(ThreadState *thr, ReportType typ) {
+  bool afterMultithreadedFork = ctx->afterMultithreadedFork();
   // We set thr->suppress_reports in the fork context.
   // Taking any locking in the fork context can lead to deadlocks.
   // If any locks are already taken, it's too late to do this check.
@@ -144,7 +145,7 @@ bool ShouldReport(ThreadState *thr, ReportType typ) {
 #if !SANITIZER_GO
       // It's impossible to join phantom threads
       // in the child after fork.
-      if (ctx->after_multithreaded_fork)
+      if (afterMultithreadedFork)
         return false;
 #endif
       return flags()->report_thread_leaks;

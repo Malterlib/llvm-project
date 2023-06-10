@@ -212,19 +212,19 @@ void *user_alloc_internal(ThreadState *thr, uptr pc, uptr sz, uptr align,
     GET_STACK_TRACE_FATAL(thr, pc);
     ReportOutOfMemory(sz, &stack);
   }
-  if (ctx && ctx->initialized && !ctx->after_multithreaded_fork)
+  if (ctx && ctx->initialized && !ctx->afterMultithreadedFork())
     OnUserAlloc(thr, pc, (uptr)p, sz, true);
-  if (signal && ctx && !ctx->after_multithreaded_fork)
+  if (signal && ctx && !ctx->afterMultithreadedFork())
     SignalUnsafeCall(thr, pc);
   return p;
 }
 
 void user_free(ThreadState *thr, uptr pc, void *p, bool signal) {
   ScopedGlobalProcessor sgp;
-  if (ctx && ctx->initialized && !ctx->after_multithreaded_fork)
+  if (ctx && ctx->initialized && !ctx->afterMultithreadedFork())
     OnUserFree(thr, pc, (uptr)p, true);
   allocator()->Deallocate(&thr->proc()->alloc_cache, p);
-  if (signal && ctx && !ctx->after_multithreaded_fork)
+  if (signal && ctx && !ctx->afterMultithreadedFork())
     SignalUnsafeCall(thr, pc);
 }
 
