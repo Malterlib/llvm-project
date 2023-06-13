@@ -88,7 +88,9 @@ struct release
 template <class T, class ...Args>
 T& make(Args ...args)
 {
+    _LIBCPP_SUPPRESS_DEPRECATED_PUSH
     static typename aligned_storage<sizeof(T)>::type buf;
+    _LIBCPP_SUPPRESS_DEPRECATED_POP
     auto *obj = ::new (&buf) T(args...);
     return *obj;
 }
@@ -551,7 +553,9 @@ const locale&
 locale::__imp::make_classic()
 {
     // only one thread can get in here and it only gets in once
+    _LIBCPP_SUPPRESS_DEPRECATED_PUSH
     static aligned_storage<sizeof(locale)>::type buf;
+    _LIBCPP_SUPPRESS_DEPRECATED_POP
     locale* c = reinterpret_cast<locale*>(&buf);
     c->__locale_ = &make<__imp>(1u);
     return *c;
@@ -568,7 +572,9 @@ locale&
 locale::__imp::make_global()
 {
     // only one thread can get in here and it only gets in once
+    _LIBCPP_SUPPRESS_DEPRECATED_PUSH
     static aligned_storage<sizeof(locale)>::type buf;
+    _LIBCPP_SUPPRESS_DEPRECATED_POP
     auto *obj = ::new (&buf) locale(locale::classic());
     return *obj;
 }
