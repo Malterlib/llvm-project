@@ -1119,6 +1119,10 @@ Bug Fixes to C++ Support
   incorrect constraint substitution.
   (`#86769 <https://github.com/llvm/llvm-project/issues/86769>`_)
 
+- Clang now correctly tracks type dependence of by-value captures in lambdas with an explicit
+  object parameter.
+  Fixes (#GH70604), (#GH79754), (#GH84163), (#GH84425), (#GH86054), (#GH86398), and (#GH86399).
+
 Bug Fixes to AST Handling
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 - Fixed an import failure of recursive friend class template.
