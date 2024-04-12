@@ -732,3 +732,12 @@ void GH67492() {
   constexpr auto test = 42;
   auto lambda = (test, []() noexcept(true) {});
 }
+
+namespace GH84473_bug {
+void f1() {
+  int b;
+  (void) [=] [[gnu::regcall]] () { // expected-warning {{an attribute specifier sequence in this position is a C++23 extension}}
+    (void) b;
+  };
+}
+}
