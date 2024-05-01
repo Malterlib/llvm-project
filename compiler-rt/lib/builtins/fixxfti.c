@@ -12,6 +12,7 @@
 
 #include "int_lib.h"
 
+#if HAS_80_BIT_LONG_DOUBLE
 #ifdef CRT_HAS_128BIT
 
 // Returns: convert a to a signed long long, rounding toward zero.
@@ -44,3 +45,4 @@ COMPILER_RT_ABI ti_int __fixxfti(xf_float a) {
 }
 
 #endif // CRT_HAS_128BIT
+#endif

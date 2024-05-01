@@ -14,6 +14,8 @@
 
 #include "int_lib.h"
 
+#if HAS_80_BIT_LONG_DOUBLE
+
 // Returns: convert a to a signed long long, rounding toward zero.
 
 // Assumption: long double is an intel 80 bit floating point type padded with 6
@@ -49,6 +51,8 @@ COMPILER_RT_ABI di_int __fixxfdi(xf_float a) {
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(pop)
+#endif
+
 #endif
 
 #endif // !_ARCH_PPC
