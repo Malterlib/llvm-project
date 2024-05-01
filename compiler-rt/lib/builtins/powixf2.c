@@ -15,6 +15,7 @@
 #include "int_lib.h"
 
 // Returns: a ^ b
+#if HAS_80_BIT_LONG_DOUBLE
 
 COMPILER_RT_ABI xf_float __powixf2(xf_float a, int b) {
   const int recip = b < 0;
@@ -29,5 +30,7 @@ COMPILER_RT_ABI xf_float __powixf2(xf_float a, int b) {
   }
   return recip ? 1 / r : r;
 }
+
+#endif
 
 #endif
