@@ -6566,12 +6566,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
 
   // -fvisibility-global-new-delete-hidden is a deprecated spelling of
   // -fvisibility-global-new-delete=force-hidden.
+  #if 0
   if (const Arg *A =
           Args.getLastArg(options::OPT_fvisibility_global_new_delete_hidden)) {
     D.Diag(diag::warn_drv_deprecated_arg)
         << A->getAsString(Args) << /*hasReplacement=*/true
         << "-fvisibility-global-new-delete=force-hidden";
   }
+  #endif
 
   if (const Arg *A =
           Args.getLastArg(options::OPT_fvisibility_global_new_delete_EQ,
