@@ -14,6 +14,7 @@
 
 #include "int_lib.h"
 
+#if HAS_80_BIT_LONG_DOUBLE
 // Returns: convert a to a unsigned int, rounding toward zero.
 //          Negative values all become zero.
 
@@ -46,5 +47,5 @@ COMPILER_RT_ABI su_int __fixunsxfsi(xf_float a) {
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma warning(pop)
 #endif
-
+#endif
 #endif // !_ARCH_PPC
