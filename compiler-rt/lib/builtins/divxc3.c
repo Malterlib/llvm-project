@@ -16,6 +16,7 @@
 #include "int_math.h"
 
 // Returns: the quotient of (a + ib) / (c + id)
+#if HAS_80_BIT_LONG_DOUBLE
 
 COMPILER_RT_ABI Lcomplex __divxc3(xf_float __a, xf_float __b, xf_float __c,
                                   xf_float __d) {
@@ -51,5 +52,7 @@ COMPILER_RT_ABI Lcomplex __divxc3(xf_float __a, xf_float __b, xf_float __c,
   }
   return z;
 }
+
+#endif
 
 #endif

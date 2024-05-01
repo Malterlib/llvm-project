@@ -8,6 +8,8 @@
 
 #include "../int_lib.h"
 
+#if HAS_80_BIT_LONG_DOUBLE
 xf_float __floatdixf(int64_t a) { return (xf_float)a; }
+#endif
 
 #endif // __i386__

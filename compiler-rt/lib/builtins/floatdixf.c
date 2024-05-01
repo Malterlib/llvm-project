@@ -14,6 +14,7 @@
 
 #include "int_lib.h"
 
+#if HAS_80_BIT_LONG_DOUBLE
 // Returns: convert a to a long double, rounding toward even.
 
 // Assumption: long double is a IEEE 80 bit floating point type padded to 128
@@ -38,4 +39,5 @@ COMPILER_RT_ABI xf_float __floatdixf(di_int a) {
   return fb.f;
 }
 
+#endif
 #endif // !_ARCH_PPC
