@@ -10,6 +10,11 @@
 #define DST_HALF
 #include "fp_trunc_impl.inc"
 
+#if HAS_80_BIT_LONG_DOUBLE
 COMPILER_RT_ABI dst_t __truncxfhf2(xf_float a) {
   return __truncXfYf2__((float)a);
 }
+#endif
+
+// Have at least one declaration to suppress warnings.
+enum Unused { ReallyUnused };

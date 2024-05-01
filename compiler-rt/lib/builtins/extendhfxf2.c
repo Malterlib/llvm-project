@@ -10,7 +10,12 @@
 #define DST_DOUBLE
 #include "fp_extend_impl.inc"
 
+#if HAS_80_BIT_LONG_DOUBLE
 // Long double are expected to be as precise as double.
 COMPILER_RT_ABI xf_float __extendhfxf2(src_t a) {
   return (xf_float)__extendXfYf2__(a);
 }
+#endif
+
+// Have at least one declaration to suppress warnings.
+enum Unused { ReallyUnused };
