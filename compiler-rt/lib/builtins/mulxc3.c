@@ -17,6 +17,8 @@
 
 // Returns: the product of a + ib and c + id
 
+#if HAS_80_BIT_LONG_DOUBLE
+
 COMPILER_RT_ABI Lcomplex __mulxc3(xf_float __a, xf_float __b, xf_float __c,
                                   xf_float __d) {
   xf_float __ac = __a * __c;
@@ -65,5 +67,7 @@ COMPILER_RT_ABI Lcomplex __mulxc3(xf_float __a, xf_float __b, xf_float __c,
   }
   return z;
 }
+
+#endif
 
 #endif
