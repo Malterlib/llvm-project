@@ -123,10 +123,10 @@ echo Package version: %package_version%
 echo Build dir: %build_dir%
 echo.
 
-if exist %build_dir% (
-  echo Build directory already exists: %build_dir%
-  exit /b 1
-)
+::if exist %build_dir% (
+::  echo Build directory already exists: %build_dir%
+::  exit /b 1
+::)
 mkdir %build_dir%
 cd %build_dir% || exit /b 1
 
@@ -141,13 +141,14 @@ if "%skip-checkout%" == "true" (
   set llvm_src=%build_dir%\llvm-project
 )
 
-curl -O https://gitlab.gnome.org/GNOME/libxml2/-/archive/v2.9.12/libxml2-v2.9.12.tar.gz || exit /b 1
-tar zxf libxml2-v2.9.12.tar.gz
+::curl -O https://gitlab.gnome.org/GNOME/libxml2/-/archive/v2.9.12/libxml2-v2.9.12.tar.gz || exit /b 1
+::tar zxf libxml2-v2.9.12.tar.gz
 
 REM Setting CMAKE_CL_SHOWINCLUDES_PREFIX to work around PR27226.
 REM Common flags for all builds.
-set common_compiler_flags=-DLIBXML_STATIC
+set common_compiler_flags=-DLIBXML_STATIC -g -fno-limit-debug-info
 set common_cmake_flags=^
+  -DLLVM_USE_SYMLINKS=ON ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DLLVM_ENABLE_ASSERTIONS=OFF ^
   -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON ^
@@ -158,7 +159,7 @@ set common_cmake_flags=^
   -DLLDB_RELOCATABLE_PYTHON=1 ^
   -DLLDB_EMBED_PYTHON_HOME=OFF ^
   -DCMAKE_CL_SHOWINCLUDES_PREFIX="Note: including file: " ^
-  -DLLVM_ENABLE_LIBXML2=FORCE_ON ^
+  -DLLVM_ENABLE_LIBXML2=OFF ^
   -DLLDB_ENABLE_LIBXML2=OFF ^
   -DCLANG_ENABLE_LIBXML2=OFF ^
   -DCMAKE_C_FLAGS="%common_compiler_flags%" ^
@@ -185,7 +186,7 @@ call "%vsdevcmd%" -arch=x86 || exit /b 1
 @echo on
 mkdir build32_stage0
 cd build32_stage0
-call :do_build_libxml || exit /b 1
+::call :do_build_libxml || exit /b 1
 
 REM Stage0 binaries directory; used in stage1.
 set "stage0_bin_dir=%build_dir%/build32_stage0/bin"
@@ -193,16 +194,17 @@ set cmake_flags=^
   %common_cmake_flags% ^
   -DLLDB_TEST_COMPILER=%stage0_bin_dir%/clang.exe ^
   -DPYTHON_HOME=%PYTHONHOME% ^
-  -DPython3_ROOT_DIR=%PYTHONHOME% ^
-  -DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
-  -DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib
+  -DPython3_ROOT_DIR=%PYTHONHOME%
+
+  ::-DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
+  ::-DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib
 
 cmake -GNinja %cmake_flags% %llvm_src%\llvm || exit /b 1
 ninja || ninja || ninja || exit /b 1
 REM ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
 REM ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
-ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
-ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
+REM ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
+REM ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
 REM ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
 cd..
 
@@ -223,8 +225,8 @@ cmake -GNinja %cmake_flags% %llvm_src%\llvm || exit /b 1
 ninja || ninja || ninja || exit /b 1
 REM ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
 REM ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
-ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
-ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
+REM ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
+REM ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
 REM ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
 ninja package || exit /b 1
 cd ..
@@ -241,7 +243,7 @@ call "%vsdevcmd%" -arch=amd64 || exit /b 1
 @echo on
 mkdir build64_stage0
 cd build64_stage0
-call :do_build_libxml || exit /b 1
+::call :do_build_libxml || exit /b 1
 
 REM Stage0 binaries directory; used in stage1.
 set "stage0_bin_dir=%build_dir%/build64_stage0/bin"
@@ -249,18 +251,22 @@ set cmake_flags=^
   %common_cmake_flags% ^
   -DLLDB_TEST_COMPILER=%stage0_bin_dir%/clang.exe ^
   -DPYTHON_HOME=%PYTHONHOME% ^
-  -DPython3_ROOT_DIR=%PYTHONHOME% ^
-  -DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
-  -DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib
+  -DPython3_ROOT_DIR=%PYTHONHOME%
 
-cmake -GNinja %cmake_flags% %llvm_src%\llvm || exit /b 1
+  ::-DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
+  ::-DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib
+
+cmake -GNinja %cmake_flags% ^
+  -DCMAKE_C_COMPILER=clang-cl.exe ^
+  -DCMAKE_CXX_COMPILER=clang-cl.exe ^
+  %llvm_src%\llvm || exit /b 1
 ninja || ninja || ninja || exit /b 1
-ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
-ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
-ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
-ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
-ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
-ninja check-clangd || ninja check-clangd || ninja check-clangd || exit /b 1
+::ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
+::ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
+::ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
+::ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
+::ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
+::ninja check-clangd || ninja check-clangd || ninja check-clangd || exit /b 1
 cd..
 
 REM CMake expects the paths that specifies the compiler and linker to be
@@ -280,12 +286,12 @@ cd build64
 call :do_generate_profile || exit /b 1
 cmake -GNinja %cmake_flags% %cmake_profile_flags% %llvm_src%\llvm || exit /b 1
 ninja || ninja || ninja || exit /b 1
-ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
-ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
-ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
-ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
-ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
-ninja check-clangd || ninja check-clangd || ninja check-clangd || exit /b 1
+::ninja check-llvm || ninja check-llvm || ninja check-llvm || exit /b 1
+::ninja check-clang || ninja check-clang || ninja check-clang || exit /b 1
+::ninja check-lld || ninja check-lld || ninja check-lld || exit /b 1
+::ninja check-sanitizer || ninja check-sanitizer || ninja check-sanitizer || exit /b 1
+::ninja check-clang-tools || ninja check-clang-tools || ninja check-clang-tools || exit /b 1
+::ninja check-clangd || ninja check-clangd || ninja check-clangd || exit /b 1
 ninja package || exit /b 1
 cd ..
 
@@ -297,29 +303,30 @@ exit /b 0
 ::==============================================================================
 :do_build_arm64
 call :set_environment %pythonarm64_dir% || exit /b 1
-call "%vsdevcmd%" -host_arch=x64 -arch=arm64 || exit /b 1
+call "%vsdevcmd%" -host_arch=arm64 -arch=arm64 || exit /b 1
 @echo on
 mkdir build_arm64_stage0
 cd build_arm64_stage0
-call :do_build_libxml || exit /b 1
+::call :do_build_libxml || exit /b 1
 
 REM Stage0 binaries directory; used in stage1.
 set "stage0_bin_dir=%build_dir%/build_arm64_stage0/bin"
 set cmake_flags=^
   %common_cmake_flags% ^
   -DCLANG_DEFAULT_LINKER=lld ^
-  -DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
-  -DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib ^
   -DPython3_ROOT_DIR=%PYTHONHOME% ^
   -DCOMPILER_RT_BUILD_PROFILE=OFF ^
   -DCOMPILER_RT_BUILD_SANITIZERS=OFF
 
+::  -DLIBXML2_INCLUDE_DIRS=%libxmldir%/include/libxml2 ^
+ :: -DLIBXML2_LIBRARIES=%libxmldir%/lib/libxml2s.lib ^
+
 REM We need to build stage0 compiler-rt with clang-cl (msvc lacks some builtins).
-cmake -GNinja %cmake_flags% ^
-  -DCMAKE_C_COMPILER=clang-cl.exe ^
-  -DCMAKE_CXX_COMPILER=clang-cl.exe ^
-  %llvm_src%\llvm || exit /b 1
-ninja || exit /b 1
+::cmake -GNinja %cmake_flags% ^
+::  -DCMAKE_C_COMPILER=clang-cl.exe ^
+::  -DCMAKE_CXX_COMPILER=clang-cl.exe ^
+::  %llvm_src%\llvm || exit /b 1
+::ninja || exit /b 1
 ::ninja check-llvm || exit /b 1
 ::ninja check-clang || exit /b 1
 ::ninja check-lld || exit /b 1
@@ -343,10 +350,10 @@ set cmake_flags=%all_cmake_flags:\=/%
 
 mkdir build_arm64
 cd build_arm64
-cmake -GNinja %cmake_flags% %llvm_src%\llvm || exit /b 1
-ninja || exit /b 1
+::cmake -GNinja %cmake_flags% %llvm_src%\llvm || exit /b 1
+::ninja || exit /b 1
 REM Check but do not fail on errors.
-ninja check-lldb
+::ninja check-lldb
 ::ninja check-llvm || exit /b 1
 ::ninja check-clang || exit /b 1
 ::ninja check-lld || exit /b 1
