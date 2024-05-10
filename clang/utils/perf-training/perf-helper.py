@@ -57,7 +57,7 @@ def merge(args):
     parser.add_argument("--sample", action="store_true", help="Sample profile")
     opts = parser.parse_args(args)
 
-    cmd = [opts.profdata, "merge", "-o", opts.output]
+    cmd = [opts.profdata, "merge", "--failure-mode=all", "-o", opts.output]
     if opts.sample:
         cmd += ["--sample"]
     for path in opts.paths:
