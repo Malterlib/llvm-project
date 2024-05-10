@@ -5,6 +5,7 @@ set(CLANG_PGO_TRAINING_DATA "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH
   )
 set(CLANG_PGO_TRAINING_DATA_SOURCE_DIR OFF CACHE STRING "Path to source directory containing cmake project with source files to use for generating pgo data")
 set(CLANG_PGO_TRAINING_DEPS "" CACHE STRING "Extra dependencies needed to build the PGO training data.")
+set(CLANG_PGO_TRAINING_PROFILES_DIR "" CACHE STRING "Extra profraw profiles to merge into PGO training data.")
 
 if(LLVM_BUILD_INSTRUMENTED)
   configure_lit_site_cfg(
@@ -29,10 +30,17 @@ if(LLVM_BUILD_INSTRUMENTED)
   if(NOT LLVM_PROFDATA)
     message(STATUS "To enable merging PGO data LLVM_PROFDATA has to point to llvm-profdata")
   else()
-    add_custom_target(generate-profdata
-      COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/perf-helper.py merge ${LLVM_PROFDATA} ${CMAKE_CURRENT_BINARY_DIR}/clang.profdata ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_BINARY_DIR}/profiles/
-      COMMENT "Merging profdata"
-      DEPENDS generate-profraw)
+    if(CLANG_PGO_TRAINING_PROFILES_DIR)
+      add_custom_target(generate-profdata
+        COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/perf-helper.py merge ${LLVM_PROFDATA} ${CMAKE_CURRENT_BINARY_DIR}/clang.profdata ${CLANG_PGO_TRAINING_PROFILES_DIR}
+        COMMENT "Merging profdata"
+        DEPENDS generate-profraw)
+    else()
+      add_custom_target(generate-profdata
+        COMMAND "${Python3_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/perf-helper.py merge ${LLVM_PROFDATA} ${CMAKE_CURRENT_BINARY_DIR}/clang.profdata ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_BINARY_DIR}/profiles/
+        COMMENT "Merging profdata"
+        DEPENDS generate-profraw)
+    endif()
     if (CLANG_PGO_TRAINING_DATA_SOURCE_DIR)
       llvm_ExternalProject_Add(generate-profraw-external ${CLANG_PGO_TRAINING_DATA_SOURCE_DIR}
               USE_TOOLCHAIN EXLUDE_FROM_ALL NO_INSTALL DEPENDS generate-profraw)
