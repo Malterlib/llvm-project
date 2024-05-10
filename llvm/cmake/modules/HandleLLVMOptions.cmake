@@ -1134,8 +1134,7 @@ if (LLVM_BUILD_INSTRUMENTED)
     # Set this to avoid running out of the value profile node section
     # under clang in dynamic linking mode.
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
-        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 11 AND
-        LLVM_LINK_LLVM_DYLIB)
+        CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 11)
       append("-Xclang -mllvm -Xclang -vp-counters-per-site=${LLVM_VP_COUNTERS_PER_SITE}"
         CMAKE_CXX_FLAGS
         CMAKE_C_FLAGS)

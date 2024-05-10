@@ -20,7 +20,7 @@ set(VE ve)
 if(APPLE)
   set(ARM64 arm64)
   set(ARM32 armv7 armv7s armv7k)
-  set(X86_64 x86_64 x86_64h)
+  set(X86_64 x86_64)
 endif()
 
 set(ALL_SANITIZER_COMMON_SUPPORTED_ARCH ${X86} ${X86_64} ${PPC64} ${RISCV64}
