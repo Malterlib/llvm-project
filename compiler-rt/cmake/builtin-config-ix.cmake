@@ -104,7 +104,7 @@ set(M68K m68k)
 if(APPLE)
   set(ARM64 arm64 arm64e)
   set(ARM32 armv7 armv7k armv7s)
-  set(X86_64 x86_64 x86_64h)
+  set(X86_64 x86_64)
 endif()
 
 set(ALL_BUILTIN_SUPPORTED_ARCH
