@@ -51,7 +51,7 @@ def merge(args):
             + "\tMerges all profraw files from path into output."
         )
         return 1
-    cmd = [args[0], "merge", "-o", args[1]]
+    cmd = [args[0], "merge", "--failure-mode=all","-o", args[1]]
     for path in args[2:]:
         cmd.extend(findFilesWithExtension(path, "profraw"))
     subprocess.check_call(cmd)
