@@ -1142,21 +1142,29 @@ void *asan_new_aligned(uptr size, uptr alignment, BufferedStackTrace *stack,
 }
 
 void asan_delete(void *ptr, BufferedStackTrace *stack, bool array) {
+  if (__asan_on_delete(ptr, 0))
+    return;
   instance.Deallocate(ptr, 0, 0, stack, array ? FROM_NEW_BR : FROM_NEW);
 }
 
 void asan_delete_aligned(void *ptr, uptr alignment, BufferedStackTrace *stack,
                          bool array) {
+  if (__asan_on_delete(ptr, 0))
+    return;
   instance.Deallocate(ptr, 0, alignment, stack, array ? FROM_NEW_BR : FROM_NEW);
 }
 
 void asan_delete_sized(void *ptr, uptr size, BufferedStackTrace *stack,
                        bool array) {
+  if (__asan_on_delete(ptr, size))
+    return;
   instance.Deallocate(ptr, size, 0, stack, array ? FROM_NEW_BR : FROM_NEW);
 }
 
 void asan_delete_sized_aligned(void *ptr, uptr size, uptr alignment,
                                BufferedStackTrace *stack, bool array) {
+  if (__asan_on_delete(ptr, size))
+    return;
   instance.Deallocate(ptr, size, alignment, stack,
                       array ? FROM_NEW_BR : FROM_NEW);
 }

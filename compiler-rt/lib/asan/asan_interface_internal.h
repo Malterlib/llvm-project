@@ -187,6 +187,9 @@ extern "C" {
   SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
   void __asan_on_error();
 
+  SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE
+  int __asan_on_delete(void *ptr, uptr size);
+
   SANITIZER_INTERFACE_ATTRIBUTE void __asan_print_accumulated_stats();
 
   SANITIZER_INTERFACE_ATTRIBUTE
