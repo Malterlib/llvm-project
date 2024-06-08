@@ -19,6 +19,7 @@ set(ASAN_SOURCES
   asan_malloc_mac.cpp
   asan_malloc_win.cpp
   asan_memory_profile.cpp
+  asan_new_delete_callback.cpp
   asan_poisoning.cpp
   asan_posix.cpp
   asan_premap_shadow.cpp
