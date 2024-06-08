@@ -998,6 +998,8 @@ void asan_free(void *ptr, BufferedStackTrace *stack, AllocType alloc_type) {
 
 void asan_delete(void *ptr, uptr size, uptr alignment,
                  BufferedStackTrace *stack, AllocType alloc_type) {
+  if (__asan_on_delete(ptr, size))
+    return;
   instance.Deallocate(ptr, size, alignment, stack, alloc_type);
 }
 

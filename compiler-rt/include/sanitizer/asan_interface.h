@@ -280,6 +280,13 @@ void SANITIZER_CDECL __asan_on_error(void);
 /// debugger).
 void SANITIZER_CDECL __asan_print_accumulated_stats(void);
 
+/// User-provided callback when the global delete operator is called.
+///
+/// You can provide a function that would be called when something is deleted.
+/// Returning non-zero means you handled the delete and the memory should not
+/// be deleted by asan.
+int SANITIZER_CDECL __asan_on_delete(void *ptr, size_t size);
+
 /// User-provided default option settings.
 ///
 /// You can provide your own implementation of this function to return a string

@@ -4,6 +4,7 @@ __asan_get_free_stack
 __asan_get_shadow_mapping
 __asan_handle_vfork
 __asan_locate_address
+__asan_on_delete
 __asan_on_error
 __asan_print_accumulated_stats
 __asan_set_death_callback
