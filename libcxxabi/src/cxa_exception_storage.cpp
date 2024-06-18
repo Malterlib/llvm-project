@@ -9,12 +9,37 @@
 //  https://itanium-cxx-abi.github.io/cxx-abi/abi-eh.html#cxx-exc-stack
 //
 //===----------------------------------------------------------------------===//
+#if defined(DMalterlib)
+#define _LIBCPP_DISABLE_NEW_DELETE
+#endif
 
 #include "cxa_exception.h"
 
 #include <__thread/support.h>
 
-#if defined(_LIBCXXABI_HAS_NO_THREADS)
+#if defined(DMalterlib)
+	#include <Mib/Core/Core>
+
+    namespace __cxxabiv1 {
+        namespace {
+            struct CSubSystem_LibCpp : public NMib::CSubSystem {
+                NMib::NThread::TCThreadLocal<__cxa_eh_globals> m_ThreadLocal;
+            };
+
+            constinit NMib::TCSubSystem<CSubSystem_LibCpp, NMib::ESubSystemDestruction_BeforeThreadLocals>
+            g_SubSystem_LibCpp = {DAggregateInit};
+            __cxa_eh_globals *__globals() {
+                return &(*g_SubSystem_LibCpp->m_ThreadLocal);
+            }
+        } // namespace
+
+        extern "C" {
+            __cxa_eh_globals *__cxa_get_globals() { return __globals(); }
+            __cxa_eh_globals *__cxa_get_globals_fast() { return __globals(); }
+        } // extern "C"
+    } // namespace __cxxabiv1
+
+#elif defined(_LIBCXXABI_HAS_NO_THREADS)
 
 namespace __cxxabiv1 {
 extern "C" {
