@@ -25,7 +25,8 @@
 // string singleton before manipulating the reference count. This is done so that
 // if an exception is created with a zero-length string in libstdc++, libc++abi
 // won't try to delete the memory.
-#if defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) || defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__)
+#if !defined(_LIBCPP_BUILD_STATIC) && \
+    (defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) || defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__))
 #  define _LIBCPP_CHECK_FOR_GCC_EMPTY_STRING_STORAGE
 #  include <dlfcn.h>
 #  include <mach-o/dyld.h>
