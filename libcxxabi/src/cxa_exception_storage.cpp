@@ -20,10 +20,10 @@
     namespace __cxxabiv1 {
         namespace {
             struct CSubSystem_LibCpp : public NMib::CSubSystem {
-                NMib::NThread::TCThreadLocal<__cxa_eh_globals> m_ThreadLocal;
+                NMib::NThread::TCThreadLocal<__cxa_eh_globals, NMib::NMemory::CAllocator_NonTrackedHeap> m_ThreadLocal;
             };
 
-            constinit NMib::TCSubSystem<CSubSystem_LibCpp, NMib::ESubSystemDestruction_BeforeThreadLocals>
+            constinit NMib::TCSubSystem<CSubSystem_LibCpp, NMib::ESubSystemDestruction_BeforeNonTrackedMemoryManager>
             g_SubSystem_LibCpp = {DAggregateInit};
             __cxa_eh_globals *__globals() {
                 return &(*g_SubSystem_LibCpp->m_ThreadLocal);
