@@ -23,13 +23,13 @@ namespace __cxxabiv1 {
 extern "C" {
 
 void
-__cxa_increment_exception_refcount(void *thrown_object) throw() {
+__cxa_increment_exception_refcount(void *thrown_object) {
     if (thrown_object != nullptr)
         std::terminate();
 }
 
 void
-__cxa_decrement_exception_refcount(void *thrown_object) throw() {
+__cxa_decrement_exception_refcount(void *thrown_object) {
     if (thrown_object != nullptr)
       std::terminate();
 }

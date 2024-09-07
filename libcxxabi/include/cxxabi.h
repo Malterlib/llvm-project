@@ -172,9 +172,9 @@ extern _LIBCXXABI_FUNC_VIS void *__cxa_current_primary_exception() throw();
 extern _LIBCXXABI_FUNC_VIS void
 __cxa_rethrow_primary_exception(void *primary_exception);
 extern _LIBCXXABI_FUNC_VIS void
-__cxa_increment_exception_refcount(void *primary_exception) throw();
+__cxa_increment_exception_refcount(void *primary_exception);
 extern _LIBCXXABI_FUNC_VIS void
-__cxa_decrement_exception_refcount(void *primary_exception) throw();
+__cxa_decrement_exception_refcount(void *primary_exception);
 
 // Apple extension to support std::uncaught_exception()
 extern _LIBCXXABI_FUNC_VIS bool __cxa_uncaught_exception() throw();

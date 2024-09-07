@@ -690,7 +690,7 @@ void __cxa_rethrow() {
     Requires:  If thrown_object is not NULL, it is a native exception.
 */
 void
-__cxa_increment_exception_refcount(void *thrown_object) throw() {
+__cxa_increment_exception_refcount(void *thrown_object) {
     if (thrown_object != NULL )
     {
         __cxa_exception* exception_header = cxa_exception_from_thrown_object(thrown_object);
@@ -707,7 +707,7 @@ __cxa_increment_exception_refcount(void *thrown_object) throw() {
     Requires:  If thrown_object is not NULL, it is a native exception.
 */
 _LIBCXXABI_NO_CFI
-void __cxa_decrement_exception_refcount(void *thrown_object) throw() {
+void __cxa_decrement_exception_refcount(void *thrown_object) {
     if (thrown_object != NULL )
     {
         __cxa_exception* exception_header = cxa_exception_from_thrown_object(thrown_object);
