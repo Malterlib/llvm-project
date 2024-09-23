@@ -22,6 +22,41 @@ namespace __sanitizer {
 
 uptr GetThreadSelf();
 
+class SANITIZER_MUTEX SmallStaticSpinMutex {
+ public:
+  void Init() {
+    atomic_store(&state_, 0, memory_order_relaxed);
+  }
+
+  void Lock() SANITIZER_ACQUIRE() {
+    if (LIKELY(TryLock())) {
+      return;
+    }
+    LockSlow();
+  }
+
+  bool TryLock() SANITIZER_TRY_ACQUIRE(true) {
+    return atomic_exchange(&state_, 1, memory_order_acquire) == 0;
+  }
+
+  void Unlock() SANITIZER_RELEASE() {
+    atomic_store(&state_, 0, memory_order_release);
+  }
+
+  void ForkedChild() SANITIZER_RELEASE() {
+    atomic_store(&state_, 0, memory_order_release);
+  }
+
+  void CheckLocked() const SANITIZER_CHECK_LOCKED() {
+    CHECK_EQ(atomic_load(&state_, memory_order_relaxed), 1);
+  }
+
+ private:
+  atomic_uint8_t state_;
+
+  void LockSlow();
+};
+
 class SANITIZER_MUTEX StaticSpinMutex {
  public:
   void Init() {

@@ -105,7 +105,7 @@ struct ContextRoot {
   // or with more concurrent collections (==more memory) and less collection
   // time. Note that concurrent collection does happen for different
   // entrypoints, regardless.
-  ::__sanitizer::StaticSpinMutex Taken;
+  ::__sanitizer::SmallStaticSpinMutex Taken;
 
   // If (unlikely) StaticSpinMutex internals change, we need to modify the LLVM
   // instrumentation lowering side because it is responsible for allocating and
