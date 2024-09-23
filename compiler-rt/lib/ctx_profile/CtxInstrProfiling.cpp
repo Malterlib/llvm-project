@@ -283,7 +283,7 @@ void __llvm_ctx_profile_start_collection() {
       &AllContextsMutex);
   for (uint32_t I = 0; I < AllContextRoots.Size(); ++I) {
     auto *Root = AllContextRoots[I];
-    __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> Lock(
+    __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> Lock(
         &Root->Taken);
     for (auto *Mem = Root->FirstMemBlock; Mem; Mem = Mem->next())
       ++NrMemUnits;
@@ -301,7 +301,7 @@ bool __llvm_ctx_profile_fetch(void *Data,
 
   for (int I = 0, E = AllContextRoots.Size(); I < E; ++I) {
     auto *Root = AllContextRoots[I];
-    __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> TakenLock(
+    __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> TakenLock(
         &Root->Taken);
     if (!validate(Root)) {
       __sanitizer::Printf("[ctxprof] Contextual Profile is %s\n", "invalid");
