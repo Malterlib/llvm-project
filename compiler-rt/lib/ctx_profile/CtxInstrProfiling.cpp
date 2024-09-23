@@ -217,7 +217,8 @@ ContextNode *getFlatProfile(FunctionData &Data, void *Callee, GUID Guid,
     // TheScratchContext. But that could leave message pump loops more sparsely
     // profiled than everything else. Maybe that doesn't matter, and we can
     // optimize this later.
-    __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> L(&Data.Mutex);
+    __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> L(
+        &Data.Mutex);
     if (ContextNode *Existing = Data.FlatCtx)
       return Existing;
 
@@ -276,7 +277,7 @@ ContextRoot *FunctionData::getOrAllocateContextRoot() {
     return Root;
   if (Root)
     return Root;
-  __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> L(&Mutex);
+  __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> L(&Mutex);
   Root = CtxRoot;
   if (!Root) {
     Root = new (__sanitizer::InternalAlloc(sizeof(ContextRoot))) ContextRoot();
@@ -431,7 +432,7 @@ void __llvm_ctx_profile_start_collection(unsigned AutodetectDuration) {
       &AllContextsMutex);
   for (uint32_t I = 0; I < AllContextRoots.Size(); ++I) {
     auto *Root = AllContextRoots[I];
-    __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> Lock(
+    __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> Lock(
         &Root->Taken);
     for (auto *Mem = Root->FirstMemBlock; Mem; Mem = Mem->next())
       ++NumMemUnits;
@@ -469,7 +470,7 @@ bool __llvm_ctx_profile_fetch(ProfileWriter &Writer) {
   Writer.startContextSection();
   for (int I = 0, E = AllContextRoots.Size(); I < E; ++I) {
     auto *Root = AllContextRoots[I];
-    __sanitizer::GenericScopedLock<__sanitizer::StaticSpinMutex> TakenLock(
+    __sanitizer::GenericScopedLock<__sanitizer::SmallStaticSpinMutex> TakenLock(
         &Root->Taken);
     if (!validate(Root)) {
       __sanitizer::Printf("[ctxprof] Contextual Profile is %s\n", "invalid");

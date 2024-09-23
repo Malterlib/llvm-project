@@ -122,7 +122,7 @@ struct ContextRoot {
   // or with more concurrent collections (==more memory) and less collection
   // time. Note that concurrent collection does happen for different
   // entrypoints, regardless.
-  ::__sanitizer::SpinMutex Taken;
+  ::__sanitizer::SmallStaticSpinMutex Taken;
 };
 
 // This is allocated and zero-initialized by the compiler, the in-place
@@ -144,7 +144,7 @@ struct ContextRoot {
 struct FunctionData {
 #define _PTRDECL(T, N) T *N = nullptr;
 #define _VOLATILE_PTRDECL(T, N) T *volatile N = nullptr;
-#define _MUTEXDECL(N) ::__sanitizer::SpinMutex N;
+#define _MUTEXDECL(N) ::__sanitizer::SmallStaticSpinMutex N;
 #define _CONTEXT_PTR ContextRoot *CtxRoot = nullptr;
   CTXPROF_FUNCTION_DATA(_PTRDECL, _CONTEXT_PTR, _VOLATILE_PTRDECL, _MUTEXDECL)
 #undef _CONTEXT_PTR
@@ -157,9 +157,9 @@ struct FunctionData {
   FunctionData() = default;
   ContextRoot *getOrAllocateContextRoot();
 
-  // If (unlikely) StaticSpinMutex internals change, we need to modify the LLVM
-  // instrumentation lowering side because it is responsible for allocating and
-  // zero-initializing ContextRoots.
+  // If (unlikely) SmallStaticSpinMutex internals change, we need to modify the
+  // LLVM instrumentation lowering side because it is responsible for allocating
+  // and zero-initializing FunctionData.
   static_assert(sizeof(Mutex) == 1);
 };
 
