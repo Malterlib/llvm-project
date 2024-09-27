@@ -12,16 +12,22 @@
 
 namespace std {
 
-exception_ptr::~exception_ptr() noexcept { abi::__cxa_decrement_exception_refcount(__ptr_); }
+exception_ptr::~exception_ptr() noexcept {
+  if (__ptr_)
+    abi::__cxa_decrement_exception_refcount(__ptr_);
+}
 
 exception_ptr::exception_ptr(const exception_ptr& other) noexcept : __ptr_(other.__ptr_) {
-  abi::__cxa_increment_exception_refcount(__ptr_);
+  if (__ptr_)
+    abi::__cxa_increment_exception_refcount(__ptr_);
 }
 
 exception_ptr& exception_ptr::operator=(const exception_ptr& other) noexcept {
   if (__ptr_ != other.__ptr_) {
-    abi::__cxa_increment_exception_refcount(other.__ptr_);
-    abi::__cxa_decrement_exception_refcount(__ptr_);
+    if (other.__ptr_)
+      abi::__cxa_increment_exception_refcount(other.__ptr_);
+    if (__ptr_)
+      abi::__cxa_decrement_exception_refcount(__ptr_);
     __ptr_ = other.__ptr_;
   }
   return *this;
@@ -30,7 +36,8 @@ exception_ptr& exception_ptr::operator=(const exception_ptr& other) noexcept {
 exception_ptr exception_ptr::__from_native_exception_pointer(void* __e) noexcept {
   exception_ptr ptr;
   ptr.__ptr_ = __e;
-  abi::__cxa_increment_exception_refcount(ptr.__ptr_);
+  if (ptr.__ptr_)
+    abi::__cxa_increment_exception_refcount(ptr.__ptr_);
 
   return ptr;
 }
