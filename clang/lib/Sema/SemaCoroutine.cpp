@@ -56,10 +56,16 @@ static QualType lookupPromiseType(Sema &S, const FunctionDecl *FD,
   const FunctionProtoType *FnType = FD->getType()->castAs<FunctionProtoType>();
   const SourceLocation FuncLoc = FD->getLocation();
 
+  bool HasExtendedTraits = false;
   ClassTemplateDecl *CoroTraits =
-      S.lookupCoroutineTraits(KwLoc, FuncLoc);
-  if (!CoroTraits)
-    return QualType();
+      S.lookupExtendedCoroutineTraits(KwLoc, FuncLoc);
+  if (!CoroTraits) {
+    CoroTraits = S.lookupCoroutineTraits(KwLoc, FuncLoc);
+    if (!CoroTraits)
+      return QualType();
+  } else {
+    HasExtendedTraits = true;
+  }
 
   // Form template argument list for coroutine_traits<R, P1, P2, ...> according
   // to [dcl.fct.def.coroutine]3
@@ -86,7 +92,12 @@ static QualType lookupPromiseType(Sema &S, const FunctionDecl *FD,
               : S.Context.getLValueReferenceType(T, /*SpelledAsLValue*/ true);
       AddArg(T);
     }
+    else if (HasExtendedTraits)
+      AddArg(S.Context.VoidTy);
   }
+  else if (HasExtendedTraits)
+    AddArg(S.Context.VoidTy);
+
   for (QualType T : FnType->getParamTypes())
     AddArg(T);
 
@@ -1950,4 +1961,36 @@ ClassTemplateDecl *Sema::lookupCoroutineTraits(SourceLocation KwLoc,
   }
 
   return StdCoroutineTraitsCache;
+}
+
+ClassTemplateDecl *Sema::lookupExtendedCoroutineTraits(SourceLocation KwLoc,
+                                               SourceLocation FuncLoc) {
+  if (StdExtendedCoroutineTraitsCache)
+    return StdExtendedCoroutineTraitsCache;
+  else if (StdExtendedCoroutineTraitsCacheNotFoundCache)
+    return nullptr;
+
+  IdentifierInfo const &TraitIdent =
+      PP.getIdentifierTable().get("extended_coroutine_traits");
+
+  NamespaceDecl *StdSpace = getStdNamespace();
+  LookupResult Result(*this, &TraitIdent, FuncLoc, LookupOrdinaryName);
+  bool Found = StdSpace && LookupQualifiedName(Result, StdSpace);
+
+  if (!Found) {
+    StdExtendedCoroutineTraitsCacheNotFoundCache = true;
+    return nullptr;
+  }
+
+  // coroutine_traits is required to be a class template.
+  StdExtendedCoroutineTraitsCache = Result.getAsSingle<ClassTemplateDecl>();
+  if (!StdExtendedCoroutineTraitsCache) {
+    Result.suppressDiagnostics();
+    NamedDecl *Found = *Result.begin();
+    Diag(Found->getLocation(), diag::err_malformed_std_coroutine_traits);
+    StdExtendedCoroutineTraitsCacheNotFoundCache = true;
+    return nullptr;
+  }
+
+  return StdExtendedCoroutineTraitsCache;
 }

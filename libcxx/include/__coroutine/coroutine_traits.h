@@ -41,6 +41,11 @@ struct __coroutine_traits_sfinae< _Tp, __void_t<typename _Tp::promise_type> > {
 template <class _Ret, class... _Args>
 struct coroutine_traits : public __coroutine_traits_sfinae<_Ret> {};
 
+template <class _Ret, class... _Args>
+struct extended_coroutine_traits : public __coroutine_traits_sfinae<_Ret> {};
+
+#define _LIBCPP_HAS_EXTENDED_COROUTINE_TRAITS
+
 _LIBCPP_END_NAMESPACE_STD
 
 #endif // __LIBCPP_STD_VER >= 20
