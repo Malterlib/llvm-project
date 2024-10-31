@@ -2682,6 +2682,8 @@ public:
   /// The C++ "std::coroutine_traits" template, which is defined in
   /// \<coroutine_traits>
   ClassTemplateDecl *StdCoroutineTraitsCache;
+  ClassTemplateDecl *StdExtendedCoroutineTraitsCache;
+  bool StdExtendedCoroutineTraitsCacheNotFoundCache;
 
   bool ActOnCoroutineBodyStart(Scope *S, SourceLocation KwLoc,
                                StringRef Keyword);
@@ -2712,6 +2714,11 @@ public:
   /// Lookup 'coroutine_traits' in std namespace and std::experimental
   /// namespace. The namespace found is recorded in Namespace.
   ClassTemplateDecl *lookupCoroutineTraits(SourceLocation KwLoc,
+                                           SourceLocation FuncLoc);
+
+  /// Lookup 'extended_coroutine_traits' in std namespace and std::experimental
+  /// namespace. The namespace found is recorded in Namespace.
+  ClassTemplateDecl *lookupExtendedCoroutineTraits(SourceLocation KwLoc,
                                            SourceLocation FuncLoc);
   /// Check that the expression co_await promise.final_suspend() shall not be
   /// potentially-throwing.
