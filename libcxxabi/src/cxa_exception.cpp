@@ -689,6 +689,9 @@ void __cxa_rethrow() {
 
     Requires:  If thrown_object is not NULL, it is a native exception.
 */
+#if defined(__clang__)
+__attribute__((always_inline))
+#endif
 void
 __cxa_increment_exception_refcount(void *thrown_object) {
     if (thrown_object != NULL )
@@ -706,6 +709,9 @@ __cxa_increment_exception_refcount(void *thrown_object) {
 
     Requires:  If thrown_object is not NULL, it is a native exception.
 */
+#if defined(__clang__)
+__attribute__((always_inline))
+#endif
 _LIBCXXABI_NO_CFI
 void __cxa_decrement_exception_refcount(void *thrown_object) {
     if (thrown_object != NULL )
