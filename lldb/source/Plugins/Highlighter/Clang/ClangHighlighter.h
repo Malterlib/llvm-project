@@ -15,10 +15,13 @@
 #include "lldb/Core/Highlighter.h"
 #include <optional>
 
+#include "MalterlibClassifier.h"
+
 namespace lldb_private {
 
 class ClangHighlighter : public Highlighter {
   llvm::StringSet<> keywords;
+  MalterlibClassifier malterlibClassifier;
 
 public:
   ClangHighlighter();
@@ -39,6 +42,25 @@ public:
 
   static llvm::StringRef GetPluginNameStatic() { return "Clang Highlighter"; }
   llvm::StringRef GetPluginName() override { return GetPluginNameStatic(); }
+
+  HighlightStyle::ColorStyle
+  highlightIdentifier(llvm::StringRef identifier,
+                      HighlightStyle::ColorStyle default_style) const;
+  HighlightStyle::ColorStyle
+  highlightNumber(llvm::StringRef identifier,
+                  HighlightStyle::ColorStyle default_style) const;
+  HighlightStyle::ColorStyle
+  highlightString(llvm::StringRef identifier,
+                  HighlightStyle::ColorStyle default_style) const;
+  HighlightStyle::ColorStyle
+  highlightPunctuation(llvm::StringRef identifier,
+                       HighlightStyle::ColorStyle default_style) const;
+  HighlightStyle::ColorStyle
+  highlightKeyword(llvm::StringRef identifier,
+                   HighlightStyle::ColorStyle default_style) const;
+  HighlightStyle::ColorStyle
+  highlightComment(llvm::StringRef identifier,
+                   HighlightStyle::ColorStyle default_style) const;
 };
 
 } // namespace lldb_private
