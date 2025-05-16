@@ -6,8 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_CLANGHIGHLIGHTER_H
-#define LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_CLANGHIGHLIGHTER_H
+#ifndef LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_MALTERLIBCLASSIFIER_H
+#define LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_MALTERLIBCLASSIFIER_H
 
 #include "lldb/Utility/Stream.h"
 #include "llvm/ADT/StringSet.h"
@@ -15,25 +15,16 @@
 #include "lldb/Core/Highlighter.h"
 #include <optional>
 
-#include "MalterlibClassifier.h"
-
 namespace lldb_private {
 
-class ClangHighlighter : public Highlighter {
-  llvm::StringSet<> keywords;
-  MalterlibClassifier malterlibClassifier;
+class MalterlibClassifier {
+  class Internal;
+
+  std::unique_ptr<Internal> internal;
 
 public:
-  ClangHighlighter();
-  llvm::StringRef GetName() const override { return "clang"; }
-
-  void Highlight(const HighlightStyle &options, llvm::StringRef line,
-                 std::optional<size_t> cursor_pos,
-                 llvm::StringRef previous_lines, Stream &s) const override;
-
-  /// Returns true if the given string represents a keywords in any Clang
-  /// supported language.
-  bool isKeyword(llvm::StringRef token) const;
+  MalterlibClassifier();
+  ~MalterlibClassifier();
 
   HighlightStyle::ColorStyle highlightIdentifier(llvm::StringRef identifier, HighlightStyle::ColorStyle default_style) const;
   HighlightStyle::ColorStyle highlightNumber(llvm::StringRef identifier, HighlightStyle::ColorStyle default_style) const;
@@ -45,4 +36,4 @@ public:
 
 } // namespace lldb_private
 
-#endif // LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_CLANGHIGHLIGHTER_H
+#endif // LLDB_SOURCE_PLUGINS_LANGUAGE_CLANGCOMMON_MALTERLIBCLASSIFIER_H
