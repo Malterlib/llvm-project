@@ -49,43 +49,75 @@ ClangHighlighter::ClangHighlighter() {
 static HighlightStyle::ColorStyle
 determineClangStyle(const ClangHighlighter &highlighter,
                     const clang::Token &token, llvm::StringRef tok_str,
-                    const HighlightStyle &options, bool &in_pp_directive) {
+                    const HighlightStyle &options, bool &in_pp_directive,
+                    bool &was_in_pp_directive, bool &in_global_include) {
   using namespace clang;
 
-  if (token.is(tok::comment)) {
+  bool prev_was_in_pp_directive = was_in_pp_directive;
+  was_in_pp_directive = in_pp_directive;
+
+  if (tok::isStringLiteral(token.getKind()) ||
+      (in_global_include && token.getKind() != tok::greater))
+    return highlighter.highlightString(tok_str, options.string_literal);
+  else if (token.is(tok::comment)) {
     // If we were in a preprocessor directive before, we now left it.
     in_pp_directive = false;
-    return options.comment;
-  } else if (in_pp_directive || token.getKind() == tok::hash) {
+    was_in_pp_directive = false;
+    in_global_include = false;
+
+    return highlighter.highlightComment(tok_str, options.comment);
+  } else if (token.getKind() == tok::hash) {
     // Let's assume that the rest of the line is a PP directive.
     in_pp_directive = true;
     // Preprocessor directives are hard to match, so we have to hack this in.
-    return options.pp_directive;
-  } else if (tok::isStringLiteral(token.getKind()))
-    return options.string_literal;
-  else if (tok::isLiteral(token.getKind()))
-    return options.scalar_literal;
-  else if (highlighter.isKeyword(tok_str))
-    return options.keyword;
-  else
+    return highlighter.highlightKeyword(tok_str, options.pp_directive);
+  } else if (tok::isLiteral(token.getKind()))
+    return highlighter.highlightNumber(tok_str, options.scalar_literal);
+  else if (highlighter.isKeyword(tok_str)) {
+    // The first key should be the "if" etc
+    if (in_pp_directive) {
+      in_pp_directive = false;
+      return highlighter.highlightKeyword(tok_str, options.pp_directive);
+    }
+
+    return highlighter.highlightKeyword(tok_str, options.keyword);
+  } else
     switch (token.getKind()) {
     case tok::raw_identifier:
     case tok::identifier:
-      return options.identifier;
+      // The first identifier should be the "include" or "define" etc
+      if (in_pp_directive) {
+        in_pp_directive = false;
+        return highlighter.highlightKeyword(tok_str, options.pp_directive);
+      }
+      return highlighter.highlightIdentifier(tok_str, options.identifier);
     case tok::l_brace:
     case tok::r_brace:
-      return options.braces;
+      return highlighter.highlightPunctuation(tok_str, options.braces);
     case tok::l_square:
     case tok::r_square:
-      return options.square_brackets;
+      return highlighter.highlightPunctuation(tok_str, options.square_brackets);
     case tok::l_paren:
     case tok::r_paren:
-      return options.parentheses;
+      return highlighter.highlightPunctuation(tok_str, options.parentheses);
     case tok::comma:
-      return options.comma;
+      return highlighter.highlightPunctuation(tok_str, options.comma);
     case tok::coloncolon:
     case tok::colon:
-      return options.colon;
+      return highlighter.highlightPunctuation(tok_str, options.colon);
+
+    case tok::less:
+      if (prev_was_in_pp_directive) {
+        in_global_include = true;
+        return highlighter.highlightString(tok_str, options.string_literal);
+      }
+      return highlighter.highlightPunctuation(tok_str, options.operators);
+    case tok::greater:
+      if (in_global_include) {
+        in_global_include = false;
+        return highlighter.highlightString(tok_str, options.string_literal);
+      }
+      return highlighter.highlightPunctuation(tok_str, options.operators);
 
     case tok::amp:
     case tok::ampamp:
@@ -106,12 +138,10 @@ determineClangStyle(const ClangHighlighter &highlighter,
     case tok::slashequal:
     case tok::percent:
     case tok::percentequal:
-    case tok::less:
     case tok::lessless:
     case tok::lessequal:
     case tok::lesslessequal:
     case tok::spaceship:
-    case tok::greater:
     case tok::greatergreater:
     case tok::greaterequal:
     case tok::greatergreaterequal:
@@ -123,11 +153,54 @@ determineClangStyle(const ClangHighlighter &highlighter,
     case tok::question:
     case tok::equal:
     case tok::equalequal:
-      return options.operators;
+      return highlighter.highlightPunctuation(tok_str, options.operators);
     default:
       break;
     }
+  was_in_pp_directive = prev_was_in_pp_directive;
   return HighlightStyle::ColorStyle();
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightIdentifier(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightIdentifier(identifier, default_style);
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightNumber(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightNumber(identifier, default_style);
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightString(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightString(identifier, default_style);
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightPunctuation(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightPunctuation(identifier, default_style);
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightKeyword(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightKeyword(identifier, default_style);
+}
+
+HighlightStyle::ColorStyle
+ClangHighlighter::highlightComment(
+    llvm::StringRef identifier,
+    HighlightStyle::ColorStyle default_style) const {
+  return malterlibClassifier.highlightComment(identifier, default_style);
 }
 
 void ClangHighlighter::Highlight(const HighlightStyle &options,
@@ -183,6 +256,8 @@ void ClangHighlighter::Highlight(const HighlightStyle &options,
 
   // Keeps track if we have entered a PP directive.
   bool in_pp_directive = false;
+  bool was_in_pp_directive = false;
+  bool in_global_include = false;
 
   // True once we actually lexed the user provided line.
   bool found_user_line = false;
@@ -238,7 +313,8 @@ void ClangHighlighter::Highlight(const HighlightStyle &options,
 
     // See how we are supposed to highlight this token.
     HighlightStyle::ColorStyle color =
-        determineClangStyle(*this, token, tok_str, options, in_pp_directive);
+        determineClangStyle(*this, token, tok_str, options, in_pp_directive,
+                            was_in_pp_directive, in_global_include);
 
     color.Apply(result, to_print);
   }
