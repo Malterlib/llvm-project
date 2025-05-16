@@ -36,6 +36,9 @@ struct HighlightStyle {
       Set(prefix, suffix);
     }
 
+    ColorStyle(bool, std::string prefix, std::string suffix)
+        : m_prefix(std::move(prefix)), m_suffix(std::move(suffix)) {}
+
     /// Applies this style to the given value.
     /// \param s
     ///     The stream to which the result should be appended.

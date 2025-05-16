@@ -288,9 +288,12 @@ struct KeyHelp {
 
 // COLOR_PAIR index names
 enum {
-  // First 16 colors are 8 black background and 8 blue background colors,
-  // needed by OutputColoredStringTruncated().
-  BlackOnBlack = 1,
+  // Fixed color pairs used outside source coloring.
+  BlackOnWhite = 1,
+  MagentaOnWhite,
+
+  // 256-color foreground sets used by OutputColoredStringTruncated().
+  BlackOnBlack,
   RedOnBlack,
   GreenOnBlack,
   YellowOnBlack,
@@ -298,18 +301,51 @@ enum {
   MagentaOnBlack,
   CyanOnBlack,
   WhiteOnBlack,
-  BlackOnBlue,
-  RedOnBlue,
-  GreenOnBlue,
-  YellowOnBlue,
-  BlueOnBlue,
-  MagentaOnBlue,
-  CyanOnBlue,
-  WhiteOnBlue,
-  // Other colors, as needed.
-  BlackOnWhite,
-  MagentaOnWhite,
-  LastColorPairIndex = MagentaOnWhite
+
+  BrightBlackOnBlack,
+  BrightRedOnBlack,
+  BrightGreenOnBlack,
+  BrightYellowOnBlack,
+  BrightBlueOnBlack,
+  BrightMagentaOnBlack,
+  BrightCyanOnBlack,
+  BrightWhiteOnBlack,
+
+  BlackOnRed = BlackOnBlack + 256,
+  RedOnRed,
+  GreenOnRed,
+  YellowOnRed,
+  BlueOnRed,
+  MagentaOnRed,
+  CyanOnRed,
+  WhiteOnRed,
+
+  BrightBlackOnRed,
+  BrightRedOnRed,
+  BrightGreenOnRed,
+  BrightYellowOnRed,
+  BrightBlueOnRed,
+  BrightMagentaOnRed,
+  BrightCyanOnRed,
+  BrightWhiteOnRed,
+
+  BlackOnGrey = BlackOnRed + 256,
+  RedOnGrey,
+  GreenOnGrey,
+  YellowOnGrey,
+  BlueOnGrey,
+  MagentaOnGrey,
+  CyanOnGrey,
+  WhiteOnGrey,
+
+  BrightBlackOnGrey,
+  BrightRedOnGrey,
+  BrightGreenOnGrey,
+  BrightYellowOnGrey,
+  BrightBlueOnGrey,
+  BrightMagentaOnGrey,
+  BrightCyanOnGrey,
+  BrightWhiteOnGrey,
 };
 
 class WindowDelegate {
@@ -390,6 +426,7 @@ public:
 
   void AttributeOn(attr_t attr) { ::wattron(m_window, attr); }
   void AttributeOff(attr_t attr) { ::wattroff(m_window, attr); }
+  void ColorSet(int color) { ::wcolor_set(m_window, color, nullptr); }
 
   int GetMaxX() const { return getmaxx(m_window); }
   int GetMaxY() const { return getmaxy(m_window); }
@@ -485,19 +522,29 @@ public:
   }
 
   // Curses doesn't allow direct output of color escape sequences, but that's
-  // how we get source lines from the Highligher class. Read the line and
+  // how we get source lines from the Highlighter class. Read the line and
   // convert color escape sequences to curses color attributes. Use
   // first_skip_count to skip leading visible characters. Returns false if all
   // visible characters were skipped due to first_skip_count.
   bool OutputColoredStringTruncated(int right_pad, StringRef string,
                                     size_t skip_first_count,
-                                    bool use_blue_background) {
+                                    bool use_pc_background,
+                                    bool use_selected_background) {
+    int start_index = BlackOnBlack;
+    if (use_pc_background)
+      start_index = BlackOnRed;
+    else if (use_selected_background)
+      start_index = BlackOnGrey;
+
     attr_t saved_attr;
     short saved_pair;
     bool result = false;
     wattr_get(m_window, &saved_attr, &saved_pair, nullptr);
-    if (use_blue_background)
-      ::wattron(m_window, COLOR_PAIR(WhiteOnBlue));
+    if (use_pc_background)
+      ::wcolor_set(m_window, WhiteOnRed, nullptr);
+    else if (use_selected_background)
+      ::wcolor_set(m_window, WhiteOnGrey, nullptr);
+
     while (!string.empty()) {
       size_t esc_pos = string.find(ANSI_ESC_START);
       if (esc_pos == StringRef::npos) {
@@ -524,33 +571,61 @@ public:
       bool consumed = string.consume_front(ANSI_ESC_START);
       assert(consumed);
       UNUSED_IF_ASSERT_DISABLED(consumed);
-      // This is written to match our Highlighter classes, which seem to
-      // generate only foreground color escape sequences. If necessary, this
-      // will need to be extended.
-      // Only 8 basic foreground colors, underline and reset, our Highlighter
-      // doesn't use anything else.
-      int value;
-      if (!!string.consumeInteger(10, value) || // Returns false on success.
-          !(value == 0 || value == ANSI_CTRL_UNDERLINE ||
-            (value >= ANSI_FG_COLOR_BLACK && value <= ANSI_FG_COLOR_WHITE))) {
-        llvm::errs() << "No valid color code in color escape sequence.\n";
+      // This is written to match our Highlighter classes, which generate
+      // foreground color escape sequences, underline, and reset.
+
+      int values[3] = {0};
+
+      if (!!string.consumeInteger(10, values[0])) { // Returns false on success.
+        llvm::errs() << "No valid code in escape sequence.\n";
         continue;
       }
+
+      if (string.consume_front(";")) {
+        if (!!string.consumeInteger(10, values[1])) { // Returns false on success.
+          llvm::errs() << "No valid code in escape sequence.\n";
+          continue;
+        }
+      }
+
+      if (string.consume_front(";")) {
+        if (!!string.consumeInteger(10, values[2])) { // Returns false on success.
+          llvm::errs() << "No valid code in escape sequence.\n";
+          continue;
+        }
+      }
+
       if (!string.consume_front(ANSI_ESC_END)) {
         llvm::errs() << "Missing '" << ANSI_ESC_END
                      << "' in color escape sequence.\n";
         continue;
       }
-      if (value == 0) { // Reset.
+
+      if (values[0] == 38 && values[1] == 5) {
+        auto color_index = start_index + values[2];
+
+        ::wcolor_set(m_window, color_index, nullptr);
+      } else if (values[0] == 0) { // Reset.
         wattr_set(m_window, saved_attr, saved_pair, nullptr);
-        if (use_blue_background)
-          ::wattron(m_window, COLOR_PAIR(WhiteOnBlue));
-      } else if (value == ANSI_CTRL_UNDERLINE) {
+        if (use_pc_background)
+          ::wcolor_set(m_window, WhiteOnRed, nullptr);
+        else if (use_selected_background)
+          ::wcolor_set(m_window, WhiteOnGrey, nullptr);
+      } else if (values[0] == ANSI_CTRL_UNDERLINE) {
         ::wattron(m_window, A_UNDERLINE);
+      } else if (values[0] >= ANSI_FG_COLOR_BLACK &&
+                 values[0] <= ANSI_FG_COLOR_WHITE) {
+        auto color_index = start_index + values[0] - ANSI_FG_COLOR_BLACK;
+
+        ::wcolor_set(m_window, color_index, nullptr);
+      } else if (values[0] >= ANSI_FG_COLOR_BRIGHT_BLACK &&
+                 values[0] <= ANSI_FG_COLOR_BRIGHT_WHITE) {
+        auto color_index =
+            start_index + 8 + values[0] - ANSI_FG_COLOR_BRIGHT_BLACK;
+
+        ::wcolor_set(m_window, color_index, nullptr);
       } else {
-        // Mapped directly to first 16 color pairs (black/blue background).
-        ::wattron(m_window, COLOR_PAIR(value - ANSI_FG_COLOR_BLACK + 1 +
-                                       (use_blue_background ? 8 : 0)));
+        llvm::errs() << "No valid color code in color escape sequence.\n";
       }
     }
     wattr_set(m_window, saved_attr, saved_pair, nullptr);
@@ -7034,13 +7109,13 @@ public:
           window.MoveCursor(1, line_y);
           const bool is_pc_line = curr_line == m_pc_line;
           const bool line_is_selected = m_selected_line == curr_line;
+          const bool is_crash_line = is_pc_line && frame_sp &&
+              frame_sp->GetConcreteFrameIndex() == 0;
+
           // Highlight the line as the PC line first (done by passing
           // argument to OutputColoredStringTruncated()), then if the selected
           // line isn't the same as the PC line, highlight it differently.
-          attr_t highlight_attr = 0;
           attr_t bp_attr = 0;
-          if (line_is_selected && !is_pc_line)
-            highlight_attr = A_REVERSE;
 
           if (bp_lines.find(curr_line + 1) != bp_lines.end())
             bp_attr = COLOR_PAIR(BlackOnWhite);
@@ -7060,9 +7135,6 @@ public:
           else
             window.PutChar(' ');
 
-          if (highlight_attr)
-            window.AttributeOn(highlight_attr);
-
           StreamString lineStream;
 
           std::optional<size_t> column;
@@ -7076,17 +7148,19 @@ public:
           if (line.ends_with("\n"))
             line = line.drop_back();
           bool wasWritten = window.OutputColoredStringTruncated(
-              1, line, m_first_visible_column, is_pc_line);
+              1, line, m_first_visible_column, is_pc_line,
+              line_is_selected && !is_pc_line);
           if (!wasWritten && (line_is_selected || is_pc_line)) {
             // Draw an empty space to show the selected/PC line if empty,
             // or draw '<' if nothing is visible because of scrolling too much
             // to the right.
+            window.ColorSet(is_pc_line ? WhiteOnRed : WhiteOnGrey);
             window.PutCStringTruncated(
                 1, line.empty() && m_first_visible_column == 0 ? " " : "<");
+            window.ColorSet(0);
           }
 
-          if (is_pc_line && frame_sp &&
-              frame_sp->GetConcreteFrameIndex() == 0) {
+          if (is_crash_line) {
             StopInfoSP stop_info_sp;
             if (thread)
               stop_info_sp = thread->GetStopInfo();
@@ -7094,23 +7168,26 @@ public:
               const char *stop_description = stop_info_sp->GetDescription();
               if (stop_description && stop_description[0]) {
                 size_t stop_description_len = strlen(stop_description);
-                int desc_x = window_width - stop_description_len - 16;
+                auto index = thread->GetIndexID();
+                int index_len = 0;
+                while (index > 0) {
+                  ++index_len;
+                  index /= 10;
+                }
+                int desc_x = window_width - stop_description_len - 16 - index_len;
                 if (desc_x - window.GetCursorX() > 0)
                   window.Printf("%*s", desc_x - window.GetCursorX(), "");
-                window.MoveCursor(window_width - stop_description_len - 16,
+                window.MoveCursor(window_width - stop_description_len - 16 - index_len,
                                   line_y);
-                const attr_t stop_reason_attr = COLOR_PAIR(WhiteOnBlue);
-                window.AttributeOn(stop_reason_attr);
+                window.ColorSet(WhiteOnRed);
                 window.PrintfTruncated(1, " <<< Thread %u: %s ",
                                        thread->GetIndexID(), stop_description);
-                window.AttributeOff(stop_reason_attr);
+                window.ColorSet(0);
               }
             } else {
               window.Printf("%*s", window_width - window.GetCursorX() - 1, "");
             }
           }
-          if (highlight_attr)
-            window.AttributeOff(highlight_attr);
         } else {
           break;
         }
@@ -7137,7 +7214,7 @@ public:
         }
 
         const attr_t selected_highlight_attr = A_REVERSE;
-        const attr_t pc_highlight_attr = COLOR_PAIR(WhiteOnBlue);
+        const attr_t pc_highlight_color = WhiteOnRed;
 
         StreamString strm;
 
@@ -7178,9 +7255,7 @@ public:
           // line isn't the same as the PC line, highlight it differently
           attr_t highlight_attr = 0;
           attr_t bp_attr = 0;
-          if (is_pc_line)
-            highlight_attr = pc_highlight_attr;
-          else if (line_is_selected)
+          if (!is_pc_line && line_is_selected)
             highlight_attr = selected_highlight_attr;
 
           if (bp_file_addrs.find(inst->GetAddress().GetFileAddress()) !=
@@ -7204,6 +7279,8 @@ public:
           else
             window.PutChar(' ');
 
+          if (is_pc_line)
+            window.ColorSet(pc_highlight_color);
           if (highlight_attr)
             window.AttributeOn(highlight_attr);
 
@@ -7255,6 +7332,8 @@ public:
               window.Printf("%*s", window_width - window.GetCursorX() - 1, "");
             }
           }
+          if (is_pc_line)
+            window.ColorSet(0);
           if (highlight_attr)
             window.AttributeOff(highlight_attr);
         }
@@ -7718,28 +7797,16 @@ void IOHandlerCursesGUI::Activate() {
     status_window_sp->SetDelegate(
         WindowDelegateSP(new StatusBarWindowDelegate(m_debugger)));
 
-    // All colors with black background.
-    init_pair(1, COLOR_BLACK, COLOR_BLACK);
-    init_pair(2, COLOR_RED, COLOR_BLACK);
-    init_pair(3, COLOR_GREEN, COLOR_BLACK);
-    init_pair(4, COLOR_YELLOW, COLOR_BLACK);
-    init_pair(5, COLOR_BLUE, COLOR_BLACK);
-    init_pair(6, COLOR_MAGENTA, COLOR_BLACK);
-    init_pair(7, COLOR_CYAN, COLOR_BLACK);
-    init_pair(8, COLOR_WHITE, COLOR_BLACK);
-    // All colors with blue background.
-    init_pair(9, COLOR_BLACK, COLOR_BLUE);
-    init_pair(10, COLOR_RED, COLOR_BLUE);
-    init_pair(11, COLOR_GREEN, COLOR_BLUE);
-    init_pair(12, COLOR_YELLOW, COLOR_BLUE);
-    init_pair(13, COLOR_BLUE, COLOR_BLUE);
-    init_pair(14, COLOR_MAGENTA, COLOR_BLUE);
-    init_pair(15, COLOR_CYAN, COLOR_BLUE);
-    init_pair(16, COLOR_WHITE, COLOR_BLUE);
+    // All colors with black, red, and grey backgrounds.
+    for (int i = 0; i < 256; ++i) {
+      init_pair(BlackOnBlack + i, i, COLOR_BLACK);
+      init_pair(BlackOnRed + i, i, 52);
+      init_pair(BlackOnGrey + i, i, 238);
+    }
+
     // These must match the order in the color indexes enum.
-    init_pair(17, COLOR_BLACK, COLOR_WHITE);
-    init_pair(18, COLOR_MAGENTA, COLOR_WHITE);
-    static_assert(LastColorPairIndex == 18, "Color indexes do not match.");
+    init_pair(BlackOnWhite, COLOR_BLACK, COLOR_WHITE);
+    init_pair(MagentaOnWhite, COLOR_MAGENTA, COLOR_WHITE);
 
     define_key("\033[Z", KEY_SHIFT_TAB);
     define_key("\033\015", KEY_ALT_ENTER);
