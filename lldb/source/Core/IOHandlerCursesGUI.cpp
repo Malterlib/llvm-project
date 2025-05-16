@@ -6822,11 +6822,28 @@ public:
     return g_source_view_key_help;
   }
 
+  std::string UntabifyLine(StringRef line) {
+    std::string output;
+
+    // Due to the complexities of UTF-8 rules, this only handles leading tabs.
+
+    while (line.consume_front("\t")) {
+      for (int i = 0; i < m_tab_size; ++i)
+        output += ' ';
+    }
+
+    output += line.str();
+
+    return output;
+  }
+
   bool WindowDelegateDraw(Window &window, bool force) override {
     ExecutionContext exe_ctx =
         m_debugger.GetCommandInterpreter().GetExecutionContext();
     Process *process = exe_ctx.GetProcessPtr();
     Thread *thread = nullptr;
+
+    set_tabsize(m_tab_size);
 
     bool update_location = false;
     if (process) {
@@ -6921,6 +6938,12 @@ public:
               m_line_width = 1;
               for (size_t n = num_lines; n >= 10; n = n / 10)
                 ++m_line_width;
+
+              // Align on tab size.
+              const int gutter_width = m_line_width + 5;
+              m_line_width =
+                  ((gutter_width + m_tab_size - 1) / m_tab_size) * m_tab_size -
+                  5;
 
               if (num_lines < num_visible_lines ||
                   m_selected_line < num_visible_lines)
@@ -7047,7 +7070,9 @@ public:
             column = m_sc.line_entry.column - 1;
           m_file_sp->DisplaySourceLines(curr_line + 1, column, 0, 0,
                                         &lineStream);
-          StringRef line = lineStream.GetString();
+          StringRef stream_line = lineStream.GetString();
+          std::string untabified_line = UntabifyLine(stream_line);
+          StringRef line = untabified_line;
           if (line.ends_with("\n"))
             line = line.drop_back();
           bool wasWritten = window.OutputColoredStringTruncated(
@@ -7541,6 +7566,7 @@ protected:
   StreamString m_title;
   lldb::user_id_t m_tid = LLDB_INVALID_THREAD_ID;
   int m_line_width = 4;
+  int m_tab_size = 4;
   uint32_t m_selected_line = 0; // The selected line
   uint32_t m_pc_line = 0;       // The line with the PC
   uint32_t m_stop_id = 0;
