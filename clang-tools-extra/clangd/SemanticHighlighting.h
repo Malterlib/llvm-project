@@ -80,11 +80,13 @@ enum class HighlightingModifier {
   UsedAsMutablePointer,
   ConstructorOrDestructor,
   UserDefined,
-
   FunctionScope,
   ClassScope,
   FileScope,
   GlobalScope,
+  Private,
+  Protected,
+  Public,
 
   LastModifier = GlobalScope
 };

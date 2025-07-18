@@ -1201,6 +1201,27 @@ getSemanticHighlightings(ParsedAST &AST, bool IncludeInactiveRegionTokens) {
             if (isUniqueDefinition(Decl))
               Tok.addModifier(HighlightingModifier::Definition);
           }
+
+          // Access-specifier modifier (only for member fields/methods).
+          if (Decl->isCXXClassMember() &&
+              (llvm::isa<clang::FieldDecl>(Decl) ||
+               llvm::isa<clang::CXXMethodDecl>(Decl) ||
+               (llvm::isa<clang::VarDecl>(Decl) &&
+                llvm::cast<clang::VarDecl>(Decl)->isStaticDataMember()))) {
+            switch (Decl->getAccess()) {
+            case clang::AS_private:
+              Tok.addModifier(HighlightingModifier::Private);
+              break;
+            case clang::AS_protected:
+              Tok.addModifier(HighlightingModifier::Protected);
+              break;
+            case clang::AS_public:
+              Tok.addModifier(HighlightingModifier::Public);
+              break;
+            case clang::AS_none:
+              break;
+            }
+          }
         }
       },
       AST.getHeuristicResolver());
@@ -1342,6 +1363,9 @@ highlightingModifierFromString(llvm::StringRef Name) {
       {"ClassScope", HighlightingModifier::ClassScope},
       {"FileScope", HighlightingModifier::FileScope},
       {"GlobalScope", HighlightingModifier::GlobalScope},
+      {"Private", HighlightingModifier::Private},
+      {"Protected", HighlightingModifier::Protected},
+      {"Public", HighlightingModifier::Public},
   };
 
   auto It = Lookup.find(Name);
@@ -1516,6 +1540,12 @@ llvm::StringRef toSemanticTokenModifier(HighlightingModifier Modifier) {
     return "fileScope"; // nonstandard
   case HighlightingModifier::GlobalScope:
     return "globalScope"; // nonstandard
+  case HighlightingModifier::Private:
+    return "private";
+  case HighlightingModifier::Protected:
+    return "protected";
+  case HighlightingModifier::Public:
+    return "public";
   }
   llvm_unreachable("unhandled HighlightingModifier");
 }
