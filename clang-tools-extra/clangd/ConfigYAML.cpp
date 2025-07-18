@@ -14,6 +14,7 @@
 #include "llvm/Support/YAMLParser.h"
 #include <optional>
 #include <string>
+#include "support/Logger.h"
 
 namespace clang {
 namespace clangd {
@@ -295,6 +296,73 @@ private:
     Dict.handle("DisabledModifiers", [&](Node &N) {
       if (auto Values = scalarValues(N))
         F.DisabledModifiers = std::move(*Values);
+    });
+    Dict.handle("Rules", [&](Node &N) {
+      auto ParseRuleSeq = [&](llvm::ArrayRef<Located<std::string>> KindName,
+                              SequenceNode &Seq) {
+        for (auto &Item : Seq) {
+          if (Item.getType() != Node::NK_Mapping) {
+            warning("Rule should be a dictionary", Item);
+            continue;
+          }
+          Located<std::string> RX{"", Item.getSourceRange()};
+          std::vector<Located<std::string>> Add;
+          std::vector<Located<std::string>> Remove;
+
+          for (auto &KV : llvm::cast<MappingNode>(Item)) {
+            if (!KV.getKey() || !KV.getValue())
+              continue;
+            auto K = scalarValue(*KV.getKey(), "Rule key");
+            if (!K)
+              continue;
+            if (**K == "regex") {
+              if (auto V = scalarValue(*KV.getValue(), "regex"))
+                RX = *V;
+            } else if (**K == "add") {
+              if (auto L = scalarValues(*KV.getValue()))
+                Add = std::move(*L);
+              else
+                warning("add should be a list", *KV.getValue());
+            } else if (**K == "remove") {
+              if (auto L = scalarValues(*KV.getValue()))
+                Remove = std::move(*L);
+              else
+                warning("remove should be a list", *KV.getValue());
+            } else {
+              warning("Unknown key in Rule", *KV.getKey());
+            }
+          }
+
+          if ((*RX).empty()) {
+            warning("Rule missing regex", Item);
+            continue;
+          }
+
+          config::Fragment::SemanticTokensBlock::RuleBlock RB{std::move(RX),
+                                                              std::move(Add),
+                                                              std::move(Remove),
+                                                              !KindName.empty() ? KindName.front() : std::optional<Located<std::string>>(std::nullopt)};
+          F.Rules.push_back(std::move(RB));
+        }
+      };
+
+      if (N.getType() != Node::NK_Mapping) {
+        warning("Rules should be a list or a dictionary", N);
+        return;
+      }
+
+      for (auto &KV : llvm::cast<MappingNode>(N)) {
+        if (!KV.getKey() || !KV.getValue())
+          continue;
+        auto KindName = scalarValue(*KV.getKey(), "Highlighting kind");
+        if (!KindName)
+          continue;
+        if (KV.getValue()->getType() != Node::NK_Sequence) {
+          warning("Rules for a kind should be a list", *KV.getValue());
+          continue;
+        }
+        ParseRuleSeq({*KindName}, llvm::cast<SequenceNode>(*KV.getValue()));
+      }
     });
     Dict.parse(N);
   }

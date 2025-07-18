@@ -28,10 +28,13 @@
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Regex.h"
+#include "SemanticHighlighting.h"
 #include <functional>
 #include <optional>
 #include <string>
 #include <vector>
+#include <array>
 
 namespace clang {
 namespace clangd {
@@ -171,11 +174,30 @@ struct Config {
     uint32_t TypeNameLimit = 32;
   } InlayHints;
 
+  // A rule mapping an identifier regex to a modifier bitmask.
+  struct HighlightRule {
+    llvm::Regex Pattern;            // ^( … )$ anchored.
+    uint32_t ClearMask = 0;         // Bits to clear first.
+    uint32_t AddMask = 0;           // Bits to set afterwards.
+
+    HighlightRule() = default;
+    HighlightRule(llvm::Regex R, uint32_t Clear, uint32_t Add)
+        : Pattern(std::move(R)), ClearMask(Clear), AddMask(Add) {}
+  };
+
   struct {
     /// Controls highlighting kinds that are disabled.
     std::vector<std::string> DisabledKinds;
     /// Controls highlighting modifiers that are disabled.
     std::vector<std::string> DisabledModifiers;
+
+    // For each highlighting kind, the rules that explicitly target it.
+    std::array<std::vector<HighlightRule>, static_cast<size_t>(HighlightingKind::LastKind) + 1>
+        RulesForKind;
+    // Rules that apply to all kinds (i.e. no specific kind set).
+    std::vector<HighlightRule> GenericRules;
+    // Indicates whether any of the rules arrays has rules.
+    bool HasRules = false;
   } SemanticTokens;
 };
 

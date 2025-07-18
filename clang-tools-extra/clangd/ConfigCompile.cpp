@@ -27,6 +27,7 @@
 #include "Config.h"
 #include "ConfigFragment.h"
 #include "ConfigProvider.h"
+#include "SemanticHighlighting.h"
 #include "Diagnostics.h"
 #include "Feature.h"
 #include "TidyProvider.h"
@@ -757,6 +758,86 @@ struct FragmentCompiler {
             C.SemanticTokens.DisabledModifiers.push_back(std::move(Kind));
         }
       });
+    }
+
+    {
+      // Build ordered HighlightRules from fragment.
+      if (!F.Rules.empty()) {
+        auto ToBit = [](llvm::StringRef Name) -> std::optional<unsigned> {
+          if (auto HM = highlightingModifierFromString(Name))
+            return static_cast<unsigned>(*HM);
+          return std::nullopt;
+        };
+
+        struct TmpRule {
+          std::string Pattern;
+          uint32_t Clear;
+          uint32_t Add;
+          std::optional<HighlightingKind> Kind;
+        };
+        std::vector<TmpRule> Tmp;
+        for (auto &RB : F.Rules) {
+          llvm::Regex RE(*RB.Regex, llvm::Regex::NoFlags);
+          std::string RegexError;
+          if (!RE.isValid(RegexError)) {
+            diag(Error, llvm::formatv("Invalid regex '{0}': {1}", *RB.Regex, RegexError).str(), RB.Regex.Range);
+            continue;
+          }
+
+          uint32_t AddMask = 0, ClearMask = 0;
+          bool Any = false;
+          for (auto &M : RB.Add) {
+            if (auto Bit = ToBit(*M)) { AddMask |= 1u << *Bit; Any = true; }
+            else diag(Warning, llvm::formatv("Unknown modifier name '{0}'", *M).str(), M.Range);
+          }
+          for (auto &M : RB.Remove) {
+            if (auto Bit = ToBit(*M)) { ClearMask |= 1u << *Bit; Any = true; }
+            else diag(Warning, llvm::formatv("Unknown modifier name '{0}'", *M).str(), M.Range);
+          }
+          if (!Any) {
+            diag(Warning, "Rule has no valid modifiers", RB.Regex.Range);
+            continue;
+          }
+          // Determine kind(s) if specified. Multiple kinds can be provided
+          // using the pipe character as a separator, e.g. "Type|Primitive|Typedef".
+          // "All" kind value indicates a generic rule that applies
+          // to every highlighting kind.
+          llvm::SmallVector<llvm::StringRef, 4> KindNames;
+          if (RB.Kind && !(**RB.Kind).empty())
+            llvm::StringRef(**RB.Kind)
+                .split(KindNames, '|', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+
+          for (llvm::StringRef Name : KindNames) {
+            if (Name == "All") {
+              Tmp.push_back({*RB.Regex, ClearMask, AddMask, std::nullopt});
+              continue;
+            }
+            if (auto HK = highlightingKindFromString(Name)) {
+              Tmp.push_back({*RB.Regex, ClearMask, AddMask, *HK});
+            } else {
+              diag(Warning, llvm::formatv("Unknown highlighting kind '{0}'", Name).str(), RB.Kind->Range);
+            }
+          }
+        }
+
+        if (!Tmp.empty()) {
+          Out.Apply.push_back([Tmp = std::move(Tmp)](const Params &, Config &C) {
+            for (const auto &R : Tmp) {
+              llvm::Regex Compiled(R.Pattern);
+              std::string RegexError;
+              if (!Compiled.isValid(RegexError))
+                continue; // should have been validated
+
+              C.SemanticTokens.HasRules = true;
+
+              if (R.Kind)
+                C.SemanticTokens.RulesForKind[static_cast<size_t>(*R.Kind)].emplace_back(std::move(Compiled), R.Clear, R.Add);
+              else
+                C.SemanticTokens.GenericRules.emplace_back(std::move(Compiled), R.Clear, R.Add);;
+            }
+          });
+        }
+      }
     }
   }
 

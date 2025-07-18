@@ -34,6 +34,7 @@
 #include "llvm/Support/Error.h"
 #include <algorithm>
 #include <optional>
+#include <array>
 
 namespace clang {
 namespace clangd {
@@ -493,6 +494,128 @@ public:
       ExtraModifiers[*Range].push_back(Modifier);
   }
 
+  void applyRulesToIdentifiers(std::vector<HighlightingToken> &Out) {
+    const auto &Config = Config::current().SemanticTokens;
+    if (!Config.HasRules)
+      return;
+
+    auto ApplyRules = [&](HighlightingToken &Tok, const llvm::StringRef &Ident) -> bool {
+      auto ApplyRule = [&](const Config::HighlightRule &Rule) {
+        Tok.Modifiers &= ~Rule.ClearMask;
+        Tok.Modifiers |= Rule.AddMask;
+      };
+
+      // First try rules that explicitly target this kind.
+      for (const auto &Rule : Config.RulesForKind[static_cast<size_t>(Tok.Kind)]) {
+        if (Rule.Pattern.match(Ident)) {
+          ApplyRule(Rule);
+          return true;
+        }
+      }
+
+      // If none matched, fall back to generic (kind-agnostic) rules.
+      for (const auto &Rule : Config.GenericRules) {
+        if (Rule.Pattern.match(Ident)) {
+          ApplyRule(Rule);
+          return true;;
+        }
+      }
+
+      return false;
+    };
+
+    llvm::DenseSet<uint64_t> Covered;
+    for (auto &Tok : Out) {
+      uint64_t Key = (static_cast<uint64_t>(Tok.R.start.line) << 32) |
+                     static_cast<uint32_t>(Tok.R.start.character);
+
+      Covered.insert(Key);
+      SourceLocation Loc = SourceMgr.translateLineCol(
+        SourceMgr.getMainFileID(), Tok.R.start.line + 1, Tok.R.start.character + 1);
+
+      if (Loc.isInvalid()) 
+        continue;
+
+      const auto *T = TB.spelledTokenContaining(Loc);
+      if (!T) 
+        continue;
+
+      auto Ident = T->text(SourceMgr);
+
+      ApplyRules(Tok, Ident);
+    }
+
+    auto Spelled = TB.spelledTokens(SourceMgr.getMainFileID());
+    bool InHeader = false;
+    bool InPreprocessor = false;
+    bool PrevInclude = false;
+    unsigned HeaderLine = 0;
+    for (const auto &ST : Spelled) {
+      tok::TokenKind K = ST.kind();
+      auto TokLine = SourceMgr.getSpellingLineNumber(ST.location());
+
+      if (TokLine != HeaderLine) {
+        InPreprocessor = false;
+        InHeader = false;
+        PrevInclude = false;
+      }
+
+      if (K == tok::hash) {
+        InPreprocessor = true;
+        HeaderLine = TokLine;
+      }
+
+      if (InHeader) {
+        // Check for end delimiter.
+        if (K == tok::greater)
+          InHeader = false;
+
+        continue; // skip header path tokens
+      }
+
+      // Detect start of an #include/#import directive header.
+      if (PrevInclude) {
+        if (K == tok::less) {
+          InHeader = true;
+          continue;
+        } else {
+          PrevInclude = false;
+        }
+      }
+
+      // Update PrevInclude flag.
+      if (InPreprocessor && K == tok::identifier) {
+        llvm::StringRef Txt = ST.text(SourceMgr);
+        PrevInclude = (Txt == "include" || Txt == "import");
+      }
+
+      // Consider identifiers, literals and keywords; skip punctuation/operator tokens.
+      if (isStringLiteral(K) || isLiteral(K))
+        continue;
+
+      auto OptRange = getRangeForSourceLocation(ST.location());
+      if (!OptRange)
+        continue;
+      const Range &R = *OptRange;
+      uint64_t Key = (static_cast<uint64_t>(R.start.line) << 32) |
+                     static_cast<uint32_t>(R.start.character);
+      if (Covered.contains(Key))
+        continue;
+
+      llvm::StringRef IdentText = ST.text(SourceMgr);
+
+      HighlightingToken Tok;
+      Tok.Kind = HighlightingKind::Unknown;
+      if (!ApplyRules(Tok, IdentText))
+        continue;
+
+      Tok.R = R;
+      Out.push_back(std::move(Tok));
+      Covered.insert(Key);
+    }
+    llvm::sort(Out);
+  };
+
   std::vector<HighlightingToken> collect(ParsedAST &AST) && {
     // Initializer lists can give duplicates of tokens, therefore all tokens
     // must be deduplicated.
@@ -529,8 +652,10 @@ public:
       TokRef = TokRef.drop_front(Conflicting.size());
     }
 
-    if (!Filter.isHighlightKindActive(HighlightingKind::InactiveCode))
+    if (!Filter.isHighlightKindActive(HighlightingKind::InactiveCode)) {
+      applyRulesToIdentifiers(NonConflicting);
       return NonConflicting;
+    }
 
     const auto &SM = AST.getSourceManager();
     StringRef MainCode = SM.getBufferOrFake(SM.getMainFileID()).getBuffer();
@@ -572,6 +697,9 @@ public:
     // Copy tokens after the last inactive line
     for (; It != NonConflicting.end(); ++It)
       WithInactiveLines.push_back(std::move(*It));
+
+    applyRulesToIdentifiers(WithInactiveLines);
+
     return WithInactiveLines;
   }
 
@@ -1377,6 +1505,15 @@ highlightingModifierFromString(llvm::StringRef Name) {
       {"Protected", HighlightingModifier::Protected},
       {"Public", HighlightingModifier::Public},
       {"Constexpr", HighlightingModifier::Constexpr},
+      {"Custom0", HighlightingModifier::Custom0},
+      {"Custom1", HighlightingModifier::Custom1},
+      {"Custom2", HighlightingModifier::Custom2},
+      {"Custom3", HighlightingModifier::Custom3},
+      {"Custom4", HighlightingModifier::Custom4},
+      {"Custom5", HighlightingModifier::Custom5},
+      {"Custom6", HighlightingModifier::Custom6},
+      {"Custom7", HighlightingModifier::Custom7},
+      {"Custom8", HighlightingModifier::Custom8},
   };
 
   auto It = Lookup.find(Name);
@@ -1559,6 +1696,24 @@ llvm::StringRef toSemanticTokenModifier(HighlightingModifier Modifier) {
     return "public";
   case HighlightingModifier::Constexpr:
     return "constexpr";
+  case HighlightingModifier::Custom0:
+    return "custom0";
+  case HighlightingModifier::Custom1:
+    return "custom1";
+  case HighlightingModifier::Custom2:
+    return "custom2";
+  case HighlightingModifier::Custom3:
+    return "custom3";
+  case HighlightingModifier::Custom4:
+    return "custom4";
+  case HighlightingModifier::Custom5:
+    return "custom5";
+  case HighlightingModifier::Custom6:
+    return "custom6";
+  case HighlightingModifier::Custom7:
+    return "custom7";
+  case HighlightingModifier::Custom8:
+    return "custom8";
   }
   llvm_unreachable("unhandled HighlightingModifier");
 }
@@ -1622,6 +1777,7 @@ std::vector<Range> getInactiveRegions(ParsedAST &AST) {
     InactiveRegions.push_back(Inactive);
   }
   return InactiveRegions;
+
 }
 
 } // namespace clangd
