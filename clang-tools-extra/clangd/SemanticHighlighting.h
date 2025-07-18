@@ -88,11 +88,20 @@ enum class HighlightingModifier {
   Protected,
   Public,
   Constexpr,
+  Custom0,
+  Custom1,
+  Custom2,
+  Custom3,
+  Custom4,
+  Custom5,
+  Custom6,
+  Custom7,
+  Custom8,
 
-  LastModifier = Constexpr
+  LastModifier = Custom8
 };
-static_assert(static_cast<unsigned>(HighlightingModifier::LastModifier) < 32,
-              "Increase width of modifiers bitfield!");
+static_assert(static_cast<unsigned>(HighlightingModifier::LastModifier) < 31,
+              "Increase width of modifiers bitfield! (Visual Studio Code does not support all 32 bits)");
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, HighlightingModifier K);
 std::optional<HighlightingModifier>
 highlightingModifierFromString(llvm::StringRef Name);

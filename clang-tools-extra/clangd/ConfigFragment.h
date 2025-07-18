@@ -399,6 +399,19 @@ struct Fragment {
     std::vector<Located<std::string>> DisabledKinds;
     /// Disables clangd to assign semantic tokens with the given modifiers.
     std::vector<Located<std::string>> DisabledModifiers;
+
+    /// Ordered highlighting rules. First matching rule wins.
+    struct RuleBlock {
+      Located<std::string> Regex;
+      std::vector<Located<std::string>> Add;
+      std::vector<Located<std::string>> Remove;
+      // Optional highlighting kind this rule applies to. If not set or set to
+      // "All", the rule applies to every token kind. "Unhighlighted" applies it
+      // to identifiers and keywords clangd gives no token, which a matching
+      // rule gives a token of the kind Unknown.
+      std::optional<Located<std::string>> Kind;
+    };
+    std::vector<RuleBlock> Rules;
   };
   SemanticTokensBlock SemanticTokens;
 
