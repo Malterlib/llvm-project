@@ -72,6 +72,13 @@ std::string annotate(llvm::StringRef Input,
   return std::move(OS.str());
 }
 
+// The modifiers the Malterlib fork adds, which the tests of the upstream
+// highlightings don't expect.
+constexpr static uint32_t ForkModifierMask =
+    1 << unsigned(HighlightingModifier::Private) |
+    1 << unsigned(HighlightingModifier::Protected) |
+    1 << unsigned(HighlightingModifier::Public);
+
 void checkHighlightings(llvm::StringRef Code,
                         std::vector<std::pair</*FileName*/ llvm::StringRef,
                                               /*FileContent*/ llvm::StringRef>>
@@ -93,7 +100,7 @@ void checkHighlightings(llvm::StringRef Code,
   auto Actual =
       getSemanticHighlightings(AST, /*IncludeInactiveRegionTokens=*/true);
   for (auto &Token : Actual)
-    Token.Modifiers &= ModifierMask;
+    Token.Modifiers &= ModifierMask & ~ForkModifierMask;
 
   EXPECT_EQ(Code, annotate(Test.code(), Actual));
 }
