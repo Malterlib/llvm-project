@@ -78,7 +78,8 @@ constexpr static uint32_t ForkModifierMask =
     1 << unsigned(HighlightingModifier::Private) |
     1 << unsigned(HighlightingModifier::Protected) |
     1 << unsigned(HighlightingModifier::Public) |
-    1 << unsigned(HighlightingModifier::Constexpr);
+    1 << unsigned(HighlightingModifier::Constexpr) |
+    ((1 << 9) - 1) << unsigned(HighlightingModifier::Custom0);
 
 void checkHighlightings(llvm::StringRef Code,
                         std::vector<std::pair</*FileName*/ llvm::StringRef,
