@@ -80,13 +80,15 @@ enum class HighlightingModifier {
   UsedAsMutablePointer,
   ConstructorOrDestructor,
   UserDefined,
-
   FunctionScope,
   ClassScope,
   FileScope,
   GlobalScope,
+  Private,
+  Protected,
+  Public,
 
-  LastModifier = GlobalScope
+  LastModifier = Public
 };
 static_assert(static_cast<unsigned>(HighlightingModifier::LastModifier) < 32,
               "Increase width of modifiers bitfield!");
