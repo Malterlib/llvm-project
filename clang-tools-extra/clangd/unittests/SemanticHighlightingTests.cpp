@@ -78,7 +78,8 @@ constexpr static uint32_t ForkModifierMask =
     1 << unsigned(HighlightingModifier::Private) |
     1 << unsigned(HighlightingModifier::Protected) |
     1 << unsigned(HighlightingModifier::Public) |
-    1 << unsigned(HighlightingModifier::Constexpr);
+    1 << unsigned(HighlightingModifier::Constexpr) |
+    ((1 << 9) - 1) << unsigned(HighlightingModifier::Custom0);
 
 void checkHighlightings(llvm::StringRef Code,
                         std::vector<std::pair</*FileName*/ llvm::StringRef,
@@ -1343,6 +1344,42 @@ o]] [[bar]])cpp";
   EXPECT_EQ(Toks[3].deltaLine, 0u);
   EXPECT_EQ(Toks[3].deltaStart, 2u);
   EXPECT_EQ(Toks[3].length, 3u);
+}
+
+// Rules for Unknown apply to the names clangd knows but can't classify, such as
+// dependent names, and rules for Unhighlighted to the identifiers and keywords
+// it gives no token.
+TEST(SemanticHighlighting, UnknownAndUnhighlightedRules) {
+  auto Bit = [](HighlightingModifier M) {
+    return 1u << static_cast<unsigned>(M);
+  };
+  const uint32_t Member = Bit(HighlightingModifier::Custom0);
+  const uint32_t Keyword = Bit(HighlightingModifier::Custom1);
+  const uint32_t Macro = Bit(HighlightingModifier::Custom2);
+  Config Cfg;
+  Cfg.SemanticTokens.HasRules = true;
+  Cfg.SemanticTokens
+      .RulesForKind[static_cast<size_t>(HighlightingKind::Unknown)]
+      .emplace_back(llvm::Regex("^m_[A-Z][A-Za-z]*$"), 0, Member);
+  Cfg.SemanticTokens.UnhighlightedRules.emplace_back(llvm::Regex("^return$"), 0,
+                                                    Keyword);
+  Cfg.SemanticTokens.UnhighlightedRules.emplace_back(
+      llvm::Regex("^D[A-Z][A-Za-z]*$"), 0, Macro);
+  WithContextValue WithCfg(Config::Key, std::move(Cfg));
+
+  Annotations Code(R"cpp(
+    template <typename T> int f(T Value) {
+      $keyword[[return]] Value.$member[[m_Count]] + Value.DCount;
+    }
+  )cpp");
+  auto AST = TestTU::withCode(Code.code()).build();
+  std::vector<std::pair<Range, uint32_t>> Custom;
+  for (const HighlightingToken &Token : getSemanticHighlightings(AST, true))
+    if (uint32_t Modifiers = Token.Modifiers & (Member | Keyword | Macro))
+      Custom.emplace_back(Token.R, Modifiers);
+  EXPECT_THAT(Custom, ::testing::ElementsAre(
+                          ::testing::Pair(Code.range("keyword"), Keyword),
+                          ::testing::Pair(Code.range("member"), Member)));
 }
 
 TEST(SemanticHighlighting, WithHighlightingFilter) {

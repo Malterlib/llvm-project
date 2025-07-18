@@ -82,7 +82,16 @@
 # CHECK-NEXT:            "private",
 # CHECK-NEXT:            "protected",
 # CHECK-NEXT:            "public",
-# CHECK-NEXT:            "constexpr"
+# CHECK-NEXT:            "constexpr",
+# CHECK-NEXT:            "custom0",
+# CHECK-NEXT:            "custom1",
+# CHECK-NEXT:            "custom2",
+# CHECK-NEXT:            "custom3",
+# CHECK-NEXT:            "custom4",
+# CHECK-NEXT:            "custom5",
+# CHECK-NEXT:            "custom6",
+# CHECK-NEXT:            "custom7",
+# CHECK-NEXT:            "custom8"
 # CHECK-NEXT:          ],
 # CHECK-NEXT:          "tokenTypes": [
 # CHECK-NEXT:            "variable",
