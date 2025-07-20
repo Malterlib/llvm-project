@@ -87,8 +87,9 @@ enum class HighlightingModifier {
   Private,
   Protected,
   Public,
+  Constexpr,
 
-  LastModifier = GlobalScope
+  LastModifier = Constexpr
 };
 static_assert(static_cast<unsigned>(HighlightingModifier::LastModifier) < 32,
               "Increase width of modifiers bitfield!");
