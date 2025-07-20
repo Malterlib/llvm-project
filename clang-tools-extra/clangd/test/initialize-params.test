@@ -81,7 +81,8 @@
 # CHECK-NEXT:            "globalScope",
 # CHECK-NEXT:            "private",
 # CHECK-NEXT:            "protected",
-# CHECK-NEXT:            "public"
+# CHECK-NEXT:            "public",
+# CHECK-NEXT:            "constexpr"
 # CHECK-NEXT:          ],
 # CHECK-NEXT:          "tokenTypes": [
 # CHECK-NEXT:            "variable",
