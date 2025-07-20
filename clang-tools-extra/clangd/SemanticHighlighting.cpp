@@ -181,6 +181,14 @@ bool isDependent(const Decl *D) {
   return false;
 }
 
+bool isConstexpr(const Decl *D) {
+  if (const auto *VD = llvm::dyn_cast<VarDecl>(D))
+    return VD->isConstexpr();
+  if (const auto *FD = llvm::dyn_cast<FunctionDecl>(D))
+    return FD->isConstexpr();
+  return false;
+}
+
 /// Returns true if `Decl` is considered to be from a default/system library.
 /// This currently checks the systemness of the file by include type, although
 /// different heuristics may be used in the future (e.g. sysroot paths).
@@ -1085,6 +1093,9 @@ getSemanticHighlightings(ParsedAST &AST, bool IncludeInactiveRegionTokens) {
           if (isDefaultLibrary(Decl))
             Tok.addModifier(HighlightingModifier::DefaultLibrary);
 
+          if (isConstexpr(Decl))
+            Tok.addModifier(HighlightingModifier::Constexpr);
+
           if (isa<CXXConstructorDecl>(Decl))
             Tok.addModifier(HighlightingModifier::ConstructorOrDestructor);
 
@@ -1252,6 +1263,7 @@ highlightingModifierFromString(llvm::StringRef Name) {
       {"Private", HighlightingModifier::Private},
       {"Protected", HighlightingModifier::Protected},
       {"Public", HighlightingModifier::Public},
+      {"Constexpr", HighlightingModifier::Constexpr},
   };
 
   auto It = Lookup.find(Name);
@@ -1432,6 +1444,8 @@ llvm::StringRef toSemanticTokenModifier(HighlightingModifier Modifier) {
     return "protected";
   case HighlightingModifier::Public:
     return "public";
+  case HighlightingModifier::Constexpr:
+    return "constexpr";
   }
   llvm_unreachable("unhandled HighlightingModifier");
 }
