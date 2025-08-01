@@ -70,12 +70,15 @@ lldb::ChildCacheState GenericOptionalFrontend::Update() {
 
   if (m_stdlib == StdLib::LibCxx)
     engaged_sp = m_backend.GetChildMemberWithName("__engaged_");
-  else if (m_stdlib == StdLib::LibStdcpp)
-    engaged_sp = m_backend.GetChildMemberWithName("_M_payload")
-                     ->GetChildMemberWithName("_M_engaged");
+  else if (m_stdlib == StdLib::LibStdcpp) {
+    if (auto payload = m_backend.GetChildMemberWithName("_M_payload"))
+      engaged_sp = payload->GetChildMemberWithName("_M_engaged");
+  }
 
-  if (!engaged_sp)
+  if (!engaged_sp) {
+    m_has_value = false;
     return lldb::ChildCacheState::eRefetch;
+  }
 
   // _M_engaged/__engaged is a bool flag and is true if the optional contains a
   // value. Converting it to unsigned gives us a size of 1 if it contains a
@@ -91,24 +94,31 @@ ValueObjectSP GenericOptionalFrontend::GetChildAtIndex(uint32_t _idx) {
 
   ValueObjectSP val_sp;
 
-  if (m_stdlib == StdLib::LibCxx)
+  if (m_stdlib == StdLib::LibCxx) {
     // __val_ contains the underlying value of an optional if it has one.
     // Currently because it is part of an anonymous union
     // GetChildMemberWithName() does not peer through and find it unless we are
     // at the parent itself. We can obtain the parent through __engaged_.
-    val_sp = m_backend.GetChildMemberWithName("__engaged_")
-                 ->GetParent()
-                 ->GetChildAtIndex(0)
-                 ->GetChildMemberWithName("__val_");
-  else if (m_stdlib == StdLib::LibStdcpp) {
-    val_sp = m_backend.GetChildMemberWithName("_M_payload")
-                 ->GetChildMemberWithName("_M_payload");
+    val_sp = m_backend.GetChildMemberWithName("__engaged_");
+    if (val_sp) {
+      if (auto Parent = val_sp->GetParent()) {
+        val_sp = Parent->GetChildAtIndex(0);
+        if (val_sp)
+          val_sp = val_sp->GetChildMemberWithName("__val_");
+      }
+    }
+  } else if (m_stdlib == StdLib::LibStdcpp) {
+    val_sp = m_backend.GetChildMemberWithName("_M_payload");
+    if (val_sp)
+      val_sp = val_sp->GetChildMemberWithName("_M_payload");;
 
-    // In some implementations, _M_value contains the underlying value of an
-    // optional, and in other versions, it's in the payload member.
-    ValueObjectSP candidate = val_sp->GetChildMemberWithName("_M_value");
-    if (candidate)
-      val_sp = candidate;
+    if (val_sp) {
+      // In some implementations, _M_value contains the underlying value of an
+      // optional, and in other versions, it's in the payload member.
+      ValueObjectSP candidate = val_sp->GetChildMemberWithName("_M_value");
+      if (candidate)
+        val_sp = candidate;
+    }
   }
 
   if (!val_sp)

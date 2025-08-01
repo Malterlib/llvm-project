@@ -325,7 +325,7 @@ llvm::Expected<uint32_t> ListFrontEnd::CalculateNumChildren() {
     size_node_sp = m_backend.GetChildMemberWithName(
         "__size_alloc_"); // pre-compressed_pair rework
 
-    if (!isOldCompressedPairLayout(*size_node_sp))
+    if (!size_node_sp || !isOldCompressedPairLayout(*size_node_sp))
       return llvm::createStringError("Unexpected std::list layout: expected "
                                      "old __compressed_pair layout.");
 
