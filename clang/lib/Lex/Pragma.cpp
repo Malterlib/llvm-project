@@ -292,6 +292,10 @@ void Preprocessor::Handle_Pragma(Token &Tok) {
 
   EnterSourceFileWithLexer(TL, nullptr);
 
+  // Check if preprocessing was aborted during file entry
+  if (wasPreprocessingAborted())
+    return;
+
   // With everything set up, lex this as a #pragma directive.
   HandlePragmaDirective({PIK__Pragma, PragmaLoc});
 

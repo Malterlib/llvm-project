@@ -553,6 +553,10 @@ void Preprocessor::EnterMainSourceFile() {
   if (!SourceMgr.isLoadedFileID(MainFileID)) {
     // Enter the main file source buffer.
     EnterSourceFile(MainFileID, nullptr, SourceLocation());
+    
+    // Check if preprocessing was aborted
+    if (wasPreprocessingAborted())
+      return;
 
     // If we've been asked to skip bytes in the main file (e.g., as part of a
     // precompiled preamble), do so now.
@@ -576,6 +580,10 @@ void Preprocessor::EnterMainSourceFile() {
 
   // Start parsing the predefines.
   EnterSourceFile(FID, nullptr, SourceLocation());
+  
+  // Check if preprocessing was aborted
+  if (wasPreprocessingAborted())
+    return;
 
   if (!PPOpts->PCHThroughHeader.empty()) {
     // Lookup and save the FileID for the through header. If it isn't found

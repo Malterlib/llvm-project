@@ -639,6 +639,10 @@ private:
   /// True if we hit the code-completion point.
   bool CodeCompletionReached = false;
 
+  /// True if preprocessing should be aborted.
+  /// This is set when a callback signals that preprocessing should stop.
+  bool PreprocessingAborted = false;
+
   /// The code completion token containing the information
   /// on the stem that is to be code completed.
   IdentifierInfo *CodeCompletionII = nullptr;
@@ -1229,6 +1233,12 @@ public:
   bool hadModuleLoaderFatalFailure() const {
     return TheModuleLoader.HadFatalFailure;
   }
+
+  /// Check if preprocessing was aborted.
+  bool wasPreprocessingAborted() const { return PreprocessingAborted; }
+  
+  /// Signal that preprocessing should be aborted.
+  void abortPreprocessing() { PreprocessingAborted = true; }
 
   /// Retrieve the number of Directives that have been processed by the
   /// Preprocessor.

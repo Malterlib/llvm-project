@@ -63,6 +63,12 @@ struct ParseInputs {
   FeatureModuleSet *FeatureModules = nullptr;
   // Used to build and manage (C++) modules.
   ModulesBuilder *ModulesManager = nullptr;
+  // When compiling in header-in-context mode, this is the target header
+  // that we want to stop at during preamble building.
+  std::string TargetHeaderFile;
+  // When using header-in-context mode, this is the compile command for the
+  // proxy file that we use to build the preamble
+  std::optional<tooling::CompileCommand> ProxyCompileCommand;
 };
 
 /// Clears \p CI from options that are not supported by clangd, like codegen or

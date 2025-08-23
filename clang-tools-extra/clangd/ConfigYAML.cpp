@@ -108,6 +108,9 @@ private:
     Dict.handle("CompilationDatabase", [&](Node &N) {
       F.CompilationDatabase = scalarValue(N, "CompilationDatabase");
     });
+    Dict.handle("HeaderCompilation", [&](Node &N) {
+      F.HeaderCompilation = scalarValue(N, "HeaderCompilation");
+    });
     Dict.parse(N);
   }
 

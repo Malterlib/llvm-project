@@ -56,16 +56,17 @@ public:
   IncludeCollector(Preprocessor &PP, SmallVectorImpl<StringRef> &IncludedFiles)
       : PP(PP), IncludedFiles(IncludedFiles) {}
 
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override {
     if (Reason != LexedFileChangeReason::EnterFile)
-      return;
+      return false;
     if (FID == PP.getPredefinesFileID())
-      return;
+      return false;
     StringRef Filename =
         PP.getSourceManager().getSLocEntry(FID).getFile().getName();
-    IncludedFiles.push_back(Filename);
+    IncludedFiles.push_back(Filename);    
+    return false;
   }
 };
 

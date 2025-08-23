@@ -170,6 +170,13 @@ struct Fragment {
     /// - Ancestors: search all parent directories (the default)
     /// - std::nullopt: do not use a compilation database, just default flags.
     std::optional<Located<std::string>> CompilationDatabase;
+
+    /// How to compile header files when no direct compile command is available.
+    /// Valid values are:
+    /// - InContext: compile headers using the full source file that includes
+    ///   them, providing full context but potentially slower.
+    /// - Isolated: compile headers in isolation with inferred flags (default).
+    std::optional<Located<std::string>> HeaderCompilation;
   };
   CompileFlagsBlock CompileFlags;
 

@@ -3741,6 +3741,14 @@ LexStart:
   assert(!Result.needsCleaning() && "Result needs cleaning");
   assert(!Result.hasPtrData() && "Result has not been reset");
 
+  // Check if preprocessing was aborted before continuing
+  if (PP && PP->wasPreprocessingAborted()) {
+    // Return an EOF token to signal end of preprocessing
+    Result.startToken();
+    Result.setKind(tok::eof);
+    return true;
+  }
+
   // CurPtr - Cache BufferPtr in an automatic variable.
   const char *CurPtr = BufferPtr;
 
@@ -4513,6 +4521,14 @@ HandleDirective:
   if (PP->hadModuleLoaderFatalFailure())
     // With a fatal failure in the module loader, we abort parsing.
     return true;
+  
+  if (PP->wasPreprocessingAborted()) {
+    // Preprocessing was aborted by a callback.
+    // Return an EOF token to signal end of preprocessing.
+    Result.startToken();
+    Result.setKind(tok::eof);
+    return true;
+  }
 
   // We parsed the directive; lex a token with the new state.
   return false;

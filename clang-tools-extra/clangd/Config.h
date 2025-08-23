@@ -69,6 +69,10 @@ struct Config {
         Edits;
     /// Where to search for compilation databases for this file's flags.
     CDBSearchSpec CDBSearch = {CDBSearchSpec::Ancestors, std::nullopt};
+    /// How to compile header files when no compile command is available.
+    /// If true, headers are compiled using the full source file that includes
+    /// them. If false, headers are compiled in isolation with inferred flags.
+    bool CompileHeadersInContext = false;
   } CompileFlags;
 
   enum class BackgroundPolicy { Build, Skip };

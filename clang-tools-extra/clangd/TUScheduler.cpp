@@ -881,7 +881,21 @@ void ASTWorker::update(ParseInputs Inputs, WantDiagnostics WantDiags,
           HeaderIncluders.remove(ProxyFile);
         } else {
           // We have a reliable command for an including file, use it.
-          Cmd = tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+          if (Config::current().CompileFlags.CompileHeadersInContext) {
+            // For header-in-context mode: 
+            // Store the proxy command for preamble building
+            Inputs.ProxyCompileCommand = *ProxyCmd;
+            
+            // Transfer the command to the header file for the main compilation
+            Cmd = tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+            Cmd->Heuristic = "header-in-context via " + ProxyFile;
+            
+            // Store the target header so preamble building knows when to stop
+            Inputs.TargetHeaderFile = FileName;
+          } else {
+            // Traditional behavior: transfer compile command to the header
+            Cmd = tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+          }
         }
       }
     }

@@ -174,7 +174,7 @@ class ModuleDepCollectorPP final : public PPCallbacks {
 public:
   ModuleDepCollectorPP(ModuleDepCollector &MDC) : MDC(MDC) {}
 
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override;
   void InclusionDirective(SourceLocation HashLoc, const Token &IncludeTok,

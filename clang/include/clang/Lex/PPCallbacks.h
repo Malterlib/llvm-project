@@ -68,9 +68,13 @@ public:
   ///
   /// \param Loc The location where the \p Lexer entered a new file from or the
   /// location that the \p Lexer moved into after exiting a file.
-  virtual void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  /// 
+  /// \returns true to abort preprocessing, false to continue normally.
+  virtual bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                                 SrcMgr::CharacteristicKind FileType,
-                                FileID PrevFID, SourceLocation Loc) {}
+                                FileID PrevFID, SourceLocation Loc) {
+    return false;
+  }
 
   /// Callback invoked whenever a source file is skipped as the result
   /// of header guard optimization.
@@ -484,11 +488,14 @@ public:
     Second->FileChanged(Loc, Reason, FileType, PrevFID);
   }
 
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override {
-    First->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc);
-    Second->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc);
+    if (First->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc))
+      return true;
+    if (Second->LexedFileChanged(FID, Reason, FileType, PrevFID, Loc))
+      return true;
+    return false;
   }
 
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,

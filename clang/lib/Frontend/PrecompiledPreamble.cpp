@@ -713,14 +713,22 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
 void PrecompiledPreamble::AddImplicitPreamble(
     CompilerInvocation &CI, IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
     llvm::MemoryBuffer *MainFileBuffer) const {
-  PreambleBounds Bounds(PreambleBytes.size(), PreambleEndsAtStartOfLine);
+  // For proxy preambles, use 0 bounds since the preamble was built from different content
+  PreambleBounds Bounds = IsProxyPreamble 
+      ? PreambleBounds(0, false)
+      : PreambleBounds(PreambleBytes.size(), PreambleEndsAtStartOfLine);
   configurePreamble(Bounds, CI, VFS, MainFileBuffer);
 }
 
 void PrecompiledPreamble::OverridePreamble(
     CompilerInvocation &CI, IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
     llvm::MemoryBuffer *MainFileBuffer) const {
-  auto Bounds = ComputePreambleBounds(CI.getLangOpts(), *MainFileBuffer, 0);
+  // For proxy preambles, don't skip any bytes from the main file
+  // since the preamble was built from different content
+  PreambleBounds Bounds = IsProxyPreamble ?
+      PreambleBounds(0, false) :
+      ComputePreambleBounds(CI.getLangOpts(), *MainFileBuffer, 0);
+
   configurePreamble(Bounds, CI, VFS, MainFileBuffer);
 }
 
