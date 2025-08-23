@@ -12,6 +12,10 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#ifdef DMalterlib
+#include <Mib/Core/Core>
+#endif
+
 #include "clang/Format/Format.h"
 #include "DefinitionBlockSeparator.h"
 #include "IntegerLiteralSeparatorFixer.h"
@@ -23,6 +27,7 @@
 #include "UsingDeclarationsSorter.h"
 #include "clang/Tooling/Inclusions/HeaderIncludes.h"
 #include "llvm/ADT/Sequence.h"
+#include "clang/Lex/Lexer.h"
 
 #define DEBUG_TYPE "format-formatter"
 
@@ -1075,6 +1080,7 @@ template <> struct MappingTraits<FormatStyle> {
     IO.mapOptional("MacroBlockEnd", Style.MacroBlockEnd);
     IO.mapOptional("Macros", Style.Macros);
     IO.mapOptional("MainIncludeChar", Style.IncludeStyle.MainIncludeChar);
+    IO.mapOptional("MalterlibRules", Style.MalterlibRules);
     IO.mapOptional("MaxEmptyLinesToKeep", Style.MaxEmptyLinesToKeep);
     IO.mapOptional("NamespaceIndentation", Style.NamespaceIndentation);
     IO.mapOptional("NamespaceMacros", Style.NamespaceMacros);
@@ -1595,6 +1601,7 @@ FormatStyle getLLVMStyle(FormatStyle::LanguageKind Language) {
   LLVMStyle.LambdaBodyIndentation = FormatStyle::LBI_Signature;
   LLVMStyle.Language = Language;
   LLVMStyle.LineEnding = FormatStyle::LE_DeriveLF;
+  LLVMStyle.MalterlibRules = false;
   LLVMStyle.MaxEmptyLinesToKeep = 1;
   LLVMStyle.NamespaceIndentation = FormatStyle::NI_None;
   LLVMStyle.ObjCBinPackProtocolList = FormatStyle::BPS_Auto;
@@ -2624,6 +2631,736 @@ private:
   bool BinPackInconclusiveFunctions;
   FormattingAttemptStatus *Status;
 };
+
+#ifdef DMalterlib
+	/// MalterlibFormatter applies Malterlib-specific formatting rules.
+	struct CMalterlibFormatter : public TokenAnalyzer
+	{
+	public:
+		struct CTreeNode
+		{
+			TCVector<FormatToken *> m_PrefixTokens; // Tokens that appear before the children. Indented at BaseIndentation
+			TCVector<FormatToken *> m_PostfixTokens; // Tokens that appear after the children. Indented at BaseIndentation
+
+			// Hierarchy
+			CTreeNode *m_pParent = nullptr;
+			TCVector<TCUniquePointer<CTreeNode>> m_Children;
+
+			// Formatting state
+			mint m_BaseIndentation = 0;
+			bool m_bShouldBreak = false;  // Whether this nodes children should be broken on new lines
+
+			// Syntactic unit type (based on tokenizer output patterns)
+			enum class ENodeType
+			{
+				mc_Root,
+
+				mc_PreprocessorDirective, // #include, #define etc.
+
+				mc_Container,
+				mc_Expression,
+				mc_Identifier,
+
+				mc_Misc         // General expression
+			};
+			ENodeType m_NodeType = ENodeType::mc_Expression;
+
+			// Breaking priority - lower numbers break first
+			mint m_BreakPriority = 100;
+
+			// Constructor
+			CTreeNode(ENodeType _NodeType = ENodeType::mc_Expression)
+				: m_NodeType(_NodeType)
+			{
+			}
+
+			// Methods - inline implementations for now
+			mint f_MeasureLength() const
+			{
+				return 0;
+/*				// Simple stub: count characters between start and end tokens
+				if (!m_pStartToken || !m_pEndToken)
+					return 0;
+
+				mint nLength = 0;
+				FormatToken *pCurrent = m_pStartToken;
+				while (pCurrent && pCurrent != m_pEndToken->Next)
+				{
+					nLength += pCurrent->TokenText.size();
+					if (pCurrent->Next && pCurrent != m_pEndToken)
+						nLength += 1; // Space between tokens
+					pCurrent = pCurrent->Next;
+				}
+				return nLength + (m_BaseIndentation * 4); // Add indentation*/
+			}
+
+			bool f_ShouldBreak(mint _ColumnLimit) const
+			{
+				return f_MeasureLength() > _ColumnLimit;
+			}
+
+			void f_ApplyBreaking()
+			{
+				m_bShouldBreak = true;
+			}
+
+			CStr f_GenerateFormatted(mint _IndentLevel) const
+			{
+				return {};
+				/*
+				// Simple stub: return original tokens with basic spacing
+				CStr Result;
+
+				// Add indentation
+				for (mint i = 0; i < _IndentLevel; ++i)
+					Result += "\t";
+
+				if (m_pStartToken)
+				{
+					FormatToken *pCurrent = m_pStartToken;
+					while (pCurrent && pCurrent != m_pEndToken->Next)
+					{
+						Result += CStr(CInitByRange(), pCurrent->TokenText.begin(), pCurrent->TokenText.end());
+						if (pCurrent->Next && pCurrent != m_pEndToken)
+							Result += " ";
+						pCurrent = pCurrent->Next;
+					}
+				}
+
+				// Add children if this node is broken
+				if (m_bShouldBreak)
+				{
+					for (auto const &pChild : m_Children)
+					{
+						Result += "\n";
+						Result += pChild->f_GenerateFormatted(_IndentLevel + 1);
+					}
+				}
+
+				return Result;*/
+			}
+
+			bool f_HasLinesExceedingLimit(mint _ColumnLimit) const
+			{
+				if (f_ShouldBreak(_ColumnLimit))
+					return true;
+
+				for (auto const &pChild : m_Children)
+				{
+					if (pChild->f_HasLinesExceedingLimit(_ColumnLimit))
+						return true;
+				}
+
+				return false;
+			}
+
+			CTreeNode* f_FindHighestPriorityNodeToBreak()
+			{
+				// Find the node with the lowest break priority that exceeds the limit
+				CTreeNode *pBestNode = nullptr;
+				mint nBestPriority = 1000;
+
+				f_FindHighestPriorityNodeToBreakRecursive(this, pBestNode, nBestPriority);
+				return pBestNode;
+			}
+
+		private:
+			void f_FindHighestPriorityNodeToBreakRecursive(CTreeNode const *_pNode, CTreeNode *&_pBestNode, mint &_nBestPriority) const
+			{
+				if (!_pNode || _pNode->m_bShouldBreak)
+					return;
+
+				if (_pNode->f_ShouldBreak(190) && _pNode->m_BreakPriority < _nBestPriority)
+				{
+					_pBestNode = const_cast<CTreeNode*>(_pNode);
+					_nBestPriority = _pNode->m_BreakPriority;
+				}
+
+				for (auto const &pChild : _pNode->m_Children)
+					f_FindHighestPriorityNodeToBreakRecursive(pChild.f_Get(), _pBestNode, _nBestPriority);
+			}
+
+		public:
+		};
+
+		CMalterlibFormatter(const Environment &Env, const FormatStyle &Style)
+		  : TokenAnalyzer(Env, Style)
+		{
+
+		}
+
+		static CStr fs_FromStringRef(StringRef const &_StringRef)
+		{
+			return CStr(CInitByRange(), _StringRef.begin(), _StringRef.end());
+		}
+
+		static std::string fs_ToString(CStr const &_String)
+		{
+			return std::string(_String.f_GetStr(), _String.f_GetStr() + _String.f_GetLen());
+		}
+
+		static ch8 const *fs_LineTypeToString(LineType _LineType)
+		{
+			switch (_LineType)
+			{
+			case LT_Invalid: return "LT_Invalid";
+			case LT_AccessModifier: return "LT_AccessModifier";
+			case LT_ImportStatement: return "LT_ImportStatement";
+			case LT_ObjCDecl: return "LT_ObjCDecl";
+			case LT_ObjCMethodDecl: return "LT_ObjCMethodDecl";
+			case LT_ObjCProperty: return "LT_ObjCProperty";
+			case LT_Other: return "LT_Other";
+			case LT_PreprocessorDirective: return "LT_PreprocessorDirective";
+			case LT_VirtualFunctionDecl: return "LT_VirtualFunctionDecl";
+			case LT_ArrayOfStructInitializer: return "LT_ArrayOfStructInitializer";
+			case LT_CommentAbovePPDirective: return "LT_CommentAbovePPDirective";
+			case LT_RequiresExpression: return "LT_RequiresExpression";
+			case LT_SimpleRequirement: return "LT_SimpleRequirement";
+			}
+
+			return "Unknown";
+		}
+
+		std::pair<tooling::Replacements, unsigned> analyze(TokenAnnotator &Annotator, SmallVectorImpl<AnnotatedLine *> &AnnotatedLines, FormatTokenLexer &Tokens) override
+		{
+			AffectedRangeMgr.computeAffectedLines(AnnotatedLines);
+
+			auto fTestingLogTokenInfo = [&](this auto &_fThis, FormatToken &_Token, mint _Depth) -> void
+				{
+					DConOut2
+						(
+							"{} {} {} {} {} {}: {}\n"
+							, tok::getTokenName(_Token.Tok.getKind())
+							, getTokenTypeName(_Token.getType())
+							, _Token.ParameterCount
+							, _Token.BlockParameterCount
+							, tok::getTokenName(_Token.ParentBracket)
+							, !!_Token.MatchingParen
+							, fs_FromStringRef(_Token.TokenText)
+						)
+					;
+
+					for (auto &pChildLine : _Token.Children)
+					{
+						for (auto pToken = pChildLine->First; pToken; pToken = pToken->Next)
+							_fThis(*pToken, _Depth + 1);
+					}
+				}
+			;
+
+			auto fTestingLogToken = [&](this auto &_fThis, FormatToken &_Token, mint _Depth) -> void
+				{
+					SourceRange WSRange = _Token.WhitespaceRange;
+					SourceManager const &SM = Env.getSourceManager();
+					CharSourceRange CharRange = CharSourceRange::getCharRange(WSRange.getBegin(), WSRange.getEnd());
+					auto ExistingWS = fs_FromStringRef(Lexer::getSourceText(CharRange, SM, LangOpts));
+
+					DConOut2("{}{}", ExistingWS, fs_FromStringRef(_Token.TokenText));
+
+					for (auto &pChildLine : _Token.Children)
+					{
+						for (auto pToken = pChildLine->First; pToken; pToken = pToken->Next)
+							_fThis(*pToken, _Depth + 1);
+					}
+				}
+			;
+
+			auto fTestingLogLine = [&](this auto &_fThis, AnnotatedLine &_Line) -> void
+				{
+					DConOut2("Line Type: {} Children:  {}:\n", fs_LineTypeToString(_Line.Type), _Line.Children.size());
+					for (auto pToken = _Line.First; pToken; pToken = pToken->Next)
+						fTestingLogTokenInfo(*pToken, 0);
+					DConOut2("\n========================\n");
+					for (auto pToken = _Line.First; pToken; pToken = pToken->Next)
+						fTestingLogToken(*pToken, 0);
+					DConOut2("\n------------------------\n");
+				}
+			;
+
+			for (auto &pLine : AnnotatedLines)
+				fTestingLogLine(*pLine);
+
+			// Build tree structure from AnnotatedLines
+			auto pRootNode = f_BuildTree(AnnotatedLines);
+
+			// Progressive breaking until all lines fit within column limit
+			while (pRootNode->f_HasLinesExceedingLimit(190))
+			{
+				auto pNodeToBreak = pRootNode->f_FindHighestPriorityNodeToBreak();
+				if (!pNodeToBreak)
+					break;  // Nothing more to break
+				pNodeToBreak->f_ApplyBreaking();
+			}
+
+			// Generate final formatted string
+			CStr FormattedCode = pRootNode->f_GenerateFormatted(0);
+
+			// Create single replacement for whole file
+			tooling::Replacements Result;
+	/*		SourceManager const &SM = Env.getSourceManager();
+
+			// Get the full file range
+			SourceLocation FileStart = SM.getLocForStartOfFile(SM.getMainFileID());
+			SourceLocation FileEnd = SM.getLocForEndOfFile(SM.getMainFileID());
+			unsigned FileLength = SM.getFileOffset(FileEnd) - SM.getFileOffset(FileStart);
+
+			std::string FormattedStdString = fs_ToString(FormattedCode);
+			cantFail(Result.add({SM, FileStart, FileLength, StringRef(FormattedStdString)}));*/
+
+			return {Result, /*Penalties=*/0};
+/*
+			// --- Rule engines will progressively fill Result. ---
+			// Build hierarchical token tree (for future rules).
+			std::unique_ptr<Node> TokenTree = buildTokenTree(AnnotatedLines);
+
+			// Placeholder: future passes will walk TokenTree to enforce indentation,
+			// spacing, etc. For now we still rely on line-based indentation.
+
+			// --- Rule engines will progressively fill Result. ---
+			// 1. Indentation engine (tabs, width 4) – WIP placeholder
+			applyIndentationRules(AnnotatedLines, Result);
+
+			// Additional rule processors will be chained here in forthcoming commits.
+
+			// No penalty bookkeeping at the moment (return 0).
+	*/
+		}
+
+		// Build tree structure from AnnotatedLines
+		TCUniquePointer<CTreeNode> f_BuildTree(SmallVectorImpl<AnnotatedLine *> &AnnotatedLines)
+		{
+			TCUniquePointer<CTreeNode> pRootNode = fg_Construct(CTreeNode::ENodeType::mc_Root);
+
+			TCUniquePointer<CTreeNode> pCurrentNode;
+
+			auto fCommitNode = [&]
+				{
+					if (!pCurrentNode)
+						return;
+
+					pCurrentNode->m_pParent = pRootNode.f_Get();
+					pCurrentNode->m_BaseIndentation = 0;
+
+					pRootNode->m_Children.f_Insert(fg_Move(pCurrentNode));
+				}
+			;
+
+			auto fProcessToken = [&](this auto &_fThis, FormatToken &_Token) -> void
+				{
+					//pCurrentNode->m_Children
+
+					for (auto &pChildLine : _Token.Children)
+					{
+						for (auto pToken = pChildLine->First; pToken; pToken = pToken->Next)
+							_fThis(*pToken);
+					}
+
+/*					SourceRange WSRange = _Token.WhitespaceRange;
+					SourceManager const &SM = Env.getSourceManager();
+					CharSourceRange CharRange = CharSourceRange::getCharRange(WSRange.getBegin(), WSRange.getEnd());
+					auto ExistingWS = fs_FromStringRef(Lexer::getSourceText(CharRange, SM, LangOpts));
+
+					DConOut2("{}{}", ExistingWS, fs_FromStringRef(_Token.TokenText));
+
+					for (auto &pChildLine : _Token.Children)
+					{
+						for (auto pToken = pChildLine->First; pToken; pToken = pToken->Next)
+							_fThis(*pToken, _Depth + 1);
+					}*/
+				}
+			;
+
+			auto fProcessLine = [&](this auto &_fThis, AnnotatedLine &_Line) -> void
+				{
+					bool bShouldCommit = true;
+					if (_Line.InMacroBody)
+					{
+						bShouldCommit = false;
+					}
+					else if (_Line.InPPDirective)
+					{
+						fCommitNode();
+						pCurrentNode = fg_Construct(CTreeNode::ENodeType::mc_PreprocessorDirective);
+						bShouldCommit = false;
+					}
+					else if (!_Line.InPPDirective)
+						fCommitNode();
+					else
+					{
+						assert(!pCurrentNode && "Add logic for handling this case");
+					}
+
+					if (!pCurrentNode)
+						pCurrentNode = fg_Construct(CTreeNode::ENodeType::mc_Misc);
+
+					for (auto pToken = _Line.First; pToken; pToken = pToken->Next)
+						fProcessToken(*pToken);
+
+					if (bShouldCommit)
+						fCommitNode();
+				}
+			;
+
+			for (auto &pLine : AnnotatedLines)
+				fProcessLine(*pLine);
+
+
+/*			for (auto pLine : AnnotatedLines)
+			{
+				if (!pLine->First)
+					continue;
+
+				// Create a line node for each AnnotatedLine
+				TCUniquePointer<CTreeNode> pLineNode = fg_Construct(pLine->First, pLine->Last, CTreeNode::ENodeType::mc_Misc);
+				pLineNode->m_pParent = pRootNode.f_Get();
+				pLineNode->m_BaseIndentation = 0;
+
+				// Analyze tokens in the line to create sub-nodes
+				f_AnalyzeLineTokens(pLineNode.f_Get(), pLine->First);
+
+				pRootNode->m_Children.f_Insert(fg_Move(pLineNode));
+			}*/
+
+			return pRootNode;
+		}
+/*
+		// Analyze tokens within a line to create appropriate sub-nodes
+		void f_AnalyzeLineTokens(CTreeNode *_pLineNode, FormatToken *_pFirst)
+		{
+			FormatToken *pCurrent = _pFirst;
+
+			while (pCurrent)
+			{
+				// Check for specific patterns and create appropriate nodes
+				if (pCurrent->is(tok::hash))
+				{
+					// Preprocessor directive
+					auto pNode = f_CreatePreprocessorNode(pCurrent);
+					if (pNode)
+					{
+						pNode->m_pParent = _pLineNode;
+						pCurrent = pNode->m_pEndToken->Next;
+						_pLineNode->m_Children.f_Insert(fg_Move(pNode));
+						continue;
+					}
+				}
+				else if (pCurrent->isOneOf(tok::identifier, tok::kw_auto) && pCurrent->Next && pCurrent->Next->is(tok::l_paren))
+				{
+					// Function call pattern: identifier(
+					auto pNode = f_CreateFunctionCallNode(pCurrent);
+					if (pNode)
+					{
+						pNode->m_pParent = _pLineNode;
+						pCurrent = pNode->m_pEndToken->Next;
+						_pLineNode->m_Children.f_Insert(fg_Move(pNode));
+						continue;
+					}
+				}
+				else if (pCurrent->is(tok::l_paren))
+				{
+					// Parameter/argument list
+					auto pNode = f_CreateParameterListNode(pCurrent);
+					if (pNode)
+					{
+						pNode->m_pParent = _pLineNode;
+						pCurrent = pNode->m_pEndToken->Next;
+						_pLineNode->m_Children.f_Insert(fg_Move(pNode));
+						continue;
+					}
+				}
+				else if (pCurrent->is(tok::less) && pCurrent->getType() == TT_TemplateOpener)
+				{
+					// Template arguments
+					auto pNode = f_CreateTemplateArgumentsNode(pCurrent);
+					if (pNode)
+					{
+						pNode->m_pParent = _pLineNode;
+						pCurrent = pNode->m_pEndToken->Next;
+						_pLineNode->m_Children.f_Insert(fg_Move(pNode));
+						continue;
+					}
+				}
+
+				pCurrent = pCurrent->Next;
+			}
+		}
+*/
+		/*
+		// Create preprocessor directive node
+		TCUniquePointer<CTreeNode> f_CreatePreprocessorNode(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->is(tok::hash))
+				return nullptr;
+
+			FormatToken *pEnd = _pStart;
+			while (pEnd->Next && !pEnd->Next->is(tok::eof))
+				pEnd = pEnd->Next;
+
+			TCUniquePointer<CTreeNode> pNode = fg_Construct(_pStart, pEnd, CTreeNode::ENodeType::mc_PreprocessorDirective);
+			pNode->m_BreakPriority = 10; // High priority to break preprocessor directives
+			return pNode;
+		}
+
+		// Create function call node
+		TCUniquePointer<CTreeNode> f_CreateFunctionCallNode(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->Next || !_pStart->Next->is(tok::l_paren))
+				return nullptr;
+
+			FormatToken *pEnd = f_FindMatchingParen(_pStart->Next);
+			if (!pEnd)
+				return nullptr;
+
+			TCUniquePointer<CTreeNode> pNode = fg_Construct(_pStart, pEnd, CTreeNode::ENodeType::mc_FunctionCall);
+			pNode->m_BreakPriority = 30; // Medium priority for function calls
+			return pNode;
+		}
+
+		// Create parameter list node
+		TCUniquePointer<CTreeNode> f_CreateParameterListNode(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->is(tok::l_paren))
+				return nullptr;
+
+			FormatToken *pEnd = f_FindMatchingParen(_pStart);
+			if (!pEnd)
+				return nullptr;
+
+			TCUniquePointer<CTreeNode> pNode = fg_Construct(_pStart, pEnd, CTreeNode::ENodeType::mc_ParameterList);
+			pNode->m_BreakPriority = 20; // High priority for parameter lists
+			return pNode;
+		}
+
+		// Create template arguments node
+		TCUniquePointer<CTreeNode> f_CreateTemplateArgumentsNode(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->is(tok::less))
+				return nullptr;
+
+			FormatToken *pEnd = f_FindMatchingTemplateCloser(_pStart);
+			if (!pEnd)
+				return nullptr;
+
+			TCUniquePointer<CTreeNode> pNode = fg_Construct(_pStart, pEnd, CTreeNode::ENodeType::mc_TemplateArguments);
+			pNode->m_BreakPriority = 25; // Medium-high priority for template args
+			return pNode;
+		}
+		 */
+
+		// Helper to find matching parenthesis
+		FormatToken* f_FindMatchingParen(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->is(tok::l_paren))
+				return nullptr;
+
+			int nDepth = 1;
+			FormatToken *pCurrent = _pStart->Next;
+
+			while (pCurrent && nDepth > 0)
+			{
+				if (pCurrent->is(tok::l_paren))
+					nDepth++;
+				else if (pCurrent->is(tok::r_paren))
+					nDepth--;
+
+				if (nDepth == 0)
+					return pCurrent;
+
+				pCurrent = pCurrent->Next;
+			}
+
+			return nullptr;
+		}
+
+		// Helper to find matching template closer
+		FormatToken* f_FindMatchingTemplateCloser(FormatToken *_pStart)
+		{
+			if (!_pStart || !_pStart->is(tok::less))
+				return nullptr;
+
+			int nDepth = 1;
+			FormatToken *pCurrent = _pStart->Next;
+
+			while (pCurrent && nDepth > 0)
+			{
+				if (pCurrent->is(tok::less) && pCurrent->getType() == TT_TemplateOpener)
+					nDepth++;
+				else if (pCurrent->is(tok::greater) && pCurrent->getType() == TT_TemplateCloser)
+					nDepth--;
+
+				if (nDepth == 0)
+					return pCurrent;
+
+				pCurrent = pCurrent->Next;
+			}
+
+			return nullptr;
+		}
+
+		// Implementation of CTreeNode methods would go here, but let me add simple stubs for now
+		// to get the basic structure compiling
+
+	private:
+		/*
+	  enum class NodeKind { Root, Block, PPDirective, Leaf };
+
+	  struct Node {
+		NodeKind Kind;
+		SmallVector<FormatToken *, 16> Tokens;
+		// Children together with the token index after which they appear.
+		struct ChildInfo {
+		  size_t InsertIndex;
+		  std::unique_ptr<Node> Child;
+		};
+		SmallVector<ChildInfo, 8> Children;
+		Node *Parent = nullptr;
+
+		explicit Node(NodeKind K, Node *P = nullptr) : Kind(K), Parent(P) {}
+
+		Node *addChild(NodeKind K, size_t AfterTokenIndex) {
+		  Children.push_back({AfterTokenIndex, std::make_unique<Node>(K, this)});
+		  return Children.back().Child.get();
+		}
+	  };
+
+	  // Build hierarchical tree of tokens.
+	  std::unique_ptr<Node> buildTokenTree(SmallVectorImpl<AnnotatedLine *> &Lines) {
+		auto Root = std::make_unique<Node>(NodeKind::Root, nullptr);
+		Node *Current = Root.get();
+
+		for (AnnotatedLine *Line : Lines) {
+		  if (Line->InPPDirective) {
+			Node *PPNode = Current->addChild(NodeKind::PPDirective, 0);
+			for (FormatToken *Tok = Line->First; Tok; Tok = Tok->Next)
+			  PPNode->Tokens.push_back(Tok);
+			continue;
+		  }
+
+		  for (FormatToken *Tok = Line->First; Tok; Tok = Tok->Next) {
+			if (Tok->is(tok::l_brace)) {
+			  Node *Block = Current->addChild(NodeKind::Block, Tok->Tok.getEndLoc().getLocWithOffset(1));
+			  Block->Tokens.push_back(Tok);
+			  Current = Block;
+			} else if (Tok->is(tok::r_brace)) {
+			  Current->Tokens.push_back(Tok);
+			  if (Current->Parent)
+				Current = Current->Parent;
+			} else {
+			  Current->Tokens.push_back(Tok);
+			}
+		  }
+
+		  // Recurse into children lines.
+		  if (!Line->Children.empty()) {
+			auto ChildTree = buildTokenTree(Line->Children);
+			if (ChildTree) {
+			  Current->Children.push_back({Tok->Tok.getEndLoc().getLocWithOffset(1), std::move(ChildTree)});
+			  ChildTree->Parent = Current;
+			}
+		  }
+		}
+		return Root;
+	  }
+
+	  /// Recursively walks annotated lines and enforces Tab-only indentation.
+	  /// This is a *placeholder* – actual replacement generation will be added in
+	  // the dedicated task "indentation_engine".
+	  void applyIndentationRules(SmallVectorImpl<AnnotatedLine *> &Lines,
+								 tooling::Replacements &Result) {
+		for (AnnotatedLine *Line : Lines) {
+		  if (Line->Affected)
+			rewriteIndent(Line, Line->Level, Result);
+
+		  applyIndentationRules(Line->Children, Result);
+		}
+	  }
+
+	  // Rewrites leading whitespace to the specified number of tab characters while
+	  // preserving any preceding newlines.
+	  void rewriteIndent(AnnotatedLine *Line, unsigned Tabs,
+						 tooling::Replacements &Result) {
+		std::string IndentTabs(Tabs, '\t');
+
+		SourceRange WSRange = Line->First->WhitespaceRange;
+		if (WSRange.getBegin().isInvalid() || WSRange.getEnd().isInvalid())
+		  return;
+
+		const SourceManager &SM = Env.getSourceManager();
+		CharSourceRange CharRange =
+			CharSourceRange::getCharRange(WSRange.getBegin(), WSRange.getEnd());
+		StringRef ExistingWS = Lexer::getSourceText(CharRange, SM, LangOpts);
+
+		size_t NLPos = ExistingWS.find_last_of('\n');
+		if (NLPos == StringRef::npos)
+		  return; // Not at start of line.
+
+		StringRef Prefix = ExistingWS.substr(0, NLPos + 1);
+		std::string NewWS = (Prefix + IndentTabs).str();
+
+		if (ExistingWS == NewWS)
+		  return;
+
+		tooling::Replacement Rep(SM, WSRange.getBegin(), ExistingWS.size(),
+								 StringRef(NewWS));
+		cantFail(Result.add(Rep));
+	  }
+
+	  // Reconstruct the file exactly from token stream.
+	  std::string reconstructFile(const SmallVectorImpl<AnnotatedLine *> &Lines,
+								  const SourceManager &SM) {
+		std::string Rebuilt;
+		llvm::raw_string_ostream OS(Rebuilt);
+
+		std::function<void(AnnotatedLine *)> EmitLine = [&](AnnotatedLine *L) {
+		  for (FormatToken *Tok = L->First; Tok; Tok = Tok->Next) {
+			SourceRange WSRange = Tok->WhitespaceRange;
+			if (!WSRange.isInvalid()) {
+			  CharSourceRange CR = CharSourceRange::getCharRange(WSRange.getBegin(),
+																WSRange.getEnd());
+			  StringRef WS = Lexer::getSourceText(CR, SM, LangOpts);
+			  OS << WS;
+			}
+			OS << Tok->TokenText;
+		  }
+		  for (AnnotatedLine *Child : L->Children)
+			EmitLine(Child);
+		};
+
+		for (AnnotatedLine *Top : Lines)
+		  EmitLine(Top);
+
+		OS.flush();
+		return Rebuilt;
+	  }
+
+	  // Serialize node back to code respecting child insertion order.
+	  void emitNode(const Node *N, llvm::raw_string_ostream &OS,
+					const SourceManager &SM) {
+		size_t TokIndex = 0;
+		size_t ChildIdx = 0;
+		for (; TokIndex < N->Tokens.size(); ++TokIndex) {
+		  // If any child should be emitted after this token, do so.
+		  while (ChildIdx < N->Children.size() &&
+				 N->Children[ChildIdx].InsertIndex == TokIndex) {
+			emitNode(N->Children[ChildIdx].Child.get(), OS, SM);
+			++ChildIdx;
+		  }
+
+		  FormatToken *Tok = N->Tokens[TokIndex];
+		  SourceRange WSRange = Tok->WhitespaceRange;
+		  if (!WSRange.isInvalid()) {
+			CharSourceRange CR =
+				CharSourceRange::getCharRange(WSRange.getBegin(), WSRange.getEnd());
+			OS << Lexer::getSourceText(CR, SM, LangOpts);
+		  }
+		  OS << Tok->TokenText;
+		}
+		// Emit remaining children (if they follow the last token).
+		for (; ChildIdx < N->Children.size(); ++ChildIdx)
+		  emitNode(N->Children[ChildIdx].Child.get(), OS, SM);
+	  }*/
+	};
+#endif
 
 /// TrailingCommaInserter inserts trailing commas into container literals.
 /// E.g.:
@@ -3835,9 +4572,18 @@ reformat(const FormatStyle &Style, StringRef Code,
     });
   }
 
-  Passes.emplace_back([&](const Environment &Env) {
-    return Formatter(Env, Expanded, Status).process();
-  });
+  // Add Malterlib formatting pass if enabled
+  if (Style.MalterlibRules) {
+#ifdef DMalterlib
+    Passes.emplace_back([&](const Environment &Env) {
+      return CMalterlibFormatter(Env, Expanded).process();
+    });
+#endif
+  } else {
+    Passes.emplace_back([&](const Environment &Env) {
+      return Formatter(Env, Expanded, Status).process();
+    });
+  }
 
   if (Style.isJavaScript() &&
       Style.InsertTrailingCommas == FormatStyle::TCS_Wrapped) {
