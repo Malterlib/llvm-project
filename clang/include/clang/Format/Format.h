@@ -3229,6 +3229,13 @@ struct FormatStyle {
   /// \version 16
   bool InsertNewlineAtEOF;
 
+  /// Apply Malterlib-specific formatting rules.
+  /// When enabled, applies custom formatting rules according to the Malterlib
+  /// coding standard. This option takes precedence over conflicting individual
+  /// formatting options.
+  /// \version 20
+  bool MalterlibRules;
+
   /// The style of inserting trailing commas into container literals.
   enum TrailingCommaStyle : int8_t {
     /// Do not insert trailing commas.
@@ -5751,6 +5758,7 @@ struct FormatStyle {
            IndentWrappedFunctionNames == R.IndentWrappedFunctionNames &&
            InsertBraces == R.InsertBraces &&
            InsertNewlineAtEOF == R.InsertNewlineAtEOF &&
+           MalterlibRules == R.MalterlibRules &&
            IntegerLiteralSeparator == R.IntegerLiteralSeparator &&
            JavaImportGroups == R.JavaImportGroups &&
            JavaScriptQuotes == R.JavaScriptQuotes &&
