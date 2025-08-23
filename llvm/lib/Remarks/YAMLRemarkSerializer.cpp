@@ -136,7 +136,7 @@ YAMLRemarkSerializer::YAMLRemarkSerializer(raw_ostream &OS)
       YAMLOutput(OS, reinterpret_cast<void *>(this)) {}
 
 YAMLRemarkSerializer::YAMLRemarkSerializer(raw_ostream &OS,
-                                           StringTable StrTabIn)
+                                           remarks::StringTable StrTabIn)
     : YAMLRemarkSerializer(OS) {
   StrTab = std::move(StrTabIn);
 }
