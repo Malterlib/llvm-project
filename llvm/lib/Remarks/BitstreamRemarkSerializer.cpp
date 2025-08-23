@@ -90,7 +90,7 @@ void BitstreamRemarkSerializerHelper::setupMetaStrTab() {
 }
 
 void BitstreamRemarkSerializerHelper::emitMetaStrTab(
-    const StringTable &StrTab) {
+    const remarks::StringTable &StrTab) {
   // The string table is not emitted if we emit remarks separately.
   R.clear();
   R.push_back(RECORD_META_STRTAB);
@@ -247,7 +247,7 @@ void BitstreamRemarkSerializerHelper::emitMetaBlock(
 }
 
 void BitstreamRemarkSerializerHelper::emitLateMetaBlock(
-    const StringTable &StrTab) {
+    const remarks::StringTable &StrTab) {
   // Emit the late meta block (after all remarks are serialized)
   Bitstream.EnterSubblock(META_BLOCK_ID, 3);
   emitMetaStrTab(StrTab);
@@ -255,7 +255,7 @@ void BitstreamRemarkSerializerHelper::emitLateMetaBlock(
 }
 
 void BitstreamRemarkSerializerHelper::emitRemark(const Remark &Remark,
-                                                 StringTable &StrTab) {
+                                                 remarks::StringTable &StrTab) {
   Bitstream.EnterSubblock(REMARK_BLOCK_ID, 4);
 
   R.clear();
@@ -310,7 +310,7 @@ BitstreamRemarkSerializer::BitstreamRemarkSerializer(raw_ostream &OS)
 }
 
 BitstreamRemarkSerializer::BitstreamRemarkSerializer(raw_ostream &OS,
-                                                     StringTable StrTabIn)
+                                                     remarks::StringTable StrTabIn)
     : RemarkSerializer(Format::Bitstream, OS) {
   StrTab = std::move(StrTabIn);
 }

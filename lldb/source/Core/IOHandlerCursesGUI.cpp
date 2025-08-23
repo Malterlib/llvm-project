@@ -7150,7 +7150,8 @@ public:
           bool wasWritten = window.OutputColoredStringTruncated(
               1, line, m_first_visible_column, is_pc_line,
               line_is_selected && !is_pc_line);
-          if (!wasWritten && (line_is_selected || is_pc_line)) {
+          if ((!wasWritten && (line_is_selected || is_pc_line)) ||
+              (line_is_selected && is_pc_line)) {
             // Draw an empty space to show the selected/PC line if empty,
             // or draw '<' if nothing is visible because of scrolling too much
             // to the right.
