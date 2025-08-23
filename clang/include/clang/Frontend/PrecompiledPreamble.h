@@ -132,6 +132,24 @@ public:
                         IntrusiveRefCntPtr<llvm::vfs::FileSystem> &VFS,
                         llvm::MemoryBuffer *MainFileBuffer) const;
 
+  /// Clear the preamble bytes. Used in proxy mode where we don't want to skip
+  /// any bytes when parsing the main file.
+  void clearPreambleBytes() {
+    PreambleBytes.clear();
+    PreambleEndsAtStartOfLine = false;
+  }
+
+  /// Mark this preamble as being built from a proxy file.
+  /// This affects how the preamble is applied to the main file.
+  void setIsProxyPreamble() {
+    IsProxyPreamble = true;
+  }
+
+  /// Check if this preamble was built from a proxy file.
+  bool isProxyPreamble() const {
+    return IsProxyPreamble;
+  }
+
 private:
   PrecompiledPreamble(std::unique_ptr<PCHStorage> Storage,
                       std::vector<char> PreambleBytes,
@@ -205,6 +223,8 @@ private:
   std::vector<char> PreambleBytes;
   /// See PreambleBounds::PreambleEndsAtStartOfLine
   bool PreambleEndsAtStartOfLine;
+  /// Whether this preamble was built from a proxy file (different from main file)
+  bool IsProxyPreamble = false;
 };
 
 /// A set of callbacks to gather useful information while building a preamble.

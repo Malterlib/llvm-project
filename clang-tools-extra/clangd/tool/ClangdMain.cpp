@@ -370,7 +370,8 @@ opt<bool> Test{
     cat(Misc),
     desc("Abbreviation for -input-style=delimited -pretty -sync "
          "-enable-test-scheme -enable-config=0 -log=verbose -crash-pragmas. "
-         "Also sets config options: Index.StandardLibrary=false. "
+         "Also sets config options: Index.StandardLibrary=false, "
+         "CompileFlags.HeaderCompilation=Isolated. "
          "Intended to simplify lit tests"),
     init(false),
     Hidden,
@@ -484,6 +485,22 @@ opt<bool> PrettyPrint{
     cat(Protocol),
     desc("Pretty-print JSON output"),
     init(false),
+};
+
+enum class HeaderCompilationMode { InContext, Isolated };
+opt<HeaderCompilationMode> HeaderCompilation{
+    "header-compilation",
+    cat(Features),
+    desc("How to compile a header without a compile command, unless the "
+         "configuration says, CompileFlags.HeaderCompilation"),
+    values(clEnumValN(HeaderCompilationMode::InContext, "InContext",
+                      "In the context of a source file that includes it, "
+                      "for accurate diagnostics (default); a file without a "
+                      "compile command and without one isn't parsed"),
+           clEnumValN(HeaderCompilationMode::Isolated, "Isolated",
+                      "In isolation, with inferred flags, like any file "
+                      "without a compile command")),
+    init(HeaderCompilationMode::InContext),
 };
 
 opt<bool> EnableConfig{
@@ -672,6 +689,26 @@ std::optional<bool> shouldEnableFunctionArgSnippets() {
          "config instead.");
   return std::nullopt;
 }
+
+/// The defaults of the clangd tool that differ from those of the library,
+/// under every other configuration: headers compiled in the context of a
+/// file that includes them, CompileFlags.HeaderCompilation=InContext, unless
+/// --header-compilation=Isolated, or in -lit-test mode, whose tests expect
+/// the upstream behavior, unless it is given.
+class DefaultsConfigProvider : public config::Provider {
+  std::vector<config::CompiledFragment>
+  getFragments(const config::Params &,
+               config::DiagnosticCallback) const override {
+    if (HeaderCompilation.getNumOccurrences()
+            ? HeaderCompilation == HeaderCompilationMode::Isolated
+            : bool(Test))
+      return {};
+    return {[](const config::Params &, Config &C) {
+      C.CompileFlags.CompileHeadersInContext = true;
+      return true;
+    }};
+  }
+};
 
 class FlagsConfigProvider : public config::Provider {
 private:
@@ -998,6 +1035,8 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
   RealThreadsafeFS TFS;
   std::vector<std::unique_ptr<config::Provider>> ProviderStack;
   std::unique_ptr<config::Provider> Config;
+  // First, so every other configuration overrides it.
+  ProviderStack.push_back(std::make_unique<DefaultsConfigProvider>());
   if (EnableConfig) {
     ProviderStack.push_back(
         config::Provider::fromAncestorRelativeYAMLFiles(".clangd", TFS));
