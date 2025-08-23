@@ -504,6 +504,34 @@ TEST_F(BackgroundIndexTest, DirectIncludesTest) {
               emptyIncludeNode());
 }
 
+#ifdef CLANGD_PATH_CASE_INSENSITIVE
+TEST_F(BackgroundIndexTest, IndexedTUForHeaderIgnoresCase) {
+  MockFS FS;
+  std::string Header = testPath("root/A.h");
+  std::string Main = testPath("root/A.cc");
+  FS.Files[Header] = "void common();";
+  FS.Files[Main] = "#include \"A.h\"\nvoid g() { (void)common; }";
+
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = Main;
+  Cmd.Directory = testPath("root");
+  Cmd.CommandLine = {"clang++", Main};
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  CDB.setCompileCommand(Main, Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  std::string HeaderWithDifferentCase = llvm::StringRef(Header).lower();
+  ASSERT_NE(HeaderWithDifferentCase, Header);
+  EXPECT_EQ(Idx.indexedTUForHeader(HeaderWithDifferentCase), Main);
+}
+#endif
+
 TEST_F(BackgroundIndexTest, ShardStorageLoad) {
   MockFS FS;
   FS.Files[testPath("root/A.h")] = R"cpp(

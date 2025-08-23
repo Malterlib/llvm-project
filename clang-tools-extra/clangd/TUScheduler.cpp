@@ -72,11 +72,13 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/StringSaver.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -250,14 +252,19 @@ class TUScheduler::HeaderIncluderCache {
   // files, as each can have a large number of transitive headers.
   // This representation is O(unique transitive source files).
   llvm::BumpPtrAllocator Arena;
+  llvm::StringSaver Strings;
   struct Association {
     llvm::StringRef MainFile;
     // Circular-linked-list of associations with the same mainFile.
     // Null indicates that the mainfile was removed.
     Association *Next;
   };
+  struct MainFileEntry {
+    llvm::StringRef MainFile;
+    Association *First = nullptr;
+  };
   llvm::StringMap<Association, llvm::BumpPtrAllocator &> HeaderToMain;
-  llvm::StringMap<Association *, llvm::BumpPtrAllocator &> MainToFirst;
+  llvm::StringMap<MainFileEntry, llvm::BumpPtrAllocator &> MainToFirst;
   std::atomic<size_t> UsedBytes; // Updated after writes.
   mutable std::mutex Mu;
 
@@ -275,7 +282,7 @@ class TUScheduler::HeaderIncluderCache {
                          llvm::ArrayRef<std::string> Headers) {
     Association *First = nullptr, *Prev = nullptr;
     for (const std::string &Header : Headers) {
-      auto &Assoc = HeaderToMain[Header];
+      auto &Assoc = HeaderToMain[maybeCaseFoldPath(Header)];
       if (Assoc.Next)
         continue; // Already has a valid association.
 
@@ -302,7 +309,8 @@ class TUScheduler::HeaderIncluderCache {
   }
 
 public:
-  HeaderIncluderCache() : HeaderToMain(Arena), MainToFirst(Arena) {
+  HeaderIncluderCache()
+      : Strings(Arena), HeaderToMain(Arena), MainToFirst(Arena) {
     updateMemoryUsage();
   }
 
@@ -310,11 +318,13 @@ public:
   // Headers not in the list will have their associations removed.
   void update(PathRef MainFile, llvm::ArrayRef<std::string> Headers) {
     std::lock_guard<std::mutex> Lock(Mu);
-    auto It = MainToFirst.try_emplace(MainFile, nullptr);
-    Association *&First = It.first->second;
+    auto It = MainToFirst.try_emplace(maybeCaseFoldPath(MainFile));
+    MainFileEntry &Entry = It.first->second;
+    Entry.MainFile = Strings.save(MainFile);
+    Association *&First = Entry.First;
     if (First)
       invalidate(First);
-    First = associate(It.first->first(), Headers);
+    First = associate(Entry.MainFile, Headers);
     updateMemoryUsage();
   }
 
@@ -323,7 +333,7 @@ public:
   // will be eligible for association with other files that get update()d.
   void remove(PathRef MainFile) {
     std::lock_guard<std::mutex> Lock(Mu);
-    Association *&First = MainToFirst[MainFile];
+    Association *&First = MainToFirst[maybeCaseFoldPath(MainFile)].First;
     if (First) {
       invalidate(First);
       First = nullptr;
@@ -335,7 +345,7 @@ public:
   /// Get the mainfile associated with Header, or the empty string if none.
   std::string get(PathRef Header) const {
     std::lock_guard<std::mutex> Lock(Mu);
-    return HeaderToMain.lookup(Header).MainFile.str();
+    return HeaderToMain.lookup(maybeCaseFoldPath(Header)).MainFile.str();
   }
 
   size_t getUsedBytes() const {
@@ -347,6 +357,19 @@ namespace {
 
 bool isReliable(const tooling::CompileCommand &Cmd) {
   return Cmd.Heuristic.empty();
+}
+
+Diag missingReliableCommandDiag(PathRef File) {
+  Diag D;
+  D.Message =
+      "clangd cannot reliably parse this file: no compile command was found "
+      "and no indexed source file context is available";
+  D.File = File.str();
+  D.AbsFile = File.str();
+  D.Severity = DiagnosticsEngine::Error;
+  D.Source = Diag::Clangd;
+  D.InsideMainFile = true;
+  return D;
 }
 
 /// Threadsafe manager for updating a TUStatus and emitting it after each
@@ -646,6 +669,8 @@ public:
 
   /// Returns compile command from the current file inputs.
   tooling::CompileCommand getCurrentCompileCommand() const;
+  /// Returns the current file inputs.
+  ParseInputs getCurrentInputs() const;
 
   /// Wait for the first build of preamble to finish. Preamble itself can be
   /// accessed via getPossiblyStalePreamble(). Note that this function will
@@ -713,6 +738,7 @@ private:
   /// Handles retention of ASTs.
   TUScheduler::ASTCache &IdleASTs;
   TUScheduler::HeaderIncluderCache &HeaderIncluders;
+  const std::function<std::string(PathRef)> IndexedHeaderIncluder;
   const bool RunSync;
   /// Time to wait after an update to see whether another update obsoletes it.
   const DebouncePolicy UpdateDebounce;
@@ -805,7 +831,8 @@ public:
   /// the ASTWorkerHandle. However, no new requests to an active ASTWorker can
   /// be schedule via the returned reference, i.e. only reads of the preamble
   /// are possible.
-  std::shared_ptr<const ASTWorker> lock() { return Worker; }
+  std::shared_ptr<const ASTWorker> lock() const { return Worker; }
+  std::shared_ptr<ASTWorker> lockMutable() { return Worker; }
 
 private:
   std::shared_ptr<ASTWorker> Worker;
@@ -837,7 +864,8 @@ ASTWorker::ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
                      Semaphore &Barrier, bool RunSync,
                      const TUScheduler::Options &Opts,
                      ParsingCallbacks &Callbacks)
-    : IdleASTs(LRUCache), HeaderIncluders(HeaderIncluders), RunSync(RunSync),
+    : IdleASTs(LRUCache), HeaderIncluders(HeaderIncluders),
+      IndexedHeaderIncluder(Opts.IndexedHeaderIncluder), RunSync(RunSync),
       UpdateDebounce(Opts.UpdateDebounce), FileName(FileName),
       ContextProvider(Opts.ContextProvider), CDB(CDB), Callbacks(Callbacks),
       Barrier(Barrier), Done(false), Status(FileName, Callbacks),
@@ -870,25 +898,68 @@ void ASTWorker::update(ParseInputs Inputs, WantDiagnostics WantDiags,
     // "PreparingBuild" status to inform users, it is non-trivial given the
     // current implementation.
     auto Cmd = CDB.getCompileCommand(FileName);
+    if (Cmd && !isReliable(*Cmd))
+      Cmd.reset();
+
     // If we don't have a reliable command for this file, it may be a header.
     // Try to find a file that includes it, to borrow its command.
-    if (!Cmd || !isReliable(*Cmd)) {
+    if (!Cmd) {
       std::string ProxyFile = HeaderIncluders.get(FileName);
+      bool ProxyFromOpenFile = !ProxyFile.empty();
+      if (ProxyFile.empty() && IndexedHeaderIncluder)
+        ProxyFile = IndexedHeaderIncluder(FileName);
       if (!ProxyFile.empty()) {
         auto ProxyCmd = CDB.getCompileCommand(ProxyFile);
         if (!ProxyCmd || !isReliable(*ProxyCmd)) {
           // This command is supposed to be reliable! It's probably gone.
-          HeaderIncluders.remove(ProxyFile);
+          if (ProxyFromOpenFile)
+            HeaderIncluders.remove(ProxyFile);
         } else {
           // We have a reliable command for an including file, use it.
-          Cmd = tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+          if (Config::current().CompileFlags.CompileHeadersInContext) {
+            // For header-in-context mode:
+            // Store the proxy command for preamble building
+            Inputs.ProxyCompileCommand = *ProxyCmd;
+
+            // Transfer the command to the header file for the main compilation
+            Cmd =
+                tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+            Cmd->Heuristic = "header-in-context via " + ProxyFile;
+
+            // Store the target header so preamble building knows when to stop
+            Inputs.TargetHeaderFile = FileName;
+          } else {
+            // Traditional behavior: transfer compile command to the header
+            Cmd =
+                tooling::transferCompileCommand(std::move(*ProxyCmd), FileName);
+          }
         }
       }
     }
-    if (Cmd)
-      Inputs.CompileCommand = std::move(*Cmd);
-    else
+
+    if (!Cmd) {
       Inputs.CompileCommand = CDB.getFallbackCommand(FileName);
+      IdleASTs.take(this);
+      RanASTCallback = false;
+      {
+        std::lock_guard<std::mutex> Lock(Mutex);
+        FileInputs = Inputs;
+        LatestPreamble.emplace();
+      }
+      PreambleCV.notify_all();
+
+      std::vector<Diag> Diags;
+      Diags.push_back(missingReliableCommandDiag(FileName));
+      Callbacks.onFailedAST(FileName, Inputs.Version, std::move(Diags),
+                            [&](llvm::function_ref<void()> Publish) {
+                              std::lock_guard<std::mutex> Lock(PublishMu);
+                              if (CanPublishResults)
+                                Publish();
+                            });
+      return;
+    }
+
+    Inputs.CompileCommand = std::move(*Cmd);
 
     bool InputsAreTheSame =
         std::tie(FileInputs.CompileCommand, FileInputs.Contents) ==
@@ -1285,6 +1356,11 @@ tooling::CompileCommand ASTWorker::getCurrentCompileCommand() const {
   return FileInputs.CompileCommand;
 }
 
+ParseInputs ASTWorker::getCurrentInputs() const {
+  std::unique_lock<std::mutex> Lock(Mutex);
+  return FileInputs;
+}
+
 TUScheduler::FileStats ASTWorker::stats() const {
   TUScheduler::FileStats Result;
   Result.ASTBuilds = ASTBuildCount;
@@ -1651,7 +1727,10 @@ TUScheduler::TUScheduler(const GlobalCompilationDatabase &CDB,
 
 TUScheduler::~TUScheduler() {
   // Notify all workers that they need to stop.
-  Files.clear();
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Files.clear();
+  }
 
   // Wait for all in-flight tasks to finish.
   if (PreambleTasks)
@@ -1661,8 +1740,15 @@ TUScheduler::~TUScheduler() {
 }
 
 bool TUScheduler::blockUntilIdle(Deadline D) const {
-  for (auto &File : Files)
-    if (!File.getValue()->Worker->blockUntilIdle(D))
+  std::vector<std::shared_ptr<const ASTWorker>> Workers;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Workers.reserve(Files.size());
+    for (auto &File : Files)
+      Workers.push_back(File.getValue()->Worker.lock());
+  }
+  for (auto &Worker : Workers)
+    if (!Worker->blockUntilIdle(D))
       return false;
   if (PreambleTasks)
     if (!PreambleTasks->wait(D))
@@ -1672,31 +1758,44 @@ bool TUScheduler::blockUntilIdle(Deadline D) const {
 
 bool TUScheduler::update(PathRef File, ParseInputs Inputs,
                          WantDiagnostics WantDiags) {
-  std::unique_ptr<FileData> &FD = Files[File];
-  bool NewFile = FD == nullptr;
+  std::shared_ptr<ASTWorker> Worker;
+  bool NewFile = false;
   bool ContentChanged = false;
-  if (!FD) {
-    // Create a new worker to process the AST-related tasks.
-    ASTWorkerHandle Worker = ASTWorker::create(
-        File, CDB, *IdleASTs, *HeaderIncluders,
-        WorkerThreads ? &*WorkerThreads : nullptr, Barrier, Opts, *Callbacks);
-    FD = std::unique_ptr<FileData>(
-        new FileData{Inputs.Contents, std::move(Worker)});
-    ContentChanged = true;
-  } else if (FD->Contents != Inputs.Contents) {
-    ContentChanged = true;
-    FD->Contents = Inputs.Contents;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    std::unique_ptr<FileData> &FD = Files[File];
+    NewFile = FD == nullptr;
+    if (!FD) {
+      // Create a new worker to process the AST-related tasks.
+      ASTWorkerHandle NewWorker = ASTWorker::create(
+          File, CDB, *IdleASTs, *HeaderIncluders,
+          WorkerThreads ? &*WorkerThreads : nullptr, Barrier, Opts, *Callbacks);
+      Worker = NewWorker.lockMutable();
+      FD = std::unique_ptr<FileData>(
+          new FileData{Inputs.Contents, std::move(NewWorker)});
+      ContentChanged = true;
+    } else {
+      Worker = FD->Worker.lockMutable();
+      if (FD->Contents != Inputs.Contents) {
+        ContentChanged = true;
+        FD->Contents = Inputs.Contents;
+      }
+    }
+    // There might be synthetic update requests, don't change the LastActiveFile
+    // in such cases.
+    if (ContentChanged)
+      LastActiveFile = File.str();
   }
-  FD->Worker->update(std::move(Inputs), WantDiags, ContentChanged);
-  // There might be synthetic update requests, don't change the LastActiveFile
-  // in such cases.
-  if (ContentChanged)
-    LastActiveFile = File.str();
+  Worker->update(std::move(Inputs), WantDiags, ContentChanged);
   return NewFile;
 }
 
 void TUScheduler::remove(PathRef File) {
-  bool Removed = Files.erase(File);
+  bool Removed = false;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Removed = Files.erase(File);
+  }
   if (!Removed)
     elog("Trying to remove file from TUScheduler that is not tracked: {0}",
          File);
@@ -1721,16 +1820,22 @@ void TUScheduler::runQuick(llvm::StringRef Name, llvm::StringRef Path,
 void TUScheduler::runWithSemaphore(llvm::StringRef Name, llvm::StringRef Path,
                                    llvm::unique_function<void()> Action,
                                    Semaphore &Sem) {
-  if (Path.empty())
-    Path = LastActiveFile;
-  else
-    LastActiveFile = Path.str();
+  std::string TaskPath;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    if (Path.empty())
+      TaskPath = LastActiveFile;
+    else {
+      LastActiveFile = Path.str();
+      TaskPath = Path.str();
+    }
+  }
   if (!PreambleTasks) {
-    WithContext WithProvidedContext(Opts.ContextProvider(Path));
+    WithContext WithProvidedContext(Opts.ContextProvider(TaskPath));
     return Action();
   }
   PreambleTasks->runAsync(Name, [this, &Sem, Ctx = Context::current().clone(),
-                                 Path(Path.str()),
+                                 Path(std::move(TaskPath)),
                                  Action = std::move(Action)]() mutable {
     std::lock_guard<Semaphore> BarrierLock(Sem);
     WithContext WC(std::move(Ctx));
@@ -1743,45 +1848,59 @@ void TUScheduler::runWithAST(
     llvm::StringRef Name, PathRef File,
     llvm::unique_function<void(llvm::Expected<InputsAndAST>)> Action,
     TUScheduler::ASTActionInvalidation Invalidation) {
-  auto It = Files.find(File);
-  if (It == Files.end()) {
+  std::shared_ptr<ASTWorker> Worker;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    auto It = Files.find(File);
+    if (It != Files.end()) {
+      LastActiveFile = File.str();
+      Worker = It->second->Worker.lockMutable();
+    }
+  }
+  if (!Worker) {
     Action(llvm::make_error<LSPError>(
         "trying to get AST for non-added document", ErrorCode::InvalidParams));
     return;
   }
-  LastActiveFile = File.str();
 
-  It->second->Worker->runWithAST(Name, std::move(Action), Invalidation);
+  Worker->runWithAST(Name, std::move(Action), Invalidation);
 }
 
 void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
                                   PreambleConsistency Consistency,
                                   Callback<InputsAndPreamble> Action) {
-  auto It = Files.find(File);
-  if (It == Files.end()) {
+  std::string Contents;
+  std::shared_ptr<ASTWorker> Worker;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    auto It = Files.find(File);
+    if (It != Files.end()) {
+      LastActiveFile = File.str();
+      Contents = It->second->Contents;
+      Worker = It->second->Worker.lockMutable();
+    }
+  }
+  if (!Worker) {
     Action(llvm::make_error<LSPError>(
         "trying to get preamble for non-added document",
         ErrorCode::InvalidParams));
     return;
   }
-  LastActiveFile = File.str();
 
   if (!PreambleTasks) {
     trace::Span Tracer(Name);
     SPAN_ATTACH(Tracer, "file", File);
     std::shared_ptr<const ASTSignals> Signals;
     std::shared_ptr<const PreambleData> Preamble =
-        It->second->Worker->getPossiblyStalePreamble(&Signals);
+        Worker->getPossiblyStalePreamble(&Signals);
     WithContext WithProvidedContext(Opts.ContextProvider(File));
-    Action(InputsAndPreamble{It->second->Contents,
-                             It->second->Worker->getCurrentCompileCommand(),
+    Action(InputsAndPreamble{Contents, Worker->getCurrentCompileCommand(),
                              Preamble.get(), Signals.get()});
     return;
   }
 
-  std::shared_ptr<const ASTWorker> Worker = It->second->Worker.lock();
   auto Task = [Worker, Consistency, Name = Name.str(), File = File.str(),
-               Contents = It->second->Contents,
+               Contents = std::move(Contents),
                Command = Worker->getCurrentCompileCommand(),
                Ctx = Context::current().derive(FileBeingProcessed,
                                                std::string(File)),
@@ -1814,20 +1933,56 @@ void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
                           std::move(Task));
 }
 
+void TUScheduler::reparseFilesWithNewContext(
+    llvm::ArrayRef<std::string> FilesToReparse) {
+  std::vector<std::shared_ptr<ASTWorker>> Workers;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    llvm::StringSet<> FilesToReparseKeys;
+    for (const std::string &File : FilesToReparse)
+      FilesToReparseKeys.insert(maybeCaseFoldPath(File));
+
+    Workers.reserve(FilesToReparse.size());
+    for (const auto &PathAndFile : Files) {
+      if (!FilesToReparseKeys.contains(maybeCaseFoldPath(PathAndFile.first())))
+        continue;
+      Workers.push_back(PathAndFile.second->Worker.lockMutable());
+    }
+  }
+  for (const auto &Worker : Workers)
+    Worker->update(Worker->getCurrentInputs(), WantDiagnostics::Auto,
+                   /*ContentChanged=*/false);
+}
+
 llvm::StringMap<TUScheduler::FileStats> TUScheduler::fileStats() const {
   llvm::StringMap<TUScheduler::FileStats> Result;
-  for (const auto &PathAndFile : Files)
-    Result.try_emplace(PathAndFile.first(),
-                       PathAndFile.second->Worker->stats());
+  std::vector<std::pair<std::string, std::shared_ptr<const ASTWorker>>> Workers;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Workers.reserve(Files.size());
+    for (const auto &PathAndFile : Files)
+      Workers.emplace_back(PathAndFile.first().str(),
+                           PathAndFile.second->Worker.lock());
+  }
+  for (const auto &PathAndWorker : Workers)
+    Result.try_emplace(PathAndWorker.first, PathAndWorker.second->stats());
   return Result;
 }
 
 std::vector<Path> TUScheduler::getFilesWithCachedAST() const {
   std::vector<Path> Result;
-  for (auto &&PathAndFile : Files) {
-    if (!PathAndFile.second->Worker->isASTCached())
+  std::vector<std::pair<std::string, std::shared_ptr<const ASTWorker>>> Workers;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Workers.reserve(Files.size());
+    for (const auto &PathAndFile : Files)
+      Workers.emplace_back(PathAndFile.first().str(),
+                           PathAndFile.second->Worker.lock());
+  }
+  for (const auto &PathAndWorker : Workers) {
+    if (!PathAndWorker.second->isASTCached())
       continue;
-    Result.push_back(std::string(PathAndFile.first()));
+    Result.push_back(PathAndWorker.first);
   }
   return Result;
 }

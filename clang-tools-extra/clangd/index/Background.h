@@ -21,11 +21,13 @@
 #include "support/Threading.h"
 #include "support/ThreadsafeFS.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -148,6 +150,9 @@ public:
     // Whether the index needs to support the containedRefs() operation.
     // May use extra memory.
     bool SupportContainedRefs = true;
+    // Called when new header-to-TU context mappings become available.
+    // The argument contains absolute paths of files whose context changed.
+    std::function<void(std::vector<std::string>)> OnIndexedHeaders = nullptr;
   };
 
   /// Creates a new background index and starts its threads.
@@ -167,6 +172,9 @@ public:
   /// Boosts priority of indexing related to Path.
   /// Typically used to index TUs when headers are opened.
   void boostRelated(llvm::StringRef Path);
+
+  /// Returns an indexed TU that includes Header, or an empty string.
+  std::string indexedTUForHeader(PathRef Header) const;
 
   // Cause background threads to stop after ther current task, any remaining
   // tasks will be discarded.
@@ -209,6 +217,14 @@ private:
   BackgroundIndexRebuilder Rebuilder;
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
   std::mutex ShardVersionsMu;
+  std::function<void(std::vector<std::string>)> OnIndexedHeaders;
+
+  std::vector<std::string>
+  updateIndexedTUForHeaders(PathRef MainFile,
+                            llvm::ArrayRef<std::string> Headers);
+  llvm::StringMap<std::string> HeaderToIndexedTU;
+  llvm::StringMap<std::vector<std::string>> IndexedTUToHeaders;
+  mutable std::mutex HeaderToIndexedTUMu;
 
   BackgroundIndexStorage::Factory IndexStorageFactory;
   // Tries to load shards for the MainFiles and their dependencies.

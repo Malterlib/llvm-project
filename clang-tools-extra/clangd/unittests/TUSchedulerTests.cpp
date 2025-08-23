@@ -1319,6 +1319,52 @@ TEST_F(TUSchedulerTests, PublishWithStalePreamble) {
   EXPECT_THAT(Collector.diagVersions().back(), Pair("3", "3"));
 }
 
+#ifdef CLANGD_PATH_CASE_INSENSITIVE
+TEST_F(TUSchedulerTests, ReparseFilesWithNewContextIgnoresCase) {
+  struct CaptureParseResult : public ParsingCallbacks {
+    CaptureParseResult(Notification &Failed, Notification &Parsed)
+        : Failed(Failed), Parsed(Parsed) {}
+
+    void onMainAST(PathRef, ParsedAST &, PublishFn Publish) override {
+      Publish([this] { Parsed.notify(); });
+    }
+
+    void onFailedAST(PathRef, llvm::StringRef, std::vector<Diag>,
+                     PublishFn Publish) override {
+      Publish([this] { Failed.notify(); });
+    }
+
+    Notification &Failed;
+    Notification &Parsed;
+  };
+
+  Notification Failed;
+  Notification Parsed;
+  CDB.ExtraClangFlags.clear();
+
+  TUScheduler S(CDB, optsForTest(),
+                std::make_unique<CaptureParseResult>(Failed, Parsed));
+  Path Header = testPath("Foo.h");
+  FS.Files[Header] = "int X;";
+
+  ParseInputs Inputs;
+  Inputs.CompileCommand = CDB.getFallbackCommand(Header);
+  Inputs.TFS = &FS;
+  Inputs.Contents = "int X;";
+  Inputs.Opts = ParseOptions();
+  S.update(Header, Inputs, WantDiagnostics::Yes);
+  ASSERT_TRUE(Failed.wait(timeoutSeconds(60)));
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  CDB.ExtraClangFlags = {"-ffreestanding"};
+  std::string HeaderWithDifferentCase = llvm::StringRef(Header).lower();
+  ASSERT_NE(HeaderWithDifferentCase, Header);
+  S.reparseFilesWithNewContext({HeaderWithDifferentCase});
+  ASSERT_TRUE(Parsed.wait(timeoutSeconds(60)));
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+}
+#endif
+
 // If a header file is missing from the CDB (or inferred using heuristics), and
 // it's included by another open file, then we parse it using that files flags.
 TEST_F(TUSchedulerTests, IncluderCache) {

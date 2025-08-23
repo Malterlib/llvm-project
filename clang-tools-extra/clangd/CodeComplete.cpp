@@ -2292,7 +2292,9 @@ codeCompleteComment(PathRef FileName, const unsigned CursorOffset,
   semaCodeComplete(
       std::make_unique<ParamNameCollector>(Options, ParamNames), Options,
       {FileName, OutsideStartOffset, *Preamble,
-       PreamblePatch::createFullPatch(FileName, ParseInput, *Preamble),
+       ParseInput.ProxyCompileCommand.has_value()
+           ? PreamblePatch::unmodified(*Preamble)
+           : PreamblePatch::createFullPatch(FileName, ParseInput, *Preamble),
        ParseInput},
       /*Includes=*/nullptr, std::move(CI));
   if (ParamNames.empty())
@@ -2377,8 +2379,10 @@ CodeCompleteResult codeComplete(PathRef FileName, Position Pos,
                                               *ParseInput.TFS)
              : std::move(Flow).run({FileName, *Offset, *Preamble,
                                     /*PreamblePatch=*/
-                                    PreamblePatch::createMacroPatch(
-                                        FileName, ParseInput, *Preamble),
+                                    ParseInput.ProxyCompileCommand.has_value()
+                                        ? PreamblePatch::unmodified(*Preamble)
+                                        : PreamblePatch::createMacroPatch(
+                                              FileName, ParseInput, *Preamble),
                                     ParseInput});
 }
 
@@ -2402,7 +2406,9 @@ SignatureHelp signatureHelp(PathRef FileName, Position Pos,
                                                ParseInput.Index, Result),
       Options,
       {FileName, *Offset, Preamble,
-       PreamblePatch::createFullPatch(FileName, ParseInput, Preamble),
+       ParseInput.ProxyCompileCommand.has_value()
+           ? PreamblePatch::unmodified(Preamble)
+           : PreamblePatch::createFullPatch(FileName, ParseInput, Preamble),
        ParseInput});
   return Result;
 }
