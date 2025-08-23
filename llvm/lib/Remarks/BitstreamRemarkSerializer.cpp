@@ -92,7 +92,7 @@ void BitstreamRemarkSerializerHelper::setupMetaStrTab() {
 }
 
 void BitstreamRemarkSerializerHelper::emitMetaStrTab(
-    const StringTable &StrTab) {
+    const remarks::StringTable &StrTab) {
   // The string table is not emitted if we emit remarks separately.
   R.clear();
   R.push_back(RECORD_META_STRTAB);
@@ -233,7 +233,7 @@ void BitstreamRemarkSerializerHelper::setupBlockInfo() {
 
 void BitstreamRemarkSerializerHelper::emitMetaBlock(
     uint64_t ContainerVersion, std::optional<uint64_t> RemarkVersion,
-    std::optional<const StringTable *> StrTab,
+    std::optional<const remarks::StringTable *> StrTab,
     std::optional<StringRef> Filename) {
   // Emit the meta block
   Bitstream.EnterSubblock(META_BLOCK_ID, 3);
@@ -268,7 +268,7 @@ void BitstreamRemarkSerializerHelper::emitMetaBlock(
 }
 
 void BitstreamRemarkSerializerHelper::emitRemarkBlock(const Remark &Remark,
-                                                      StringTable &StrTab) {
+                                                      remarks::StringTable &StrTab) {
   Bitstream.EnterSubblock(REMARK_BLOCK_ID, 4);
 
   R.clear();
@@ -339,7 +339,7 @@ BitstreamRemarkSerializer::BitstreamRemarkSerializer(raw_ostream &OS,
 
 BitstreamRemarkSerializer::BitstreamRemarkSerializer(raw_ostream &OS,
                                                      SerializerMode Mode,
-                                                     StringTable StrTabIn)
+                                                     remarks::StringTable StrTabIn)
     : RemarkSerializer(Format::Bitstream, OS, Mode),
       Helper(Mode == SerializerMode::Separate
                  ? BitstreamRemarkContainerType::SeparateRemarksFile
@@ -356,7 +356,7 @@ void BitstreamRemarkSerializer::emit(const Remark &Remark) {
     BitstreamMetaSerializer MetaSerializer(
         OS, Helper,
         IsStandalone ? &*StrTab
-                     : std::optional<const StringTable *>(std::nullopt));
+                     : std::optional<const remarks::StringTable *>(std::nullopt));
     MetaSerializer.emit();
     DidSetUp = true;
   }

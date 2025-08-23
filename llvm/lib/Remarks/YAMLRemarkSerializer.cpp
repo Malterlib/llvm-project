@@ -61,7 +61,7 @@ template <> struct MappingTraits<remarks::Remark *> {
     if (auto *Serializer = dyn_cast<YAMLStrTabRemarkSerializer>(
             reinterpret_cast<RemarkSerializer *>(io.getContext()))) {
       assert(Serializer->StrTab && "YAMLStrTabSerializer with no StrTab.");
-      StringTable &StrTab = *Serializer->StrTab;
+      remarks::StringTable &StrTab = *Serializer->StrTab;
       unsigned PassID = StrTab.add(Remark->PassName).first;
       unsigned NameID = StrTab.add(Remark->RemarkName).first;
       unsigned FunctionID = StrTab.add(Remark->FunctionName).first;
@@ -85,7 +85,7 @@ template <> struct MappingTraits<RemarkLocation> {
     if (auto *Serializer = dyn_cast<YAMLStrTabRemarkSerializer>(
             reinterpret_cast<RemarkSerializer *>(io.getContext()))) {
       assert(Serializer->StrTab && "YAMLStrTabSerializer with no StrTab.");
-      StringTable &StrTab = *Serializer->StrTab;
+      remarks::StringTable &StrTab = *Serializer->StrTab;
       unsigned FileID = StrTab.add(File).first;
       io.mapRequired("File", FileID);
     } else {
@@ -139,7 +139,7 @@ template <> struct MappingTraits<Argument> {
     if (auto *Serializer = dyn_cast<YAMLStrTabRemarkSerializer>(
             reinterpret_cast<RemarkSerializer *>(io.getContext()))) {
       assert(Serializer->StrTab && "YAMLStrTabSerializer with no StrTab.");
-      StringTable &StrTab = *Serializer->StrTab;
+      remarks::StringTable &StrTab = *Serializer->StrTab;
       auto ValueID = StrTab.add(A.Val).first;
       io.mapRequired(A.Key.data(), ValueID);
     } else if (StringRef(A.Val).count('\n') > 1) {
@@ -158,12 +158,12 @@ template <> struct MappingTraits<Argument> {
 LLVM_YAML_IS_SEQUENCE_VECTOR(Argument)
 
 YAMLRemarkSerializer::YAMLRemarkSerializer(raw_ostream &OS, SerializerMode Mode,
-                                           std::optional<StringTable> StrTabIn)
+                                           std::optional<remarks::StringTable> StrTabIn)
     : YAMLRemarkSerializer(Format::YAML, OS, Mode, std::move(StrTabIn)) {}
 
 YAMLRemarkSerializer::YAMLRemarkSerializer(Format SerializerFormat,
                                            raw_ostream &OS, SerializerMode Mode,
-                                           std::optional<StringTable> StrTabIn)
+                                           std::optional<remarks::StringTable> StrTabIn)
     : RemarkSerializer(SerializerFormat, OS, Mode),
       YAMLOutput(OS, reinterpret_cast<void *>(this)) {
   StrTab = std::move(StrTabIn);
@@ -217,7 +217,7 @@ static void emitVersion(raw_ostream &OS) {
 }
 
 static void emitStrTab(raw_ostream &OS,
-                       std::optional<const StringTable *> StrTab) {
+                       std::optional<const remarks::StringTable *> StrTab) {
   // Emit the string table in the section.
   uint64_t StrTabSize = StrTab ? (*StrTab)->SerializedSize : 0;
   // Emit the total size of the string table (the size itself excluded):
