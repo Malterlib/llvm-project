@@ -540,11 +540,11 @@ class ModuleDepCollector::ModuleDepCollectorPP final : public PPCallbacks {
 public:
   ModuleDepCollectorPP(ModuleDepCollector &MDC) : MDC(MDC) {}
 
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override {
     if (Reason != LexedFileChangeReason::EnterFile)
-      return;
+      return false;
 
     SourceManager &SM = MDC.ScanInstance.getSourceManager();
 
@@ -553,6 +553,8 @@ public:
     // We do not want #line markers to affect dependency generation!
     if (std::optional<StringRef> Filename = SM.getNonBuiltinFilenameForID(FID))
       MDC.addFileDep(llvm::sys::path::remove_leading_dotslash(*Filename));
+
+    return false;
   }
 
   void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,

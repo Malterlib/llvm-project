@@ -90,10 +90,12 @@ class CppFilePreambleCallbacks : public PreambleCallbacks {
 public:
   CppFilePreambleCallbacks(
       PathRef File, PreambleBuildStats *Stats, bool ParseForwardingFunctions,
-      std::function<void(CompilerInstance &)> BeforeExecuteCallback)
+      std::function<void(CompilerInstance &)> BeforeExecuteCallback,
+      PathRef TargetHeaderFile)
       : File(File), Stats(Stats),
         ParseForwardingFunctions(ParseForwardingFunctions),
-        BeforeExecuteCallback(std::move(BeforeExecuteCallback)) {}
+        BeforeExecuteCallback(std::move(BeforeExecuteCallback)),
+        TargetHeaderFile(TargetHeaderFile) {}
 
   IncludeStructure takeIncludes() { return std::move(Includes); }
 
@@ -162,9 +164,78 @@ public:
     assert(SourceMgr && LangOpts && PP &&
            "SourceMgr, LangOpts and PP must be set at this point");
 
-    return std::make_unique<PPChainedCallbacks>(
-        std::make_unique<CollectMainFileMacros>(*PP, Macros),
-        collectPragmaMarksCallback(*SourceMgr, Marks));
+    // When we have a target header, we want to stop preprocessing when we encounter it
+    if (!TargetHeaderFile.empty()) {
+      // Create a callback that stops preprocessing when entering the target header
+      class StopAtTargetHeaderCallback : public PPCallbacks {
+      public:
+        StopAtTargetHeaderCallback(PathRef TargetHeader, const SourceManager **SM)
+            : TargetHeader(TargetHeader), SourceMgrPtr(SM) {}
+
+        bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+                             SrcMgr::CharacteristicKind FileType,
+                             FileID PrevFID, SourceLocation Loc) override {
+          if (Reason == LexedFileChangeReason::EnterFile && SourceMgrPtr &&
+              *SourceMgrPtr) {
+            const SourceManager &SM = **SourceMgrPtr;
+
+            // Skip the main file itself
+            if (FID == SM.getMainFileID())
+              return false;
+
+            // Get the file being entered
+            if (auto FE = SM.getFileEntryRefForID(FID)) {
+              if (!TargetLookedUp) {
+                TargetLookedUp = true;
+                Target = SM.getFileManager().getOptionalFileRef(TargetHeader);
+                // Files open in the editor have their own identity in the
+                // file system with their contents, which an include of the
+                // same file through a symlink doesn't share.
+                if (llvm::sys::fs::real_path(TargetHeader, TargetRealPath))
+                  TargetRealPath.clear();
+              }
+              StringRef RealPath = FE->getFileEntry().tryGetRealPathName();
+              // Check if this is our target header. Compare the files rather
+              // than their names, which differ for e.g. symlinks, and can
+              // match an unrelated header with the same name.
+              if (pathEqual(FE->getName(), TargetHeader) ||
+                  (!RealPath.empty() && !TargetRealPath.empty() &&
+                   pathEqual(RealPath, TargetRealPath)) ||
+                  (Target ? *FE == *Target
+                          : maybeCaseFoldPath(
+                                llvm::sys::path::filename(FE->getName())) ==
+                                maybeCaseFoldPath(
+                                    llvm::sys::path::filename(TargetHeader)))) {
+                // Stop preprocessing here - we've reached the target header
+                return true;
+              }
+            }
+          }
+          return false;
+        }
+
+      private:
+        PathRef TargetHeader;
+        const SourceManager **SourceMgrPtr;
+        bool TargetLookedUp = false;
+        OptionalFileEntryRef Target;
+        llvm::SmallString<256> TargetRealPath;
+      };
+
+      auto StopCallback = std::make_unique<StopAtTargetHeaderCallback>(TargetHeaderFile, &SourceMgr);
+
+
+      return std::make_unique<PPChainedCallbacks>(
+          std::make_unique<PPChainedCallbacks>(
+            std::move(StopCallback),
+            std::make_unique<CollectMainFileMacros>(*PP, Macros)
+          ),
+          collectPragmaMarksCallback(*SourceMgr, Marks));
+    } else {
+      return std::make_unique<PPChainedCallbacks>(
+          std::make_unique<CollectMainFileMacros>(*PP, Macros),
+          collectPragmaMarksCallback(*SourceMgr, Marks));
+    }
   }
 
   bool shouldSkipFunctionBody(Decl *D) override {
@@ -206,6 +277,7 @@ private:
   bool ParseForwardingFunctions;
   std::function<void(CompilerInstance &)> BeforeExecuteCallback;
   std::optional<CapturedASTCtx> CapturedCtx;
+  PathRef TargetHeaderFile;
 };
 
 // Represents directives other than includes, where basic textual information is
@@ -576,10 +648,51 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
               PreambleBuildStats *Stats) {
   // Note that we don't need to copy the input contents, preamble can live
   // without those.
-  auto ContentsBuffer =
-      llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
-  auto Bounds = computePreambleBounds(CI.getLangOpts(), *ContentsBuffer,
-                                      Inputs.Opts.SkipPreambleBuild);
+
+  // Use the appropriate compile command and contents
+  PathRef PreambleFileName = FileName;
+  std::unique_ptr<llvm::MemoryBuffer> ProxyBuffer;
+
+  // In header-in-context mode, build the preamble from the proxy file
+  if (Inputs.ProxyCompileCommand) {
+    // Build a new compiler invocation from the proxy command
+    IgnoringDiagConsumer IgnoreDiags;
+    ParseInputs ProxyInputs = Inputs;
+    ProxyInputs.CompileCommand = *Inputs.ProxyCompileCommand;
+    auto ProxyCI = buildCompilerInvocation(ProxyInputs, IgnoreDiags);
+    // Read the proxy file contents. Without them, building the proxy file's
+    // invocation from the header's contents would parse the header as the
+    // proxy file, so build the preamble from the header instead.
+    if (ProxyCI) {
+      auto VFS = Inputs.TFS->view(Inputs.ProxyCompileCommand->Directory);
+      if (auto Buffer =
+              VFS->getBufferForFile(Inputs.ProxyCompileCommand->Filename)) {
+        CI = std::move(*ProxyCI);
+        PreambleFileName = Inputs.ProxyCompileCommand->Filename;
+        // Copy the contents: buffers of in-memory file systems, like the one
+        // of files open in the editor, reference memory owned by the file
+        // system, which goes away with VFS.
+        ProxyBuffer = llvm::MemoryBuffer::getMemBufferCopy(
+            (*Buffer)->getBuffer(), (*Buffer)->getBufferIdentifier());
+      }
+    }
+    if (!ProxyBuffer) {
+      elog("Could not build the preamble of {0} from {1}, building it from "
+           "the file itself",
+           FileName, Inputs.ProxyCompileCommand->Filename);
+    }
+  }
+  const bool InProxyMode = ProxyBuffer != nullptr;
+
+  auto ContentsBuffer = ProxyBuffer
+      ? llvm::MemoryBuffer::getMemBuffer(ProxyBuffer->getBuffer(), PreambleFileName)
+      : llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
+
+  // In proxy mode, use the whole file as preamble since we'll stop at the target header
+  auto Bounds = InProxyMode
+      ? PreambleBounds{static_cast<unsigned>(ContentsBuffer->getBufferSize()), true}
+      : computePreambleBounds(CI.getLangOpts(), *ContentsBuffer,
+                              Inputs.Opts.SkipPreambleBuild);
 
   trace::Span Tracer("BuildPreamble");
   SPAN_ATTACH(Tracer, "File", FileName);
@@ -623,12 +736,13 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   CI.getPreprocessorOpts().WriteCommentListToPCH = false;
 
   CppFilePreambleCallbacks CapturedInfo(
-      FileName, Stats, Inputs.Opts.PreambleParseForwardingFunctions,
+      PreambleFileName, Stats, Inputs.Opts.PreambleParseForwardingFunctions,
       [&ASTListeners](CompilerInstance &CI) {
         for (const auto &L : ASTListeners)
           L->beforeExecute(CI);
-      });
-  llvm::SmallString<32> AbsFileName(FileName);
+      },
+      InProxyMode ? PathRef(Inputs.TargetHeaderFile) : PathRef());
+  llvm::SmallString<32> AbsFileName(PreambleFileName);
   VFS->makeAbsolute(AbsFileName);
   auto StatCache = std::make_shared<PreambleFileStatusCache>(AbsFileName);
   auto StatCacheFS = StatCache->getProducingFS(VFS);
@@ -666,6 +780,14 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
         PreambleTimer.getTime());
     std::vector<Diag> Diags = PreambleDiagnostics.take();
     auto Result = std::make_shared<PreambleData>(std::move(*BuiltPreamble));
+
+    // In proxy mode, clear preamble bytes so nothing is skipped when parsing the header
+    // and mark it as a proxy preamble
+    if (InProxyMode) {
+      Result->Preamble.clearPreambleBytes();
+      Result->Preamble.setIsProxyPreamble();
+    }
+
     Result->Version = Inputs.Version;
     Result->CompileCommand = Inputs.CompileCommand;
     Result->Diags = std::move(Diags);
@@ -723,11 +845,17 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
 bool isPreambleCompatible(const PreambleData &Preamble,
                           const ParseInputs &Inputs, PathRef FileName,
                           const CompilerInvocation &CI) {
+  auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
+  if (Inputs.ProxyCompileCommand.has_value()) // When in proxy mode the preamble is always empty
+    return compileCommandsAreEqual(Inputs.CompileCommand,
+                                 Preamble.CompileCommand) &&
+         (!Preamble.RequiredModules ||
+          Preamble.RequiredModules->canReuse(CI, VFS));
+
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
   auto Bounds = computePreambleBounds(CI.getLangOpts(), *ContentsBuffer,
                                       Inputs.Opts.SkipPreambleBuild);
-  auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
 
   // Check that the set of required modules hasn't changed.
   // Preamble.RequiredModules->canReuse only verifies that the previously

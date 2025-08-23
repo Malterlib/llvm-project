@@ -333,6 +333,23 @@ struct FragmentCompiler {
               C.CompileFlags.CDBSearch = Spec;
             });
     }
+
+    if (F.HeaderCompilation) {
+      if (**F.HeaderCompilation == "InContext") {
+        Out.Apply.push_back([](const Params &, Config &C) {
+          C.CompileFlags.CompileHeadersInContext = true;
+        });
+      } else if (**F.HeaderCompilation == "Isolated") {
+        Out.Apply.push_back([](const Params &, Config &C) {
+          C.CompileFlags.CompileHeadersInContext = false;
+        });
+      } else {
+        diag(Warning,
+             llvm::formatv("HeaderCompilation must be 'InContext' or 'Isolated', not '{0}'",
+                           **F.HeaderCompilation).str(),
+             F.HeaderCompilation->Range);
+      }
+    }
   }
 
   void compile(Fragment::IndexBlock &&F) {

@@ -178,6 +178,13 @@ struct Fragment {
     /// fallback if no query driver is supplied or if the query driver regex
     /// string fails to match the compiler used in the CDB.
     std::optional<Located<std::string>> BuiltinHeaders;
+
+    /// How to compile header files when no direct compile command is available.
+    /// Valid values are:
+    /// - InContext: compile headers using the full source file that includes
+    ///   them, providing full context but potentially slower.
+    /// - Isolated: compile headers in isolation with inferred flags.
+    std::optional<Located<std::string>> HeaderCompilation;
   };
   CompileFlagsBlock CompileFlags;
 

@@ -482,8 +482,14 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   DiagnosticConsumer *DiagConsumer = &ASTDiags;
   IgnoreDiagnostics DropDiags;
   if (Preamble) {
-    Patch = PreamblePatch::createFullPatch(Filename, Inputs, *Preamble);
-    Patch->apply(*CI);
+    // Don't use PreamblePatch when we built the preamble from a proxy file
+    // as the patch system expects the preamble to be from the same file. A
+    // stale preamble can be of the other kind than the current inputs, e.g.
+    // until a header that gained an including file has its preamble rebuilt.
+    if (!Preamble->Preamble.isProxyPreamble()) {
+      Patch = PreamblePatch::createFullPatch(Filename, Inputs, *Preamble);
+      Patch->apply(*CI);
+    }
   }
   auto Clang = prepareCompilerInstance(
       std::move(CI), Inputs.Opts.SkipPreambleBuild ? nullptr : PreamblePCH,
@@ -687,10 +693,17 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // If we are using a preamble, copy existing includes.
   if (Preamble) {
     Includes = Preamble->Includes;
-    Includes.MainFileIncludes = Patch->preambleIncludes();
-    // Replay the preamble includes so that clang-tidy checks can see them.
-    ReplayPreamble::attach(Patch->preambleIncludes(), Patch->mainFileMacros(),
-                           *Clang, Patch->modifiedBounds());
+    if (Patch) {
+      Includes.MainFileIncludes = Patch->preambleIncludes();
+      // Replay the preamble includes so that clang-tidy checks can see them.
+      ReplayPreamble::attach(Patch->preambleIncludes(),
+                             Patch->mainFileMacros(), *Clang,
+                             Patch->modifiedBounds());
+    } else {
+      // In proxy mode, the main file (header) has no includes of its own
+      // All includes are in the preamble (proxy file)
+      Includes.MainFileIncludes.clear();
+    }
     PI = *Preamble->Pragmas;
   }
   // Important: collectIncludeStructure is registered *after* ReplayPreamble!
@@ -704,9 +717,13 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // with non-preamble macros below.
   MainFileMacros Macros;
   std::vector<PragmaMark> Marks;
-  if (Preamble) {
+  if (Preamble && Patch) {
     Macros = Patch->mainFileMacros();
     Marks = Patch->marks();
+  } else if (Preamble) {
+    // In proxy mode, the main file (header) has no macros or marks of its own
+    // They're all in the preamble (proxy file)
+    // Macros and Marks remain empty
   }
   auto &PP = Clang->getPreprocessor();
   auto MacroCollector = std::make_unique<CollectMainFileMacros>(PP, Macros);
@@ -766,7 +783,9 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   // FIXME: Also skip generation of diagnostics altogether to speed up ast
   // builds when we are patching a stale preamble.
   // Add diagnostics from the preamble, if any.
-  if (Preamble)
+  // A preamble built from an including file has diagnostics for that file and
+  // the headers it includes before this one, with locations in those files.
+  if (Preamble && Patch)
     llvm::append_range(Diags, Patch->patchedDiags());
   // Finally, add diagnostics coming from the AST.
   {
