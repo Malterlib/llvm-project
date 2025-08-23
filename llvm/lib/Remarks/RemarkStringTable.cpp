@@ -20,7 +20,7 @@
 using namespace llvm;
 using namespace llvm::remarks;
 
-StringTable::StringTable(const ParsedStringTable &Other) {
+remarks::StringTable::StringTable(const ParsedStringTable &Other) {
   for (unsigned i = 0, e = Other.size(); i < e; ++i)
     if (Expected<StringRef> MaybeStr = Other[i])
       add(*MaybeStr);
@@ -28,7 +28,7 @@ StringTable::StringTable(const ParsedStringTable &Other) {
       llvm_unreachable("Unexpected error while building remarks string table.");
 }
 
-std::pair<unsigned, StringRef> StringTable::add(StringRef Str) {
+std::pair<unsigned, StringRef> remarks::StringTable::add(StringRef Str) {
   size_t NextID = StrTab.size();
   auto KV = StrTab.insert({Str, NextID});
   // If it's a new string, add it to the final size.
@@ -38,7 +38,7 @@ std::pair<unsigned, StringRef> StringTable::add(StringRef Str) {
   return {KV.first->second, KV.first->first()};
 }
 
-void StringTable::internalize(Remark &R) {
+void remarks::StringTable::internalize(Remark &R) {
   auto Impl = [&](StringRef &S) { S = add(S).second; };
   Impl(R.PassName);
   Impl(R.RemarkName);
@@ -53,7 +53,7 @@ void StringTable::internalize(Remark &R) {
   }
 }
 
-void StringTable::serialize(raw_ostream &OS) const {
+void remarks::StringTable::serialize(raw_ostream &OS) const {
   // Emit the sequence of strings.
   for (StringRef Str : serialize()) {
     OS << Str;
@@ -62,7 +62,7 @@ void StringTable::serialize(raw_ostream &OS) const {
   }
 }
 
-std::vector<StringRef> StringTable::serialize() const {
+std::vector<StringRef> remarks::StringTable::serialize() const {
   std::vector<StringRef> Strings{StrTab.size()};
   for (const auto &KV : StrTab)
     Strings[KV.second] = KV.first();
