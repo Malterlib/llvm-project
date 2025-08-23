@@ -5,7 +5,7 @@
 // This is a private header.
 
 /* Exported configuration */
-#include "llvm/Config/llvm-config.h"
+#include "${CMAKE_CURRENT_BINARY_DIR}/include/llvm/Config/llvm-config.h"
 
 /* Bug report URL. */
 #define BUG_REPORT_URL "${BUG_REPORT_URL}"

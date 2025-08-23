@@ -7,7 +7,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "lldb/Version/Version.h"
+#ifdef DMalterlib
+#include "tools/lldb/source/Version/VCSVersion.inc"
+#else
 #include "VCSVersion.inc"
+#endif
 #include "lldb/Version/Version.inc"
 #include "clang/Basic/Version.h"
 
