@@ -84,7 +84,7 @@ public:
   ///
   /// \param Loc The location where the \p Lexer entered a new file from or the
   /// location that the \p Lexer moved into after exiting a file.
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override;
 

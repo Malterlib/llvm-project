@@ -70,10 +70,14 @@ struct Config {
         Edits;
     /// Where to search for compilation databases for this file's flags.
     CDBSearchSpec CDBSearch = {CDBSearchSpec::Ancestors, std::nullopt};
-
     /// Whether to use clangd's own builtin headers, or ones from the system
     /// include extractor, if available.
     BuiltinHeaderPolicy BuiltinHeaders = BuiltinHeaderPolicy::Clangd;
+
+    /// How to compile header files when no compile command is available.
+    /// If true, headers are compiled using the full source file that includes
+    /// them. If false, headers are compiled in isolation with inferred flags.
+    bool CompileHeadersInContext = true;
   } CompileFlags;
 
   enum class BackgroundPolicy { Build, Skip };

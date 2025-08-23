@@ -166,7 +166,10 @@ CodeCompleteResult completionsNoCompile(llvm::StringRef Text,
 
   MockFS FS;
   Annotations Test(Text);
-  ParseInputs ParseInput{tooling::CompileCommand(), &FS, Test.code().str()};
+  ParseInputs ParseInput;
+  ParseInput.CompileCommand = tooling::CompileCommand();
+  ParseInput.TFS = &FS;
+  ParseInput.Contents = Test.code().str();
   return codeComplete(FilePath, Test.point(), /*Preamble=*/nullptr, ParseInput,
                       Opts);
 }

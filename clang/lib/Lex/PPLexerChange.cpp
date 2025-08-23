@@ -98,6 +98,11 @@ bool Preprocessor::EnterSourceFile(FileID FID, ConstSearchDirIterator CurDir,
         TheLexer->DepDirectives = *MaybeDepDirectives;
 
   EnterSourceFileWithLexer(TheLexer, CurDir);
+
+  // Check if preprocessing was aborted during file entry
+  if (wasPreprocessingAborted())
+    return true;
+
   return false;
 }
 
@@ -133,9 +138,16 @@ void Preprocessor::EnterSourceFileWithLexer(Lexer *TheLexer,
     }
     Callbacks->FileChanged(CurLexer->getFileLoc(), PPCallbacks::EnterFile,
                            FileType, PrevFID);
-    Callbacks->LexedFileChanged(CurLexer->getFileID(),
-                                PPCallbacks::LexedFileChangeReason::EnterFile,
-                                FileType, PrevFID, EnterLoc);
+    if (Callbacks->LexedFileChanged(CurLexer->getFileID(),
+                                    PPCallbacks::LexedFileChangeReason::EnterFile,
+                                    FileType, PrevFID, EnterLoc)) {
+      // Abort preprocessing if callback requests it
+      abortPreprocessing();
+
+      // No need to manipulate conditional stacks or lexer state -
+      // we'll just stop all processing
+      return;
+    }
   }
 }
 

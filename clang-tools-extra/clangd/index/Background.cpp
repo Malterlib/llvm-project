@@ -37,6 +37,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Threading.h"
@@ -98,6 +99,7 @@ BackgroundIndex::BackgroundIndex(
       ContextProvider(std::move(Opts.ContextProvider)),
       IndexedSymbols(IndexContents::All, Opts.SupportContainedRefs),
       Rebuilder(this, &IndexedSymbols, Opts.ThreadPoolSize),
+      OnIndexedHeaders(std::move(Opts.OnIndexedHeaders)),
       IndexStorageFactory(std::move(IndexStorageFactory)),
       Queue(std::move(Opts.OnProgress)),
       CommandsChanged(
@@ -180,6 +182,45 @@ void BackgroundIndex::boostRelated(llvm::StringRef Path) {
     Queue.boost(filenameWithoutExtension(Path), IndexBoostedFile);
 }
 
+std::string BackgroundIndex::indexedTUForHeader(PathRef Header) const {
+  std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+  return HeaderToIndexedTU.lookup(maybeCaseFoldPath(Header));
+}
+
+std::vector<std::string> BackgroundIndex::updateIndexedTUForHeaders(
+    PathRef MainFile, llvm::ArrayRef<std::string> Headers) {
+  std::vector<std::string> ChangedHeaders;
+  llvm::StringSet<> WasAssociatedWithMain;
+  std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+
+  std::string MainFileKey = maybeCaseFoldPath(MainFile);
+  std::vector<std::string> &StoredHeaders = IndexedTUToHeaders[MainFileKey];
+  for (const std::string &HeaderKey : StoredHeaders) {
+    auto It = HeaderToIndexedTU.find(HeaderKey);
+    if (It == HeaderToIndexedTU.end() || !pathEqual(It->second, MainFile))
+      continue;
+    WasAssociatedWithMain.insert(HeaderKey);
+    HeaderToIndexedTU.erase(It);
+  }
+
+  StoredHeaders.clear();
+  StoredHeaders.reserve(Headers.size());
+  std::string MainFileStorage = MainFile.str();
+  for (const std::string &Header : Headers) {
+    if (pathEqual(Header, MainFile))
+      continue;
+    std::string HeaderKey = maybeCaseFoldPath(Header);
+    StoredHeaders.push_back(HeaderKey);
+    if (HeaderToIndexedTU.find(HeaderKey) != HeaderToIndexedTU.end())
+      continue;
+    HeaderToIndexedTU[HeaderKey] = MainFileStorage;
+    if (!WasAssociatedWithMain.count(HeaderKey))
+      ChangedHeaders.push_back(Header);
+  }
+
+  return ChangedHeaders;
+}
+
 /// Given index results from a TU, only update symbols coming from files that
 /// are different or missing from than \p ShardVersionsSnapshot. Also stores new
 /// index information on IndexStorage.
@@ -187,6 +228,7 @@ void BackgroundIndex::update(
     llvm::StringRef MainFile, IndexFileIn Index,
     const llvm::StringMap<ShardVersion> &ShardVersionsSnapshot,
     bool HadErrors) {
+  std::vector<std::string> IndexedHeaders;
   // Keys are URIs.
   llvm::StringMap<std::pair<Path, FileDigest>> FilesToUpdate;
   // Note that sources do not contain any information regarding missing headers,
@@ -198,6 +240,8 @@ void BackgroundIndex::update(
       elog("Failed to resolve URI: {0}", AbsPath.takeError());
       continue;
     }
+    if (!pathEqual(*AbsPath, MainFile))
+      IndexedHeaders.push_back(*AbsPath);
     const auto DigestIt = ShardVersionsSnapshot.find(*AbsPath);
     // File has different contents, or indexing was successful this time.
     if (DigestIt == ShardVersionsSnapshot.end() ||
@@ -205,6 +249,10 @@ void BackgroundIndex::update(
         (DigestIt->getValue().HadErrors && !HadErrors))
       FilesToUpdate[IGN.URI] = {std::move(*AbsPath), IGN.Digest};
   }
+  std::vector<std::string> ChangedHeaders =
+      updateIndexedTUForHeaders(MainFile, IndexedHeaders);
+  if (!ChangedHeaders.empty() && OnIndexedHeaders)
+    OnIndexedHeaders(std::move(ChangedHeaders));
 
   // Shard slabs into files.
   FileShardedIndex ShardedIndex(std::move(Index));
@@ -218,7 +266,7 @@ void BackgroundIndex::update(
 
     // Only store command line hash for main files of the TU, since our
     // current model keeps only one version of a header file.
-    if (Path != MainFile)
+    if (!pathEqual(Path, MainFile))
       IF->Cmd.reset();
 
     // We need to store shards before updating the index, since the latter
@@ -368,6 +416,22 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
   // Load shards for all of the mainfiles.
   const std::vector<LoadedShard> Result =
       loadIndexShards(MainFiles, IndexStorageFactory, CDB);
+  llvm::StringMap<std::vector<std::string>> HeadersByTU;
+  for (const LoadedShard &LS : Result) {
+    if (!LS.Shard || LS.DependentTU.empty() ||
+        pathEqual(LS.AbsolutePath, LS.DependentTU))
+      continue;
+    HeadersByTU[LS.DependentTU].push_back(LS.AbsolutePath);
+  }
+  std::vector<std::string> ChangedHeaders;
+  for (const auto &It : HeadersByTU) {
+    std::vector<std::string> Changed =
+        updateIndexedTUForHeaders(It.first(), It.second);
+    ChangedHeaders.insert(ChangedHeaders.end(), Changed.begin(), Changed.end());
+  }
+  if (!ChangedHeaders.empty() && OnIndexedHeaders)
+    OnIndexedHeaders(std::move(ChangedHeaders));
+
   size_t LoadedShards = 0;
   {
     // Update in-memory state.

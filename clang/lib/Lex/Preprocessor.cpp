@@ -555,6 +555,10 @@ void Preprocessor::EnterMainSourceFile() {
     // Enter the main file source buffer.
     EnterSourceFile(MainFileID, nullptr, SourceLocation());
 
+    // Check if preprocessing was aborted
+    if (wasPreprocessingAborted())
+      return;
+
     // If we've been asked to skip bytes in the main file (e.g., as part of a
     // precompiled preamble), do so now.
     if (SkipMainFilePreamble.first > 0)
@@ -595,6 +599,10 @@ void Preprocessor::EnterMainSourceFile() {
 
   // Start parsing the predefines.
   EnterSourceFile(FID, nullptr, SourceLocation());
+
+  // Check if preprocessing was aborted
+  if (wasPreprocessingAborted())
+    return;
 
   if (!PPOpts.PCHThroughHeader.empty()) {
     // Lookup and save the FileID for the through header. If it isn't found
@@ -1700,10 +1708,11 @@ void NoTrivialPPDirectiveTracer::setSeenNoTrivialPPDirective() {
     SeenNoTrivialPPDirective = true;
 }
 
-void NoTrivialPPDirectiveTracer::LexedFileChanged(
+bool NoTrivialPPDirectiveTracer::LexedFileChanged(
     FileID FID, LexedFileChangeReason Reason,
     SrcMgr::CharacteristicKind FileType, FileID PrevFID, SourceLocation Loc) {
   InMainFile = (FID == PP.getSourceManager().getMainFileID());
+  return false;
 }
 
 void NoTrivialPPDirectiveTracer::MacroExpands(const Token &MacroNameTok,

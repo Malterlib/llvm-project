@@ -234,7 +234,12 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
   // Pass a callback into `WorkScheduler` to extract symbols from a newly
   // parsed file and rebuild the file index synchronously each time an AST
   // is parsed.
-  WorkScheduler.emplace(CDB, TUScheduler::Options(Opts),
+  TUScheduler::Options SchedulerOpts(Opts);
+  SchedulerOpts.IndexedHeaderIncluder = [this](PathRef Header) {
+    return BackgroundIdx ? BackgroundIdx->indexedTUForHeader(Header)
+                         : std::string();
+  };
+  WorkScheduler.emplace(CDB, SchedulerOpts,
                         std::make_unique<UpdateIndexCallbacks>(
                             DynamicIdx.get(), Callbacks, TFS,
                             IndexTasks ? &*IndexTasks : nullptr,
@@ -259,6 +264,11 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
     };
     BGOpts.ContextProvider = Opts.ContextProvider;
     BGOpts.SupportContainedRefs = Opts.EnableOutgoingCalls;
+    BGOpts.OnIndexedHeaders = [this](std::vector<std::string> Headers) {
+      std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
+      if (WorkScheduler)
+        WorkScheduler->reparseFilesWithNewContext(Headers);
+    };
     BackgroundIdx = std::make_unique<BackgroundIndex>(
         TFS, CDB,
         BackgroundIndexStorage::createDiskBackedStorageFactory(
@@ -284,7 +294,10 @@ ClangdServer::~ClangdServer() {
   // Destroying TUScheduler first shuts down request threads that might
   // otherwise access members concurrently.
   // (Nobody can be using TUScheduler because we're on the main thread).
-  WorkScheduler.reset();
+  {
+    std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
+    WorkScheduler.reset();
+  }
   // Now requests have stopped, we can shut down feature modules.
   if (FeatureModules) {
     for (auto &Mod : *FeatureModules)
@@ -445,7 +458,10 @@ void ClangdServer::codeComplete(PathRef File, Position Pos,
         SpecFuzzyFind->CachedReq = CachedCompletionFuzzyFindRequestByFile[File];
       }
     }
-    ParseInputs ParseInput{IP->Command, &getHeaderFS(), IP->Contents.str()};
+    ParseInputs ParseInput;
+    ParseInput.CompileCommand = IP->Command;
+    ParseInput.TFS = &getHeaderFS();
+    ParseInput.Contents = IP->Contents.str();
     // FIXME: Add traling new line if there is none at eof, workaround a crash,
     // see https://github.com/clangd/clangd/issues/332
     if (!IP->Contents.ends_with("\n"))
@@ -507,7 +523,10 @@ void ClangdServer::signatureHelp(PathRef File, Position Pos,
     if (!PreambleData)
       return CB(error("Failed to parse includes"));
 
-    ParseInputs ParseInput{IP->Command, &getHeaderFS(), IP->Contents.str()};
+    ParseInputs ParseInput;
+    ParseInput.CompileCommand = IP->Command;
+    ParseInput.TFS = &getHeaderFS();
+    ParseInput.Contents = IP->Contents.str();
     // FIXME: Add traling new line if there is none at eof, workaround a crash,
     // see https://github.com/clangd/clangd/issues/332
     if (!IP->Contents.ends_with("\n"))

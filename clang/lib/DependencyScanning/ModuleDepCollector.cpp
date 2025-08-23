@@ -532,13 +532,13 @@ void ModuleDepCollector::associateWithContextHash(
   assert(Inserted && "duplicate module mapping");
 }
 
-void ModuleDepCollectorPP::LexedFileChanged(FileID FID,
+bool ModuleDepCollectorPP::LexedFileChanged(FileID FID,
                                             LexedFileChangeReason Reason,
                                             SrcMgr::CharacteristicKind FileType,
                                             FileID PrevFID,
                                             SourceLocation Loc) {
   if (Reason != LexedFileChangeReason::EnterFile)
-    return;
+    return false;
 
   SourceManager &SM = MDC.ScanInstance.getSourceManager();
 
@@ -547,6 +547,8 @@ void ModuleDepCollectorPP::LexedFileChanged(FileID FID,
   // We do not want #line markers to affect dependency generation!
   if (std::optional<StringRef> Filename = SM.getNonBuiltinFilenameForID(FID))
     MDC.addFileDep(llvm::sys::path::remove_leading_dotslash(*Filename));
+
+  return false;
 }
 
 void ModuleDepCollectorPP::InclusionDirective(

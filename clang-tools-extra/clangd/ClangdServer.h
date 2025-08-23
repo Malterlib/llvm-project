@@ -36,6 +36,7 @@
 #include "llvm/ADT/StringRef.h"
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -491,6 +492,8 @@ private:
   const SymbolIndex *Index = nullptr;
   // If present, an index of symbols in open files. Read via *Index.
   std::unique_ptr<FileIndex> DynamicIdx;
+  // Guards background-index callbacks that can schedule reparses.
+  mutable std::mutex BackgroundIndexReparseMu;
   // If present, the new "auto-index" maintained in background threads.
   std::unique_ptr<BackgroundIndex> BackgroundIdx;
   // Storage for merged views of the various indexes.

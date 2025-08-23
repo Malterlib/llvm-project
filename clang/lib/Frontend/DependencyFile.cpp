@@ -35,11 +35,11 @@ struct DepCollectorPPCallbacks : public PPCallbacks {
   DepCollectorPPCallbacks(DependencyCollector &L, Preprocessor &PP)
       : DepCollector(L), PP(PP) {}
 
-  void LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
+  bool LexedFileChanged(FileID FID, LexedFileChangeReason Reason,
                         SrcMgr::CharacteristicKind FileType, FileID PrevFID,
                         SourceLocation Loc) override {
     if (Reason != PPCallbacks::LexedFileChangeReason::EnterFile)
-      return;
+      return false;
 
     // Dependency generation really does want to go all the way to the
     // file entry for a source location to find out what is depended on.
@@ -50,6 +50,8 @@ struct DepCollectorPPCallbacks : public PPCallbacks {
           llvm::sys::path::remove_leading_dotslash(*Filename),
           /*FromModule*/ false, isSystem(FileType), /*IsModuleFile*/ false,
           /*IsMissing*/ false);
+
+    return false;
   }
 
   void FileSkipped(const FileEntryRef &SkippedFile, const Token &FilenameTok,

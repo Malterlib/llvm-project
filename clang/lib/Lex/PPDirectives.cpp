@@ -2465,8 +2465,9 @@ Preprocessor::ImportAction Preprocessor::HandleHeaderIncludeOrImport(
       // that it's part of the corresponding module.
     } else {
       // We hit an error processing the import. Bail out.
-      if (hadModuleLoaderFatalFailure()) {
-        // With a fatal failure in the module loader, we abort parsing.
+      if (hadModuleLoaderFatalFailure() || wasPreprocessingAborted()) {
+        // With a fatal failure in the module loader or aborted preprocessing,
+        // we abort parsing.
         Token &Result = IncludeTok;
         assert(CurLexer && "#include but no current lexer set!");
         Result.startToken();
