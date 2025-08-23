@@ -136,7 +136,7 @@ struct crashreporter_annotations_t gCRAnnotations
 };
 #endif // CRASHREPORTER_ANNOTATIONS_INITIALIZER
 } // extern "C"
-#elif defined(__APPLE__) && HAVE_CRASHREPORTER_INFO
+#elif defined(__APPLE__) && HAVE_CRASHREPORTER_INFO && !defined(LLVM_DISABLE_CRASHREPORTER_INFO)
 extern "C" const char *__crashreporter_info__
     __attribute__((visibility("hidden"))) = 0;
 asm(".desc ___crashreporter_info__, 0x10");
@@ -146,7 +146,7 @@ asm(".desc ___crashreporter_info__, 0x10");
 static void setCrashLogMessage(const char *msg) {
 #ifdef HAVE_CRASHREPORTERCLIENT_H
   (void)CRSetCrashLogMessage(msg);
-#elif HAVE_CRASHREPORTER_INFO
+#elif HAVE_CRASHREPORTER_INFO && !defined(LLVM_DISABLE_CRASHREPORTER_INFO)
   __crashreporter_info__ = msg;
 #endif
   // Don't reorder subsequent operations: whatever comes after might crash and
