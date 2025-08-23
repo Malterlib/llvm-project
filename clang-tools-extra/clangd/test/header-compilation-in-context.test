@@ -1,0 +1,17 @@
+# A file without a compile command, and without an indexed source file that
+# includes it, isn't parsed when headers are compiled in the context of an
+# including file, which clangd does by default, and the error says how to
+# parse it on its own instead.
+# RUN: clangd -lit-test --header-compilation=InContext < %s | FileCheck -strict-whitespace %s
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"processId":123,"rootPath":"clangd","capabilities":{},"trace":"off"}}
+---
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"test:///foo.h","languageId":"cpp","text":"int f();\n"}}}
+#      CHECK:  "method": "textDocument/publishDiagnostics",
+# CHECK-NEXT:  "params": {
+# CHECK-NEXT:    "diagnostics": [
+# CHECK-NEXT:      {
+# CHECK-NEXT:        "message": "Clangd cannot reliably parse this file: no compile command was found and no indexed source file context is available; to parse it on its own with a guessed command instead, set 'CompileFlags: {HeaderCompilation: Isolated}' in a .clangd file, or start clangd with --header-compilation=Isolated",
+---
+{"jsonrpc":"2.0","id":5,"method":"shutdown"}
+---
+{"jsonrpc":"2.0","method":"exit"}

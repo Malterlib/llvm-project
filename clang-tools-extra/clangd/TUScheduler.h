@@ -18,10 +18,13 @@
 #include "support/MemoryTree.h"
 #include "support/Path.h"
 #include "support/Threading.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -236,6 +239,10 @@ public:
     /// Typically to inject per-file configuration.
     /// If the path is empty, context sholud be "generic".
     std::function<Context(PathRef)> ContextProvider;
+
+    /// Returns an indexed translation unit that includes the specified file.
+    /// This is used as a fallback header context when no open TU includes it.
+    std::function<std::string(PathRef)> IndexedHeaderIncluder;
   };
 
   TUScheduler(const GlobalCompilationDatabase &CDB, const Options &Opts,
@@ -334,6 +341,10 @@ public:
                        PreambleConsistency Consistency,
                        Callback<InputsAndPreamble> Action);
 
+  /// Reparse open files whose header context may have become available.
+  /// This can be called from the background-index thread.
+  void reparseFilesWithNewContext(llvm::ArrayRef<std::string> Files);
+
   /// Wait until there are no scheduled or running tasks.
   /// Mostly useful for synchronizing tests.
   bool blockUntilIdle(Deadline D) const;
@@ -369,6 +380,10 @@ private:
   Semaphore Barrier;
   Semaphore QuickRunBarrier;
   llvm::StringMap<std::unique_ptr<FileData>> Files;
+  mutable std::mutex FilesMu;
+  // Incremented after a preamble build scheduled reparses of other files, so
+  // that blockUntilIdle() can notice workers given work after it waited.
+  std::atomic<unsigned> ContextReparses = {0};
   std::unique_ptr<ASTCache> IdleASTs;
   std::unique_ptr<HeaderIncluderCache> HeaderIncluders;
   // std::nullopt when running tasks synchronously and non-std::nullopt when
