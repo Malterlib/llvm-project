@@ -5537,6 +5537,14 @@ the configuration (without a prefix: ``Auto``).
 
 
 
+.. _MalterlibRules:
+
+**MalterlibRules** (``Boolean``) :versionbadge:`clang-format 20` :ref:`¶ <MalterlibRules>`
+  Apply Malterlib-specific formatting rules.
+  When enabled, applies custom formatting rules according to the Malterlib
+  coding standard. This option takes precedence over conflicting individual
+  formatting options.
+
 .. _MaxEmptyLinesToKeep:
 
 **MaxEmptyLinesToKeep** (``Unsigned``) :versionbadge:`clang-format 3.7` :ref:`¶ <MaxEmptyLinesToKeep>`
