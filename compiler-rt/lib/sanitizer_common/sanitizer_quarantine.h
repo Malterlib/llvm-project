@@ -112,8 +112,16 @@ class Quarantine {
       SpinMutexLock l(&cache_mutex_);
       cache_.Transfer(c);
     }
-    if (cache_.Size() > GetMaxSize() && recycle_mutex_.TryLock())
-      Recycle(atomic_load_relaxed(&min_size_), cb);
+    // Use blocking Lock() instead of TryLock() to ensure recycling happens.
+    // Re-check condition after acquiring lock since another thread may have
+    // already recycled while we were waiting.
+    if (cache_.Size() > GetMaxSize()) {
+      recycle_mutex_.Lock();
+      if (cache_.Size() > GetMaxSize())
+        Recycle(atomic_load_relaxed(&min_size_), cb);
+      else
+        recycle_mutex_.Unlock();
+    }
   }
 
   void NOINLINE DrainAndRecycle(Cache *c, Callback cb) {
