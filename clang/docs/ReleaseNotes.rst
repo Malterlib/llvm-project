@@ -670,6 +670,8 @@ Bug Fixes to C++ Support
 - Fixed an issue where recursive instantiation could lead to escape of SFINAE errors. (#GH179118)
 - Fixed an assertion failure in floating conversion narrowing caused by C++ constant expression checks in C23 mode. (#GH173847)
 
+- Fix initialization of GRO when GRO-return type mismatches, as part of CWG2563. (#GH98744)
+
 Bug Fixes to AST Handling
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 - Fix incorrect name qualifiers applied to alias CTAD. (#GH136624)
