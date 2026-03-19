@@ -2907,7 +2907,7 @@ private:
 			TCVector<TCUniquePointer<CTreeNode>> m_Children;
 
 			// Formatting state
-			mint m_BaseIndentation = 0;
+			umint m_BaseIndentation = 0;
 			bool m_bShouldBreak = false;  // Whether this nodes children should be broken on new lines
 
 			// Syntactic unit type (based on tokenizer output patterns)
@@ -2926,7 +2926,7 @@ private:
 			ENodeType m_NodeType = ENodeType::mc_Expression;
 
 			// Breaking priority - lower numbers break first
-			mint m_BreakPriority = 100;
+			umint m_BreakPriority = 100;
 
 			// Constructor
 			CTreeNode(ENodeType _NodeType = ENodeType::mc_Expression)
@@ -2935,14 +2935,14 @@ private:
 			}
 
 			// Methods - inline implementations for now
-			mint f_MeasureLength() const
+			umint f_MeasureLength() const
 			{
 				return 0;
 /*				// Simple stub: count characters between start and end tokens
 				if (!m_pStartToken || !m_pEndToken)
 					return 0;
 
-				mint nLength = 0;
+				umint nLength = 0;
 				FormatToken *pCurrent = m_pStartToken;
 				while (pCurrent && pCurrent != m_pEndToken->Next)
 				{
@@ -2954,7 +2954,7 @@ private:
 				return nLength + (m_BaseIndentation * 4); // Add indentation*/
 			}
 
-			bool f_ShouldBreak(mint _ColumnLimit) const
+			bool f_ShouldBreak(umint _ColumnLimit) const
 			{
 				return f_MeasureLength() > _ColumnLimit;
 			}
@@ -2964,7 +2964,7 @@ private:
 				m_bShouldBreak = true;
 			}
 
-			CStr f_GenerateFormatted(mint _IndentLevel) const
+			CStr f_GenerateFormatted(umint _IndentLevel) const
 			{
 				return {};
 				/*
@@ -2972,7 +2972,7 @@ private:
 				CStr Result;
 
 				// Add indentation
-				for (mint i = 0; i < _IndentLevel; ++i)
+				for (umint i = 0; i < _IndentLevel; ++i)
 					Result += "\t";
 
 				if (m_pStartToken)
@@ -3000,7 +3000,7 @@ private:
 				return Result;*/
 			}
 
-			bool f_HasLinesExceedingLimit(mint _ColumnLimit) const
+			bool f_HasLinesExceedingLimit(umint _ColumnLimit) const
 			{
 				if (f_ShouldBreak(_ColumnLimit))
 					return true;
@@ -3018,14 +3018,14 @@ private:
 			{
 				// Find the node with the lowest break priority that exceeds the limit
 				CTreeNode *pBestNode = nullptr;
-				mint nBestPriority = 1000;
+				umint nBestPriority = 1000;
 
 				f_FindHighestPriorityNodeToBreakRecursive(this, pBestNode, nBestPriority);
 				return pBestNode;
 			}
 
 		private:
-			void f_FindHighestPriorityNodeToBreakRecursive(CTreeNode const *_pNode, CTreeNode *&_pBestNode, mint &_nBestPriority) const
+			void f_FindHighestPriorityNodeToBreakRecursive(CTreeNode const *_pNode, CTreeNode *&_pBestNode, umint &_nBestPriority) const
 			{
 				if (!_pNode || _pNode->m_bShouldBreak)
 					return;
@@ -3085,7 +3085,7 @@ private:
 		{
 			AffectedRangeMgr.computeAffectedLines(AnnotatedLines);
 
-			auto fTestingLogTokenInfo = [&](this auto &_fThis, FormatToken &_Token, mint _Depth) -> void
+			auto fTestingLogTokenInfo = [&](this auto &_fThis, FormatToken &_Token, umint _Depth) -> void
 				{
 					DConOut2
 						(
@@ -3108,7 +3108,7 @@ private:
 				}
 			;
 
-			auto fTestingLogToken = [&](this auto &_fThis, FormatToken &_Token, mint _Depth) -> void
+			auto fTestingLogToken = [&](this auto &_fThis, FormatToken &_Token, umint _Depth) -> void
 				{
 					SourceRange WSRange = _Token.WhitespaceRange;
 					SourceManager const &SM = Env.getSourceManager();
