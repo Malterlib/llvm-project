@@ -162,12 +162,12 @@ if
 Correct examples:
 
 ```
-for (mint iValue = 0; iValue < 5; ++iValue)
+for (umint iValue = 0; iValue < 5; ++iValue)
 	fg_FuncCall0(ValueArray[i]);
 ```
 
 ```
-for (mint iValue = 0; iValue < 5; ++iValue)
+for (umint iValue = 0; iValue < 5; ++iValue)
 {
 	fg_FuncCall0(ValueArray[i]);
 	fg_FuncCall1(ValueArray[i]);
@@ -177,7 +177,7 @@ for (mint iValue = 0; iValue < 5; ++iValue)
 ```
 for
 (
-	mint iValue = 0
+	umint iValue = 0
 	; iValue < 5
 	; ++iValue
 )
