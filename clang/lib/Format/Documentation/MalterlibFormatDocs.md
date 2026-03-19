@@ -24,7 +24,7 @@ All operators, except '.', '->' and '*' (dereference), have spaces before and af
 
 ```
 int a = b * c;
- 
+
 if ((a == b) && (c == d))
 {
 	d = d * b + c * a;
@@ -73,7 +73,7 @@ fg_FuncCall
 		, 8
 	)
 ;
- 
+
 using CType =
 	TCTemplate
 	<
@@ -145,7 +145,7 @@ else
 ```
 
 ```
-if 
+if
 (
 	bExprX
 	&& (bExprY || bExprZ)
@@ -162,12 +162,12 @@ if
 Correct examples:
 
 ```
-for (mint iValue = 0; iValue < 5; ++iValue)
+for (umint iValue = 0; iValue < 5; ++iValue)
 	fg_FuncCall0(ValueArray[i]);
 ```
 
 ```
-for (mint iValue = 0; iValue < 5; ++iValue)
+for (umint iValue = 0; iValue < 5; ++iValue)
 {
 	fg_FuncCall0(ValueArray[i]);
 	fg_FuncCall1(ValueArray[i]);
@@ -175,9 +175,9 @@ for (mint iValue = 0; iValue < 5; ++iValue)
 ```
 
 ```
-for 
+for
 (
-	mint iValue = 0
+	umint iValue = 0
 	; iValue < 5
 	; ++iValue
 )
@@ -344,7 +344,7 @@ A function declaration or prototype is defined as follows. Note that the orderin
 
 ```
 [static] [virtual] [inline] [other_attributes] <return type> f_FunctionName(<parameter list>) [const] [volatile] [= 0];
- 
+
 [static] [virtual] [inline] [other_attributes] auto f_FunctionName(<parameter list>) [const] [volatile] [= 0] -> <return type>;
 ```
 
@@ -364,16 +364,16 @@ Examples:
 
 ```
 void fg_Function(int _Param0, int _Param1);
- 
+
 void fg_Function(int _Param0, int _Param1)
 {
 }
- 
+
 template <typename tf_CType>
 void fg_Function(int _Param0, int _Param1)
 {
 }
- 
+
 void f_Function
 	(
 		int _Param0
@@ -381,7 +381,7 @@ void f_Function
 	)
 	const volatile = 0
 ;
- 
+
 void fg_Function
 	(
 		int _Param0
@@ -389,10 +389,10 @@ void fg_Function
 	)
 {
 }
- 
+
 template <typename tf_CType>
 typename TCLongTemplate<tf_CType>::CType fg_Function(int _Param0, int _Param1);
- 
+
 template <typename tf_CType>
 static inline_always auto fg_Function(int _Param0, int _Param1)
 	-> typename TCLongTemplate
@@ -403,17 +403,17 @@ static inline_always auto fg_Function(int _Param0, int _Param1)
 	>
 	::CType::template TCTest<fp32>::CType
 ;
- 
+
 template <typename tf_CType>
 auto fg_Function
 	(
 		int _Param0
 		, int _Param1
 	)
-	-> typename TCLongTemplate<tf_CType, uint32, 3>::CType 
+	-> typename TCLongTemplate<tf_CType, uint32, 3>::CType
 {
 }
- 
+
 template <typename tf_CType>
 auto f_Function
 	(
@@ -421,22 +421,22 @@ auto f_Function
 		, int _Param1
 	)
 	const volatile
-	-> typename TCLongTemplate<tf_CType>::CType 
+	-> typename TCLongTemplate<tf_CType>::CType
 {
 }
- 
+
 template <typename tf_CType>
 auto f_Function(int _Param0, int _Param1) const volatile
-	-> typename TCLongTemplate<tf_CType>::CType 
+	-> typename TCLongTemplate<tf_CType>::CType
 {
 }
- 
+
 auto fg_Function
 	(
 		int _Param0
 		, int _Param1
 	)
-	-> typename TCLongTemplate<fp32, uint32, 3>::CType 
+	-> typename TCLongTemplate<fp32, uint32, 3>::CType
 {
 }
 ```
@@ -476,11 +476,11 @@ public:
 	};
 
 	using CRetValue = uint32;
- 
+
 	CRetValue f_PublicFunction(CSubStruct const &_Param);
- 
+
 	uint32 m_PublicMember;
- 
+
 protected:
 	struct CProtectedSubStruct
 	{
@@ -488,11 +488,11 @@ protected:
 	};
 
 	using CProtectedRetValue = uint32;
- 
+
 	CProtectedRetValue fp_ProtectedFunction(CProtectedSubStruct const &_Param);
- 
+
 	uint32 mp_ProtectedMember;
- 
+
 private:
 	struct CPrivateSubStruct
 	{
@@ -500,9 +500,9 @@ private:
 	};
 
 	using CPrivateRetValue = uint32;
- 
+
 	CPrivateRetValue fp_PrivateFunction(CPrivateSubStruct const &_Param);
- 
+
 	uint32 mp_PrivateMember;
 };
 ```
@@ -516,11 +516,11 @@ struct CTest
 	};
 
 	using CRetValue = uint32;
- 
+
 	CRetValue f_PublicFunction(CSubStruct const &_Param);
- 
+
 	uint32 m_PublicMember;
- 
+
 protected:
 	struct CProtectedSubStruct
 	{
@@ -528,11 +528,11 @@ protected:
 	};
 
 	using CProtectedRetValue = uint32;
- 
+
 	CProtectedRetValue fp_ProtectedFunction(CProtectedSubStruct const &_Param);
- 
+
 	uint32 mp_ProtectedMember;
- 
+
 private:
 	struct CPrivateSubStruct
 	{
@@ -540,9 +540,9 @@ private:
 	};
 
 	using CPrivateRetValue = uint32;
- 
+
 	CPrivateRetValue fp_PrivateFunction(CPrivateSubStruct const &_Param);
- 
+
 	uint32 mp_PrivateMember;
 };
 ```
@@ -556,7 +556,7 @@ template <typename tf_CType>
 void f_FunctionName(tf_CType &&_Variable) const
 	requires cIsCompatible<tf_CType>
 ;
- 
+
 template <typename tf_CType>
 	requires cIsCompatible<tf_CType>
 struct TCTestClass
