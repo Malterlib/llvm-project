@@ -17,3 +17,7 @@ add_lldb_library(lldbPluginPlatformMacOSXObjCXX
 
 
 target_compile_options(lldbPluginPlatformMacOSXObjCXX PRIVATE -fno-objc-exceptions)
+
+if(NOT LLVM_ENABLE_RTTI AND LLVM_CXXFLAGS_RTTI_DISABLE)
+  target_compile_options(lldbPluginPlatformMacOSXObjCXX PRIVATE ${LLVM_CXXFLAGS_RTTI_DISABLE})
+endif()

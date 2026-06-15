@@ -21,3 +21,7 @@ add_lldb_library(lldbHostMacOSXObjCXX NO_PLUGIN_DEPENDENCIES
 target_compile_options(lldbHostMacOSXObjCXX PRIVATE
   -fno-objc-exceptions
   -Wno-deprecated-declarations)
+
+if(NOT LLVM_ENABLE_RTTI AND LLVM_CXXFLAGS_RTTI_DISABLE)
+  target_compile_options(lldbHostMacOSXObjCXX PRIVATE ${LLVM_CXXFLAGS_RTTI_DISABLE})
+endif()
