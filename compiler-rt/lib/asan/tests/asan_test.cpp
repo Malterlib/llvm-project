@@ -447,6 +447,9 @@ TEST(AddressSanitizer, MallocUsableSizeTest) {
   EXPECT_EQ(0U, malloc_usable_size(NULL));
   EXPECT_EQ(kArraySize, malloc_usable_size(array));
   EXPECT_EQ(sizeof(int), malloc_usable_size(int_ptr));
+  char *zero_array = Ident((char*)malloc(0));
+  EXPECT_EQ(0U, malloc_usable_size(zero_array));
+  free(zero_array);
   EXPECT_DEATH(malloc_usable_size((void*)0x123), kMallocUsableSizeErrorMsg);
   EXPECT_DEATH(malloc_usable_size(array + kArraySize / 2),
                kMallocUsableSizeErrorMsg);
