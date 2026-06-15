@@ -301,6 +301,14 @@ long double    truncl(long double x);
 #    include_next <math.h>
 #  endif
 
+#  ifndef INFINITY
+#    define INFINITY __builtin_inff()
+#  endif
+
+#  ifndef NAN
+#    define NAN __builtin_nanf("")
+#  endif
+
 #  ifdef __cplusplus
 
 // We support including .h headers inside 'extern "C"' contexts, so switch
