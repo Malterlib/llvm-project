@@ -525,6 +525,10 @@ void LookupResult::resolveKind() {
   for (unsigned I = 0; I < N; I++) {
     const NamedDecl *D = Decls[I]->getUnderlyingDecl();
     D = cast<NamedDecl>(D->getCanonicalDecl());
+    if (const auto *ID = dyn_cast<ObjCInterfaceDecl>(D))
+      if (ID->getIdentifier() && ID->getIdentifier()->isStr("Protocol"))
+        D = cast<NamedDecl>(
+            getSema().Context.getObjCProtocolDecl()->getCanonicalDecl());
 
     // Ignore an invalid declaration unless it's the only one left.
     // Also ignore HLSLBufferDecl which not have name conflict with other Decls.
