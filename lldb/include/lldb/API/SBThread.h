@@ -95,6 +95,8 @@ public:
 
   lldb::tid_t GetThreadID() const;
 
+  lldb::addr_t GetThreadPointer() const;
+
   uint32_t GetIndexID() const;
 
   const char *GetName() const;

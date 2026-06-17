@@ -82,6 +82,13 @@ See also :py:class:`SBFrame` ."
 ) lldb::SBThread::GetThreadID;
 
 %feature("docstring", "
+    Returns the thread pointer value for this SBThread if LLDB can obtain it
+    without executing code in the inferior, or LLDB_INVALID_ADDRESS otherwise.
+    On Darwin targets this may be provided from the thread-specific data base
+    reported by debugserver."
+) lldb::SBThread::GetThreadPointer;
+
+%feature("docstring", "
     Return the index number for this SBThread.  The index number is the same thing
     that a user gives as an argument to 'thread select' in the command line lldb.
     These numbers start at 1 (for the first thread lldb sees in a debug session)

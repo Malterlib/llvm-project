@@ -219,6 +219,20 @@ void ThreadGDBRemote::SetAssociatedWithLibdispatchQueue(
   m_associated_with_libdispatch_queue = associated_with_libdispatch_queue;
 }
 
+lldb::addr_t ThreadGDBRemote::GetThreadPointer() {
+  ProcessSP process_sp(GetProcess());
+  if (process_sp) {
+    ProcessGDBRemote *gdb_process =
+        static_cast<ProcessGDBRemote *>(process_sp.get());
+    lldb::addr_t thread_pointer =
+        gdb_process->GetThreadPointerForThread(GetProtocolID());
+    if (thread_pointer != LLDB_INVALID_ADDRESS)
+      return thread_pointer;
+  }
+
+  return Thread::GetThreadPointer();
+}
+
 StructuredData::ObjectSP ThreadGDBRemote::FetchThreadExtendedInfo() {
   StructuredData::ObjectSP object_sp;
   const lldb::user_id_t tid = GetProtocolID();
