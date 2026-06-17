@@ -609,6 +609,19 @@ StructuredData::ObjectSP GDBRemoteCommunicationClient::GetThreadsInfo() {
   return object_sp;
 }
 
+bool GDBRemoteCommunicationClient::GetThreadPointerSupported() {
+  if (m_supports_jThreadPointer == eLazyBoolCalculate) {
+    StringExtractorGDBRemote response;
+    m_supports_jThreadPointer = eLazyBoolNo;
+    if (SendPacketAndWaitForResponse("jThreadPointer:", response) ==
+        PacketResult::Success) {
+      if (response.IsOKResponse())
+        m_supports_jThreadPointer = eLazyBoolYes;
+    }
+  }
+  return m_supports_jThreadPointer;
+}
+
 bool GDBRemoteCommunicationClient::GetThreadExtendedInfoSupported() {
   if (m_supports_jThreadExtendedInfo == eLazyBoolCalculate) {
     StringExtractorGDBRemote response;

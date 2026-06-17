@@ -32,6 +32,23 @@ using namespace lldb_private;
 using GetThreadDescriptionFunctionPtr =
     HRESULT(WINAPI *)(HANDLE hThread, PWSTR *ppszThreadDescription);
 
+using NtQueryInformationThreadPtr = LONG(WINAPI *)(HANDLE, ULONG, PVOID, ULONG,
+                                                  PULONG);
+
+struct ClientId {
+  HANDLE UniqueProcess;
+  HANDLE UniqueThread;
+};
+
+struct ThreadBasicInformation {
+  LONG ExitStatus;
+  PVOID TebBaseAddress;
+  ClientId Client;
+  ULONG_PTR AffinityMask;
+  LONG Priority;
+  LONG BasePriority;
+};
+
 TargetThreadWindows::TargetThreadWindows(ProcessWindows &process,
                                          const HostThread &thread)
     : Thread(process, thread.GetNativeThread().GetThreadId()),
@@ -173,6 +190,33 @@ Status TargetThreadWindows::DoResume() {
   }
 
   return Status();
+}
+
+lldb::addr_t TargetThreadWindows::GetThreadPointer() {
+  lldb::addr_t thread_pointer = Thread::GetThreadPointer();
+  if (thread_pointer != LLDB_INVALID_ADDRESS)
+    return thread_pointer;
+
+  static NtQueryInformationThreadPtr NtQueryInformationThread = []() {
+    HMODULE module = ::GetModuleHandleW(L"ntdll.dll");
+    if (!module)
+      return NtQueryInformationThreadPtr();
+
+    return reinterpret_cast<NtQueryInformationThreadPtr>(
+        ::GetProcAddress(module, "NtQueryInformationThread"));
+  }();
+
+  if (!NtQueryInformationThread)
+    return LLDB_INVALID_ADDRESS;
+
+  ThreadBasicInformation info = {};
+  LONG status = NtQueryInformationThread(
+      m_host_thread.GetNativeThread().GetSystemHandle(), 0, &info, sizeof(info),
+      nullptr);
+  if (status < 0 || !info.TebBaseAddress)
+    return LLDB_INVALID_ADDRESS;
+
+  return reinterpret_cast<lldb::addr_t>(info.TebBaseAddress);
 }
 
 const char *TargetThreadWindows::GetName() {

@@ -35,6 +35,7 @@ public:
   CreateRegisterContextForFrame(StackFrame *frame) override;
   bool CalculateStopInfo() override;
   const char *GetName() override;
+  lldb::addr_t GetThreadPointer() override;
 
   Status DoResume();
 

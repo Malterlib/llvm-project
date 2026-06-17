@@ -88,6 +88,8 @@ public:
   void SetAssociatedWithLibdispatchQueue(
       lldb_private::LazyBool associated_with_libdispatch_queue) override;
 
+  lldb::addr_t GetThreadPointer() override;
+
   StructuredData::ObjectSP FetchThreadExtendedInfo() override;
 
 protected:

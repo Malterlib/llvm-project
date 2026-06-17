@@ -99,6 +99,7 @@ public:
     query_host_info,                               // 'qHostInfo'
     query_gdb_server_version,                      // 'qGDBServerVersion'
     query_process_info,                            // 'qProcessInfo'
+    json_query_thread_pointer,                     // 'jThreadPointer'
     json_query_thread_extended_info,               // 'jThreadExtendedInfo'
     json_query_get_loaded_dynamic_libraries_infos, // 'jGetLoadedDynamicLibrariesInfos'
     json_query_threads_info,                       // 'jThreadsInfo'
@@ -187,6 +188,7 @@ public:
   rnb_err_t HandlePacket_qVAttachOrWaitSupported(const char *p);
   rnb_err_t HandlePacket_qSyncThreadStateSupported(const char *p);
   rnb_err_t HandlePacket_qThreadInfo(const char *p);
+  rnb_err_t HandlePacket_jThreadPointer(const char *p);
   rnb_err_t HandlePacket_jThreadExtendedInfo(const char *p);
   rnb_err_t HandlePacket_jGetLoadedDynamicLibrariesInfos(const char *p);
   rnb_err_t HandlePacket_jThreadsInfo(const char *p);

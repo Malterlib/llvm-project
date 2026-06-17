@@ -463,6 +463,10 @@ void RNBRemote::CreatePacketTable() {
                      "QEnableErrorStrings",
                      "Tell " DEBUGSERVER_PROGRAM_NAME
                      " it can append descriptive error messages in replies."));
+  t.push_back(Packet(json_query_thread_pointer,
+                     &RNBRemote::HandlePacket_jThreadPointer, NULL,
+                     "jThreadPointer",
+                     "Replies with JSON data containing the thread pointer."));
   t.push_back(Packet(json_query_thread_extended_info,
                      &RNBRemote::HandlePacket_jThreadExtendedInfo, NULL,
                      "jThreadExtendedInfo",
@@ -5721,6 +5725,48 @@ rnb_err_t RNBRemote::HandlePacket_jThreadsInfo(const char *p) {
     }
   }
   return SendErrorPacket("E85");
+}
+
+rnb_err_t RNBRemote::HandlePacket_jThreadPointer(const char *p) {
+  if (!m_ctx.HasValidProcessID())
+    return SendErrorPacket("E81");
+
+  const char thread_pointer_query[] = {"jThreadPointer:"};
+  if (strcmp(p, thread_pointer_query) == 0)
+    return SendPacket("OK");
+
+  const char thread_pointer_str[] = {"jThreadPointer:{"};
+  if (strncmp(p, thread_pointer_str, sizeof(thread_pointer_str) - 1) != 0)
+    return SendErrorPacket("E82");
+
+  p += strlen(thread_pointer_str);
+
+  uint64_t tid = get_integer_value_for_key_name_from_json("thread", p);
+  uint64_t plo_pthread_tsd_base_address_offset =
+      get_integer_value_for_key_name_from_json(
+          "plo_pthread_tsd_base_address_offset", p);
+  uint64_t plo_pthread_tsd_base_offset =
+      get_integer_value_for_key_name_from_json("plo_pthread_tsd_base_offset",
+                                               p);
+  uint64_t plo_pthread_tsd_entry_size =
+      get_integer_value_for_key_name_from_json("plo_pthread_tsd_entry_size",
+                                               p);
+
+  if (tid == INVALID_NUB_ADDRESS)
+    return SendErrorPacket("E83");
+
+  nub_addr_t thread_pointer = INVALID_NUB_ADDRESS;
+  if (plo_pthread_tsd_entry_size != INVALID_NUB_ADDRESS &&
+      plo_pthread_tsd_base_offset != INVALID_NUB_ADDRESS) {
+    thread_pointer = DNBGetTSDAddressForThread(
+        m_ctx.ProcessID(), tid, plo_pthread_tsd_base_address_offset,
+        plo_pthread_tsd_base_offset, plo_pthread_tsd_entry_size);
+  }
+
+  std::ostringstream json;
+  json << "{\"thread_pointer\":" << thread_pointer << "}";
+  std::string json_quoted = binary_encode_string(json.str());
+  return SendPacket(json_quoted);
 }
 
 rnb_err_t RNBRemote::HandlePacket_jThreadExtendedInfo(const char *p) {

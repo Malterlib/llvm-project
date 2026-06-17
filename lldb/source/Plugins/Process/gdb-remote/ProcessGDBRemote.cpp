@@ -4204,6 +4204,51 @@ DataExtractor ProcessGDBRemote::GetAuxvData() {
   return DataExtractor(buf, GetByteOrder(), GetAddressByteSize());
 }
 
+lldb::addr_t ProcessGDBRemote::GetThreadPointerForThread(lldb::tid_t tid) {
+  if (!m_gdb_comm.GetThreadPointerSupported())
+    return LLDB_INVALID_ADDRESS;
+
+  StructuredData::ObjectSP args_dict(new StructuredData::Dictionary());
+  SystemRuntime *runtime = GetSystemRuntime();
+  if (runtime)
+    runtime->AddThreadExtendedInfoPacketHints(args_dict);
+  args_dict->GetAsDictionary()->AddIntegerItem("thread", tid);
+
+  StreamString packet;
+  packet << "jThreadPointer:";
+  args_dict->Dump(packet, false);
+
+  // FIXME the final character of a JSON dictionary, '}', is the escape
+  // character in gdb-remote binary mode.  lldb currently doesn't escape
+  // these characters in its packet output -- so we add the quoted version of
+  // the } character here manually in case we talk to a debugserver which un-
+  // escapes the characters at packet read time.
+  packet << (char)(0x7d ^ 0x20);
+
+  StringExtractorGDBRemote response;
+  response.SetResponseValidatorToJSON();
+  if (m_gdb_comm.SendPacketAndWaitForResponse(packet.GetString(), response) !=
+      GDBRemoteCommunication::PacketResult::Success)
+    return LLDB_INVALID_ADDRESS;
+
+  if (response.GetResponseType() != StringExtractorGDBRemote::eResponse ||
+      response.Empty())
+    return LLDB_INVALID_ADDRESS;
+
+  StructuredData::ObjectSP object_sp =
+      StructuredData::ParseJSON(response.GetStringRef());
+  if (!object_sp)
+    return LLDB_INVALID_ADDRESS;
+
+  StructuredData::ObjectSP thread_pointer_sp =
+      object_sp->GetObjectForDotSeparatedPath("thread_pointer");
+  if (!thread_pointer_sp ||
+      thread_pointer_sp->GetType() != eStructuredDataTypeInteger)
+    return LLDB_INVALID_ADDRESS;
+
+  return thread_pointer_sp->GetUnsignedIntegerValue(LLDB_INVALID_ADDRESS);
+}
+
 StructuredData::ObjectSP
 ProcessGDBRemote::GetExtendedInfoForThread(lldb::tid_t tid) {
   StructuredData::ObjectSP object_sp;

@@ -332,6 +332,22 @@ lldb::tid_t SBThread::GetThreadID() const {
   return LLDB_INVALID_THREAD_ID;
 }
 
+lldb::addr_t SBThread::GetThreadPointer() const {
+  LLDB_INSTRUMENT_VA(this);
+
+  llvm::Expected<StoppedExecutionContext> exe_ctx =
+      GetStoppedExecutionContext(m_opaque_sp);
+  if (!exe_ctx) {
+    LLDB_LOG_ERROR(GetLog(LLDBLog::API), exe_ctx.takeError(), "{0}");
+    return LLDB_INVALID_ADDRESS;
+  }
+
+  ThreadSP thread_sp(m_opaque_sp->GetThreadSP());
+  if (thread_sp)
+    return thread_sp->GetThreadPointer();
+  return LLDB_INVALID_ADDRESS;
+}
+
 uint32_t SBThread::GetIndexID() const {
   LLDB_INSTRUMENT_VA(this);
 

@@ -1866,8 +1866,21 @@ void Thread::SettingsInitialize() {}
 void Thread::SettingsTerminate() {}
 
 lldb::addr_t Thread::GetThreadPointer() {
-  if (m_reg_context_sp)
-    return m_reg_context_sp->GetThreadPointer();
+  if (m_reg_context_sp) {
+    lldb::addr_t thread_pointer = m_reg_context_sp->GetThreadPointer();
+    if (thread_pointer != LLDB_INVALID_ADDRESS)
+      return thread_pointer;
+  }
+
+  StructuredData::ObjectSP thread_info = GetExtendedInfo();
+  if (thread_info) {
+    StructuredData::ObjectSP tsd_address =
+        thread_info->GetObjectForDotSeparatedPath("tsd_address");
+    if (tsd_address &&
+        tsd_address->GetType() == eStructuredDataTypeInteger)
+      return tsd_address->GetUnsignedIntegerValue(LLDB_INVALID_ADDRESS);
+  }
+
   return LLDB_INVALID_ADDRESS;
 }
 
