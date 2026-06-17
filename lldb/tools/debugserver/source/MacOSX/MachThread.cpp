@@ -688,7 +688,7 @@ MachThread::GetTSDAddressForThread(uint64_t plo_pthread_tsd_base_address_offset,
         }
       }
     }
-    if (plo_pthread_tsd_entry_size == 4) {
+    if (plo_pthread_tsd_entry_size == 8) {
       uint64_t addr = 0;
       if (m_process->ReadMemory(pthread_t_value +
                                     plo_pthread_tsd_base_address_offset,

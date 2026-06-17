@@ -252,6 +252,8 @@ public:
 
   StructuredData::ObjectSP GetDynamicLoaderProcessState() override;
 
+  lldb::addr_t GetThreadPointerForThread(lldb::tid_t tid);
+
   std::string HarmonizeThreadIdsForProfileData(
       StringExtractorGDBRemote &inputStringExtractor);
 
