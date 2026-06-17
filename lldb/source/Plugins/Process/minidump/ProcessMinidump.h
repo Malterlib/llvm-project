@@ -76,6 +76,8 @@ public:
 
   ArchSpec GetArchitecture();
 
+  bool IsWow64() const { return m_is_wow64; }
+
   Status
   GetMemoryRegions(lldb_private::MemoryRegionInfos &region_list) override;
 

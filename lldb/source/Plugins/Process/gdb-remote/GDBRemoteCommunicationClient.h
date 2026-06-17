@@ -470,6 +470,8 @@ public:
 
   StructuredData::ObjectSP GetThreadsInfo();
 
+  bool GetThreadPointerSupported();
+
   bool GetThreadExtendedInfoSupported();
 
   bool GetLoadedDynamicLibrariesInfosSupported();
@@ -598,6 +600,7 @@ protected:
   LazyBool m_supports_qXfer_memory_map_read = eLazyBoolCalculate;
   LazyBool m_supports_qXfer_siginfo_read = eLazyBoolCalculate;
   LazyBool m_supports_augmented_libraries_svr4_read = eLazyBoolCalculate;
+  LazyBool m_supports_jThreadPointer = eLazyBoolCalculate;
   LazyBool m_supports_jThreadExtendedInfo = eLazyBoolCalculate;
   LazyBool m_supports_jLoadedDynamicLibrariesInfos = eLazyBoolCalculate;
   LazyBool m_supports_jGetSharedCacheInfo = eLazyBoolCalculate;

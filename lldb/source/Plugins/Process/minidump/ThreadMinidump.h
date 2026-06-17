@@ -32,9 +32,13 @@ public:
   lldb::RegisterContextSP
   CreateRegisterContextForFrame(StackFrame *frame) override;
 
+  lldb::addr_t GetThreadPointer() override;
+
 protected:
   lldb::RegisterContextSP m_thread_reg_ctx_sp;
   llvm::ArrayRef<uint8_t> m_gpregset_data;
+  lldb::addr_t m_thread_pointer;
+  lldb::addr_t m_effective_thread_pointer;
 
   bool CalculateStopInfo() override;
 };
