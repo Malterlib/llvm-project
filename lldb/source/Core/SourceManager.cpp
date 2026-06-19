@@ -568,8 +568,11 @@ void SourceManager::File::CommonInitializerImpl(SupportFileNSP support_file_nsp,
 
   // If the file exists, read in the data.
   if (m_mod_time != llvm::sys::TimePoint<>()) {
+    // Source files can be edited while the debugger is running. Read them as
+    // volatile so LLDB does not keep a mapped file region alive.
     m_data_sp = FileSystem::Instance().CreateDataBuffer(
-        m_support_file_nsp->GetSpecOnly());
+        m_support_file_nsp->GetSpecOnly(), /*size=*/0, /*offset=*/0,
+        /*is_volatile=*/true);
     // Even if we have a valid modification time, reading the data might fail.
     // Use the checksum from the line entry so we don't show a checksum
     // mismatch.

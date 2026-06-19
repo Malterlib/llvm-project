@@ -154,10 +154,12 @@ public:
   /// \{
   std::shared_ptr<DataBuffer> CreateDataBuffer(const llvm::Twine &path,
                                                uint64_t size = 0,
-                                               uint64_t offset = 0);
+                                               uint64_t offset = 0,
+                                               bool is_volatile = false);
   std::shared_ptr<DataBuffer> CreateDataBuffer(const FileSpec &file_spec,
                                                uint64_t size = 0,
-                                               uint64_t offset = 0);
+                                               uint64_t offset = 0,
+                                               bool is_volatile = false);
   std::shared_ptr<WritableDataBuffer>
   CreateWritableDataBuffer(const llvm::Twine &path, uint64_t size = 0,
                            uint64_t offset = 0);

@@ -48,6 +48,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatAdapters.h"
+#include "llvm/Support/Path.h"
 
 #include <cstdio>
 #include <cstdlib>
