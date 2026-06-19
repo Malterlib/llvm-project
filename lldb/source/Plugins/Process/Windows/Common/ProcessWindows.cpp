@@ -63,9 +63,12 @@ std::string GetProcessExecutableName(HANDLE process_handle) {
     copied = ::GetModuleFileNameExW(process_handle, NULL, file_name.data(),
                                     file_name_size);
   } while (copied >= file_name_size);
-  file_name.resize(copied);
+
+  std::wstring wide_file_name(file_name.data(), copied);
   std::string result;
-  llvm::convertWideToUTF8(file_name.data(), result);
+  if (!llvm::convertWideToUTF8(wide_file_name, result))
+    return {};
+
   return result;
 }
 
