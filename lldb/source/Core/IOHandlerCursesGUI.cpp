@@ -7845,7 +7845,7 @@ protected:
   int m_max_y = 0;
 };
 
-DisplayOptions ValueObjectListDelegate::g_options = {true};
+DisplayOptions ValueObjectListDelegate::g_options = {false};
 
 IOHandlerCursesGUI::IOHandlerCursesGUI(Debugger &debugger)
     : IOHandler(debugger, IOHandler::Type::Curses) {}
