@@ -257,6 +257,8 @@ public:
 
   lldb::SBType FindDirectNestedType(const char *name);
 
+  lldb::SBType GetContainingType();
+
   lldb::SBType &operator=(const lldb::SBType &rhs);
 
   bool operator==(lldb::SBType &rhs);
