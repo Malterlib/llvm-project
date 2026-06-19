@@ -75,6 +75,10 @@ public:
   clang::QualType GetBasicType(lldb::BasicType type);
   clang::QualType GetOrCreateClangType(PdbTypeSymId type);
   CompilerType GetOrCreateType(PdbTypeSymId type);
+  clang::NamespaceDecl *GetOrCreateNamespaceDecl(const char *name,
+                                                 clang::DeclContext &context);
+  void RegisterTagType(PdbTypeSymId type, clang::QualType qt,
+                       bool resolved = false);
 
   bool CompleteTagDecl(clang::TagDecl &tag);
   bool CompleteType(CompilerType ct);
@@ -129,8 +133,6 @@ private:
   clang::VarDecl *CreateVariableDecl(PdbSymUid uid,
                                      llvm::codeview::CVSymbol sym,
                                      clang::DeclContext &scope);
-  clang::NamespaceDecl *GetOrCreateNamespaceDecl(const char *name,
-                                                 clang::DeclContext &context);
   clang::FunctionDecl *CreateFunctionDeclFromId(PdbTypeSymId func_tid,
                                                 PdbCompilandSymId func_sid);
   clang::FunctionDecl *

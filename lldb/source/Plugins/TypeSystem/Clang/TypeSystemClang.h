@@ -922,6 +922,8 @@ public:
   CompilerType GetDirectNestedTypeWithName(lldb::opaque_compiler_type_t type,
                                            llvm::StringRef name) override;
 
+  CompilerType GetContainingType(lldb::opaque_compiler_type_t type) override;
+
   bool IsTemplateType(lldb::opaque_compiler_type_t type) override;
 
   size_t GetNumTemplateArguments(lldb::opaque_compiler_type_t type,

@@ -7150,6 +7150,28 @@ TypeSystemClang::GetDirectNestedTypeWithName(lldb::opaque_compiler_type_t type,
   return CompilerType();
 }
 
+CompilerType
+TypeSystemClang::GetContainingType(lldb::opaque_compiler_type_t type) {
+  if (!type)
+    return CompilerType();
+
+  clang::QualType qual_type = RemoveWrappingTypes(GetCanonicalQualType(type));
+  clang::TagDecl *tag_decl = qual_type->getAsTagDecl();
+  if (!tag_decl)
+    return CompilerType();
+
+  clang::DeclContext *decl_context = tag_decl->getDeclContext();
+  auto *containing_record =
+      llvm::dyn_cast_or_null<clang::CXXRecordDecl>(decl_context);
+  if (!containing_record)
+    return CompilerType();
+
+  containing_record = containing_record->getDefinitionOrSelf();
+  return GetType(getASTContext().getTypeDeclType(
+      clang::ElaboratedTypeKeyword::None, /*Qualifier=*/std::nullopt,
+      static_cast<clang::TypeDecl *>(containing_record)));
+}
+
 bool TypeSystemClang::IsTemplateType(lldb::opaque_compiler_type_t type) {
   if (!type)
     return false;
@@ -7171,24 +7193,21 @@ TypeSystemClang::GetNumTemplateArguments(lldb::opaque_compiler_type_t type,
   const clang::Type::TypeClass type_class = qual_type->getTypeClass();
   switch (type_class) {
   case clang::Type::Record:
-    if (GetCompleteType(type)) {
-      const clang::CXXRecordDecl *cxx_record_decl =
-          qual_type->getAsCXXRecordDecl();
-      if (cxx_record_decl) {
-        const clang::ClassTemplateSpecializationDecl *template_decl =
-            llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(
-                cxx_record_decl);
-        if (template_decl) {
-          const auto &template_arg_list = template_decl->getTemplateArgs();
-          size_t num_args = template_arg_list.size();
-          assert(num_args && "template specialization without any args");
-          if (expand_pack && num_args) {
-            const auto &pack = template_arg_list[num_args - 1];
-            if (pack.getKind() == clang::TemplateArgument::Pack)
-              num_args += pack.pack_size() - 1;
-          }
-          return num_args;
+    if (const clang::CXXRecordDecl *cxx_record_decl =
+            qual_type->getAsCXXRecordDecl()) {
+      const clang::ClassTemplateSpecializationDecl *template_decl =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(
+              cxx_record_decl);
+      if (template_decl) {
+        const auto &template_arg_list = template_decl->getTemplateArgs();
+        size_t num_args = template_arg_list.size();
+        assert(num_args && "template specialization without any args");
+        if (expand_pack && num_args) {
+          const auto &pack = template_arg_list[num_args - 1];
+          if (pack.getKind() == clang::TemplateArgument::Pack)
+            num_args += pack.pack_size() - 1;
         }
+        return num_args;
       }
     }
     break;
@@ -7210,8 +7229,6 @@ TypeSystemClang::GetAsTemplateSpecialization(
   const clang::Type::TypeClass type_class = qual_type->getTypeClass();
   switch (type_class) {
   case clang::Type::Record: {
-    if (! GetCompleteType(type))
-      return nullptr;
     const clang::CXXRecordDecl *cxx_record_decl =
         qual_type->getAsCXXRecordDecl();
     if (!cxx_record_decl)

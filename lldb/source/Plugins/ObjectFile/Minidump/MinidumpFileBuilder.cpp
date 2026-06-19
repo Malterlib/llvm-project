@@ -677,13 +677,18 @@ Status MinidumpFileBuilder::AddThreadList() {
               thread_sp->GetIndexID(), thread_context.size());
     helper_data.AppendData(thread_context.data(), thread_context.size());
 
+    lldb::addr_t thread_pointer = thread_sp->GetThreadPointer();
+    if (thread_pointer == LLDB_INVALID_ADDRESS)
+      thread_pointer = 0;
+
     llvm::minidump::Thread t;
     t.ThreadId = static_cast<llvm::support::ulittle32_t>(thread_sp->GetID());
     t.SuspendCount = static_cast<llvm::support::ulittle32_t>(
         (thread_sp->GetState() == StateType::eStateSuspended) ? 1 : 0);
     t.PriorityClass = static_cast<llvm::support::ulittle32_t>(0);
     t.Priority = static_cast<llvm::support::ulittle32_t>(0);
-    t.EnvironmentBlock = static_cast<llvm::support::ulittle64_t>(0);
+    t.EnvironmentBlock =
+        static_cast<llvm::support::ulittle64_t>(thread_pointer);
     t.Stack = stack, t.Context = thread_context_memory_locator;
 
     // We save off the stack object so we can circle back and clean it up.

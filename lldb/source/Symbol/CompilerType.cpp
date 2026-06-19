@@ -952,6 +952,14 @@ CompilerType::GetDirectNestedTypeWithName(llvm::StringRef name) const {
   return CompilerType();
 }
 
+CompilerType CompilerType::GetContainingType() const {
+  if (IsValid()) {
+    if (auto type_system_sp = GetTypeSystem())
+      return type_system_sp->GetContainingType(m_type);
+  }
+  return CompilerType();
+}
+
 size_t CompilerType::GetNumTemplateArguments(bool expand_pack) const {
   if (IsValid()) {
     if (auto type_system_sp = GetTypeSystem())

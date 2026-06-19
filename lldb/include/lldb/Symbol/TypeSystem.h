@@ -396,6 +396,10 @@ public:
     return CompilerType();
   }
 
+  virtual CompilerType GetContainingType(lldb::opaque_compiler_type_t type) {
+    return CompilerType();
+  }
+
   virtual bool IsTemplateType(lldb::opaque_compiler_type_t type);
 
   virtual size_t GetNumTemplateArguments(lldb::opaque_compiler_type_t type,
