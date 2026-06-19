@@ -2,7 +2,7 @@
 // REQUIRES: lld, x86
 
 // Test various interesting cases for AST reconstruction.
-// RUN: %clang_cl --target=x86_64-windows-msvc -Od -Z7 \
+// RUN: %clang_cl --target=x86_64-windows-msvc -Od -Z7 -GS- \
 // RUN:   -Xclang -fkeep-static-consts -c /Fo%t.obj -- %s
 // RUN: lld-link -debug:full -nodefaultlib -entry:main %t.obj -out:%t.exe -pdb:%t.pdb
 // RUN: %lldb -f %t.exe -s \
@@ -47,13 +47,14 @@ template<typename Param>
 class U {
 public:
   // See llvm.org/pr39607.  clang-cl currently doesn't emit an important debug
-  // info record for nested template instantiations, so we can't reconstruct
-  // a proper DeclContext hierarchy for these.  As such, U<X>::V<Y> will show up
-  // in the global namespace.
+  // info record for nested template instantiations, so NativePDB recovers the
+  // DeclContext hierarchy from the instantiated parent record when it is
+  // available.
   template<typename Param>
   struct V {
     Param I = 8;
     Param J = 9;
+    Param method(Param Value) { return Value; }
 
     using W = T::NestedTypedef;
     using X = U<int>;
@@ -65,6 +66,7 @@ public:
   };
   Param K = 10;
   Param L = 11;
+  Param method(Param Value) { return Value; }
   using Y = V<int>;
   using Z = V<T>;
 };
@@ -81,7 +83,9 @@ constexpr S::NestedEnum GlobalEnum = S::NestedEnum::EnumValue1;
 
 
 int main(int argc, char **argv) {
-  return 0;
+  U<int> UValue;
+  U<int>::V<int> VValue;
+  return UValue.method(1) + VValue.method(2);
 }
 
 
@@ -161,24 +165,44 @@ int main(int argc, char **argv) {
 // CHECK: | | `-FieldDecl {{.*}} H 'int'
 // CHECK: | `-FieldDecl {{.*}} NT 'int'
 
-// CHECK: |-CXXRecordDecl {{.*}} class U<int> definition
+// CHECK: |-ClassTemplateDecl {{.*}} U
+// CHECK: | |-TemplateTypeParmDecl {{.*}} class depth 0 index 0
+// CHECK: | |-CXXRecordDecl {{.*}} class U
+// CHECK: | `-ClassTemplateSpecialization {{.*}} 'U'
+// CHECK: |-ClassTemplateSpecializationDecl {{.*}} class U definition explicit_specialization
+// CHECK: | |-TemplateArgument type 'int'
+// CHECK: | | `-BuiltinType {{.*}} 'int'
+// CHECK: | |-CXXMethodDecl {{.*}} method 'int (int)'
+// CHECK: | | `-ParmVarDecl {{.*}} 'int'
 // CHECK: | |-CXXRecordDecl {{.*}} struct W definition
 // CHECK: | | |-FieldDecl {{.*}} M 'int'
 // CHECK: | | `-FieldDecl {{.*}} N 'int'
+// CHECK: | |-ClassTemplateDecl {{.*}} V
+// CHECK: | | |-TemplateTypeParmDecl {{.*}} class depth 0 index 0
+// CHECK: | | |-CXXRecordDecl {{.*}} struct V
+// CHECK: | | |-ClassTemplateSpecialization {{.*}} 'V'
+// CHECK: | | `-ClassTemplateSpecialization {{.*}} 'V'
+// CHECK: | |-ClassTemplateSpecializationDecl {{.*}} struct V definition explicit_specialization
+// CHECK: | | |-TemplateArgument type 'int'
+// CHECK: | | | `-BuiltinType {{.*}} 'int'
+// CHECK: | | |-CXXMethodDecl {{.*}} method 'int (int)'
+// CHECK: | | | `-ParmVarDecl {{.*}} 'int'
+// CHECK: | | |-TypedefDecl {{.*}} W 'int'
+// CHECK: | | | `-BuiltinType {{.*}} 'int'
+// CHECK: | | |-TypedefDecl {{.*}} X 'U<int>'
+// CHECK: | | | `-RecordType {{.*}} 'U<int>' canonical
+// CHECK: | | |   `-ClassTemplateSpecialization {{.*}} 'U'
+// CHECK: | | |-FieldDecl {{.*}} I 'int'
+// CHECK: | | `-FieldDecl {{.*}} J 'int'
 // CHECK: | |-TypedefDecl {{.*}} Y 'U<int>::V<int>'
 // CHECK: | | `-RecordType {{.*}} 'U<int>::V<int>' canonical
-// CHECK: | |   `-CXXRecord {{.*}} 'U<int>::V<int>'
+// CHECK: | |   `-ClassTemplateSpecialization {{.*}} 'V'
+// CHECK: | |-ClassTemplateSpecializationDecl {{.*}} <undeserialized declarations> struct V explicit_specialization
+// CHECK: | | `-TemplateArgument type 'T'
+// CHECK: | |   `-RecordType {{.*}} 'T' canonical
+// CHECK: | |     `-CXXRecord {{.*}} 'T'
 // CHECK: | |-TypedefDecl {{.*}} Z 'U<int>::V<T>'
 // CHECK: | | `-RecordType {{.*}} 'U<int>::V<T>' canonical
-// CHECK: | |   `-CXXRecord {{.*}} 'U<int>::V<T>'
+// CHECK: | |   `-ClassTemplateSpecialization {{.*}} 'V'
 // CHECK: | |-FieldDecl {{.*}} K 'int'
 // CHECK: | `-FieldDecl {{.*}} L 'int'
-
-// CHECK: |-CXXRecordDecl {{.*}} struct U<int>::V<int> definition
-// CHECK: | |-TypedefDecl {{.*}}> W 'int'
-// CHECK: | | `-BuiltinType {{.*}} 'int'
-// CHECK: | |-TypedefDecl {{.*}} X 'U<int>'
-// CHECK: | | `-RecordType {{.*}} 'U<int>' canonical
-// CHECK: | |   `-CXXRecord {{.*}} 'U<int>'
-// CHECK: | |-FieldDecl {{.*}} I 'int'
-// CHECK: | `-FieldDecl {{.*}} J 'int'

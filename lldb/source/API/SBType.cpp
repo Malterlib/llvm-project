@@ -730,6 +730,19 @@ SBType SBType::FindDirectNestedType(const char *name) {
   return SBType(m_opaque_sp->FindDirectNestedType(name));
 }
 
+lldb::SBType SBType::GetContainingType() {
+  LLDB_INSTRUMENT_VA(this);
+
+  if (!IsValid())
+    return SBType();
+
+  CompilerType containing_type =
+      m_opaque_sp->GetCompilerType(false).GetContainingType();
+  if (containing_type.IsValid())
+    return SBType(containing_type);
+  return SBType();
+}
+
 SBTypeList::SBTypeList() : m_opaque_up(new TypeListImpl()) {
   LLDB_INSTRUMENT_VA(this);
 }
