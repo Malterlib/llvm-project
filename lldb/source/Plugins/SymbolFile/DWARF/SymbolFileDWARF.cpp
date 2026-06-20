@@ -2926,7 +2926,11 @@ void SymbolFileDWARF::FindTypes(const TypeQuery &query, TypeResults &results) {
       auto type_basename_simple = query_simple.GetTypeBasename();
       // Copy our match's context and update the basename we are looking for
       // so we can use this only to compare the context correctly.
-      m_index->GetTypesWithQuery(query_simple, [&](DWARFDIE die) {
+      m_index->GetTypes(type_basename_simple, [&](DWARFDIE die) {
+        if (query.HasLanguage() &&
+            !query.LanguageMatches(GetLanguageFamily(*die.GetCU())))
+          return IterationAction::Continue;
+
         std::vector<CompilerContext> qualified_context =
             query.GetModuleSearch()
                 ? die.GetDeclContext(/*derive_template_names=*/true)

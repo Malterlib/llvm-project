@@ -1894,7 +1894,18 @@ DWARFASTParserClang::ParseStructureLikeDIE(const SymbolContext &sc,
     metadata.SetIsDynamicCXXType(dwarf->ClassOrStructIsVirtual(die));
 
   TypeSystemClang::TemplateParameterInfos template_param_infos;
-  if (ParseTemplateParameterInfos(die, template_param_infos)) {
+  bool is_template = ParseTemplateParameterInfos(die, template_param_infos);
+  if (!is_template && attrs.is_forward_declaration) {
+    DWARFDIE def_die = dwarf->FindDefinitionDIE(die);
+    if (!def_die) {
+      if (SymbolFileDWARFDebugMap *debug_map_symfile =
+              dwarf->GetDebugMapSymfile())
+        def_die = debug_map_symfile->FindDefinitionDIE(die);
+    }
+    if (def_die && def_die != die)
+      is_template = ParseTemplateParameterInfos(def_die, template_param_infos);
+  }
+  if (is_template) {
     clang::ClassTemplateDecl *class_template_decl =
         m_ast.ParseClassTemplateDecl(
             containing_decl_ctx, GetOwningClangModule(die), attrs.accessibility,
