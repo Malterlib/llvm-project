@@ -155,7 +155,11 @@ if (CMAKE_SYSTEM_NAME MATCHES "NetBSD")
   list(APPEND EXTRA_LIBS kvm)
 endif()
 if (LLDB_ENABLE_LIBXML2)
-  list(APPEND EXTRA_LIBS LibXml2::LibXml2)
+  if (LLVM_LIBXML2_SOURCE_DIR)
+    list(APPEND EXTRA_LIBS "$<BUILD_INTERFACE:LibXml2::LibXml2>")
+  else()
+    list(APPEND EXTRA_LIBS LibXml2::LibXml2)
+  endif()
 endif()
 if (HAVE_LIBDL)
   list(APPEND EXTRA_LIBS ${CMAKE_DL_LIBS})
@@ -191,4 +195,3 @@ add_lldb_library(lldbHost NO_PLUGIN_DEPENDENCIES
     ${LLDBObjCLibs}
     ${LLDB_LIBEDIT_LIBS}
   )
-

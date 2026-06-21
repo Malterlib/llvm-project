@@ -299,38 +299,61 @@ static constexpr int SourceColorCount =
 
 #if PDCURSES
 constexpr chtype ReplacementChar = 0xfffd;
+
+#if defined(PDC_CHARTEXT_BITS) && PDC_CHARTEXT_BITS >= 21
+constexpr bool PDCHandlesFullUnicodeCodepoints = true;
+constexpr chtype WideFillerChar = 0;
+#else
+constexpr bool PDCHandlesFullUnicodeCodepoints = false;
 constexpr chtype WideFillerChar =
 #ifdef PDC_WIDE_FILLER
     PDC_WIDE_FILLER;
 #else
     0xffff;
 #endif
+#endif
+
 constexpr llvm::UTF32 FirstSupplementaryCodePoint = 0x10000;
 constexpr llvm::UTF32 LastUnicodeCodePoint = 0x10ffff;
 
 struct PDCDecodedCharacter {
   chtype cells[2] = {};
   int cell_count = 0;
+  int display_width = 0;
 };
 
 static int GetPDCDisplayWidth(StringRef utf8) {
   int width = llvm::sys::unicode::columnWidthUTF8(utf8);
-  if (width < 1)
+  if (width < 0)
     return 1;
+#if !defined(PDC_CHARTEXT_BITS) || PDC_CHARTEXT_BITS < 21
+  if (width == 0)
+    return 1;
+#endif
   return std::min(width, 2);
 }
 
 static void SetDecodedCharacter(PDCDecodedCharacter &character,
                                 llvm::UTF32 codepoint, int display_width) {
+  character.display_width = display_width;
+
   if (codepoint < FirstSupplementaryCodePoint) {
     character.cells[0] = static_cast<chtype>(codepoint);
     character.cell_count = 1;
-    while (character.cell_count < display_width)
-      character.cells[character.cell_count++] = WideFillerChar;
+    if constexpr (!PDCHandlesFullUnicodeCodepoints) {
+      while (character.cell_count < display_width)
+        character.cells[character.cell_count++] = WideFillerChar;
+    }
     return;
   }
 
   if (codepoint <= LastUnicodeCodePoint) {
+    if constexpr (PDCHandlesFullUnicodeCodepoints) {
+      character.cells[0] = static_cast<chtype>(codepoint);
+      character.cell_count = 1;
+      return;
+    }
+
     codepoint -= FirstSupplementaryCodePoint;
     character.cells[0] = static_cast<chtype>(0xd800 + (codepoint >> 10));
     character.cells[1] = static_cast<chtype>(0xdc00 + (codepoint & 0x3ff));
@@ -340,6 +363,7 @@ static void SetDecodedCharacter(PDCDecodedCharacter &character,
 
   character.cells[0] = ReplacementChar;
   character.cell_count = 1;
+  character.display_width = 1;
 }
 
 static size_t GetCStringLength(const char *s, int len) {
@@ -810,11 +834,11 @@ protected:
       PDCDecodedCharacter character;
       if (!DecodeUTF8CodeUnits(text, character))
         break;
-      if (chars + character.cell_count > max_chars)
+      if (chars + character.display_width > max_chars)
         break;
       for (int i = 0; i < character.cell_count; ++i)
         ::waddch(m_window, character.cells[i]);
-      chars += character.cell_count;
+      chars += character.display_width;
     }
   }
 #endif
@@ -861,10 +885,7 @@ public:
                    bounds.origin.x));
   }
 
-  virtual ~Window() {
-    RemoveSubWindows();
-    Reset();
-  }
+  virtual ~Window() { Detach(); }
 
   void Reset(WINDOW *w = nullptr, bool del = true) {
     if (m_window == w)
@@ -978,7 +999,9 @@ public:
         else if (m_curr_active_window_idx != UINT32_MAX &&
                  m_curr_active_window_idx > i)
           --m_curr_active_window_idx;
-        window->Erase();
+        WindowSP removed_window_sp = *pos;
+        removed_window_sp->Erase();
+        removed_window_sp->Detach();
         m_subwindows.erase(pos);
         m_needs_update = true;
         if (m_parent)
@@ -1004,14 +1027,28 @@ public:
   void RemoveSubWindows() {
     m_curr_active_window_idx = UINT32_MAX;
     m_prev_active_window_idx = UINT32_MAX;
+    bool removed_any = false;
     for (Windows::iterator pos = m_subwindows.begin();
          pos != m_subwindows.end(); pos = m_subwindows.erase(pos)) {
-      (*pos)->Erase();
+      WindowSP removed_window_sp = *pos;
+      removed_window_sp->Erase();
+      removed_window_sp->Detach();
+      removed_any = true;
     }
+    if (!removed_any)
+      return;
     if (m_parent)
       m_parent->Touch();
     else
       ::touchwin(stdscr);
+  }
+
+  void Detach() {
+    RemoveSubWindows();
+    Reset();
+    m_parent = nullptr;
+    m_is_subwin = false;
+    m_can_activate = false;
   }
 
   // Window drawing utilities
@@ -4547,7 +4584,10 @@ public:
     ::keypad(stdscr, TRUE);
   }
 
-  void Terminate() { ::endwin(); }
+  void Terminate() {
+    m_window_sp.reset();
+    ::endwin();
+  }
 
   void Run(Debugger &debugger) {
     bool done = false;

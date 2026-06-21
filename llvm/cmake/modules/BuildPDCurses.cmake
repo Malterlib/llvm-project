@@ -1,0 +1,35 @@
+function(llvm_add_pdcurses_source_target)
+  set(_pdcurses_source_dir "${LLVM_PDCURSES_SOURCE_DIR}")
+  if(NOT _pdcurses_source_dir)
+    set(_pdcurses_source_dir "${LLDB_PDCURSES_SOURCE_DIR}")
+  endif()
+
+  if(NOT _pdcurses_source_dir)
+    return()
+  endif()
+
+  set(_pdcurses_target "${LLVM_PDCURSES_TARGET}")
+  if(NOT _pdcurses_target)
+    set(_pdcurses_target "${LLDB_PDCURSES_TARGET}")
+  endif()
+  if(NOT _pdcurses_target)
+    set(_pdcurses_target "cmpdcurses")
+  endif()
+
+  get_filename_component(_pdcurses_source_dir "${_pdcurses_source_dir}" ABSOLUTE)
+  if(NOT EXISTS "${_pdcurses_source_dir}/CMakeLists.txt")
+    message(FATAL_ERROR "LLVM_PDCURSES_SOURCE_DIR does not contain CMakeLists.txt: ${_pdcurses_source_dir}")
+  endif()
+
+  if(NOT TARGET ${_pdcurses_target})
+    add_subdirectory("${_pdcurses_source_dir}" "${CMAKE_BINARY_DIR}/pdcurses" EXCLUDE_FROM_ALL)
+  endif()
+  if(NOT TARGET ${_pdcurses_target})
+    message(FATAL_ERROR "LLVM_PDCURSES_SOURCE_DIR did not define target ${_pdcurses_target}: ${_pdcurses_source_dir}")
+  endif()
+
+  set_target_properties(${_pdcurses_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+  set(LLVM_PDCURSES_SOURCE_DIR "${_pdcurses_source_dir}" CACHE PATH "The PDCurses source directory" FORCE)
+  set(LLVM_PDCURSES_TARGET "${_pdcurses_target}" CACHE STRING "The PDCurses CMake target to link" FORCE)
+endfunction()

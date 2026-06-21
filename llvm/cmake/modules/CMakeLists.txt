@@ -9,7 +9,32 @@ set(llvm_cmake_builddir "${llvm_cmake_builddir}/cmake/llvm")
 # First for users who use an installed LLVM, create the LLVMExports.cmake file.
 set(LLVM_EXPORTS_FILE ${llvm_cmake_builddir}/LLVMExports.cmake)
 get_property(LLVM_EXPORTS GLOBAL PROPERTY LLVM_EXPORTS)
-export(TARGETS ${LLVM_EXPORTS} FILE ${LLVM_EXPORTS_FILE})
+set(LLVM_BUILDTREE_EXTERNAL_EXPORTS)
+if(LLVM_ZLIB_SOURCE_DIR AND TARGET llvm_zlib_static)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS llvm_zlib_static)
+endif()
+if(LLVM_LIBXML2_SOURCE_DIR AND TARGET LibXml2)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS LibXml2)
+endif()
+if(LLVM_CURL_SOURCE_DIR AND TARGET libcurl_static)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS libcurl_static)
+endif()
+if(LLVM_LIBEDIT_SOURCE_DIR AND TARGET llvm_libedit_static)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS llvm_libedit_static)
+endif()
+if(LLVM_PDCURSES_SOURCE_DIR AND TARGET pdcurses_include_dirs)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS pdcurses_include_dirs)
+endif()
+if(LLVM_PDCURSES_SOURCE_DIR AND LLVM_PDCURSES_TARGET AND TARGET ${LLVM_PDCURSES_TARGET})
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS ${LLVM_PDCURSES_TARGET})
+endif()
+if((LLVM_NCURSES_SOURCE_DIR OR LLVM_NCURSES_TERMCAP_SOURCE_DIR) AND TARGET llvm_ncursesw_static AND TARGET llvm_panelw_static AND TARGET llvm_tinfow_static)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS llvm_ncursesw_static llvm_panelw_static llvm_tinfow_static)
+endif()
+if(LLVM_LUA_SOURCE_DIR AND TARGET llvm_lua_static)
+  list(APPEND LLVM_BUILDTREE_EXTERNAL_EXPORTS llvm_lua_static)
+endif()
+export(TARGETS ${LLVM_EXPORTS} ${LLVM_BUILDTREE_EXTERNAL_EXPORTS} FILE ${LLVM_EXPORTS_FILE})
 
 # Then for users who want to link against the LLVM build tree, provide the
 # normal targets and the build tree only targets.
@@ -91,7 +116,7 @@ endif()
 # LLVM_CONFIG_CMAKE_DIR being the source directory. In contrast in the install
 # tree, both the generated LLVMExports.cmake file and the rest of the cmake
 # source files are put in the same cmake directory.
-set(LLVM_CONFIG_EXPORTS "${LLVM_EXPORTS};${LLVM_EXPORTS_BUILDTREE_ONLY}")
+set(LLVM_CONFIG_EXPORTS "${LLVM_EXPORTS};${LLVM_EXPORTS_BUILDTREE_ONLY};${LLVM_BUILDTREE_EXTERNAL_EXPORTS}")
 set(LLVM_CONFIG_INCLUDE_EXPORTS "include(\"${LLVM_EXPORTS_FILE}\")")
 set(llvm_config_include_buildtree_only_exports
 "include(\"${LLVM_BUILDTREEONLY_EXPORTS_FILE}\")")

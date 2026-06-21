@@ -1,6 +1,8 @@
 # Link LibCURL if the user wants it
 if (LLVM_ENABLE_CURL)
-  set(imported_libs CURL::libcurl)
+  if (NOT LLVM_CURL_SOURCE_DIR)
+    set(imported_libs CURL::libcurl)
+  endif()
 endif()
 
 # Link cpp-httplib if the user wants it
@@ -34,3 +36,7 @@ add_llvm_library(LLVMDebuginfod
   BinaryFormat
   Object
   )
+
+if (LLVM_ENABLE_CURL AND LLVM_CURL_SOURCE_DIR)
+  target_link_libraries(LLVMDebuginfod PRIVATE "$<BUILD_INTERFACE:CURL::libcurl>")
+endif()

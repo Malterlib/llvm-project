@@ -1,0 +1,40 @@
+# Try to find the libxml2 library.
+#
+# If LLVM_LIBXML2_SOURCE_DIR is set, libxml2 is compiled as a static target
+# inside the LLVM build graph instead of being found from the host system.
+
+if(LLVM_LIBXML2_SOURCE_DIR)
+  get_filename_component(LLVM_LIBXML2_SOURCE_DIR "${LLVM_LIBXML2_SOURCE_DIR}" ABSOLUTE)
+  if(NOT EXISTS "${LLVM_LIBXML2_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "LLVM_LIBXML2_SOURCE_DIR does not contain libxml2 sources: ${LLVM_LIBXML2_SOURCE_DIR}")
+  endif()
+
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_DOCS OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_ICONV OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_ICU OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_MODULES OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_PYTHON OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_READLINE OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_TESTS OFF CACHE BOOL "" FORCE)
+  set(LIBXML2_WITH_ZLIB OFF CACHE BOOL "" FORCE)
+
+  if(NOT TARGET LibXml2::LibXml2)
+    add_subdirectory("${LLVM_LIBXML2_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/libxml2" EXCLUDE_FROM_ALL)
+  endif()
+  if(NOT TARGET LibXml2::LibXml2)
+    message(FATAL_ERROR "LLVM_LIBXML2_SOURCE_DIR did not define target LibXml2::LibXml2: ${LLVM_LIBXML2_SOURCE_DIR}")
+  endif()
+
+  set(LibXml2_FOUND TRUE)
+  set(LIBXML2_FOUND TRUE)
+  set(LIBXML2_INCLUDE_DIR "${LLVM_LIBXML2_SOURCE_DIR}/include" CACHE PATH "" FORCE)
+  set(LIBXML2_INCLUDE_DIRS "${LLVM_LIBXML2_SOURCE_DIR}/include;${CMAKE_BINARY_DIR}/libxml2/include" CACHE PATH "" FORCE)
+  set(LIBXML2_LIBRARY LibXml2::LibXml2 CACHE STRING "" FORCE)
+  set(LIBXML2_LIBRARIES LibXml2::LibXml2 CACHE STRING "" FORCE)
+else()
+  include("${CMAKE_ROOT}/Modules/FindLibXml2.cmake")
+endif()
+
+mark_as_advanced(LIBXML2_INCLUDE_DIR LIBXML2_LIBRARY)
