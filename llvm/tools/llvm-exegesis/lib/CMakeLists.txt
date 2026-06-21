@@ -43,7 +43,11 @@ set(LLVM_LINK_COMPONENTS
 
 set(libs)
 if(LLVM_ENABLE_LIBPFM AND HAVE_LIBPFM)
-  list(APPEND libs pfm)
+  if(LIBPFM_LIBRARY)
+    list(APPEND libs ${LIBPFM_LIBRARY})
+  else()
+    list(APPEND libs pfm)
+  endif()
 endif()
 if(HAVE_LIBRT)
   list(APPEND libs rt)
