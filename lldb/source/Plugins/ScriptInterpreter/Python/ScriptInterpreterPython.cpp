@@ -83,6 +83,35 @@ static ScriptInterpreterPythonImpl *GetPythonInterpreter(Debugger &debugger) {
 
 namespace {
 
+#if LLDB_EMBED_PYTHON_HOME
+static void ExitOnPythonConfigError(PyStatus status) {
+  if (PyStatus_Exception(status))
+    Py_ExitStatusException(status);
+}
+
+#if defined(_WIN32)
+static std::string JoinPythonHomePath(llvm::StringRef python_home,
+                                      llvm::StringRef component) {
+  llvm::SmallString<256> path(python_home);
+  llvm::sys::path::append(path, component);
+  return std::string(path);
+}
+
+static void AppendPythonModuleSearchPath(PyConfig &config,
+                                         llvm::StringRef path) {
+  std::string path_string = path.str();
+  wchar_t *wide_path = Py_DecodeLocale(path_string.c_str(), nullptr);
+  if (!wide_path)
+    Py_ExitStatusException(PyStatus_NoMemory());
+
+  PyStatus status =
+      PyWideStringList_Append(&config.module_search_paths, wide_path);
+  PyMem_RawFree(wide_path);
+  ExitOnPythonConfigError(status);
+}
+#endif
+#endif
+
 // Initializing Python is not a straightforward process.  We cannot control
 // what external code may have done before getting to this point in LLDB,
 // including potentially having already initialized Python, so we need to do a
@@ -120,11 +149,33 @@ public:
       return spec.GetPath();
     }();
     if (!g_python_home.empty()) {
-      PyConfig_SetBytesString(&config, &config.home, g_python_home.c_str());
+      ExitOnPythonConfigError(
+          PyConfig_SetBytesString(&config, &config.home, g_python_home.c_str()));
+
+#if defined(_WIN32)
+      // On Windows, a relative embedded Python home such as "python" is
+      // resolved against liblldb's directory, but CPython still derives some
+      // default search paths from the DLL/executable directory. Set the search
+      // path explicitly so a layout with bin/python as PYTHONHOME does not need
+      // duplicate runtime files next to liblldb.dll.
+      std::string python_zip =
+          "python" + std::to_string(PY_MAJOR_VERSION) +
+          std::to_string(PY_MINOR_VERSION) + ".zip";
+      AppendPythonModuleSearchPath(config,
+                                   JoinPythonHomePath(g_python_home, python_zip));
+      AppendPythonModuleSearchPath(config, g_python_home);
+      AppendPythonModuleSearchPath(config,
+                                   JoinPythonHomePath(g_python_home, "DLLs"));
+      AppendPythonModuleSearchPath(config,
+                                   JoinPythonHomePath(g_python_home, "Lib"));
+      if (FileSpec shlib_dir = HostInfo::GetShlibDir())
+        AppendPythonModuleSearchPath(config, shlib_dir.GetPath());
+      config.module_search_paths_set = 1;
+#endif
     }
 
     config.install_signal_handlers = 0;
-    Py_InitializeFromConfig(&config);
+    ExitOnPythonConfigError(Py_InitializeFromConfig(&config));
     PyConfig_Clear(&config);
 #else
     Py_InitializeEx(/*install_sigs=*/0);
