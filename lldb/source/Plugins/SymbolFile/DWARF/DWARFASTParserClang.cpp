@@ -1266,13 +1266,16 @@ std::pair<bool, TypeSP> DWARFASTParserClang::ParseCXXMethod(
   clang::CXXMethodDecl *cxx_method_decl = m_ast.AddMethodToCXXRecordType(
       class_opaque_type.GetOpaqueQualType(), attrs.name.GetCString(),
       MakeLLDBFuncAsmLabel(die), clang_type, attrs.is_virtual, is_static,
-      attrs.is_inline, attrs.is_explicit, is_attr_used, attrs.is_artificial);
+      attrs.is_inline, attrs.is_explicit, is_attr_used, attrs.is_artificial,
+      &attrs.decl);
 
   if (cxx_method_decl) {
     LinkDeclContextToDIE(cxx_method_decl, die);
 
     ClangASTMetadata metadata;
     metadata.SetUserID(die.GetID());
+    if (attrs.decl.IsValid())
+      metadata.SetDeclaration(attrs.decl);
 
     if (char const *object_pointer_name = object_parameter.GetName()) {
       metadata.SetObjectPtrName(object_pointer_name);

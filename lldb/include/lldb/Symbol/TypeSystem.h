@@ -24,6 +24,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 
+#include "lldb/Core/Declaration.h"
 #include "lldb/Core/PluginInterface.h"
 #include "lldb/Expression/Expression.h"
 #include "lldb/Symbol/CompilerDecl.h"
@@ -100,6 +101,8 @@ public:
 
   virtual CompilerDeclContext DeclGetDeclContext(void *opaque_decl);
 
+  virtual bool DeclGetDeclaration(void *opaque_decl, Declaration &decl);
+
   virtual CompilerType DeclGetFunctionReturnType(void *opaque_decl);
 
   virtual size_t DeclGetFunctionNumArguments(void *opaque_decl);
@@ -124,6 +127,8 @@ public:
 
   virtual ConstString
   DeclContextGetScopeQualifiedName(void *opaque_decl_ctx) = 0;
+
+  virtual CompilerType DeclContextGetDeclaringType(void *opaque_decl_ctx);
 
   virtual bool DeclContextIsClassMethod(void *opaque_decl_ctx) = 0;
 
