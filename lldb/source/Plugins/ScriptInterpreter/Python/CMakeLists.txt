@@ -18,7 +18,14 @@ if (LLDB_ENABLE_LIBEDIT)
   list(APPEND LLDB_LIBEDIT_LIBS LibEdit::LibEdit)
 endif()
 
+if(LLDB_DYNAMIC_PYTHON_RUNTIME)
+  set(LLDB_PYTHON_LIBRARIES ${CMAKE_DL_LIBS})
+else()
+  set(LLDB_PYTHON_LIBRARIES ${Python3_LIBRARIES})
+endif()
+
 set(python_plugin_sources
+  LLDBPythonRuntime.cpp
   PythonDataObjects.cpp
   PythonReadline.cpp
   ScriptInterpreterPython.cpp
@@ -64,9 +71,9 @@ if (LLDB_ENABLE_DYNAMIC_SCRIPTINTERPRETERS)
   else()
     # For the limited API, rely on #pragma comment(lib, "python3.lib")
     # emitted by SWIG. For the full API, link the version-specific import lib.
-    if (NOT LLDB_ENABLE_PYTHON_LIMITED_API)
+    if (NOT LLDB_ENABLE_PYTHON_LIMITED_API OR LLDB_DYNAMIC_PYTHON_RUNTIME)
       target_link_libraries(lldbPluginScriptInterpreterPython PRIVATE
-        ${Python3_LIBRARIES})
+        ${LLDB_PYTHON_LIBRARIES})
     endif()
     target_link_directories(lldbPluginScriptInterpreterPython PRIVATE
       ${PYTHON_SABI_LIBRARY_DIRS})
@@ -94,7 +101,7 @@ if (LLDB_ENABLE_DYNAMIC_SCRIPTINTERPRETERS)
       lldbInterpreter
       lldbTarget
       lldbValueObject
-      ${Python3_LIBRARIES}
+      ${LLDB_PYTHON_LIBRARIES}
       ${LLDB_LIBEDIT_LIBS}
   )
   target_include_directories(lldbStaticScriptInterpreterPython
@@ -105,8 +112,8 @@ else()
   # On Windows with the limited API, the Python import library is selected via
   # #pragma comment(lib, ...) in pyconfig.h based on Py_LIMITED_API.
   # On all other platforms, always link Python3_LIBRARIES explicitly.
-  if (NOT (WIN32 AND LLDB_ENABLE_PYTHON_LIMITED_API))
-    set(python_link_libs ${Python3_LIBRARIES})
+  if (LLDB_DYNAMIC_PYTHON_RUNTIME OR NOT (WIN32 AND LLDB_ENABLE_PYTHON_LIMITED_API))
+    set(python_link_libs ${LLDB_PYTHON_LIBRARIES})
   endif()
   add_lldb_library(lldbPluginScriptInterpreterPython PLUGIN
     ${python_plugin_sources}
