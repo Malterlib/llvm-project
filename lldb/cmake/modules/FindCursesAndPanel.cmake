@@ -6,6 +6,22 @@
 
 include(CMakePushCheckState)
 
+if(LLDB_PDCURSES_SOURCE_DIR)
+  get_filename_component(LLDB_PDCURSES_SOURCE_DIR "${LLDB_PDCURSES_SOURCE_DIR}" ABSOLUTE)
+  if(NOT EXISTS "${LLDB_PDCURSES_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "LLDB_PDCURSES_SOURCE_DIR does not contain CMakeLists.txt: ${LLDB_PDCURSES_SOURCE_DIR}")
+  endif()
+
+  if(NOT TARGET cmpdcurses)
+    add_subdirectory("${LLDB_PDCURSES_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/tools/lldb/pdcurses" EXCLUDE_FROM_ALL)
+  endif()
+
+  set(CURSES_INCLUDE_DIRS "${LLDB_PDCURSES_SOURCE_DIR}" CACHE PATH "The curses include directory" FORCE)
+  set(CURSES_LIBRARIES cmpdcurses CACHE STRING "The curses library target" FORCE)
+  set(PANEL_LIBRARIES cmpdcurses CACHE STRING "The curses panel library target" FORCE)
+  set(HAS_TERMINFO_SYMBOLS TRUE CACHE BOOL "PDCurses provides the required curses symbols" FORCE)
+endif()
+
 function(lldb_check_curses_tinfo CURSES_INCLUDE_DIRS CURSES_LIBRARIES CURSES_HAS_TINFO)
   cmake_reset_check_state()
   set(CMAKE_REQUIRED_INCLUDES "${CURSES_INCLUDE_DIRS}")
@@ -65,4 +81,3 @@ else()
     mark_as_advanced(TINFO_LIBRARIES)
   endif()
 endif()
-

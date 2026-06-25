@@ -61,6 +61,8 @@
 #endif
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/ConvertUTF.h"
+#include "llvm/Support/Unicode.h"
 
 #ifdef _WIN32
 #include "lldb/Host/windows/windows.h"
@@ -76,6 +78,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <type_traits>
 
@@ -93,8 +96,13 @@ using llvm::StringRef;
 #define KEY_ESCAPE 27
 #define KEY_DELETE 127
 
+#if PDCURSES
+#define KEY_SHIFT_TAB KEY_BTAB
+#define KEY_ALT_ENTER ALT_ENTER
+#else
 #define KEY_SHIFT_TAB (KEY_MAX + 1)
 #define KEY_ALT_ENTER (KEY_MAX + 2)
+#endif
 
 namespace lldb_private {
 namespace curses {
@@ -286,6 +294,111 @@ struct KeyHelp {
   const char *description;
 };
 
+static constexpr int SourceColorCount =
+    256;
+
+#if PDCURSES
+constexpr chtype ReplacementChar = 0xfffd;
+constexpr chtype WideFillerChar =
+#ifdef PDC_WIDE_FILLER
+    PDC_WIDE_FILLER;
+#else
+    0xffff;
+#endif
+constexpr llvm::UTF32 FirstSupplementaryCodePoint = 0x10000;
+constexpr llvm::UTF32 LastUnicodeCodePoint = 0x10ffff;
+
+struct PDCDecodedCharacter {
+  chtype cells[2] = {};
+  int cell_count = 0;
+};
+
+static int GetPDCDisplayWidth(StringRef utf8) {
+  int width = llvm::sys::unicode::columnWidthUTF8(utf8);
+  if (width < 1)
+    return 1;
+  return std::min(width, 2);
+}
+
+static void SetDecodedCharacter(PDCDecodedCharacter &character,
+                                llvm::UTF32 codepoint, int display_width) {
+  if (codepoint < FirstSupplementaryCodePoint) {
+    character.cells[0] = static_cast<chtype>(codepoint);
+    character.cell_count = 1;
+    while (character.cell_count < display_width)
+      character.cells[character.cell_count++] = WideFillerChar;
+    return;
+  }
+
+  if (codepoint <= LastUnicodeCodePoint) {
+    codepoint -= FirstSupplementaryCodePoint;
+    character.cells[0] = static_cast<chtype>(0xd800 + (codepoint >> 10));
+    character.cells[1] = static_cast<chtype>(0xdc00 + (codepoint & 0x3ff));
+    character.cell_count = 2;
+    return;
+  }
+
+  character.cells[0] = ReplacementChar;
+  character.cell_count = 1;
+}
+
+static size_t GetCStringLength(const char *s, int len) {
+  if (len < 0)
+    return ::strlen(s);
+
+  size_t result = 0;
+  while (result < static_cast<size_t>(len) && s[result] != '\0')
+    ++result;
+  return result;
+}
+
+static bool DecodeUTF8CodeUnits(StringRef &text,
+                                PDCDecodedCharacter &character) {
+  character = PDCDecodedCharacter();
+
+  if (text.empty())
+    return false;
+
+  const llvm::UTF8 *begin =
+      reinterpret_cast<const llvm::UTF8 *>(text.data());
+  unsigned byte_count = llvm::getNumBytesForUTF8(*begin);
+  if (byte_count == 0) {
+    SetDecodedCharacter(character, ReplacementChar, 1);
+    text = text.drop_front();
+    return true;
+  }
+
+  if (byte_count > text.size()) {
+    text = StringRef();
+    return false;
+  }
+
+  const llvm::UTF8 *end = begin + byte_count;
+  if (!llvm::isLegalUTF8Sequence(begin, end)) {
+    SetDecodedCharacter(character, ReplacementChar, 1);
+    text = text.drop_front();
+    return true;
+  }
+
+  llvm::UTF32 codepoint = 0;
+  const llvm::UTF8 *next = begin;
+  llvm::ConversionResult result =
+      llvm::convertUTF8Sequence(&next, end, &codepoint, llvm::strictConversion);
+  if (result != llvm::conversionOK) {
+    SetDecodedCharacter(character, ReplacementChar, 1);
+    text = text.drop_front();
+    return true;
+  }
+
+  int display_width = GetPDCDisplayWidth(
+      StringRef(reinterpret_cast<const char *>(begin), next - begin));
+  text = text.drop_front(next - begin);
+  SetDecodedCharacter(character, codepoint, display_width);
+  return true;
+}
+
+#endif
+
 // COLOR_PAIR index names
 enum {
   // Fixed color pairs used outside source coloring.
@@ -311,7 +424,7 @@ enum {
   BrightCyanOnBlack,
   BrightWhiteOnBlack,
 
-  BlackOnRed = BlackOnBlack + 256,
+  BlackOnRed = BlackOnBlack + SourceColorCount,
   RedOnRed,
   GreenOnRed,
   YellowOnRed,
@@ -329,7 +442,7 @@ enum {
   BrightCyanOnRed,
   BrightWhiteOnRed,
 
-  BlackOnGrey = BlackOnRed + 256,
+  BlackOnGrey = BlackOnRed + SourceColorCount,
   RedOnGrey,
   GreenOnGrey,
   YellowOnGrey,
@@ -347,6 +460,40 @@ enum {
   BrightCyanOnGrey,
   BrightWhiteOnGrey,
 };
+
+#if PDCURSES
+int GetPDCColor(int color) {
+  if (color < COLORS)
+    return color;
+
+  if (color < 16)
+    return color;
+
+  if (color >= 232)
+    return color >= 244 ? COLOR_WHITE : COLOR_BLACK;
+
+  color -= 16;
+  const int red = color / 36;
+  const int green = (color / 6) % 6;
+  const int blue = color % 6;
+
+  int result = 0;
+  if (red >= 3)
+    result |= COLOR_RED;
+  if (green >= 3)
+    result |= COLOR_GREEN;
+  if (blue >= 3)
+    result |= COLOR_BLUE;
+  if (red >= 5 || green >= 5 || blue >= 5)
+    result |= 8;
+
+  return result;
+}
+#endif
+
+int GetSourceColorPair(int start_index, int color) {
+  return start_index + color;
+}
 
 class WindowDelegate {
 public:
@@ -444,21 +591,38 @@ public:
   }
 
   void PutChar(int ch) { ::waddch(m_window, ch); }
-  void PutCString(const char *s, int len = -1) { ::waddnstr(m_window, s, len); }
+  void PutCString(const char *s, int len = -1) {
+#if PDCURSES
+    PutCStringAsUTF8(s, len, std::numeric_limits<int>::max());
+#else
+    ::waddnstr(m_window, s, len);
+#endif
+  }
 
   void PutCStringTruncated(int right_pad, const char *s, int len = -1) {
-    int bytes_left = GetWidth() - GetCursorX();
-    if (bytes_left > right_pad) {
-      bytes_left -= right_pad;
-      ::waddnstr(m_window, s, len < 0 ? bytes_left : std::min(bytes_left, len));
+    int chars_left = GetWidth() - GetCursorX();
+    if (chars_left > right_pad) {
+      chars_left -= right_pad;
+#if PDCURSES
+      PutCStringAsUTF8(s, len, chars_left);
+#else
+      ::waddnstr(m_window, s, len < 0 ? chars_left : std::min(chars_left, len));
+#endif
     }
   }
 
   void Printf(const char *format, ...) __attribute__((format(printf, 2, 3))) {
     va_list args;
     va_start(args, format);
+#if PDCURSES
+    StreamString strm;
+    strm.PrintfVarArg(format, args);
+    va_end(args);
+    PutCString(strm.GetData());
+#else
     vw_printw(m_window, format, args);
     va_end(args);
+#endif
   }
 
   void PrintfTruncated(int right_pad, const char *format, ...)
@@ -602,7 +766,7 @@ public:
       }
 
       if (values[0] == 38 && values[1] == 5) {
-        auto color_index = start_index + values[2];
+        auto color_index = GetSourceColorPair(start_index, values[2]);
 
         ::wcolor_set(m_window, color_index, nullptr);
       } else if (values[0] == 0) { // Reset.
@@ -615,13 +779,15 @@ public:
         ::wattron(m_window, A_UNDERLINE);
       } else if (values[0] >= ANSI_FG_COLOR_BLACK &&
                  values[0] <= ANSI_FG_COLOR_WHITE) {
-        auto color_index = start_index + values[0] - ANSI_FG_COLOR_BLACK;
+        auto color_index =
+            GetSourceColorPair(start_index, values[0] - ANSI_FG_COLOR_BLACK);
 
         ::wcolor_set(m_window, color_index, nullptr);
       } else if (values[0] >= ANSI_FG_COLOR_BRIGHT_BLACK &&
                  values[0] <= ANSI_FG_COLOR_BRIGHT_WHITE) {
         auto color_index =
-            start_index + 8 + values[0] - ANSI_FG_COLOR_BRIGHT_BLACK;
+            GetSourceColorPair(start_index,
+                               8 + values[0] - ANSI_FG_COLOR_BRIGHT_BLACK);
 
         ::wcolor_set(m_window, color_index, nullptr);
       } else {
@@ -633,6 +799,26 @@ public:
   }
 
 protected:
+#if PDCURSES
+  void PutCStringAsUTF8(const char *s, int len, int max_chars) {
+    if (!s || max_chars <= 0)
+      return;
+
+    StringRef text(s, GetCStringLength(s, len));
+    int chars = 0;
+    while (!text.empty() && chars < max_chars) {
+      PDCDecodedCharacter character;
+      if (!DecodeUTF8CodeUnits(text, character))
+        break;
+      if (chars + character.cell_count > max_chars)
+        break;
+      for (int i = 0; i < character.cell_count; ++i)
+        ::waddch(m_window, character.cells[i]);
+      chars += character.cell_count;
+    }
+  }
+#endif
+
   Type m_type;
   WINDOW *m_window = nullptr;
 };
@@ -662,7 +848,7 @@ public:
         m_prev_active_window_idx(UINT32_MAX), m_delete(del),
         m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
     if (w)
-      Reset(w);
+      Reset(w, del);
   }
 
   Window(const char *name, const Rect &bounds)
@@ -672,7 +858,7 @@ public:
         m_prev_active_window_idx(UINT32_MAX), m_delete(false),
         m_needs_update(true), m_can_activate(true), m_is_subwin(false) {
     Reset(::newwin(bounds.size.height, bounds.size.width, bounds.origin.y,
-                   bounds.origin.y));
+                   bounds.origin.x));
   }
 
   virtual ~Window() {
@@ -7667,9 +7853,12 @@ IOHandlerCursesGUI::IOHandlerCursesGUI(Debugger &debugger)
 void IOHandlerCursesGUI::Activate() {
   IOHandler::Activate();
   if (!m_app_up) {
+    m_debugger.SaveInputTerminalState();
+    m_saved_terminal_state = true;
+
     m_app_up = std::make_unique<Application>(
         m_input_sp ? m_input_sp->GetStream() : nullptr,
-        m_output_sp ? m_input_sp->GetStream() : nullptr);
+        m_output_sp ? m_output_sp->GetUnlockedFile().GetStream() : nullptr);
 
     // This is both a window and a menu delegate
     std::shared_ptr<ApplicationDelegate> app_delegate_sp(
@@ -7798,23 +7987,41 @@ void IOHandlerCursesGUI::Activate() {
     status_window_sp->SetDelegate(
         WindowDelegateSP(new StatusBarWindowDelegate(m_debugger)));
 
-    // All colors with black, red, and grey backgrounds.
-    for (int i = 0; i < 256; ++i) {
-      init_pair(BlackOnBlack + i, i, COLOR_BLACK);
-      init_pair(BlackOnRed + i, i, 52);
-      init_pair(BlackOnGrey + i, i, 238);
+    // All source colors with black, red, and grey backgrounds.
+    for (int i = 0; i < SourceColorCount; ++i) {
+#if PDCURSES
+      const int foreground = GetPDCColor(i);
+      const int red_background = GetPDCColor(52);
+      const int grey_background = GetPDCColor(238);
+#else
+      const int foreground = i;
+      const int red_background = 52;
+      const int grey_background = 238;
+#endif
+      init_pair(BlackOnBlack + i, foreground, COLOR_BLACK);
+      init_pair(BlackOnRed + i, foreground, red_background);
+      init_pair(BlackOnGrey + i, foreground, grey_background);
     }
 
     // These must match the order in the color indexes enum.
     init_pair(BlackOnWhite, COLOR_BLACK, COLOR_WHITE);
     init_pair(MagentaOnWhite, COLOR_MAGENTA, COLOR_WHITE);
 
+#if !PDCURSES
     define_key("\033[Z", KEY_SHIFT_TAB);
     define_key("\033\015", KEY_ALT_ENTER);
+#endif
   }
 }
 
-void IOHandlerCursesGUI::Deactivate() { m_app_up->Terminate(); }
+void IOHandlerCursesGUI::Deactivate() {
+  m_app_up->Terminate();
+
+  if (m_saved_terminal_state) {
+    m_debugger.RestoreInputTerminalState();
+    m_saved_terminal_state = false;
+  }
+}
 
 void IOHandlerCursesGUI::Run() {
   m_app_up->Run(m_debugger);
