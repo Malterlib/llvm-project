@@ -57,6 +57,8 @@ public:
 
   lldb::SBType GetType();
 
+  lldb::SBType GetDeclaringType();
+
   lldb::SBBlock GetBlock();
 
   lldb::LanguageType GetLanguage();

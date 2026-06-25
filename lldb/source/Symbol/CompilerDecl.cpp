@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "lldb/Symbol/CompilerDecl.h"
+#include "lldb/Core/Declaration.h"
 #include "lldb/Symbol/CompilerDeclContext.h"
 #include "lldb/Symbol/TypeSystem.h"
 #include "lldb/Utility/Scalar.h"
@@ -23,6 +24,10 @@ ConstString CompilerDecl::GetMangledName() const {
 
 CompilerDeclContext CompilerDecl::GetDeclContext() const {
   return m_type_system->DeclGetDeclContext(m_opaque_decl);
+}
+
+bool CompilerDecl::GetDeclaration(Declaration &decl) const {
+  return m_type_system->DeclGetDeclaration(m_opaque_decl, decl);
 }
 
 CompilerType CompilerDecl::GetType() const {

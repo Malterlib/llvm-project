@@ -837,6 +837,8 @@ public:
 
   CompilerType GetType() const;
 
+  Declaration GetDeclaration() const;
+
   CompilerType GetReturnType() const;
 
   size_t GetNumArguments() const;

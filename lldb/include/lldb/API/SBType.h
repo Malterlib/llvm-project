@@ -90,6 +90,8 @@ public:
 
   lldb::SBType GetArgumentTypeAtIndex(uint32_t);
 
+  lldb::SBDeclaration GetDeclaration();
+
   lldb::MemberFunctionKind GetKind();
 
   bool GetDescription(lldb::SBStream &description,
