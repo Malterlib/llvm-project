@@ -15,7 +15,7 @@
 // NOTE: Since Python may define some pre-processor definitions which affect the
 // standard headers on some systems, you must include Python.h before any
 // standard headers are included.
-#include "Python.h"
+#include "lldb-python.h"
 
 // no need to hack into Python's readline module if libedit isn't used.
 //

@@ -59,6 +59,10 @@ static llvm::Expected<bool> *g_fcxx_modules_workaround [[maybe_unused]];
 // Include python for non windows machines
 #include <Python.h>
 
+#if LLDB_DYNAMIC_PYTHON_RUNTIME
+#include "LLDBPythonRuntime.h"
+#endif
+
 // Provide a meaningful diagnostic error if someone tries to compile this file
 // with a version of Python we don't support.
 static_assert(PY_VERSION_HEX >= LLDB_MINIMUM_PYTHON_VERSION,

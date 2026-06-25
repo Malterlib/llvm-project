@@ -151,15 +151,14 @@ add_lldb_library(liblldb SHARED ${option_framework}
   ${option_install_prefix}
 )
 
-# lib/pythonX.Y/dist-packages/lldb/_lldb.so is a symlink to lib/liblldb.so,
-# which depends on lib/libLLVM*.so (BUILD_SHARED_LIBS) or lib/libLLVM-10git.so
-# (LLVM_LINK_LLVM_DYLIB). Add an additional rpath $ORIGIN/../../../../lib so
-# that _lldb.so can be loaded from Python.
-if(LLDB_ENABLE_PYTHON AND (BUILD_SHARED_LIBS OR LLVM_LINK_LLVM_DYLIB) AND UNIX AND NOT APPLE)
-  set_property(TARGET liblldb APPEND PROPERTY INSTALL_RPATH "\$ORIGIN/../../../../lib${LLVM_LIBDIR_SUFFIX}")
+if(LLDB_ENABLE_PYTHON AND UNIX AND NOT APPLE)
+  file(RELATIVE_PATH LLDB_PYTHON_NATIVE_TO_LIB_RPATH
+    "${CMAKE_INSTALL_PREFIX}/${LLDB_PYTHON_RELATIVE_PATH}/lldb/native"
+    "${CMAKE_INSTALL_PREFIX}/lib${LLVM_LIBDIR_SUFFIX}")
+  set_property(TARGET liblldb APPEND PROPERTY INSTALL_RPATH "\$ORIGIN/${LLDB_PYTHON_NATIVE_TO_LIB_RPATH}")
 endif()
 
-if(Python3_RPATH)
+if(Python3_RPATH AND NOT LLDB_DYNAMIC_PYTHON_RUNTIME)
   set_property(TARGET liblldb APPEND PROPERTY INSTALL_RPATH "${Python3_RPATH}")
   set_property(TARGET liblldb APPEND PROPERTY BUILD_RPATH   "${Python3_RPATH}")
 endif()

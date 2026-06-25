@@ -122,6 +122,13 @@ static void AppendPythonModuleSearchPath(PyConfig &config,
 struct InitializePythonRAII {
 public:
   InitializePythonRAII() {
+#if LLDB_DYNAMIC_PYTHON_RUNTIME
+    if (!LLDBPythonRuntime_Initialize()) {
+      fputs("LLDB failed to initialize the Python runtime.\n", stderr);
+      abort();
+    }
+#endif
+
     // The table of built-in modules can only be extended before Python is
     // initialized.
     if (!Py_IsInitialized()) {

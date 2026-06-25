@@ -32,6 +32,6 @@ if (CXX_SUPPORTS_NO_DOCUMENTATION_DEPRECATED_SYNC)
     PRIVATE -Wno-documentation-deprecated-sync)
 endif()
 
-if(Python3_RPATH)
+if(Python3_RPATH AND NOT LLDB_DYNAMIC_PYTHON_RUNTIME)
   set_property(TARGET APITests APPEND PROPERTY BUILD_RPATH "${Python3_RPATH}")
 endif()

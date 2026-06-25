@@ -138,6 +138,14 @@ endif()
 set(LLDB_EXPORT_ALL_SYMBOLS 0 CACHE BOOL
   "Causes lldb to export some private symbols when building liblldb. See lldb/source/API/liblldb-private.exports for the full list of symbols that get exported.")
 
+set(LLDB_DYNAMIC_PYTHON_RUNTIME 0 CACHE BOOL
+  "Resolve libpython dynamically at runtime instead of linking liblldb to one Python shared library.")
+if(LLDB_DYNAMIC_PYTHON_RUNTIME)
+  add_compile_definitions(LLDB_DYNAMIC_PYTHON_RUNTIME=1)
+else()
+  add_compile_definitions(LLDB_DYNAMIC_PYTHON_RUNTIME=0)
+endif()
+
 set(LLDB_EXPORT_ALL_SYMBOLS_EXPORTS_FILE "" CACHE PATH
   "When `LLDB_EXPORT_ALL_SYMBOLS` is enabled, this specifies the exports file to use when building liblldb.")
 

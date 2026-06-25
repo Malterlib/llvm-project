@@ -22,7 +22,7 @@ add_lldb_tool(lldb-test
     ${LLDB_ALL_PLUGINS}
   )
 
-if(Python3_RPATH)
+if(Python3_RPATH AND NOT LLDB_DYNAMIC_PYTHON_RUNTIME)
   set_property(TARGET lldb-test APPEND PROPERTY INSTALL_RPATH "${Python3_RPATH}")
   set_property(TARGET lldb-test APPEND PROPERTY BUILD_RPATH   "${Python3_RPATH}")
 endif()

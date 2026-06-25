@@ -19,6 +19,12 @@ if (LLDB_ENABLE_LIBEDIT)
   list(APPEND LLDB_LIBEDIT_LIBS LibEdit::LibEdit)
 endif()
 
+if(LLDB_DYNAMIC_PYTHON_RUNTIME)
+  set(LLDB_PYTHON_LIBRARIES ${CMAKE_DL_LIBS})
+else()
+  set(LLDB_PYTHON_LIBRARIES ${Python3_LIBRARIES})
+endif()
+
 add_lldb_library(lldbPluginScriptInterpreterPythonInterfaces PLUGIN
   OperatingSystemPythonInterface.cpp
   ScriptInterpreterPythonInterfaces.cpp
@@ -39,8 +45,7 @@ add_lldb_library(lldbPluginScriptInterpreterPythonInterfaces PLUGIN
     lldbHost
     lldbInterpreter
     lldbTarget
-    ${Python3_LIBRARIES}
+    ${LLDB_PYTHON_LIBRARIES}
     ${LLDB_LIBEDIT_LIBS}
   )
-
 

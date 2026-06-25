@@ -16,6 +16,6 @@ add_lldb_unittest(ScriptInterpreterPythonTests
     LLVMTestingSupport
   )
 
-if(Python3_RPATH)
+if(Python3_RPATH AND NOT LLDB_DYNAMIC_PYTHON_RUNTIME)
   set_property(TARGET ScriptInterpreterPythonTests APPEND PROPERTY BUILD_RPATH "${Python3_RPATH}")
 endif()
