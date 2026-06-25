@@ -38,6 +38,7 @@ public:
 
 protected:
   std::unique_ptr<curses::Application> m_app_up;
+  bool m_saved_terminal_state = false;
 };
 
 } // namespace lldb_private
