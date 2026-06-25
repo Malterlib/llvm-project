@@ -9,10 +9,13 @@
 #ifndef LLDB_SOURCE_PLUGINS_EXPRESSIONPARSER_CLANG_CLANGASTMETADATA_H
 #define LLDB_SOURCE_PLUGINS_EXPRESSIONPARSER_CLANG_CLANGASTMETADATA_H
 
+#include "lldb/Core/Declaration.h"
 #include "lldb/Core/dwarf.h"
 #include "lldb/lldb-defines.h"
 #include "lldb/lldb-enumerations.h"
 #include "lldb/lldb-private-enumerations.h"
+
+#include <optional>
 
 namespace lldb_private {
 
@@ -87,6 +90,14 @@ public:
 
   bool HasObjectPtr() const { return m_has_object_ptr; }
 
+  void SetDeclaration(const Declaration &declaration) {
+    m_declaration = declaration;
+  }
+
+  const std::optional<Declaration> &GetDeclaration() const {
+    return m_declaration;
+  }
+
   /// A type is "forcefully completed" if it was declared complete to satisfy an
   /// AST invariant (e.g. base classes must be complete types), but in fact we
   /// were not able to find a actual definition for it.
@@ -99,6 +110,8 @@ public:
   void Dump(Stream *s);
 
 private:
+  std::optional<Declaration> m_declaration;
+
   union {
     lldb::user_id_t m_user_id;
     uint64_t m_isa_ptr;

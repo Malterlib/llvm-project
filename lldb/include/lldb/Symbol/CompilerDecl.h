@@ -73,6 +73,8 @@ public:
 
   CompilerDeclContext GetDeclContext() const;
 
+  bool GetDeclaration(Declaration &decl) const;
+
   // If this decl has a type, return it.
   CompilerType GetType() const;
 

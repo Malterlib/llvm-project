@@ -8,6 +8,7 @@
 
 #include "lldb/API/SBType.h"
 #include "Utils.h"
+#include "lldb/API/SBDeclaration.h"
 #include "lldb/API/SBDefines.h"
 #include "lldb/API/SBModule.h"
 #include "lldb/API/SBStream.h"
@@ -1022,6 +1023,18 @@ lldb::SBType SBTypeMemberFunction::GetArgumentTypeAtIndex(uint32_t i) {
         std::make_shared<TypeImpl>(m_opaque_sp->GetArgumentAtIndex(i)));
   }
   return sb_type;
+}
+
+lldb::SBDeclaration SBTypeMemberFunction::GetDeclaration() {
+  LLDB_INSTRUMENT_VA(this);
+
+  SBDeclaration sb_declaration;
+  if (m_opaque_sp) {
+    Declaration declaration = m_opaque_sp->GetDeclaration();
+    if (declaration.IsValid())
+      sb_declaration.SetDeclaration(declaration);
+  }
+  return sb_declaration;
 }
 
 lldb::MemberFunctionKind SBTypeMemberFunction::GetKind() {
