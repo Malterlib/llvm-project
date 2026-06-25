@@ -41,3 +41,9 @@ For example (from test/lldbutil.py, but slightly modified for doc purpose),::
     provide some guidance to the user about this.
     Returns false if unoptimized, or unknown."
 ) lldb::SBFunction::GetIsOptimized;
+
+%feature("docstring", "
+    Returns the class, struct, union, or Objective-C interface type that
+    declares this function. For free functions, or when the debug info does not
+    provide a declaring type, returns an invalid SBType."
+) lldb::SBFunction::GetDeclaringType;

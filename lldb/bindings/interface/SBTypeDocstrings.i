@@ -638,6 +638,15 @@ SBType supports the eq/ne operator. For example,::
 ) lldb::SBType::GetFunctionArgumentTypes;
 
 %feature("docstring",
+    "Returns the declaration location for this member function, if debug info
+    provides one.
+
+    Returns an invalid `SBDeclaration` when this member function is invalid or
+    the declaration location is unavailable.
+    "
+) lldb::SBTypeMemberFunction::GetDeclaration;
+
+%feature("docstring",
     "Returns the number of member functions of this type.
 
     Returns ``0`` if an error occurred or this type is invalid.

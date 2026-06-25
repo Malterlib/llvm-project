@@ -47,5 +47,9 @@ void ClangASTMetadata::Dump(Stream *s) {
   if (m_is_dynamic_cxx) {
     s->Printf("is_dynamic_cxx=%i ", m_is_dynamic_cxx);
   }
+
+  if (m_declaration && m_declaration->IsValid())
+    m_declaration->Dump(s, false);
+
   s->EOL();
 }

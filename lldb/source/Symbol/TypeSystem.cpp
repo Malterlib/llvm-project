@@ -180,6 +180,10 @@ CompilerDeclContext TypeSystem::DeclGetDeclContext(void *opaque_decl) {
   return CompilerDeclContext();
 }
 
+bool TypeSystem::DeclGetDeclaration(void *, Declaration &) {
+  return false;
+}
+
 CompilerType TypeSystem::DeclGetFunctionReturnType(void *opaque_decl) {
   return CompilerType();
 }
@@ -199,6 +203,10 @@ TypeSystem::DeclGetCompilerContext(void *opaque_decl) {
 std::vector<lldb_private::CompilerContext>
 TypeSystem::DeclContextGetCompilerContext(void *opaque_decl_ctx) {
   return {};
+}
+
+CompilerType TypeSystem::DeclContextGetDeclaringType(void *opaque_decl_ctx) {
+  return CompilerType();
 }
 
 std::vector<CompilerDecl>

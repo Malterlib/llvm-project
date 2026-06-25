@@ -14,6 +14,8 @@
 #include "lldb/Core/Disassembler.h"
 #include "lldb/Core/Module.h"
 #include "lldb/Symbol/CompileUnit.h"
+#include "lldb/Symbol/CompilerDeclContext.h"
+#include "lldb/Symbol/CompilerType.h"
 #include "lldb/Symbol/Function.h"
 #include "lldb/Symbol/Type.h"
 #include "lldb/Symbol/VariableList.h"
@@ -221,6 +223,20 @@ SBType SBFunction::GetType() {
       sb_type.ref().SetType(function_type->shared_from_this());
   }
   return sb_type;
+}
+
+SBType SBFunction::GetDeclaringType() {
+  LLDB_INSTRUMENT_VA(this);
+
+  if (!m_opaque_ptr)
+    return SBType();
+
+  CompilerType declaring_type =
+      m_opaque_ptr->GetDeclContext().GetDeclaringType();
+  if (!declaring_type)
+    return SBType();
+
+  return SBType(declaring_type);
 }
 
 SBBlock SBFunction::GetBlock() {

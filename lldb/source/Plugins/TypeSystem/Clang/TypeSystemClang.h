@@ -552,6 +552,8 @@ public:
 
   CompilerDeclContext DeclGetDeclContext(void *opaque_decl) override;
 
+  bool DeclGetDeclaration(void *opaque_decl, Declaration &decl) override;
+
   CompilerType DeclGetFunctionReturnType(void *opaque_decl) override;
 
   size_t DeclGetFunctionNumArguments(void *opaque_decl) override;
@@ -585,6 +587,8 @@ public:
   ConstString DeclContextGetName(void *opaque_decl_ctx) override;
 
   ConstString DeclContextGetScopeQualifiedName(void *opaque_decl_ctx) override;
+
+  CompilerType DeclContextGetDeclaringType(void *opaque_decl_ctx) override;
 
   bool DeclContextIsClassMethod(void *opaque_decl_ctx) override;
 
@@ -1012,7 +1016,8 @@ public:
       lldb::opaque_compiler_type_t type, llvm::StringRef name,
       llvm::StringRef asm_label, const CompilerType &method_type,
       lldb::AccessType access, bool is_virtual, bool is_static, bool is_inline,
-      bool is_explicit, bool is_attr_used, bool is_artificial);
+      bool is_explicit, bool is_attr_used, bool is_artificial,
+      const Declaration *decl = nullptr);
 
   void AddMethodOverridesForCXXRecordType(lldb::opaque_compiler_type_t type);
 

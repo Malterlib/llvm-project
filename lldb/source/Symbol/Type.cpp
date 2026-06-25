@@ -1222,6 +1222,13 @@ ConstString TypeMemberFunctionImpl::GetMangledName() const {
 
 CompilerType TypeMemberFunctionImpl::GetType() const { return m_type; }
 
+Declaration TypeMemberFunctionImpl::GetDeclaration() const {
+  Declaration declaration;
+  if (m_decl)
+    m_decl.GetDeclaration(declaration);
+  return declaration;
+}
+
 lldb::MemberFunctionKind TypeMemberFunctionImpl::GetKind() const {
   return m_kind;
 }

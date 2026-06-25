@@ -73,6 +73,7 @@
 #include "lldb/Utility/ArchSpec.h"
 #include "lldb/Utility/DataExtractor.h"
 #include "lldb/Utility/Flags.h"
+#include "lldb/Utility/FileSpec.h"
 #include "lldb/Utility/LLDBAssert.h"
 #include "lldb/Utility/LLDBLog.h"
 #include "lldb/Utility/RegularExpression.h"
@@ -7846,7 +7847,8 @@ clang::CXXMethodDecl *TypeSystemClang::AddMethodToCXXRecordType(
     lldb::opaque_compiler_type_t type, llvm::StringRef name,
     llvm::StringRef asm_label, const CompilerType &method_clang_type,
     lldb::AccessType access, bool is_virtual, bool is_static, bool is_inline,
-    bool is_explicit, bool is_attr_used, bool is_artificial) {
+    bool is_explicit, bool is_attr_used, bool is_artificial,
+    const Declaration *decl) {
   if (!type || !method_clang_type.IsValid() || name.empty())
     return nullptr;
 
@@ -7980,6 +7982,12 @@ clang::CXXMethodDecl *TypeSystemClang::AddMethodToCXXRecordType(
   if (!asm_label.empty())
     cxx_method_decl->addAttr(
         clang::AsmLabelAttr::CreateImplicit(getASTContext(), asm_label));
+
+  if (decl && decl->IsValid()) {
+    ClangASTMetadata metadata;
+    metadata.SetDeclaration(*decl);
+    SetMetadata(cxx_method_decl, metadata);
+  }
 
   // Parameters on member function declarations in DWARF generally don't
   // have names, so we omit them when creating the ParmVarDecls.
@@ -9287,6 +9295,35 @@ CompilerDeclContext TypeSystemClang::DeclGetDeclContext(void *opaque_decl) {
   return CompilerDeclContext();
 }
 
+bool TypeSystemClang::DeclGetDeclaration(void *opaque_decl, Declaration &decl) {
+  clang::Decl *clang_decl = static_cast<clang::Decl *>(opaque_decl);
+  if (!clang_decl)
+    return false;
+
+  auto metadata = GetMetadata(clang_decl);
+  if (!metadata && clang_decl->getCanonicalDecl() != clang_decl)
+    metadata = GetMetadata(clang_decl->getCanonicalDecl());
+  if (metadata && metadata->GetDeclaration() &&
+      metadata->GetDeclaration()->IsValid()) {
+    decl = *metadata->GetDeclaration();
+    return true;
+  }
+
+  clang::SourceLocation location = clang_decl->getLocation();
+  if (location.isInvalid())
+    return false;
+
+  clang::PresumedLoc presumed_location =
+      clang_decl->getASTContext().getSourceManager().getPresumedLoc(location);
+  if (presumed_location.isInvalid())
+    return false;
+
+  decl.SetFile(FileSpec(presumed_location.getFilename()));
+  decl.SetLine(presumed_location.getLine());
+  decl.SetColumn(presumed_location.getColumn());
+  return decl.IsValid();
+}
+
 CompilerType TypeSystemClang::DeclGetFunctionReturnType(void *opaque_decl) {
   if (clang::FunctionDecl *func_decl =
           llvm::dyn_cast<clang::FunctionDecl>((clang::Decl *)opaque_decl))
@@ -9605,6 +9642,33 @@ TypeSystemClang::DeclContextGetScopeQualifiedName(void *opaque_decl_ctx) {
       return ConstString(GetTypeNameForDecl(named_decl));
   }
   return ConstString();
+}
+
+CompilerType
+TypeSystemClang::DeclContextGetDeclaringType(void *opaque_decl_ctx) {
+  if (!opaque_decl_ctx)
+    return CompilerType();
+
+  clang::DeclContext *decl_ctx = (clang::DeclContext *)opaque_decl_ctx;
+  clang::DeclContext *declaring_ctx = nullptr;
+
+  if (auto *method_decl = llvm::dyn_cast<clang::CXXMethodDecl>(decl_ctx))
+    declaring_ctx = method_decl->getParent();
+  else if (auto *objc_method_decl =
+               llvm::dyn_cast<clang::ObjCMethodDecl>(decl_ctx))
+    return GetTypeForDecl(objc_method_decl->getClassInterface());
+  else if (auto *function_decl = llvm::dyn_cast<clang::FunctionDecl>(decl_ctx))
+    declaring_ctx = function_decl->getDeclContext();
+  else
+    declaring_ctx = decl_ctx;
+
+  if (auto *tag_decl = llvm::dyn_cast_or_null<clang::TagDecl>(declaring_ctx))
+    return GetTypeForDecl(tag_decl);
+  if (auto *objc_interface_decl =
+          llvm::dyn_cast_or_null<clang::ObjCInterfaceDecl>(declaring_ctx))
+    return GetTypeForDecl(objc_interface_decl);
+
+  return CompilerType();
 }
 
 bool TypeSystemClang::DeclContextIsClassMethod(void *opaque_decl_ctx) {
