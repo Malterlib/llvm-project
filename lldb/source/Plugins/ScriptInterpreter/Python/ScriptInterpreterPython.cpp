@@ -127,6 +127,13 @@ static void AppendPythonModuleSearchPath(PyConfig &config,
 struct InitializePythonRAII {
 public:
   InitializePythonRAII() {
+#if LLDB_DYNAMIC_PYTHON_RUNTIME
+    if (!LLDBPythonRuntime_Initialize()) {
+      fputs("LLDB failed to initialize the Python runtime.\n", stderr);
+      abort();
+    }
+#endif
+
     // The table of built-in modules can only be extended before Python is
     // initialized.
     if (!Py_IsInitialized()) {
@@ -709,6 +716,15 @@ llvm::StringRef ScriptInterpreterPython::GetPluginDescriptionStatic() {
 }
 
 void ScriptInterpreterPython::Initialize() {
+#if LLDB_DYNAMIC_PYTHON_RUNTIME
+  // The dynamic runtime finds Python itself (the python3 in PATH, then any
+  // libpython3 of the minimum version or newer). Without one, LLDB runs
+  // without the Python script interpreter.
+  if (!LLDBPythonRuntime_Initialize()) {
+    LLDB_LOG(GetLog(LLDBLog::Script), "{0}", LLDBPythonRuntime_GetError());
+    return;
+  }
+#else
   llvm::Expected<ScriptInterpreterRuntimeLoader &> loader =
       ScriptInterpreterRuntimeLoader::Get(lldb::eScriptLanguagePython);
   if (!loader) {
@@ -719,6 +735,7 @@ void ScriptInterpreterPython::Initialize() {
     LLDB_LOG_ERROR(GetLog(LLDBLog::Script), std::move(error), "{0}");
     return;
   }
+#endif
 
 #if LLDB_ENABLE_MTE
   // Python's allocator (pymalloc) is not aware of Memory Tagging Extension
