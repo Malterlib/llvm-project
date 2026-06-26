@@ -34,12 +34,27 @@ using namespace lldb_private::npdb;
 
 using Error = llvm::Error;
 
+static void ApplyDeclarationMetadata(TypeSystemClang &clang_ast,
+                                     clang::Decl *decl,
+                                     const Declaration &declaration) {
+  if (!decl || !declaration.IsValid())
+    return;
+
+  ClangASTMetadata metadata;
+  if (std::optional<ClangASTMetadata> existing_metadata =
+          clang_ast.GetMetadata(decl))
+    metadata = *existing_metadata;
+  metadata.SetDeclaration(declaration);
+  clang_ast.SetMetadata(decl, metadata);
+}
+
 UdtRecordCompleter::UdtRecordCompleter(
     PdbTypeSymId id, CompilerType &derived_ct, clang::TagDecl &tag_decl,
     PdbAstBuilder &ast_builder, PdbIndex &index,
     llvm::DenseMap<clang::Decl *, DeclStatus> &decl_to_status,
     llvm::DenseMap<lldb::opaque_compiler_type_t,
-                   llvm::SmallSet<std::pair<llvm::StringRef, CompilerType>, 8>>
+                   std::map<std::pair<llvm::StringRef, CompilerType>,
+                            clang::CXXMethodDecl *>>
         &cxx_record_map)
     : m_cv_tag_record(CVTagRecord::create(index.tpi().getType(id.index))),
       m_id(id), m_derived_ct(derived_ct), m_tag_decl(tag_decl),
@@ -92,21 +107,40 @@ void UdtRecordCompleter::AddMethod(llvm::StringRef name, TypeIndex type_idx,
   TypeSystemClang::RequireCompleteType(method_ct);
   lldb::opaque_compiler_type_t derived_opaque_ty =
       m_derived_ct.GetOpaqueQualType();
-  auto iter = m_cxx_record_map.find(derived_opaque_ty);
-  if (iter != m_cxx_record_map.end()) {
-    if (iter->getSecond().contains({name, method_ct})) {
-      return;
-    }
+  auto &methods = m_cxx_record_map[derived_opaque_ty];
+
+  Declaration declaration;
+  auto *pdb = static_cast<SymbolFileNativePDB *>(
+      m_ast_builder.clang().GetSymbolFile()->GetBackingSymbolFile());
+  if (std::optional<PdbCompilandSymId> method_id =
+          pdb->FindMethodDeclaration(name, type_idx)) {
+    llvm::Expected<Declaration> declaration_or_err =
+        pdb->ResolveFunctionDeclaration(*method_id);
+    if (declaration_or_err)
+      declaration = *declaration_or_err;
+    else
+      llvm::consumeError(declaration_or_err.takeError());
+  }
+
+  if (auto method_iter = methods.find({name, method_ct});
+      method_iter != methods.end()) {
+    ApplyDeclarationMetadata(m_ast_builder.clang(), method_iter->second,
+                             declaration);
+    return;
   }
 
   lldb::AccessType access_type = TranslateMemberAccess(access);
   bool is_artificial = (options & MethodOptions::CompilerGenerated) ==
                        MethodOptions::CompilerGenerated;
-  m_ast_builder.clang().AddMethodToCXXRecordType(
-      derived_opaque_ty, name.data(), /*asm_label=*/{}, method_ct, access_type,
-      attrs.isVirtual(), attrs.isStatic(), false, false, false, is_artificial);
 
-  m_cxx_record_map[derived_opaque_ty].insert({name, method_ct});
+  clang::CXXMethodDecl *method =
+      m_ast_builder.clang().AddMethodToCXXRecordType(
+          derived_opaque_ty, name.data(), /*asm_label=*/{}, method_ct,
+          access_type, attrs.isVirtual(), attrs.isStatic(), false, false, false,
+          is_artificial, declaration.IsValid() ? &declaration : nullptr);
+
+  if (method)
+    methods.try_emplace({name, method_ct}, method);
 }
 
 Error UdtRecordCompleter::visitKnownMember(CVMemberRecord &cvr,

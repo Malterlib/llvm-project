@@ -25,11 +25,14 @@
 #include "lldb/Core/Module.h"
 #include "lldb/Symbol/ObjectFile.h"
 #include "lldb/Utility/LLDBAssert.h"
+#include "lldb/Utility/FileSpec.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/QualTypeNames.h"
 #include "clang/AST/TemplateBase.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <limits>
 #include <optional>
@@ -41,16 +44,31 @@ using namespace llvm::codeview;
 using namespace llvm::pdb;
 
 namespace {
+static void ApplyDeclarationMetadata(TypeSystemClang &clang_ast,
+                                     clang::Decl *decl,
+                                     const Declaration &declaration) {
+  if (!decl || !declaration.IsValid())
+    return;
+
+  ClangASTMetadata metadata;
+  if (std::optional<ClangASTMetadata> existing_metadata =
+          clang_ast.GetMetadata(decl))
+    metadata = *existing_metadata;
+  metadata.SetDeclaration(declaration);
+  clang_ast.SetMetadata(decl, metadata);
+}
+
 struct CreateMethodDecl : public TypeVisitorCallbacks {
   CreateMethodDecl(PdbIndex &m_index, TypeSystemClang &m_clang,
                    TypeIndex func_type_index,
                    clang::FunctionDecl *&function_decl,
                    lldb::opaque_compiler_type_t parent_ty,
                    llvm::StringRef proc_name, ConstString mangled_name,
-                   CompilerType func_ct)
+                   CompilerType func_ct, const Declaration *declaration)
       : m_index(m_index), m_clang(m_clang), func_type_index(func_type_index),
         function_decl(function_decl), parent_ty(parent_ty),
-        proc_name(proc_name), mangled_name(mangled_name), func_ct(func_ct) {}
+        proc_name(proc_name), mangled_name(mangled_name), func_ct(func_ct),
+        declaration(declaration) {}
   PdbIndex &m_index;
   TypeSystemClang &m_clang;
   TypeIndex func_type_index;
@@ -59,6 +77,7 @@ struct CreateMethodDecl : public TypeVisitorCallbacks {
   llvm::StringRef proc_name;
   ConstString mangled_name;
   CompilerType func_ct;
+  const Declaration *declaration;
 
   llvm::Error visitKnownMember(CVMemberRecord &cvr,
                                OverloadedMethodRecord &overloaded) override {
@@ -100,7 +119,7 @@ struct CreateMethodDecl : public TypeVisitorCallbacks {
         parent_ty, proc_name, mangled_name, func_ct, /*access=*/access_type,
         /*is_virtual=*/is_virtual, /*is_static=*/is_static,
         /*is_inline=*/false, /*is_explicit=*/false,
-        /*is_attr_used=*/false, /*is_artificial=*/is_artificial);
+        /*is_attr_used=*/false, /*is_artificial=*/is_artificial, declaration);
   }
 };
 } // namespace
@@ -163,6 +182,50 @@ TranslateCallingConvention(llvm::codeview::CallingConvention conv) {
   default:
     return std::nullopt;
   }
+}
+
+static std::optional<clang::CallingConv>
+TranslateCallingConvention(llvm::ms_demangle::CallingConv conv) {
+  using CC = llvm::ms_demangle::CallingConv;
+  switch (conv) {
+  case CC::None:
+  case CC::Cdecl:
+    return clang::CallingConv::CC_C;
+  case CC::Pascal:
+    return clang::CallingConv::CC_X86Pascal;
+  case CC::Thiscall:
+    return clang::CallingConv::CC_X86ThisCall;
+  case CC::Stdcall:
+    return clang::CallingConv::CC_X86StdCall;
+  case CC::Fastcall:
+    return clang::CallingConv::CC_X86FastCall;
+  case CC::Vectorcall:
+    return clang::CallingConv::CC_X86VectorCall;
+  case CC::Regcall:
+    return clang::CallingConv::CC_X86RegCall;
+  case CC::Swift:
+    return clang::CallingConv::CC_Swift;
+  case CC::SwiftAsync:
+    return clang::CallingConv::CC_SwiftAsync;
+  case CC::Clrcall:
+  case CC::Eabi:
+    return std::nullopt;
+  }
+  llvm_unreachable("Unhandled Microsoft demangle calling convention");
+}
+
+static std::optional<clang::RefQualifierKind>
+TranslateFunctionRefQualifier(llvm::ms_demangle::FunctionRefQualifier ref) {
+  using Ref = llvm::ms_demangle::FunctionRefQualifier;
+  switch (ref) {
+  case Ref::None:
+    return clang::RefQualifierKind::RQ_None;
+  case Ref::Reference:
+    return clang::RefQualifierKind::RQ_LValue;
+  case Ref::RValueReference:
+    return clang::RefQualifierKind::RQ_RValue;
+  }
+  llvm_unreachable("Unhandled Microsoft demangle function ref qualifier");
 }
 
 static bool IsAnonymousNamespaceName(llvm::StringRef name) {
@@ -290,6 +353,86 @@ static llvm::StringRef GetUnqualifiedTypeName(llvm::StringRef name) {
   return name.drop_front(*separator_pos + 2);
 }
 
+static llvm::StringRef TrimTypeNameQuotes(llvm::StringRef name) {
+  name = name.trim();
+  while (!name.empty() && (name.front() == '`' || name.front() == '\''))
+    name = name.drop_front().trim();
+  while (!name.empty() && (name.back() == '`' || name.back() == '\''))
+    name = name.drop_back().trim();
+  return name;
+}
+
+static std::optional<Declaration>
+GetLambdaDeclarationFromTypeName(llvm::StringRef name) {
+  constexpr llvm::StringLiteral lambda_at("lambda at ");
+  size_t pos = name.find(lambda_at);
+  if (pos == llvm::StringRef::npos)
+    return std::nullopt;
+
+  llvm::StringRef source_name = name.drop_front(pos + lambda_at.size());
+  source_name = TrimTypeNameQuotes(source_name);
+
+  size_t column_separator = source_name.rfind(':');
+  if (column_separator == llvm::StringRef::npos)
+    return std::nullopt;
+
+  size_t line_separator = source_name.rfind(':', column_separator - 1);
+  if (line_separator == llvm::StringRef::npos)
+    return std::nullopt;
+
+  uint32_t line = 0;
+  llvm::StringRef line_text =
+      source_name.slice(line_separator + 1, column_separator);
+  if (line_text.getAsInteger(10, line) || line == 0)
+    return std::nullopt;
+
+  uint32_t column = 0;
+  llvm::StringRef column_text = source_name.drop_front(column_separator + 1);
+  if (column_text.getAsInteger(10, column))
+    column = 0;
+
+  llvm::StringRef file_name = source_name.take_front(line_separator);
+  return Declaration(FileSpec(file_name.str()), line, column);
+}
+
+static std::optional<Declaration>
+GetDirectLambdaDeclarationFromTypeName(llvm::StringRef name) {
+  constexpr llvm::StringLiteral lambda_at("lambda at ");
+  name = TrimTypeNameQuotes(name);
+  for (llvm::StringRef prefix : {llvm::StringRef("class "),
+                                 llvm::StringRef("struct "),
+                                 llvm::StringRef("union ")}) {
+    if (name.starts_with(prefix)) {
+      name = TrimTypeNameQuotes(name.drop_front(prefix.size()));
+      break;
+    }
+  }
+  if (!name.starts_with(lambda_at))
+    return std::nullopt;
+  return GetLambdaDeclarationFromTypeName(name);
+}
+
+static void ApplyTypeDeclarationMetadata(PdbAstBuilder &builder,
+                                         clang::QualType qt,
+                                         const Declaration &declaration) {
+  if (qt.isNull() || !declaration.IsValid())
+    return;
+
+  TypeSystemClang &clang_ast = builder.clang();
+  ClangASTMetadata metadata;
+  if (clang::TagDecl *tag = qt->getAsTagDecl()) {
+    if (std::optional<ClangASTMetadata> existing_metadata =
+            clang_ast.GetMetadata(tag))
+      metadata = *existing_metadata;
+    metadata.SetDeclaration(declaration);
+    clang_ast.SetMetadata(tag, metadata);
+  } else {
+    metadata.SetDeclaration(declaration);
+  }
+
+  clang_ast.SetMetadata(qt.getTypePtr(), metadata);
+}
+
 static std::string RemoveTemplateSeparatorWhitespace(llvm::StringRef name) {
   std::string result;
   result.reserve(name.size());
@@ -334,6 +477,45 @@ static std::string RemoveTemplateSeparatorWhitespace(llvm::StringRef name) {
   return result;
 }
 
+static std::string
+AddCodeViewAdjacentClosingTemplateWhitespace(llvm::StringRef name) {
+  std::string result;
+  result.reserve(name.size());
+
+  for (size_t i = 0; i < name.size(); ++i) {
+    result.push_back(name[i]);
+    if (name[i] == '>' && i + 1 < name.size() && name[i + 1] == '>')
+      result.push_back(' ');
+  }
+
+  return result;
+}
+
+static void AddTypeNameCandidate(std::vector<std::string> &candidates,
+                                 llvm::StringRef name) {
+  if (name.empty())
+    return;
+
+  for (llvm::StringRef candidate : candidates) {
+    if (candidate == name)
+      return;
+  }
+
+  candidates.push_back(name.str());
+}
+
+static void AddTemplateTypeNameCandidates(
+    std::vector<std::string> &candidates, llvm::StringRef name) {
+  AddTypeNameCandidate(candidates, name);
+
+  std::string compact = RemoveTemplateSeparatorWhitespace(name);
+  AddTypeNameCandidate(candidates, compact);
+
+  std::string codeview_compact =
+      AddCodeViewAdjacentClosingTemplateWhitespace(compact);
+  AddTypeNameCandidate(candidates, codeview_compact);
+}
+
 static std::vector<std::string>
 ParseTemplateArgumentsFromName(llvm::StringRef name) {
   std::vector<std::string> args;
@@ -367,6 +549,41 @@ ParseTemplateArgumentsFromName(llvm::StringRef name) {
   }
 
   return args;
+}
+
+static void ApplyTemplateArgumentDeclarationMetadataFromName(
+    PdbAstBuilder &builder, clang::QualType qt, llvm::StringRef name) {
+  if (qt.isNull())
+    return;
+
+  clang::TagDecl *tag = qt->getAsTagDecl();
+  auto *specialization =
+      llvm::dyn_cast_or_null<clang::ClassTemplateSpecializationDecl>(tag);
+  if (!specialization)
+    return;
+
+  std::vector<std::string> spelled_args =
+      ParseTemplateArgumentsFromName(GetUnqualifiedTypeName(name));
+  if (spelled_args.empty())
+    return;
+
+  clang::ArrayRef<clang::TemplateArgument> template_args =
+      specialization->getTemplateArgs().asArray();
+  size_t count = std::min(spelled_args.size(), template_args.size());
+  for (size_t i = 0; i < count; ++i) {
+    clang::TemplateArgument const &arg = template_args[i];
+    if (arg.getKind() != clang::TemplateArgument::Type)
+      continue;
+
+    clang::QualType arg_type = arg.getAsType();
+    ApplyTemplateArgumentDeclarationMetadataFromName(builder, arg_type,
+                                                    spelled_args[i]);
+
+    std::optional<Declaration> declaration =
+        GetDirectLambdaDeclarationFromTypeName(spelled_args[i]);
+    if (declaration)
+      ApplyTypeDeclarationMetadata(builder, arg_type, *declaration);
+  }
 }
 
 struct TemplateArgumentTypeName {
@@ -455,49 +672,105 @@ FindPdbTemplateArgumentType(PdbAstBuilder &builder, llvm::StringRef name,
     return {};
 
   TemplateArgumentTypeName unqualified = StripTopLevelQualifiers(name);
+  llvm::StringRef scope_unqualified =
+      TrimTypeNameQuotes(GetUnqualifiedTypeName(unqualified.name));
 
   SymbolFileNativePDB *pdb = static_cast<SymbolFileNativePDB *>(
       builder.clang().GetSymbolFile()->GetBackingSymbolFile());
   PdbIndex &index = pdb->GetIndex();
 
   std::vector<std::string> candidates;
-  candidates.push_back(name.str());
-
-  std::string compact_name = RemoveTemplateSeparatorWhitespace(name);
-  if (compact_name != candidates.front())
-    candidates.push_back(compact_name);
+  AddTemplateTypeNameCandidates(candidates, name);
 
   if (unqualified.name != name.str()) {
-    candidates.push_back(unqualified.name);
-    std::string compact_unqualified_name =
-        RemoveTemplateSeparatorWhitespace(unqualified.name);
-    if (compact_unqualified_name != unqualified.name)
-      candidates.push_back(compact_unqualified_name);
+    AddTemplateTypeNameCandidates(candidates, unqualified.name);
   }
+
+  if (!scope_unqualified.empty() && scope_unqualified != unqualified.name) {
+    AddTemplateTypeNameCandidates(candidates, scope_unqualified);
+  }
+
+  auto make_qualified_type = [&](TypeIndex ti) -> clang::QualType {
+    if (ti == current_type_index)
+      return {};
+
+    clang::QualType qt = builder.GetOrCreateClangType(PdbTypeSymId(ti));
+    if (qt.isNull())
+      return {};
+
+    if (name.contains('<') && !IsClassTemplateSpecializationType(qt)) {
+      clang::QualType specialization_qt =
+          CreateFallbackTemplateSpecializationTypeFromName(
+              builder, name, current_type_index, ti, qt);
+      if (!specialization_qt.isNull())
+        qt = specialization_qt;
+    }
+    ApplyTemplateArgumentDeclarationMetadataFromName(builder, qt, name);
+    if (unqualified.is_const)
+      qt = qt.withConst();
+    if (unqualified.is_volatile)
+      qt = qt.withVolatile();
+    return qt;
+  };
 
   for (llvm::StringRef candidate : candidates) {
     std::vector<TypeIndex> matches = index.tpi().findRecordsByName(candidate);
     for (TypeIndex ti : matches) {
-      if (ti == current_type_index)
-        continue;
-
-      clang::QualType qt = builder.GetOrCreateClangType(PdbTypeSymId(ti));
-      if (!qt.isNull()) {
-        if (name.contains('<') && !IsClassTemplateSpecializationType(qt)) {
-          clang::QualType specialization_qt =
-              CreateFallbackTemplateSpecializationTypeFromName(
-                  builder, name, current_type_index, ti, qt);
-          if (!specialization_qt.isNull())
-            qt = specialization_qt;
-        }
-        if (unqualified.is_const)
-          qt = qt.withConst();
-        if (unqualified.is_volatile)
-          qt = qt.withVolatile();
+      clang::QualType qt = make_qualified_type(ti);
+      if (!qt.isNull())
         return qt;
-      }
     }
   }
+
+  for (llvm::StringRef candidate : candidates) {
+    std::optional<PdbTypeSymId> match =
+        pdb->FindCompleteTypeByName(candidate, current_type_index);
+    if (!match)
+      continue;
+
+    clang::QualType qt = make_qualified_type(match->index);
+    if (!qt.isNull())
+      return qt;
+  }
+
+  auto find_by_source_location = [&]() -> clang::QualType {
+    constexpr llvm::StringLiteral lambda_at("lambda at ");
+    llvm::StringRef source_name = unqualified.name;
+    size_t pos = source_name.find(lambda_at);
+    if (pos == llvm::StringRef::npos)
+      return {};
+
+    source_name = source_name.drop_front(pos + lambda_at.size());
+    source_name = TrimTypeNameQuotes(source_name);
+
+    size_t column_separator = source_name.rfind(':');
+    if (column_separator == llvm::StringRef::npos)
+      return {};
+
+    size_t line_separator = source_name.rfind(':', column_separator - 1);
+    if (line_separator == llvm::StringRef::npos)
+      return {};
+
+    uint32_t line = 0;
+    llvm::StringRef line_text =
+        source_name.slice(line_separator + 1, column_separator);
+    if (line_text.getAsInteger(10, line) || line == 0)
+      return {};
+
+    llvm::StringRef file_name = source_name.take_front(line_separator);
+    llvm::StringRef file_basename = llvm::sys::path::filename(file_name);
+
+    std::optional<PdbTypeSymId> match =
+        pdb->FindUdtDeclarationBySourceLocation(file_basename, line,
+                                                current_type_index);
+    if (!match)
+      return {};
+
+    return make_qualified_type(match->index);
+  };
+
+  if (clang::QualType qt = find_by_source_location(); !qt.isNull())
+    return qt;
 
   return {};
 }
@@ -529,6 +802,11 @@ GetClangTypeForTemplateArgument(PdbAstBuilder &builder,
                                 llvm::ms_demangle::Node &node,
                                 TypeIndex current_type_index);
 
+static clang::QualType
+GetClangTypeForMSDemangleType(PdbAstBuilder &builder,
+                              llvm::ms_demangle::Node &node,
+                              TypeIndex current_type_index);
+
 static clang::TemplateArgument CreateIntegralTemplateArgument(
     TypeSystemClang &clang_ast, llvm::ms_demangle::IntegerLiteralNode &literal,
     clang::QualType type = {});
@@ -549,24 +827,40 @@ static clang::QualType CreateFallbackTemplateArgumentRecordType(
   clang::DeclContext *context = clang_ast.GetTranslationUnitDecl();
   clang::DeclarationName decl_name(&ast.Idents.get(name));
   for (clang::NamedDecl *decl : context->lookup(decl_name)) {
-    if (auto *tag_decl = llvm::dyn_cast<clang::TagDecl>(decl))
-      return ApplyMSDemangleTypeQualifiers(
+    if (auto *tag_decl = llvm::dyn_cast<clang::TagDecl>(decl)) {
+      clang::QualType qt = ApplyMSDemangleTypeQualifiers(
           ast.getTypeDeclType(clang::ElaboratedTypeKeyword::None,
                               /*Qualifier=*/std::nullopt,
                               static_cast<clang::TypeDecl *>(tag_decl)),
           qualifiers);
+      if (std::optional<Declaration> declaration =
+              GetLambdaDeclarationFromTypeName(name))
+        ApplyTypeDeclarationMetadata(builder, qt, *declaration);
+      return qt;
+    }
+  }
+
+  std::optional<Declaration> declaration =
+      GetLambdaDeclarationFromTypeName(name);
+  std::optional<ClangASTMetadata> metadata;
+  if (declaration) {
+    metadata.emplace();
+    metadata->SetDeclaration(*declaration);
   }
 
   CompilerType ct = clang_ast.CreateRecordType(
       context, OptionalClangModuleID(), lldb::eAccessPublic, name,
       llvm::to_underlying(GetClangTagTypeKindForMSDemangleTag(tag_kind)),
-      lldb::eLanguageTypeC_plus_plus);
+      lldb::eLanguageTypeC_plus_plus, metadata);
   if (!ct.IsValid())
     return {};
 
   clang::QualType qt =
       clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
-  return ApplyMSDemangleTypeQualifiers(qt, qualifiers);
+  qt = ApplyMSDemangleTypeQualifiers(qt, qualifiers);
+  if (declaration)
+    ApplyTypeDeclarationMetadata(builder, qt, *declaration);
+  return qt;
 }
 
 static bool InsertTemplateArgumentFromMSDemangleNode(
@@ -580,11 +874,12 @@ static bool InsertTemplateArgumentFromMSDemangleNode(
     return true;
   }
 
-  clang::QualType qt =
-      GetClangTypeForTemplateArgument(builder, node, current_type_index);
-  if (qt.isNull() && !fallback_type_name.empty())
+  clang::QualType qt;
+  if (!fallback_type_name.empty())
     qt = FindPdbTemplateArgumentType(builder, fallback_type_name,
                                      current_type_index);
+  if (qt.isNull())
+    qt = GetClangTypeForTemplateArgument(builder, node, current_type_index);
   if (qt.isNull()) {
     if (auto *tag_type =
             llvm::dyn_cast<llvm::ms_demangle::TagTypeNode>(&node)) {
@@ -600,6 +895,12 @@ static bool InsertTemplateArgumentFromMSDemangleNode(
   }
   if (qt.isNull())
     return false;
+
+  if (!fallback_type_name.empty()) {
+    if (std::optional<Declaration> declaration =
+            GetLambdaDeclarationFromTypeName(fallback_type_name))
+      ApplyTypeDeclarationMetadata(builder, qt, *declaration);
+  }
 
   template_param_infos.InsertArg(nullptr, clang::TemplateArgument(qt));
   return true;
@@ -688,6 +989,9 @@ static clang::QualType CreateFallbackTemplateArgumentType(
   }
 
   ClangASTMetadata metadata;
+  if (std::optional<Declaration> declaration =
+          GetLambdaDeclarationFromTypeName(name))
+    metadata.SetDeclaration(*declaration);
   CompilerType ct = CreateClassTemplateSpecializationType(
       builder, context, lldb::eAccessPublic, template_name,
       GetClangTagTypeKindForMSDemangleTag(tag_type.Tag), template_param_infos,
@@ -697,6 +1001,7 @@ static clang::QualType CreateFallbackTemplateArgumentType(
 
   clang::QualType qt =
       clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
+  ApplyTemplateArgumentDeclarationMetadataFromName(builder, qt, name);
   return ApplyMSDemangleTypeQualifiers(qt, tag_type.Quals);
 }
 
@@ -704,6 +1009,11 @@ static clang::QualType
 GetClangTypeForTemplateArgument(PdbAstBuilder &builder,
                                 llvm::ms_demangle::Node &node,
                                 TypeIndex current_type_index) {
+  clang::QualType qt =
+      GetClangTypeForMSDemangleType(builder, node, current_type_index);
+  if (!qt.isNull())
+    return qt;
+
   if (auto *primitive =
           llvm::dyn_cast<llvm::ms_demangle::PrimitiveTypeNode>(&node))
     return ApplyMSDemangleTypeQualifiers(
@@ -715,6 +1025,167 @@ GetClangTypeForTemplateArgument(PdbAstBuilder &builder,
 
   std::string type_name = GetTemplateArgumentTypeName(node);
   return FindPdbTemplateArgumentType(builder, type_name, current_type_index);
+}
+
+static unsigned
+GetClangTypeQualifiers(llvm::ms_demangle::Qualifiers qualifiers) {
+  unsigned result = 0;
+  if ((qualifiers & llvm::ms_demangle::Q_Const) != 0)
+    result |= clang::Qualifiers::Const;
+  if ((qualifiers & llvm::ms_demangle::Q_Volatile) != 0)
+    result |= clang::Qualifiers::Volatile;
+  if ((qualifiers & llvm::ms_demangle::Q_Restrict) != 0)
+    result |= clang::Qualifiers::Restrict;
+  return result;
+}
+
+static bool IsVoidTypeNode(llvm::ms_demangle::Node &node) {
+  auto *primitive = llvm::dyn_cast<llvm::ms_demangle::PrimitiveTypeNode>(&node);
+  return primitive &&
+         primitive->PrimKind == llvm::ms_demangle::PrimitiveKind::Void;
+}
+
+static unsigned GetMemberFunctionTypeQualifiers(PdbIndex &index,
+                                                TypeIndex this_type_idx) {
+  if (this_type_idx.isNoneType() || this_type_idx.isSimple())
+    return 0;
+
+  CVType this_type = index.tpi().getType(this_type_idx);
+  if (this_type.kind() != LF_POINTER)
+    return 0;
+
+  PointerRecord pointer;
+  llvm::cantFail(TypeDeserializer::deserializeAs<PointerRecord>(this_type,
+                                                                 pointer));
+
+  unsigned qualifiers = 0;
+  TypeIndex pointee_idx = pointer.ReferentType;
+  while (!pointee_idx.isNoneType() && !pointee_idx.isSimple()) {
+    CVType pointee_type = index.tpi().getType(pointee_idx);
+    if (pointee_type.kind() != LF_MODIFIER)
+      break;
+
+    ModifierRecord modifier;
+    llvm::cantFail(TypeDeserializer::deserializeAs<ModifierRecord>(
+        pointee_type, modifier));
+    if ((modifier.Modifiers & ModifierOptions::Const) != ModifierOptions::None)
+      qualifiers |= clang::Qualifiers::Const;
+    if ((modifier.Modifiers & ModifierOptions::Volatile) !=
+        ModifierOptions::None)
+      qualifiers |= clang::Qualifiers::Volatile;
+    pointee_idx = modifier.ModifiedType;
+  }
+
+  return qualifiers;
+}
+
+static clang::QualType
+GetClangTypeForMSDemangleFunctionSignature(
+    PdbAstBuilder &builder, llvm::ms_demangle::FunctionSignatureNode &signature,
+    TypeIndex current_type_index) {
+  if (!signature.ReturnType)
+    return {};
+
+  clang::QualType return_type =
+      GetClangTypeForMSDemangleType(builder, *signature.ReturnType,
+                                    current_type_index);
+  if (return_type.isNull())
+    return {};
+
+  std::vector<CompilerType> arg_types;
+  if (signature.Params) {
+    arg_types.reserve(signature.Params->Count);
+    for (size_t i = 0; i < signature.Params->Count; ++i) {
+      llvm::ms_demangle::Node *param = signature.Params->Nodes[i];
+      if (!param)
+        return {};
+      if (signature.Params->Count == 1 && IsVoidTypeNode(*param))
+        continue;
+
+      clang::QualType arg_type =
+          GetClangTypeForMSDemangleType(builder, *param, current_type_index);
+      if (arg_type.isNull())
+        return {};
+      arg_types.push_back(builder.ToCompilerType(arg_type));
+    }
+  }
+
+  std::optional<clang::CallingConv> cc =
+      TranslateCallingConvention(signature.CallConvention);
+  if (!cc)
+    return {};
+  std::optional<clang::RefQualifierKind> ref_qual =
+      TranslateFunctionRefQualifier(signature.RefQualifier);
+  if (!ref_qual)
+    return {};
+
+  CompilerType function_type = builder.clang().CreateFunctionType(
+      builder.ToCompilerType(return_type), arg_types, signature.IsVariadic,
+      GetClangTypeQualifiers(signature.Quals), *cc, *ref_qual);
+  if (!function_type.IsValid())
+    return {};
+
+  return clang::QualType::getFromOpaquePtr(function_type.GetOpaqueQualType());
+}
+
+static clang::QualType
+GetClangTypeForMSDemangleType(PdbAstBuilder &builder,
+                              llvm::ms_demangle::Node &node,
+                              TypeIndex current_type_index) {
+  if (auto *primitive =
+          llvm::dyn_cast<llvm::ms_demangle::PrimitiveTypeNode>(&node))
+    return ApplyMSDemangleTypeQualifiers(
+        GetClangTypeForPrimitiveTemplateArgument(builder, primitive->PrimKind),
+        primitive->Quals);
+
+  if (auto *function_signature =
+          llvm::dyn_cast<llvm::ms_demangle::FunctionSignatureNode>(&node))
+    return ApplyMSDemangleTypeQualifiers(
+        GetClangTypeForMSDemangleFunctionSignature(
+            builder, *function_signature, current_type_index),
+        function_signature->Quals);
+
+  if (auto *pointer = llvm::dyn_cast<llvm::ms_demangle::PointerTypeNode>(&node)) {
+    if (!pointer->Pointee || pointer->ClassParent)
+      return {};
+
+    clang::QualType pointee_type =
+        GetClangTypeForMSDemangleType(builder, *pointer->Pointee,
+                                      current_type_index);
+    if (pointee_type.isNull())
+      return {};
+
+    clang::ASTContext &ast = builder.clang().getASTContext();
+    clang::QualType pointer_type;
+    switch (pointer->Affinity) {
+    case llvm::ms_demangle::PointerAffinity::Pointer:
+      pointer_type = ast.getPointerType(pointee_type);
+      break;
+    case llvm::ms_demangle::PointerAffinity::Reference:
+      pointer_type = ast.getLValueReferenceType(pointee_type);
+      break;
+    case llvm::ms_demangle::PointerAffinity::RValueReference:
+      pointer_type = ast.getRValueReferenceType(pointee_type);
+      break;
+    case llvm::ms_demangle::PointerAffinity::None:
+      return {};
+    }
+
+    return ApplyMSDemangleTypeQualifiers(pointer_type, pointer->Quals);
+  }
+
+  if (auto *tag_type = llvm::dyn_cast<llvm::ms_demangle::TagTypeNode>(&node)) {
+    std::string type_name = GetTemplateArgumentTypeName(node);
+    clang::QualType tag_qt =
+        FindPdbTemplateArgumentType(builder, type_name, current_type_index);
+    if (tag_qt.isNull()) {
+      tag_qt = CreateFallbackTemplateArgumentType(builder, type_name, *tag_type,
+                                                  current_type_index);
+    }
+    return ApplyMSDemangleTypeQualifiers(tag_qt, tag_type->Quals);
+  }
+
+  return {};
 }
 
 static clang::TemplateArgument CreateIntegralTemplateArgument(
@@ -893,6 +1364,9 @@ static clang::QualType CreateFallbackTemplateArgumentSpecializationType(
                                 : lldb::eAccessPublic;
 
   ClangASTMetadata metadata;
+  if (std::optional<Declaration> declaration =
+          GetLambdaDeclarationFromTypeName(name))
+    metadata.SetDeclaration(*declaration);
   CompilerType ct = CreateClassTemplateSpecializationType(
       builder, context, access, GetUnqualifiedTypeName(name), ttk,
       template_param_infos, metadata, false);
@@ -901,6 +1375,7 @@ static clang::QualType CreateFallbackTemplateArgumentSpecializationType(
 
   clang::QualType qt =
       clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
+  ApplyTemplateArgumentDeclarationMetadataFromName(builder, qt, name);
   return ApplyMSDemangleTypeQualifiers(qt, qualifiers);
 }
 
@@ -935,6 +1410,14 @@ static clang::QualType CreateFallbackTemplateSpecializationTypeFromName(
   ClangASTMetadata metadata;
   metadata.SetUserID(toOpaqueUid(PdbTypeSymId(type_index)));
   metadata.SetIsDynamicCXXType(false);
+  SymbolFileNativePDB *pdb = static_cast<SymbolFileNativePDB *>(
+      builder.clang().GetSymbolFile()->GetBackingSymbolFile());
+  llvm::Expected<Declaration> declaration =
+      pdb->ResolveUdtDeclaration(PdbTypeSymId(type_index));
+  if (declaration)
+    metadata.SetDeclaration(*declaration);
+  else
+    llvm::consumeError(declaration.takeError());
 
   CompilerType ct = CreateClassTemplateSpecializationType(
       builder, context, access, GetUnqualifiedTypeName(type_name),
@@ -944,6 +1427,7 @@ static clang::QualType CreateFallbackTemplateSpecializationTypeFromName(
 
   clang::QualType qt =
       clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
+  ApplyTemplateArgumentDeclarationMetadataFromName(builder, qt, name);
   TypeSystemClang::StartTagDeclarationDefinition(ct);
   TypeSystemClang::SetHasExternalStorage(qt.getAsOpaquePtr(), true);
   builder.RegisterTagType(PdbTypeSymId(type_index), qt);
@@ -1007,11 +1491,12 @@ static bool ParseTemplateParameterInfos(
       continue;
     }
 
-    clang::QualType qt =
-        GetClangTypeForTemplateArgument(builder, *node, current_type_index);
-    if (qt.isNull() && i < record_template_args.size())
+    clang::QualType qt;
+    if (i < record_template_args.size())
       qt = FindPdbTemplateArgumentType(builder, record_template_args[i],
                                        current_type_index);
+    if (qt.isNull())
+      qt = GetClangTypeForTemplateArgument(builder, *node, current_type_index);
     if (qt.isNull()) {
       if (auto *tag_type =
               llvm::dyn_cast<llvm::ms_demangle::TagTypeNode>(node)) {
@@ -1156,6 +1641,9 @@ static CompilerType CreateClassTemplateSpecializationTypeForDecl(
   if (ct.IsValid()) {
     clang_ast.SetMetadata(class_template_decl, metadata);
     clang_ast.SetMetadata(class_specialization_decl, metadata);
+    clang::QualType qt =
+        clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
+    clang_ast.SetMetadata(qt.getTypePtr(), metadata);
   }
   return ct;
 }
@@ -1358,7 +1846,15 @@ clang::Decl *PdbAstBuilder::GetOrCreateSymbolForId(PdbCompilandSymId id) {
     return GetOrCreateFunctionDecl(id);
   case S_GDATA32:
   case S_LDATA32:
-  case S_GTHREAD32:
+  case S_GTHREAD32: {
+    VariableInfo var_info = GetVariableNameInfo(cvs);
+    clang::DeclContext *context = nullptr;
+    std::string name;
+    std::tie(context, name) = CreateDeclInfoForUndecoratedName(var_info.name);
+    if (!context)
+      context = FromCompilerDeclContext(GetTranslationUnitDecl());
+    return CreateVariableDecl(PdbSymUid(id), cvs, *context, name);
+  }
   case S_CONSTANT:
     // global variable
     return nullptr;
@@ -1439,15 +1935,44 @@ PdbAstBuilder::CreateDeclInfoForUndecoratedName(llvm::StringRef name) {
   llvm::StringRef scope_name = specs.back().GetFullName();
 
   // It might be a class name, try that first.
-  std::vector<TypeIndex> types = index.tpi().findRecordsByName(scope_name);
-  while (!types.empty()) {
-    clang::QualType qt = GetOrCreateClangType(types.back());
-    if (qt.isNull())
-      continue;
-    clang::TagDecl *tag = qt->getAsTagDecl();
-    if (tag)
-      return {clang::TagDecl::castToDeclContext(tag), std::string(uname)};
-    types.pop_back();
+  auto get_type_decl_context = [&](llvm::StringRef type_name)
+      -> clang::DeclContext * {
+    std::vector<TypeIndex> types = index.tpi().findRecordsByName(type_name);
+    while (!types.empty()) {
+      clang::QualType qt = GetOrCreateClangType(types.back());
+      types.pop_back();
+      if (qt.isNull())
+        continue;
+
+      ApplyTemplateArgumentDeclarationMetadataFromName(*this, qt, type_name);
+      clang::TagDecl *tag = qt->getAsTagDecl();
+      if (tag)
+        return clang::TagDecl::castToDeclContext(tag);
+    }
+
+    return nullptr;
+  };
+
+  std::vector<std::string> scope_candidates;
+  scope_candidates.push_back(scope_name.str());
+  std::string compact_scope_name =
+      RemoveTemplateSeparatorWhitespace(scope_name);
+  if (compact_scope_name != scope_name)
+    scope_candidates.push_back(compact_scope_name);
+
+  for (llvm::StringRef scope_candidate : scope_candidates) {
+    if (clang::DeclContext *tag_context =
+            get_type_decl_context(scope_candidate))
+      return {tag_context, std::string(uname)};
+  }
+
+  if (scope_name.contains('<')) {
+    clang::QualType qt = FindPdbTemplateArgumentType(*this, scope_name,
+                                                     TypeIndex());
+    if (!qt.isNull()) {
+      if (clang::TagDecl *tag = qt->getAsTagDecl())
+        return {clang::TagDecl::castToDeclContext(tag), std::string(uname)};
+    }
   }
 
   // If that fails, treat it as a series of namespaces.
@@ -1472,6 +1997,23 @@ clang::DeclContext *PdbAstBuilder::GetParentClangDeclContext(PdbSymUid uid) {
       return GetOrCreateClangDeclContextForUid(*scope);
 
     CVSymbol sym = index.ReadSymbolRecord(uid.asCompilandSym());
+    if (sym.kind() == S_GPROC32 || sym.kind() == S_LPROC32) {
+      ProcSym proc(static_cast<SymbolRecordKind>(sym.kind()));
+      llvm::cantFail(SymbolDeserializer::deserializeAs<ProcSym>(sym, proc));
+      if (!proc.FunctionType.isSimple()) {
+        CVType func_type = index.tpi().getType(proc.FunctionType);
+        if (func_type.kind() == LF_MFUNCTION) {
+          MemberFunctionRecord mfr;
+          llvm::cantFail(
+              TypeDeserializer::deserializeAs<MemberFunctionRecord>(func_type,
+                                                                     mfr));
+          if (!mfr.getClassType().isNoneType())
+            return GetOrCreateClangDeclContextForUid(
+                PdbTypeSymId(mfr.getClassType(), false));
+        }
+      }
+    }
+
     return CreateDeclInfoForUndecoratedName(getSymbolName(sym)).first;
   }
   case PdbSymUidKind::Type: {
@@ -1726,6 +2268,13 @@ clang::QualType PdbAstBuilder::CreateRecordType(PdbTypeSymId id,
   ClangASTMetadata metadata;
   metadata.SetUserID(toOpaqueUid(id));
   metadata.SetIsDynamicCXXType(false);
+  SymbolFileNativePDB *pdb = static_cast<SymbolFileNativePDB *>(
+      m_clang.GetSymbolFile()->GetBackingSymbolFile());
+  llvm::Expected<Declaration> declaration = pdb->ResolveUdtDeclaration(id);
+  if (declaration)
+    metadata.SetDeclaration(*declaration);
+  else
+    llvm::consumeError(declaration.takeError());
 
   TypeSystemClang::TemplateParameterInfos template_param_infos;
   CompilerType ct;
@@ -1773,6 +2322,7 @@ clang::QualType PdbAstBuilder::CreateRecordType(PdbTypeSymId id,
   // ask us.
   clang::QualType result =
       clang::QualType::getFromOpaquePtr(ct.GetOpaqueQualType());
+  m_clang.SetMetadata(result.getTypePtr(), metadata);
 
   TypeSystemClang::SetHasExternalStorage(result.getAsOpaquePtr(), true);
   return result;
@@ -1816,14 +2366,18 @@ PdbAstBuilder::GetOrCreateBlockDecl(PdbCompilandSymId block_id) {
 }
 
 clang::VarDecl *PdbAstBuilder::CreateVariableDecl(PdbSymUid uid, CVSymbol sym,
-                                                  clang::DeclContext &scope) {
+                                                  clang::DeclContext &scope,
+                                                  llvm::StringRef name) {
   VariableInfo var_info = GetVariableNameInfo(sym);
   clang::QualType qt = GetOrCreateClangType(var_info.type);
   if (qt.isNull())
     return nullptr;
 
+  if (name.empty())
+    name = var_info.name;
+
   clang::VarDecl *var_decl = m_clang.CreateVariableDeclaration(
-      &scope, OptionalClangModuleID(), var_info.name.str().c_str(), qt);
+      &scope, OptionalClangModuleID(), name.str().c_str(), qt);
 
   m_uid_to_decl[toOpaqueUid(uid)] = var_decl;
   DeclStatus status;
@@ -1858,8 +2412,13 @@ clang::VarDecl *PdbAstBuilder::GetOrCreateVariableDecl(PdbGlobalSymId var_id) {
       m_clang.GetSymbolFile()->GetBackingSymbolFile());
   PdbIndex &index = pdb->GetIndex();
   CVSymbol sym = index.ReadSymbolRecord(var_id);
-  auto context = FromCompilerDeclContext(GetTranslationUnitDecl());
-  return CreateVariableDecl(PdbSymUid(var_id), sym, *context);
+  VariableInfo var_info = GetVariableNameInfo(sym);
+  clang::DeclContext *context = nullptr;
+  std::string name;
+  std::tie(context, name) = CreateDeclInfoForUndecoratedName(var_info.name);
+  if (!context)
+    context = FromCompilerDeclContext(GetTranslationUnitDecl());
+  return CreateVariableDecl(PdbSymUid(var_id), sym, *context, name);
 }
 
 CompilerType PdbAstBuilder::GetOrCreateTypedefType(PdbGlobalSymId id) {
@@ -1947,7 +2506,9 @@ clang::QualType PdbAstBuilder::CreateType(PdbTypeSymId type) {
     MemberFunctionRecord mfr;
     llvm::cantFail(
         TypeDeserializer::deserializeAs<MemberFunctionRecord>(cvt, mfr));
-    return CreateFunctionType(mfr.ArgumentList, mfr.ReturnType, mfr.CallConv);
+    return CreateFunctionType(
+        mfr.ArgumentList, mfr.ReturnType, mfr.CallConv,
+        GetMemberFunctionTypeQualifiers(index, mfr.ThisType));
   }
 
   return {};
@@ -1966,6 +2527,12 @@ clang::QualType PdbAstBuilder::GetOrCreateClangType(PdbTypeSymId type) {
       m_clang.GetSymbolFile()->GetBackingSymbolFile());
   PdbIndex &index = pdb->GetIndex();
   PdbTypeSymId best_type = GetBestPossibleDecl(type, index.tpi());
+  if (best_type.index == type.index && IsForwardRefUdt(type, index.tpi())) {
+    CVTagRecord tag = CVTagRecord::create(index.tpi().getType(type.index));
+    if (std::optional<PdbTypeSymId> complete_type =
+            pdb->FindCompleteTypeByName(tag.name(), type.index))
+      best_type = *complete_type;
+  }
 
   clang::QualType qt;
   if (best_type.index != type.index) {
@@ -2017,12 +2584,20 @@ PdbAstBuilder::CreateFunctionDecl(PdbCompilandSymId func_id,
             llvm::cast<clang::TypeDecl>(parent));
     lldb::opaque_compiler_type_t parent_opaque_ty =
         ToCompilerType(parent_qt).GetOpaqueQualType();
-    // FIXME: Remove this workaround.
-    auto iter = m_cxx_record_map.find(parent_opaque_ty);
-    if (iter != m_cxx_record_map.end()) {
-      if (iter->getSecond().contains({func_name, func_ct})) {
-        return nullptr;
-      }
+
+    Declaration declaration;
+    llvm::Expected<Declaration> declaration_or_err =
+        pdb->ResolveFunctionDeclaration(func_id);
+    if (declaration_or_err)
+      declaration = *declaration_or_err;
+    else
+      llvm::consumeError(declaration_or_err.takeError());
+
+    auto &methods = m_cxx_record_map[parent_opaque_ty];
+    auto method_iter = methods.find({func_name, func_ct});
+    if (method_iter != methods.end()) {
+      ApplyDeclarationMetadata(m_clang, method_iter->second, declaration);
+      return method_iter->second;
     }
 
     CVType cvt = index.tpi().getType(func_ti);
@@ -2053,7 +2628,8 @@ PdbAstBuilder::CreateFunctionDecl(PdbCompilandSymId func_id,
         llvm::consumeError(std::move(error));
       CreateMethodDecl process(index, m_clang, func_ti, function_decl,
                                parent_opaque_ty, func_name, mangled_name,
-                               func_ct);
+                               func_ct,
+                               declaration.IsValid() ? &declaration : nullptr);
       if (llvm::Error err = visitMemberRecordStream(field_list.Data, process))
         llvm::consumeError(std::move(err));
     }
@@ -2064,9 +2640,12 @@ PdbAstBuilder::CreateFunctionDecl(PdbCompilandSymId func_id,
           /*access=*/lldb::AccessType::eAccessPublic,
           /*is_virtual=*/false, /*is_static=*/false,
           /*is_inline=*/false, /*is_explicit=*/false,
-          /*is_attr_used=*/false, /*is_artificial=*/false);
+          /*is_attr_used=*/false, /*is_artificial=*/false,
+          declaration.IsValid() ? &declaration : nullptr);
     }
-    m_cxx_record_map[parent_opaque_ty].insert({func_name, func_ct});
+    if (clang::CXXMethodDecl *method =
+            llvm::dyn_cast_or_null<clang::CXXMethodDecl>(function_decl))
+      methods.try_emplace({func_name, func_ct}, method);
   } else {
     function_decl = m_clang.CreateFunctionDeclaration(
         parent, OptionalClangModuleID(), func_name, func_ct, func_storage,
@@ -2213,6 +2792,8 @@ PdbAstBuilder::GetOrCreateFunctionDecl(PdbCompilandSymId func_id) {
   llvm::StringRef proc_name = proc.Name;
   proc_name.consume_front(context_name);
   proc_name.consume_front("::");
+  if (parent->isRecord())
+    proc_name = MSVCUndecoratedNameParser::DropScope(proc.Name);
   clang::FunctionDecl *function_decl =
       CreateFunctionDecl(func_id, proc_name, proc.FunctionType, func_ct,
                          func_type->getNumParams(), storage, false, parent);
@@ -2367,7 +2948,7 @@ clang::QualType PdbAstBuilder::CreateArrayType(const ArrayRecord &ar) {
 
 clang::QualType PdbAstBuilder::CreateFunctionType(
     TypeIndex args_type_idx, TypeIndex return_type_idx,
-    llvm::codeview::CallingConvention calling_convention) {
+    llvm::codeview::CallingConvention calling_convention, unsigned type_quals) {
   SymbolFileNativePDB *pdb = static_cast<SymbolFileNativePDB *>(
       m_clang.GetSymbolFile()->GetBackingSymbolFile());
   PdbIndex &index = pdb->GetIndex();
@@ -2403,7 +2984,8 @@ clang::QualType PdbAstBuilder::CreateFunctionType(
 
   CompilerType return_ct = ToCompilerType(return_type);
   CompilerType func_sig_ast_type =
-      m_clang.CreateFunctionType(return_ct, arg_types, is_variadic, 0, *cc);
+      m_clang.CreateFunctionType(return_ct, arg_types, is_variadic, type_quals,
+                                 *cc);
 
   return clang::QualType::getFromOpaquePtr(
       func_sig_ast_type.GetOpaqueQualType());

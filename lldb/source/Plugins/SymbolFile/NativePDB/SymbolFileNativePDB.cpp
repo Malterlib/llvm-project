@@ -51,6 +51,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Path.h"
 
 #include "DWARFLocationExpression.h"
 #include "PdbSymUid.h"
@@ -1043,6 +1044,80 @@ VariableSP SymbolFileNativePDB::CreateGlobalVariable(PdbGlobalSymId var_id) {
   return var_sp;
 }
 
+VariableSP SymbolFileNativePDB::CreateGlobalVariable(PdbCompilandSymId var_id,
+                                                     CompileUnit &comp_unit) {
+  CVSymbol sym = m_index->ReadSymbolRecord(var_id);
+  lldb::ValueType scope = eValueTypeInvalid;
+  TypeIndex ti;
+  llvm::StringRef name;
+  uint16_t section = 0;
+  uint32_t offset = 0;
+  bool is_external = false;
+  switch (sym.kind()) {
+  case S_GDATA32:
+    is_external = true;
+    [[fallthrough]];
+  case S_LDATA32: {
+    DataSym ds(sym.kind());
+    llvm::cantFail(SymbolDeserializer::deserializeAs<DataSym>(sym, ds));
+    ti = ds.Type;
+    scope = (sym.kind() == S_GDATA32) ? eValueTypeVariableGlobal
+                                      : eValueTypeVariableStatic;
+    name = ds.Name;
+    section = ds.Segment;
+    offset = ds.DataOffset;
+    break;
+  }
+  case S_GTHREAD32:
+    is_external = true;
+    [[fallthrough]];
+  case S_LTHREAD32: {
+    ThreadLocalDataSym tlds(sym.kind());
+    llvm::cantFail(
+        SymbolDeserializer::deserializeAs<ThreadLocalDataSym>(sym, tlds));
+    ti = tlds.Type;
+    name = tlds.Name;
+    section = tlds.Segment;
+    offset = tlds.DataOffset;
+    scope = eValueTypeVariableThreadLocal;
+    break;
+  }
+  default:
+    return nullptr;
+  }
+
+  Declaration decl;
+  PdbTypeSymId tid(ti, false);
+  SymbolFileTypeSP type_sp =
+      std::make_shared<SymbolFileType>(*this, toOpaqueUid(tid));
+  Variable::RangeList ranges;
+  auto ts_or_err = GetTypeSystemForLanguage(comp_unit.GetLanguage());
+  if (auto err = ts_or_err.takeError())
+    return nullptr;
+  auto ts = *ts_or_err;
+  if (!ts)
+    return nullptr;
+
+  ts->GetNativePDBParser()->GetOrCreateDeclForUid(PdbSymUid(var_id));
+
+  ModuleSP module_sp = GetObjectFile()->GetModule();
+  DWARFExpressionList location(
+      module_sp, MakeGlobalLocationExpression(section, offset, module_sp),
+      nullptr);
+
+  std::string global_name("::");
+  global_name += name;
+  bool artificial = false;
+  bool location_is_constant_data = false;
+  bool static_member = false;
+  VariableSP var_sp = std::make_shared<Variable>(
+      toOpaqueUid(var_id), name.str().c_str(), global_name.c_str(), type_sp,
+      scope, &comp_unit, ranges, &decl, location, is_external, artificial,
+      location_is_constant_data, static_member);
+
+  return var_sp;
+}
+
 lldb::VariableSP
 SymbolFileNativePDB::CreateConstantSymbol(PdbGlobalSymId var_id,
                                           const CVSymbol &cvs) {
@@ -1080,6 +1155,19 @@ SymbolFileNativePDB::GetOrCreateGlobalVariable(PdbGlobalSymId var_id) {
   auto emplace_result = m_global_vars.try_emplace(toOpaqueUid(var_id), nullptr);
   if (emplace_result.second) {
     if (VariableSP var_sp = CreateGlobalVariable(var_id))
+      emplace_result.first->second = var_sp;
+    else
+      return nullptr;
+  }
+
+  return emplace_result.first->second;
+}
+
+VariableSP SymbolFileNativePDB::GetOrCreateGlobalVariable(
+    PdbCompilandSymId var_id, CompileUnit &comp_unit) {
+  auto emplace_result = m_global_vars.try_emplace(toOpaqueUid(var_id), nullptr);
+  if (emplace_result.second) {
+    if (VariableSP var_sp = CreateGlobalVariable(var_id, comp_unit))
       emplace_result.first->second = var_sp;
     else
       return nullptr;
@@ -1328,6 +1416,49 @@ uint32_t SymbolFileNativePDB::ResolveSymbolContext(
     }
   }
 
+  if (resolve_scope & eSymbolContextVariable) {
+    lldbassert(sc.comp_unit);
+    std::vector<SymbolAndUid> matches =
+        m_index->FindGlobalSymbolsByExactVa(file_addr);
+    for (const auto &match : matches) {
+      if (match.uid.kind() != PdbSymUidKind::GlobalSym)
+        continue;
+
+      PDB_SymType type = CVSymToPDBSym(match.sym.kind());
+      if (type != PDB_SymType::Data)
+        continue;
+
+      VariableSP variable = GetOrCreateGlobalVariable(match.uid.asGlobalSym());
+      if (!variable)
+        continue;
+
+      sc.variable = variable.get();
+      resolved_flags |= eSymbolContextVariable;
+      break;
+    }
+
+    if (!(resolved_flags & eSymbolContextVariable)) {
+      matches = m_index->FindSymbolsByExactVa(file_addr);
+      for (const auto &match : matches) {
+        if (match.uid.kind() != PdbSymUidKind::CompilandSym)
+          continue;
+
+        PDB_SymType type = CVSymToPDBSym(match.sym.kind());
+        if (type != PDB_SymType::Data)
+          continue;
+
+        PdbCompilandSymId csid = match.uid.asCompilandSym();
+        VariableSP variable = GetOrCreateGlobalVariable(csid, *sc.comp_unit);
+        if (!variable)
+          continue;
+
+        sc.variable = variable.get();
+        resolved_flags |= eSymbolContextVariable;
+        break;
+      }
+    }
+  }
+
   if (resolve_scope & eSymbolContextLineEntry) {
     lldbassert(sc.comp_unit);
     if (auto *line_table = sc.comp_unit->GetLineTable()) {
@@ -1567,6 +1698,178 @@ bool SymbolFileNativePDB::ParseSupportFiles(CompileUnit &comp_unit,
     support_files.Append(spec);
   }
   return true;
+}
+
+void SymbolFileNativePDB::CacheFunctionDeclarations(CompilandIndexItem &cii) {
+  if (cii.m_function_declarations_parsed)
+    return;
+  cii.m_function_declarations_parsed = true;
+
+  using FunctionRangeMap =
+      RangeDataVector<lldb::addr_t, lldb::addr_t, uint32_t>;
+  FunctionRangeMap function_ranges;
+
+  const CVSymbolArray &symbols = cii.m_debug_stream.getSymbolArray();
+  auto symbol_iter = symbols.begin();
+  while (symbol_iter != symbols.end()) {
+    if (symbol_iter->kind() != S_GPROC32 && symbol_iter->kind() != S_LPROC32) {
+      ++symbol_iter;
+      continue;
+    }
+
+    SegmentOffsetLength sol = GetSegmentOffsetAndLength(*symbol_iter);
+    if (sol.so.segment != 0 && sol.length != 0) {
+      lldb::addr_t function_addr =
+          m_index->MakeVirtualAddress(sol.so.segment, sol.so.offset);
+      if (function_addr != LLDB_INVALID_ADDRESS) {
+        function_ranges.Append(FunctionRangeMap::Entry(
+            function_addr, sol.length, symbol_iter.offset()));
+      }
+    }
+
+    symbol_iter = symbols.at(getScopeEndOffset(*symbol_iter));
+  }
+
+  if (function_ranges.IsEmpty())
+    return;
+  function_ranges.Sort();
+
+  std::vector<uint32_t> function_offsets;
+  for (const DebugSubsectionRecord &dssr :
+       cii.m_debug_stream.getSubsectionsArray()) {
+    if (dssr.kind() != DebugSubsectionKind::Lines)
+      continue;
+
+    DebugLinesSubsectionRef lines;
+    llvm::BinaryStreamReader reader(dssr.getRecordData());
+    if (auto EC = lines.initialize(reader)) {
+      llvm::consumeError(std::move(EC));
+      continue;
+    }
+
+    const LineFragmentHeader *lfh = lines.header();
+    lldb::addr_t fragment_addr =
+        m_index->MakeVirtualAddress(lfh->RelocSegment, lfh->RelocOffset);
+    if (fragment_addr == LLDB_INVALID_ADDRESS)
+      continue;
+
+    for (const LineColumnEntry &group : lines) {
+      llvm::Expected<uint32_t> file_index_or_err =
+          GetFileIndex(cii, group.NameIndex);
+      if (!file_index_or_err) {
+        llvm::consumeError(file_index_or_err.takeError());
+        continue;
+      }
+
+      uint32_t file_index = *file_index_or_err;
+      if (file_index >= cii.m_file_list.size())
+        continue;
+
+      for (const LineNumberEntry &entry : group.LineNumbers) {
+        LineInfo line_info(entry.Flags);
+        if (line_info.isAlwaysStepInto() || line_info.isNeverStepInto())
+          continue;
+
+        uint32_t line = line_info.getStartLine();
+        if (line == 0)
+          continue;
+
+        lldb::addr_t line_addr = fragment_addr + entry.Offset;
+        function_offsets.clear();
+        function_ranges.FindEntryIndexesThatContain(line_addr,
+                                                    function_offsets);
+
+        for (uint32_t function_offset : function_offsets) {
+          auto [declaration_iter, inserted] =
+              cii.m_function_declarations.try_emplace(function_offset);
+          CompilandIndexItem::FunctionDeclarationLocation &location =
+              declaration_iter->second;
+          if (!inserted && line_addr >= location.m_addr)
+            continue;
+
+          location.m_addr = line_addr;
+          location.m_file_index = file_index;
+          location.m_line = line;
+        }
+      }
+    }
+  }
+}
+
+llvm::Expected<Declaration>
+SymbolFileNativePDB::ResolveFunctionDeclaration(PdbCompilandSymId id) {
+  CompilandIndexItem *cii = m_index->compilands().GetCompiland(id.modi);
+  if (!cii)
+    return llvm::createStringError("No compiland found");
+
+  CacheFunctionDeclarations(*cii);
+  auto declaration_iter = cii->m_function_declarations.find(id.offset);
+  if (declaration_iter == cii->m_function_declarations.end())
+    return llvm::createStringError("No line entry found");
+
+  const CompilandIndexItem::FunctionDeclarationLocation &location =
+      declaration_iter->second;
+  if (location.m_file_index >= cii->m_file_list.size() ||
+      location.m_line == 0)
+    return llvm::createStringError("No line entry found");
+
+  llvm::StringRef file = cii->m_file_list[location.m_file_index];
+  FileSpec::Style style =
+      file.starts_with("/") ? FileSpec::Style::posix : FileSpec::Style::windows;
+  return Declaration(FileSpec(file, style), location.m_line);
+}
+
+void SymbolFileNativePDB::CacheMethodDeclarations() {
+  PdbIndex &index = GetIndex();
+  uint32_t module_count = index.dbi().modules().getModuleCount();
+  for (uint16_t modi = 0; modi < module_count; ++modi) {
+    CompilandIndexItem &cii = index.compilands().GetOrCreateCompiland(modi);
+    const CVSymbolArray &symbols = cii.m_debug_stream.getSymbolArray();
+    auto iter = symbols.begin();
+    while (iter != symbols.end()) {
+      if (iter->kind() != S_GPROC32 && iter->kind() != S_LPROC32) {
+        ++iter;
+        continue;
+      }
+
+      PdbCompilandSymId sym_id{modi, iter.offset()};
+      ProcSym proc = cantFail(SymbolDeserializer::deserializeAs<ProcSym>(*iter));
+      if (proc.Name.empty() || proc.FunctionType.isSimple()) {
+        iter = symbols.at(getScopeEndOffset(*iter));
+        continue;
+      }
+
+      CVType type = index.tpi().getType(proc.FunctionType);
+      if (type.kind() == LF_MFUNCTION) {
+        llvm::StringRef basename =
+            MSVCUndecoratedNameParser::DropScope(proc.Name);
+        if (basename.empty())
+          basename = proc.Name;
+        m_method_declarations.try_emplace(
+            MethodDeclarationKey(proc.FunctionType.getIndex(), basename.str()),
+            sym_id);
+      }
+
+      iter = symbols.at(getScopeEndOffset(*iter));
+    }
+  }
+}
+
+std::optional<PdbCompilandSymId>
+SymbolFileNativePDB::FindMethodDeclaration(llvm::StringRef name,
+                                           TypeIndex function_type) {
+  if (name.empty() || function_type.isSimple())
+    return std::nullopt;
+
+  std::call_once(m_cached_method_declarations,
+                 [this] { CacheMethodDeclarations(); });
+
+  auto iter = m_method_declarations.find(
+      MethodDeclarationKey(function_type.getIndex(), name.str()));
+  if (iter == m_method_declarations.end())
+    return std::nullopt;
+
+  return iter->second;
 }
 
 bool SymbolFileNativePDB::ParseImportedModules(
@@ -2108,6 +2411,54 @@ void SymbolFileNativePDB::FindTypesByName(llvm::StringRef name,
 
     types.Insert(type);
   }
+}
+
+std::optional<PdbTypeSymId>
+SymbolFileNativePDB::FindCompleteTypeByName(
+    llvm::StringRef name, llvm::codeview::TypeIndex excluded_type) {
+  if (name.empty())
+    return std::nullopt;
+
+  TypeQuery query(name);
+  ConstString type_basename = query.GetTypeBasename();
+  if (!type_basename)
+    return std::nullopt;
+
+  CompleteTypeNameKey cache_key(name.str(), excluded_type.getIndex());
+  auto cache_iter = m_complete_type_name_cache.find(cache_key);
+  if (cache_iter != m_complete_type_name_cache.end())
+    return cache_iter->second;
+
+  std::vector<uint32_t> matches;
+  m_type_base_names.GetValues(type_basename, matches);
+
+  std::optional<PdbTypeSymId> result;
+  for (uint32_t match_idx : matches) {
+    TypeIndex ti(match_idx);
+    if (ti == excluded_type)
+      continue;
+
+    CVType cvt = m_index->tpi().getType(ti);
+    if (!IsTagRecord(cvt))
+      continue;
+
+    CVTagRecord tag = CVTagRecord::create(cvt);
+    if (tag.asTag().isForwardRef())
+      continue;
+
+    std::vector context = GetContextForType(ti);
+    if (context.empty() || !query.ContextMatches(context))
+      continue;
+
+    if (result) {
+      m_complete_type_name_cache.emplace(std::move(cache_key), std::nullopt);
+      return std::nullopt;
+    }
+    result = PdbTypeSymId(ti);
+  }
+
+  m_complete_type_name_cache.emplace(std::move(cache_key), result);
+  return result;
 }
 
 size_t SymbolFileNativePDB::ParseTypes(CompileUnit &comp_unit) {
@@ -2873,6 +3224,93 @@ void SymbolFileNativePDB::CacheUdtDeclarations() {
   }
 }
 
+llvm::Expected<llvm::StringRef> SymbolFileNativePDB::GetUdtDeclarationFileName(
+    const UdtDeclaration &udt_declaration) {
+  if (udt_declaration.IsIpiIndex) {
+    CVType cvt = m_index->ipi().getType(udt_declaration.FileNameIndex);
+    if (cvt.kind() != LF_STRING_ID)
+      return llvm::createStringError("File name was not a LF_STRING_ID");
+
+    StringIdRecord sid;
+    llvm::cantFail(TypeDeserializer::deserializeAs(cvt, sid));
+    return sid.String;
+  }
+
+  // The file name index is an index into the string table.
+  auto string_table = m_index->pdb().getStringTable();
+  if (!string_table)
+    return string_table.takeError();
+
+  llvm::Expected<llvm::StringRef> string =
+      string_table->getStringTable().getString(
+          udt_declaration.FileNameIndex.getIndex());
+  if (!string)
+    return string.takeError();
+
+  return *string;
+}
+
+void SymbolFileNativePDB::CacheUdtDeclarationSourceLocations() {
+  std::call_once(m_cached_udt_declarations, [this] { CacheUdtDeclarations(); });
+
+  for (const auto &entry : m_udt_declarations) {
+    if (entry.second.Line == 0)
+      continue;
+
+    llvm::Expected<llvm::StringRef> file_name =
+        GetUdtDeclarationFileName(entry.second);
+    if (!file_name) {
+      llvm::consumeError(file_name.takeError());
+      continue;
+    }
+
+    // rustc sets the filename to "<unknown>" for some files.
+    if (*file_name == "\\<unknown>")
+      continue;
+
+    std::string file_basename =
+        llvm::sys::path::filename(*file_name).lower();
+    if (file_basename.empty())
+      continue;
+
+    m_udt_declarations_by_source_location[{file_basename, entry.second.Line}]
+        .push_back(entry.first);
+  }
+}
+
+std::optional<PdbTypeSymId>
+SymbolFileNativePDB::FindUdtDeclarationBySourceLocation(
+    llvm::StringRef file_basename, uint32_t line,
+    llvm::codeview::TypeIndex excluded_type) {
+  if (file_basename.empty() || line == 0)
+    return std::nullopt;
+
+  std::call_once(m_cached_udt_declaration_source_locations,
+                 [this] { CacheUdtDeclarationSourceLocations(); });
+
+  auto iter = m_udt_declarations_by_source_location.find(
+      {file_basename.lower(), line});
+  if (iter == m_udt_declarations_by_source_location.end())
+    return std::nullopt;
+
+  for (TypeIndex ti : iter->second) {
+    if (ti == excluded_type)
+      continue;
+
+    CVType cvt = m_index->tpi().getType(ti);
+    if (!IsTagRecord(cvt))
+      continue;
+
+    CVTagRecord tag = CVTagRecord::create(cvt);
+    if (tag.asTag().isForwardRef())
+      continue;
+
+    return PdbTypeSymId(ti);
+  }
+
+  return std::nullopt;
+}
+
 llvm::Expected<Declaration>
 SymbolFileNativePDB::ResolveUdtDeclaration(PdbTypeSymId type_id) {
   std::call_once(m_cached_udt_declarations, [this] { CacheUdtDeclarations(); });
@@ -2881,32 +3319,14 @@ SymbolFileNativePDB::ResolveUdtDeclaration(PdbTypeSymId type_id) {
   if (it == m_udt_declarations.end())
     return llvm::createStringError("No UDT declaration found");
 
-  llvm::StringRef file_name;
-  if (it->second.IsIpiIndex) {
-    CVType cvt = m_index->ipi().getType(it->second.FileNameIndex);
-    if (cvt.kind() != LF_STRING_ID)
-      return llvm::createStringError("File name was not a LF_STRING_ID");
-
-    StringIdRecord sid;
-    llvm::cantFail(TypeDeserializer::deserializeAs(cvt, sid));
-    file_name = sid.String;
-  } else {
-    // The file name index is an index into the string table
-    auto string_table = m_index->pdb().getStringTable();
-    if (!string_table)
-      return string_table.takeError();
-
-    llvm::Expected<llvm::StringRef> string =
-        string_table->getStringTable().getString(
-            it->second.FileNameIndex.getIndex());
-    if (!string)
-      return string.takeError();
-    file_name = *string;
-  }
+  llvm::Expected<llvm::StringRef> file_name =
+      GetUdtDeclarationFileName(it->second);
+  if (!file_name)
+    return file_name.takeError();
 
   // rustc sets the filename to "<unknown>" for some files
-  if (file_name == "\\<unknown>")
+  if (*file_name == "\\<unknown>")
     return Declaration();
 
-  return Declaration(FileSpec(file_name), it->second.Line);
+  return Declaration(FileSpec(*file_name), it->second.Line);
 }

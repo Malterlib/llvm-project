@@ -20,7 +20,9 @@
 #include "CompileUnitIndex.h"
 #include "PdbIndex.h"
 #include "PdbAstBuilder.h"
+#include <map>
 #include <optional>
+#include <vector>
 
 namespace clang {
 class TagDecl;
@@ -169,6 +171,19 @@ public:
   std::optional<llvm::codeview::TypeIndex>
   GetParentType(llvm::codeview::TypeIndex ti);
 
+  llvm::Expected<Declaration> ResolveUdtDeclaration(PdbTypeSymId type_id);
+  llvm::Expected<Declaration> ResolveFunctionDeclaration(PdbCompilandSymId id);
+  std::optional<PdbCompilandSymId>
+  FindMethodDeclaration(llvm::StringRef name,
+                        llvm::codeview::TypeIndex function_type);
+  std::optional<PdbTypeSymId>
+  FindCompleteTypeByName(llvm::StringRef name,
+                         llvm::codeview::TypeIndex excluded_type);
+  std::optional<PdbTypeSymId>
+  FindUdtDeclarationBySourceLocation(llvm::StringRef file_basename,
+                                     uint32_t line,
+                                     llvm::codeview::TypeIndex excluded_type);
+
 private:
   struct LineTableEntryComparator {
     bool operator()(const lldb_private::LineTable::Entry &lhs,
@@ -233,6 +248,8 @@ private:
   lldb::TypeSP GetOrCreateType(PdbTypeSymId type_id);
   lldb::TypeSP GetOrCreateType(llvm::codeview::TypeIndex ti);
   lldb::VariableSP GetOrCreateGlobalVariable(PdbGlobalSymId var_id);
+  lldb::VariableSP GetOrCreateGlobalVariable(PdbCompilandSymId var_id,
+                                             CompileUnit &comp_unit);
   Block *GetOrCreateBlock(PdbCompilandSymId block_id);
   lldb::VariableSP GetOrCreateLocalVariable(PdbCompilandSymId scope_id,
                                             PdbCompilandSymId var_id,
@@ -249,6 +266,8 @@ private:
   lldb::TypeSP CreateType(PdbTypeSymId type_id, CompilerType ct);
   lldb::TypeSP CreateAndCacheType(PdbTypeSymId type_id);
   lldb::VariableSP CreateGlobalVariable(PdbGlobalSymId var_id);
+  lldb::VariableSP CreateGlobalVariable(PdbCompilandSymId var_id,
+                                        CompileUnit &comp_unit);
   lldb::VariableSP CreateConstantSymbol(PdbGlobalSymId var_id,
                                         const llvm::codeview::CVSymbol &cvs);
   size_t ParseVariablesForCompileUnit(CompileUnit &comp_unit,
@@ -274,8 +293,9 @@ private:
   /// This includes functions and global variables
   void CacheGlobalBaseNames();
 
+  void CacheFunctionDeclarations(CompilandIndexItem &cii);
   void CacheUdtDeclarations();
-  llvm::Expected<Declaration> ResolveUdtDeclaration(PdbTypeSymId type_id);
+  void CacheUdtDeclarationSourceLocations();
 
   /// Find a symbol name at a specific address (`so`).
   ///
@@ -321,8 +341,25 @@ private:
 
     uint32_t Line;
   };
+  llvm::Expected<llvm::StringRef>
+  GetUdtDeclarationFileName(const UdtDeclaration &udt_declaration);
+
   llvm::DenseMap<llvm::codeview::TypeIndex, UdtDeclaration> m_udt_declarations;
   std::once_flag m_cached_udt_declarations;
+
+  using MethodDeclarationKey = std::pair<uint32_t, std::string>;
+  void CacheMethodDeclarations();
+  std::map<MethodDeclarationKey, PdbCompilandSymId> m_method_declarations;
+  std::once_flag m_cached_method_declarations;
+
+  using CompleteTypeNameKey = std::pair<std::string, uint32_t>;
+  std::map<CompleteTypeNameKey, std::optional<PdbTypeSymId>>
+      m_complete_type_name_cache;
+
+  std::map<std::pair<std::string, uint32_t>,
+           std::vector<llvm::codeview::TypeIndex>>
+      m_udt_declarations_by_source_location;
+  std::once_flag m_cached_udt_declaration_source_locations;
 
   lldb_private::UniqueCStringMap<uint32_t> m_type_base_names;
 

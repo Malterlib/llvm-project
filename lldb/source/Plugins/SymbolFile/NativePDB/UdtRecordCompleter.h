@@ -16,10 +16,12 @@
 #include "llvm/DebugInfo/CodeView/CVRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/CodeView/TypeVisitorCallbacks.h"
+#include <map>
 #include <optional>
 
 namespace clang {
 class CXXBaseSpecifier;
+class CXXMethodDecl;
 class QualType;
 class TagDecl;
 } // namespace clang
@@ -52,7 +54,8 @@ class UdtRecordCompleter : public llvm::codeview::TypeVisitorCallbacks {
   ClangASTImporter::LayoutInfo m_layout;
   llvm::DenseMap<clang::Decl *, DeclStatus> &m_decl_to_status;
   llvm::DenseMap<lldb::opaque_compiler_type_t,
-                 llvm::SmallSet<std::pair<llvm::StringRef, CompilerType>, 8>>
+                 std::map<std::pair<llvm::StringRef, CompilerType>,
+                          clang::CXXMethodDecl *>>
       &m_cxx_record_map;
 
 public:
@@ -61,8 +64,8 @@ public:
       PdbAstBuilder &ast_builder, PdbIndex &index,
       llvm::DenseMap<clang::Decl *, DeclStatus> &decl_to_status,
       llvm::DenseMap<lldb::opaque_compiler_type_t,
-                     llvm::SmallSet<std::pair<llvm::StringRef, CompilerType>,
-                                    8>> &cxx_record_map);
+                     std::map<std::pair<llvm::StringRef, CompilerType>,
+                              clang::CXXMethodDecl *>> &cxx_record_map);
 
 #define MEMBER_RECORD(EnumName, EnumVal, Name)                                 \
   llvm::Error visitKnownMember(llvm::codeview::CVMemberRecord &CVR,            \

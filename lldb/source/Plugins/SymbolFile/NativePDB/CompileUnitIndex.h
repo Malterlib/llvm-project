@@ -10,6 +10,7 @@
 #define LLDB_SOURCE_PLUGINS_SYMBOLFILE_NATIVEPDB_COMPILEUNITINDEX_H
 
 #include "lldb/Utility/RangeMap.h"
+#include "lldb/lldb-defines.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/IntervalMap.h"
@@ -57,10 +58,11 @@ struct CompilandIndexItem {
   std::vector<llvm::StringRef> m_file_list;
 
   // Maps virtual address to global symbol id, which can then be used to
-  // locate the exact compile unit and offset of the symbol.  Note that this
-  // is intentionally an ordered map so that we can find all symbols up to a
-  // given starting address.
-  std::map<lldb::addr_t, PdbSymUid> m_symbols_by_va;
+  // locate the exact compile unit and offset of the symbol.  Note that this is
+  // intentionally ordered so that we can find all symbols up to a given
+  // starting address.  Multiple symbols can have the same address after
+  // identical COMDAT folding, so keep all entries.
+  std::multimap<lldb::addr_t, PdbSymUid> m_symbols_by_va;
 
   // S_COMPILE3 sym describing compilation settings for the module.
   std::optional<llvm::codeview::Compile3Sym> m_compile_opts;
@@ -83,6 +85,15 @@ struct CompilandIndexItem {
       lldb_private::RangeDataVector<lldb::addr_t, uint32_t,
                                     std::pair<uint32_t, uint32_t>>;
   GlobalLineTable m_global_line_table;
+
+  struct FunctionDeclarationLocation {
+    lldb::addr_t m_addr = LLDB_INVALID_ADDRESS;
+    uint32_t m_file_index = UINT32_MAX;
+    uint32_t m_line = 0;
+  };
+  llvm::DenseMap<uint32_t, FunctionDeclarationLocation>
+      m_function_declarations;
+  bool m_function_declarations_parsed = false;
 };
 
 /// Indexes information about all compile units.  This is really just a map of

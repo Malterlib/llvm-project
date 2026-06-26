@@ -17,10 +17,12 @@
 
 #include "PdbIndex.h"
 #include "PdbSymUid.h"
+#include <map>
 #include <optional>
 
 namespace clang {
 class TagDecl;
+class CXXMethodDecl;
 class DeclContext;
 class Decl;
 class QualType;
@@ -123,7 +125,8 @@ private:
                                  const llvm::codeview::EnumRecord &record);
   clang::QualType
   CreateFunctionType(TypeIndex args_type_idx, TypeIndex return_type_idx,
-                     llvm::codeview::CallingConvention calling_convention);
+                     llvm::codeview::CallingConvention calling_convention,
+                     unsigned type_quals = 0);
   clang::QualType CreateType(PdbTypeSymId type);
 
   void CreateFunctionParameters(PdbCompilandSymId func_id,
@@ -132,7 +135,8 @@ private:
   clang::Decl *GetOrCreateSymbolForId(PdbCompilandSymId id);
   clang::VarDecl *CreateVariableDecl(PdbSymUid uid,
                                      llvm::codeview::CVSymbol sym,
-                                     clang::DeclContext &scope);
+                                     clang::DeclContext &scope,
+                                     llvm::StringRef name = {});
   clang::FunctionDecl *CreateFunctionDeclFromId(PdbTypeSymId func_tid,
                                                 PdbCompilandSymId func_sid);
   clang::FunctionDecl *
@@ -161,10 +165,11 @@ private:
   llvm::DenseMap<lldb::user_id_t, clang::Decl *> m_uid_to_decl;
   llvm::DenseMap<lldb::user_id_t, clang::QualType> m_uid_to_type;
 
-  // From class/struct's opaque_compiler_type_t to a set containing the pairs of
-  // method's name and CompilerType.
+  // From class/struct's opaque_compiler_type_t to known methods by name and
+  // CompilerType.
   llvm::DenseMap<lldb::opaque_compiler_type_t,
-                 llvm::SmallSet<std::pair<llvm::StringRef, CompilerType>, 8>>
+                 std::map<std::pair<llvm::StringRef, CompilerType>,
+                          clang::CXXMethodDecl *>>
       m_cxx_record_map;
 
   using NamespaceSet = llvm::DenseSet<clang::NamespaceDecl *>;
