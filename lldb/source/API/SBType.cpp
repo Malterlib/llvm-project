@@ -344,6 +344,18 @@ lldb::SBTypeMemberFunction SBType::GetMemberFunctionAtIndex(uint32_t idx) {
   return sb_func_type;
 }
 
+lldb::SBDeclaration SBType::GetDeclaration() {
+  LLDB_INSTRUMENT_VA(this);
+
+  SBDeclaration sb_declaration;
+  if (IsValid()) {
+    Declaration declaration;
+    if (m_opaque_sp->GetCompilerType(true).GetDeclaration(declaration))
+      sb_declaration.SetDeclaration(declaration);
+  }
+  return sb_declaration;
+}
+
 SBTypeStaticField::SBTypeStaticField() { LLDB_INSTRUMENT_VA(this); }
 
 SBTypeStaticField::SBTypeStaticField(lldb_private::CompilerDecl decl)
