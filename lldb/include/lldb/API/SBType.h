@@ -242,6 +242,8 @@ public:
 
   lldb::SBTypeMemberFunction GetMemberFunctionAtIndex(uint32_t idx);
 
+  lldb::SBDeclaration GetDeclaration();
+
   lldb::SBModule GetModule();
 
   const char *GetName();

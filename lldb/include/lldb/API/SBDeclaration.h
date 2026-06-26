@@ -51,6 +51,7 @@ protected:
   lldb_private::Declaration *get();
 
 private:
+  friend class SBType;
   friend class SBTypeMemberFunction;
   friend class SBValue;
 
