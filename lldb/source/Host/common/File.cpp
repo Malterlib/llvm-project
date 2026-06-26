@@ -568,6 +568,8 @@ Status NativeFileBase::Write(const void *buf, size_t &num_bytes) {
 
   ssize_t bytes_written = -1;
   if (ValueGuard descriptor_guard = DescriptorIsValid()) {
+    if (TryWriteDescriptorUnlocked(buf, num_bytes, error))
+      return error;
     bytes_written =
         llvm::sys::RetryAfterSignal(-1, ::write, m_descriptor, buf, num_bytes);
     if (bytes_written == -1) {
