@@ -113,7 +113,6 @@ ProcessLauncherWindows::LaunchProcess(const ProcessLaunchInfo &launch_info,
 
   STARTUPINFOEXW startupinfoex = {};
   startupinfoex.StartupInfo.cb = sizeof(STARTUPINFOEXW);
-  startupinfoex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
   HPCON hPC = launch_info.GetPTY().GetPseudoTerminalHandle();
   bool use_pty = launch_info.ShouldUsePTY();
@@ -147,13 +146,16 @@ ProcessLauncherWindows::LaunchProcess(const ProcessLaunchInfo &launch_info,
       return HostProcess();
     }
   } else {
-    auto inherited_handles_or_err = GetInheritedHandles(
-        launch_info, startupinfoex, stdout_handle, stderr_handle, stdin_handle);
-    if (!inherited_handles_or_err) {
-      error = Status(inherited_handles_or_err.getError());
-      return HostProcess();
+    if (launch_info.GetNumFileActions() != 0) {
+      auto inherited_handles_or_err = GetInheritedHandles(
+          launch_info, startupinfoex, stdout_handle, stderr_handle,
+          stdin_handle);
+      if (!inherited_handles_or_err) {
+        error = Status(inherited_handles_or_err.getError());
+        return HostProcess();
+      }
+      inherited_handles = std::move(*inherited_handles_or_err);
     }
-    inherited_handles = std::move(*inherited_handles_or_err);
   }
 
   const char *hide_console_var =
@@ -225,6 +227,7 @@ llvm::ErrorOr<std::vector<HANDLE>> ProcessLauncherWindows::GetInheritedHandles(
     HANDLE stdout_handle, HANDLE stderr_handle, HANDLE stdin_handle) {
   std::vector<HANDLE> inherited_handles;
 
+  startupinfoex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
   startupinfoex.StartupInfo.hStdError =
       stderr_handle ? stderr_handle : GetStdHandle(STD_ERROR_HANDLE);
   startupinfoex.StartupInfo.hStdInput =
