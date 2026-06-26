@@ -4694,6 +4694,18 @@ public:
           }
         }
       } else {
+        if (ch == 3) {
+          ExecutionContext exe_ctx =
+              debugger.GetCommandInterpreter().GetExecutionContext();
+          if (exe_ctx.HasProcessScope()) {
+            Process *process = exe_ctx.GetProcessPtr();
+            if (process && process->IsAlive())
+              process->Halt();
+          }
+          m_update_screen = true;
+          continue;
+        }
+
         HandleCharResult key_result = m_window_sp->HandleChar(ch);
         switch (key_result) {
         case eKeyHandled:
