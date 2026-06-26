@@ -17,8 +17,11 @@
 #include "llvm/DebugInfo/CodeView/CVRecord.h"
 #include "llvm/Support/Threading.h"
 
+#include <map>
+
 namespace clang {
 class TagDecl;
+class CXXMethodDecl;
 class DeclContext;
 class Decl;
 class QualType;
@@ -134,7 +137,8 @@ private:
   clang::Decl *GetOrCreateSymbolForId(PdbCompilandSymId id);
   clang::VarDecl *CreateVariableDecl(PdbSymUid uid,
                                      llvm::codeview::CVSymbol sym,
-                                     clang::DeclContext &scope);
+                                     clang::DeclContext &scope,
+                                     llvm::StringRef name = {});
   clang::FunctionDecl *CreateFunctionDeclFromId(PdbTypeSymId func_tid,
                                                 PdbCompilandSymId func_sid);
   clang::FunctionDecl *
@@ -167,10 +171,11 @@ private:
   llvm::DenseMap<lldb::user_id_t, clang::Decl *> m_uid_to_decl;
   llvm::DenseMap<lldb::user_id_t, clang::QualType> m_uid_to_type;
 
-  // From class/struct's opaque_compiler_type_t to a set containing the pairs of
-  // method's name and CompilerType.
+  // From class/struct's opaque_compiler_type_t to known methods by name and
+  // CompilerType.
   llvm::DenseMap<lldb::opaque_compiler_type_t,
-                 llvm::SmallSet<std::pair<llvm::StringRef, CompilerType>, 8>>
+                 std::map<std::pair<llvm::StringRef, CompilerType>,
+                          clang::CXXMethodDecl *>>
       m_cxx_record_map;
 
   using NamespaceSet = llvm::DenseSet<clang::NamespaceDecl *>;
