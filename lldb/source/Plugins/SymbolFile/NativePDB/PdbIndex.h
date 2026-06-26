@@ -101,6 +101,8 @@ class PdbIndex {
   /// Maps virtual address to module index
   llvm::IntervalMap<lldb::addr_t, uint16_t> m_va_to_modi;
 
+  std::multimap<lldb::addr_t, PdbGlobalSymId> m_global_symbols_by_va;
+
   /// The address at which the program has been loaded into memory.
   lldb::addr_t m_load_address = 0;
 
@@ -144,6 +146,9 @@ public:
 
   lldb::addr_t MakeVirtualAddress(uint16_t segment, uint32_t offset) const;
 
+  void BuildGlobalSymbolAddressMap();
+  std::vector<SymbolAndUid> FindGlobalSymbolsByExactVa(lldb::addr_t va);
+  std::vector<SymbolAndUid> FindSymbolsByExactVa(lldb::addr_t va);
   std::vector<SymbolAndUid> FindSymbolsByVa(lldb::addr_t va);
 
   llvm::codeview::CVSymbol ReadSymbolRecord(PdbCompilandSymId cu_sym) const;
