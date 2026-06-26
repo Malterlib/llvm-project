@@ -129,10 +129,60 @@ void PdbIndex::BuildAddrToSymbolMap(CompilandIndexItem &cci) {
 
     PdbCompilandSymId cu_sym_id(modi, iter.offset());
 
-    // It's rare, but we could have multiple symbols with the same address
-    // because of identical comdat folding.  Right now, the first one will win.
     cci.m_symbols_by_va.insert(std::make_pair(va, PdbSymUid(cu_sym_id)));
   }
+}
+
+void PdbIndex::BuildGlobalSymbolAddressMap() {
+  if (!m_global_symbols_by_va.empty())
+    return;
+
+  for (uint32_t gid : globals().getGlobalsTable()) {
+    PdbGlobalSymId global{gid, false};
+    CVSymbol sym = ReadSymbolRecord(global);
+    if (!SymbolHasAddress(sym))
+      continue;
+
+    SegmentOffset so = GetSegmentAndOffset(sym);
+    lldb::addr_t va = MakeVirtualAddress(so.segment, so.offset);
+    if (va == LLDB_INVALID_ADDRESS)
+      continue;
+
+    m_global_symbols_by_va.insert(std::make_pair(va, global));
+  }
+}
+
+std::vector<SymbolAndUid> PdbIndex::FindGlobalSymbolsByExactVa(
+    lldb::addr_t va) {
+  std::vector<SymbolAndUid> result;
+
+  BuildGlobalSymbolAddressMap();
+
+  auto range = m_global_symbols_by_va.equal_range(va);
+  for (auto iter = range.first; iter != range.second; ++iter)
+    result.push_back({ReadSymbolRecord(iter->second), PdbSymUid(iter->second)});
+
+  return result;
+}
+
+std::vector<SymbolAndUid> PdbIndex::FindSymbolsByExactVa(lldb::addr_t va) {
+  std::vector<SymbolAndUid> result;
+
+  std::optional<uint16_t> modi = GetModuleIndexForVa(va);
+  if (!modi)
+    return result;
+
+  CompilandIndexItem &cci = compilands().GetOrCreateCompiland(*modi);
+  if (cci.m_symbols_by_va.empty())
+    BuildAddrToSymbolMap(cci);
+
+  auto range = cci.m_symbols_by_va.equal_range(va);
+  for (auto iter = range.first; iter != range.second; ++iter) {
+    PdbCompilandSymId cu_sym_id = iter->second.asCompilandSym();
+    result.push_back({ReadSymbolRecord(cu_sym_id), iter->second});
+  }
+
+  return result;
 }
 
 std::vector<SymbolAndUid> PdbIndex::FindSymbolsByVa(lldb::addr_t va) {
