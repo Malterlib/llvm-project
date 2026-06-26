@@ -271,6 +271,8 @@ public:
 
   lldb::SBDeclaration GetDeclaration();
 
+  lldb::SBType GetDeclaringType();
+
   /// Find out if a SBValue might have children.
   ///
   /// This call is much more efficient than GetNumChildren() as it
