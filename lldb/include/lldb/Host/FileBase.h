@@ -458,6 +458,13 @@ protected:
   /// Duplicate a file descriptor.
   virtual int Dup(int fd) const;
 
+  /// Hook for descriptor writes that bypass the default write path.  Returns
+  /// true if the bytes were consumed.
+  virtual bool TryWriteDescriptorUnlocked(const void *buf, size_t &num_bytes,
+                                          Status &error) {
+    return false;
+  }
+
   /// Hook for stream writes that bypass the default fwrite path.  Returns
   /// true if the bytes were consumed.
   virtual bool TryWriteStreamUnlocked(const void *buf, size_t &num_bytes,

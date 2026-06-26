@@ -16,37 +16,95 @@
 #include <stdio.h>
 
 #include "lldb/Utility/Status.h"
-#include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/ConvertUTF.h"
+
+#include <algorithm>
 
 using namespace lldb_private;
 
+static HANDLE GetStandardFileHandle(int fd) {
+  if (fd == STDIN_FILENO)
+    return ::GetStdHandle(STD_INPUT_HANDLE);
+  if (fd == STDOUT_FILENO)
+    return ::GetStdHandle(STD_OUTPUT_HANDLE);
+  if (fd == STDERR_FILENO)
+    return ::GetStdHandle(STD_ERROR_HANDLE);
+  return INVALID_HANDLE_VALUE;
+}
+
+static HANDLE GetStandardFileHandle(FILE *fh) {
+  if (fh == stdin)
+    return ::GetStdHandle(STD_INPUT_HANDLE);
+  if (fh == stdout)
+    return ::GetStdHandle(STD_OUTPUT_HANDLE);
+  if (fh == stderr)
+    return ::GetStdHandle(STD_ERROR_HANDLE);
+  return INVALID_HANDLE_VALUE;
+}
+
+static bool IsWindowsConsoleHandle(HANDLE handle) {
+  if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
+    return false;
+
+  DWORD mode = 0;
+  return ::GetConsoleMode(handle, &mode) != 0;
+}
+
+static HANDLE GetWindowsConsoleHandle(int fd) {
+  HANDLE handle = GetStandardFileHandle(fd);
+  if (!IsWindowsConsoleHandle(handle) && File::DescriptorIsValid(fd))
+    handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+
+  return IsWindowsConsoleHandle(handle) ? handle : nullptr;
+}
+
+static HANDLE GetWindowsConsoleHandle(FILE *fh) {
+  HANDLE handle = GetStandardFileHandle(fh);
+  if (!IsWindowsConsoleHandle(handle) && fh != nullptr)
+    handle = GetWindowsConsoleHandle(::_fileno(fh));
+
+  return IsWindowsConsoleHandle(handle) ? handle : nullptr;
+}
+
+// Returns false for invalid UTF-8 or write failures so the caller falls back
+// to the byte-oriented path.
+static bool WriteUTF8ToWindowsConsole(HANDLE handle, const void *buf,
+                                      size_t num_bytes) {
+  if (!IsWindowsConsoleHandle(handle))
+    return false;
+
+  llvm::SmallVector<wchar_t, 256> wide_text;
+  if (auto ec = llvm::sys::windows::UTF8ToUTF16(
+          llvm::StringRef(static_cast<const char *>(buf), num_bytes),
+          wide_text))
+    return false;
+
+  size_t written = 0;
+  constexpr size_t max_write_size = 32767;
+  while (written < wide_text.size()) {
+    DWORD chars_to_write = static_cast<DWORD>(
+        std::min(max_write_size, wide_text.size() - written));
+    DWORD chars_written = 0;
+    if (!::WriteConsoleW(handle, &wide_text[written], chars_to_write,
+                         &chars_written, nullptr))
+      return false;
+    if (chars_written == 0)
+      return false;
+    written += chars_written;
+  }
+  return true;
+}
+
 NativeFileWindows::NativeFileWindows(FILE *fh, OpenOptions options,
                                      bool transfer_ownership)
-    : NativeFileBase(fh, options, transfer_ownership) {
-  HANDLE h = INVALID_HANDLE_VALUE;
-  if (fh == stdin)
-    h = ::GetStdHandle(STD_INPUT_HANDLE);
-  else if (fh == stdout)
-    h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-  else if (fh == stderr)
-    h = ::GetStdHandle(STD_ERROR_HANDLE);
-  m_is_windows_console =
-      h != INVALID_HANDLE_VALUE && ::GetFileType(h) == FILE_TYPE_CHAR;
-}
+    : NativeFileBase(fh, options, transfer_ownership),
+      m_windows_console_handle(GetWindowsConsoleHandle(fh)) {}
 
 NativeFileWindows::NativeFileWindows(int fd, OpenOptions options,
                                      bool transfer_ownership)
-    : NativeFileBase(fd, options, transfer_ownership) {
-  HANDLE h = INVALID_HANDLE_VALUE;
-  if (fd == STDIN_FILENO)
-    h = ::GetStdHandle(STD_INPUT_HANDLE);
-  else if (fd == STDOUT_FILENO)
-    h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-  else if (fd == STDERR_FILENO)
-    h = ::GetStdHandle(STD_ERROR_HANDLE);
-  m_is_windows_console =
-      h != INVALID_HANDLE_VALUE && ::GetFileType(h) == FILE_TYPE_CHAR;
-}
+    : NativeFileBase(fd, options, transfer_ownership),
+      m_windows_console_handle(GetWindowsConsoleHandle(fd)) {}
 
 void NativeFileWindows::CalculateInteractiveAndTerminal() {
   const int fd = GetDescriptor();
@@ -75,6 +133,12 @@ IOObject::WaitableHandle NativeFileWindows::GetWaitableHandle() {
   return (HANDLE)_get_osfhandle(GetDescriptor());
 }
 
+Status NativeFileWindows::Close() {
+  Status error = NativeFileBase::Close();
+  m_windows_console_handle = nullptr;
+  return error;
+}
+
 Status NativeFileWindows::Sync() {
   Status error;
   if (ValueGuard descriptor_guard = DescriptorIsValid()) {
@@ -86,16 +150,23 @@ Status NativeFileWindows::Sync() {
   return error;
 }
 
+bool NativeFileWindows::TryWriteDescriptorUnlocked(const void *buf,
+                                                   size_t &num_bytes,
+                                                   Status &error) {
+  return WriteUTF8ToWindowsConsole(m_windows_console_handle, buf, num_bytes);
+}
+
 bool NativeFileWindows::TryWriteStreamUnlocked(const void *buf,
                                                size_t &num_bytes,
                                                Status &error) {
-  if (!m_is_windows_console)
-    return false;
-  // Bypass fwrite for console output: use raw_fd_ostream so that the Windows
-  // console renders non-ASCII characters via its UTF-16 path.
-  llvm::raw_fd_ostream(_fileno(m_stream), false)
-      .write((const char *)buf, num_bytes);
-  return true;
+  return WriteUTF8ToWindowsConsole(m_windows_console_handle, buf, num_bytes);
+}
+
+size_t NativeFileWindows::PrintfVarArg(const char *format, va_list args) {
+  // Format through File so console output reaches Write and WriteConsoleW.
+  if (m_windows_console_handle)
+    return File::PrintfVarArg(format, args);
+  return NativeFileBase::PrintfVarArg(format, args);
 }
 
 Status NativeFileWindows::Read(void *buf, size_t &num_bytes, off_t &offset) {

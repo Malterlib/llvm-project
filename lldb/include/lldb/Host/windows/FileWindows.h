@@ -29,7 +29,9 @@ public:
   using NativeFileBase::Write;
 
   WaitableHandle GetWaitableHandle() override;
+  Status Close() override;
   Status Sync() override;
+  size_t PrintfVarArg(const char *format, va_list args) override;
   Status Read(void *dst, size_t &num_bytes, off_t &offset) override;
   Status Write(const void *src, size_t &num_bytes, off_t &offset) override;
 
@@ -45,15 +47,17 @@ protected:
   int Fileno(FILE *fh) const override;
   int Dup(int fd) const override;
 
+  bool TryWriteDescriptorUnlocked(const void *buf, size_t &num_bytes,
+                                  Status &error) override;
   bool TryWriteStreamUnlocked(const void *buf, size_t &num_bytes,
                               Status &error) override;
 
   void OnStreamOpened() override;
 
 private:
-  /// Set when this file wraps stdin/stdout/stderr connected to a console;
-  /// triggers the raw_fd_ostream path for correct non-ASCII output.
-  bool m_is_windows_console = false;
+  /// Console handle when this file writes to a Windows console; UTF-8 output
+  /// is then written through WriteConsoleW.
+  void *m_windows_console_handle = nullptr;
 
   NativeFileWindows(const NativeFileWindows &) = delete;
   const NativeFileWindows &operator=(const NativeFileWindows &) = delete;
