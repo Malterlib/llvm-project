@@ -1222,6 +1222,9 @@ void Debugger::RestoreInputTerminalState() {
 
 void Debugger::RedrawStatusline(
     std::optional<ExecutionContextRef> exe_ctx_ref) {
+  if (IsForwardingEvents())
+    return;
+
   std::lock_guard<std::mutex> guard(m_statusline_mutex);
 
   if (!m_statusline)
@@ -2176,7 +2179,7 @@ lldb::thread_result_t Debugger::DefaultEventHandler() {
                        CommandInterpreter::eBroadcastBitAsynchronousErrorData) {
               const char *data = static_cast<const char *>(
                   EventDataBytes::GetBytesFromEvent(event_sp.get()));
-              if (data && data[0]) {
+              if (!IsForwardingEvents() && data && data[0]) {
                 StreamUP error_up = GetAsyncErrorStream();
                 error_up->PutCString(data);
                 error_up->Flush();
@@ -2185,7 +2188,7 @@ lldb::thread_result_t Debugger::DefaultEventHandler() {
                                         eBroadcastBitAsynchronousOutputData) {
               const char *data = static_cast<const char *>(
                   EventDataBytes::GetBytesFromEvent(event_sp.get()));
-              if (data && data[0]) {
+              if (!IsForwardingEvents() && data && data[0]) {
                 StreamUP output_up = GetAsyncOutputStream();
                 output_up->PutCString(data);
                 output_up->Flush();
@@ -2300,7 +2303,8 @@ void Debugger::HandleProgressEvent(const lldb::EventSP &event_sp) {
     }
 
     // Show progress using Operating System Command (OSC) sequences.
-    if (GetShowProgress() && IsEscapeCodeCapableTTY()) {
+    if (GetShowProgress() && !IsForwardingEvents() &&
+        IsEscapeCodeCapableTTY()) {
       if (lldb::LockableStreamFileSP stream_sp = GetOutputStreamSP()) {
 
         // Clear progress if this was the last progress event.
@@ -2334,6 +2338,9 @@ Debugger::GetCurrentProgressReport() const {
 }
 
 void Debugger::HandleDiagnosticEvent(const lldb::EventSP &event_sp) {
+  if (IsForwardingEvents())
+    return;
+
   auto *data = DiagnosticEventData::GetEventDataFromEvent(event_sp.get());
   if (!data)
     return;
