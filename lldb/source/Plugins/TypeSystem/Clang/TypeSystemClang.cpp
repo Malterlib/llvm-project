@@ -1214,6 +1214,42 @@ CompilerType TypeSystemClang::GetTypeForDecl(clang::ValueDecl *value_decl) {
   return GetType(value_decl->getType());
 }
 
+bool TypeSystemClang::GetTypeDeclaration(lldb::opaque_compiler_type_t type,
+                                         Declaration &decl) {
+  if (!type)
+    return false;
+
+  auto get_declaration_from_metadata =
+      [&](const std::optional<ClangASTMetadata> &metadata) -> bool {
+    if (metadata && metadata->GetDeclaration() &&
+        metadata->GetDeclaration()->IsValid()) {
+      decl = *metadata->GetDeclaration();
+      return true;
+    }
+    return false;
+  };
+
+  clang::QualType qual_type = GetQualType(type);
+  if (get_declaration_from_metadata(GetMetadata(qual_type.getTypePtr())))
+    return true;
+
+  if (clang::TagDecl *tag_decl = qual_type->getAsTagDecl())
+    return DeclGetDeclaration(tag_decl, decl);
+
+  if (const auto *objc_type = qual_type->getAs<clang::ObjCObjectType>())
+    if (clang::ObjCInterfaceDecl *interface_decl = objc_type->getInterface())
+      return DeclGetDeclaration(interface_decl, decl);
+
+  clang::QualType canonical_type = GetCanonicalQualType(type);
+  if (get_declaration_from_metadata(GetMetadata(canonical_type.getTypePtr())))
+    return true;
+
+  if (clang::TagDecl *tag_decl = canonical_type->getAsTagDecl())
+    return DeclGetDeclaration(tag_decl, decl);
+
+  return false;
+}
+
 #pragma mark Structure, Unions, Classes
 
 void TypeSystemClang::SetOwningModule(clang::Decl *decl,
@@ -4506,8 +4542,7 @@ TypeSystemClang::GetMemberFunctionAtIndex(lldb::opaque_compiler_type_t type,
           if (idx <
               static_cast<size_t>(std::distance(method_iter, method_end))) {
             std::advance(method_iter, idx);
-            clang::CXXMethodDecl *cxx_method_decl =
-                method_iter->getCanonicalDecl();
+            clang::CXXMethodDecl *cxx_method_decl = *method_iter;
             if (cxx_method_decl) {
               name = cxx_method_decl->getDeclName().getAsString();
               if (cxx_method_decl->isStatic())

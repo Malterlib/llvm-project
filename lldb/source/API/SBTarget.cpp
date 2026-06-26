@@ -43,9 +43,11 @@
 #include "lldb/Interpreter/Interfaces/ScriptedFrameProviderInterface.h"
 #include "lldb/Symbol/DeclVendor.h"
 #include "lldb/Symbol/ObjectFile.h"
+#include "lldb/Symbol/SymbolContext.h"
 #include "lldb/Symbol/SymbolFile.h"
 #include "lldb/Symbol/SymbolVendor.h"
 #include "lldb/Symbol/TypeSystem.h"
+#include "lldb/Symbol/Variable.h"
 #include "lldb/Symbol/VariableList.h"
 #include "lldb/Target/ABI.h"
 #include "lldb/Target/Language.h"
@@ -1997,6 +1999,36 @@ lldb::SBValue SBTarget::FindFirstGlobalVariable(const char *name) {
   if (sb_value_list.IsValid() && sb_value_list.GetSize() > 0)
     return sb_value_list.GetValueAtIndex(0);
   return SBValue();
+}
+
+lldb::SBValue SBTarget::FindGlobalVariableByAddress(lldb::addr_t vm_addr) {
+  LLDB_INSTRUMENT_VA(this, vm_addr);
+
+  TargetSP target_sp = GetSP();
+  if (!target_sp)
+    return SBValue();
+
+  Address address;
+  if (!target_sp->ResolveLoadAddress(vm_addr, address))
+    return SBValue();
+
+  SymbolContext sc;
+  sc.target_sp = target_sp;
+  uint32_t resolved = target_sp->GetImages().ResolveSymbolContextForAddress(
+      address, eSymbolContextVariable, sc);
+  if (!(resolved & eSymbolContextVariable) || !sc.variable)
+    return SBValue();
+
+  VariableSP var_sp = sc.variable->shared_from_this();
+  ExecutionContextScope *exe_scope = target_sp->GetProcessSP().get();
+  if (exe_scope == nullptr)
+    exe_scope = target_sp.get();
+
+  ValueObjectSP valobj_sp = ValueObjectVariable::Create(exe_scope, var_sp);
+  if (!valobj_sp)
+    return SBValue();
+
+  return SBValue(valobj_sp);
 }
 
 SBSourceManager SBTarget::GetSourceManager() {

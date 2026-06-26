@@ -143,6 +143,9 @@ public:
   virtual CompilerDeclContext
   GetCompilerDeclContextForType(const CompilerType &type);
 
+  virtual bool GetTypeDeclaration(lldb::opaque_compiler_type_t type,
+                                  Declaration &decl);
+
   virtual std::vector<lldb_private::CompilerContext>
   DeclContextGetCompilerContext(void *opaque_decl_ctx);
 

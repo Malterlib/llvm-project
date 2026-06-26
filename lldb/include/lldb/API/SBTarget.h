@@ -540,6 +540,15 @@ public:
   ///     An SBValue that gets filled in with the found variable (if any).
   lldb::SBValue FindFirstGlobalVariable(const char *name);
 
+  /// Find a global (or static) variable by load address.
+  ///
+  /// \param[in] vm_addr
+  ///     The load address of the global or static variable.
+  ///
+  /// \return
+  ///     An SBValue that gets filled in with the found variable (if any).
+  lldb::SBValue FindGlobalVariableByAddress(lldb::addr_t vm_addr);
+
   /// Find global and static variables by pattern.
   ///
   /// \param[in] name

@@ -229,6 +229,11 @@ TypeSystem::GetCompilerDeclContextForType(const CompilerType &type) {
   return CompilerDeclContext();
 }
 
+bool TypeSystem::GetTypeDeclaration(lldb::opaque_compiler_type_t type,
+                                    Declaration &decl) {
+  return false;
+}
+
 #pragma mark TypeSystemMap
 
 TypeSystemMap::TypeSystemMap() : m_mutex(), m_map() {}

@@ -24,6 +24,9 @@
 #include "lldb/DataFormatters/DataVisualization.h"
 #include "lldb/DataFormatters/DumpValueObjectOptions.h"
 #include "lldb/Symbol/Block.h"
+#include "lldb/Symbol/CompilerDecl.h"
+#include "lldb/Symbol/CompilerDeclContext.h"
+#include "lldb/Symbol/CompilerType.h"
 #include "lldb/Symbol/ObjectFile.h"
 #include "lldb/Symbol/Type.h"
 #include "lldb/Symbol/Variable.h"
@@ -1314,6 +1317,31 @@ lldb::SBDeclaration SBValue::GetDeclaration() {
       decl_sb.SetDeclaration(decl);
   }
   return decl_sb;
+}
+
+lldb::SBType SBValue::GetDeclaringType() {
+  LLDB_INSTRUMENT_VA(this);
+
+  ValueLocker locker;
+  lldb::ValueObjectSP value_sp(GetSP(locker));
+  if (!value_sp)
+    return SBType();
+
+  VariableSP variable_sp = value_sp->GetVariable();
+  if (!variable_sp)
+    return SBType();
+
+  CompilerType declaring_type;
+  CompilerDecl decl = variable_sp->GetDecl();
+  if (decl)
+    declaring_type = decl.GetDeclContext().GetDeclaringType();
+
+  if (!declaring_type)
+    declaring_type = variable_sp->GetDeclContext().GetDeclaringType();
+  if (!declaring_type)
+    return SBType();
+
+  return SBType(declaring_type);
 }
 
 lldb::SBWatchpoint SBValue::Watch(bool resolve_location, bool read, bool write,

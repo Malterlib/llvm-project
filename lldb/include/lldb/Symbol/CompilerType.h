@@ -22,6 +22,7 @@
 namespace lldb_private {
 
 class DataExtractor;
+class Declaration;
 class TypeSystem;
 
 /// Generic representation of a type in a programming language.
@@ -286,6 +287,8 @@ public:
   ConstString GetDisplayTypeName() const;
 
   ConstString GetMangledTypeName() const;
+
+  bool GetDeclaration(Declaration &decl) const;
 
   uint32_t
   GetTypeInfo(CompilerType *pointee_or_element_compiler_type = nullptr) const;

@@ -568,6 +568,9 @@ public:
 
   CompilerType GetTypeForDecl(void *opaque_decl) override;
 
+  bool GetTypeDeclaration(lldb::opaque_compiler_type_t type,
+                          Declaration &decl) override;
+
   // CompilerDeclContext override functions
 
   /// Creates a CompilerDeclContext from the given DeclContext

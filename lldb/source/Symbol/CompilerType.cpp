@@ -525,6 +525,14 @@ ConstString CompilerType::GetMangledTypeName() const {
   return ConstString("<invalid>");
 }
 
+bool CompilerType::GetDeclaration(Declaration &decl) const {
+  if (IsValid()) {
+    if (auto type_system_sp = GetTypeSystem())
+      return type_system_sp->GetTypeDeclaration(m_type, decl);
+  }
+  return false;
+}
+
 uint32_t CompilerType::GetTypeInfo(
     CompilerType *pointee_or_element_compiler_type) const {
   if (IsValid())

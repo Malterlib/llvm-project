@@ -205,5 +205,19 @@ linked list."
         An empty SBData otherwise."
 ) lldb::SBValue::GetData;
 
+%feature("docstring", "
+    Returns the declaration location for this value, if debug info provides one.
+
+    Returns an invalid `SBDeclaration` when this value is invalid or the
+    declaration location is unavailable."
+) lldb::SBValue::GetDeclaration;
+
+%feature("docstring", "
+    If this value is declared inside a type, returns that declaring type.
+
+    Returns an invalid `SBType` when this value is invalid or no declaring type
+    is available."
+) lldb::SBValue::GetDeclaringType;
+
 %feature("docstring", "Returns an expression path for this value."
 ) lldb::SBValue::GetExpressionPath;

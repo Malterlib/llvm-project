@@ -308,6 +308,16 @@ produces: ::
         An SBValue that gets filled in with the found variable (if any)."
 ) lldb::SBTarget::FindFirstGlobalVariable;
 
+ %feature("docstring", "
+    Find a global (or static) variable by load address.
+
+    @param[in] vm_addr
+        The load address of the global or static variable.
+
+    @return
+        An SBValue that gets filled in with the found variable (if any)."
+) lldb::SBTarget::FindGlobalVariableByAddress;
+
 %feature("docstring", "
     Resolve a current file address into a section offset address.
 
