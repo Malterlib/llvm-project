@@ -8,6 +8,7 @@
 
 #include "lldb/Host/File.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cstdarg>
@@ -31,16 +32,90 @@
 #include "lldb/Utility/FileSpec.h"
 #include "lldb/Utility/Log.h"
 #include "lldb/Utility/VASPrintf.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/Errno.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Process.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace lldb;
 using namespace lldb_private;
 using llvm::Expected;
+
+#if defined(_WIN32)
+static HANDLE GetStandardFileHandle(int fd) {
+  if (fd == STDIN_FILENO)
+    return ::GetStdHandle(STD_INPUT_HANDLE);
+  if (fd == STDOUT_FILENO)
+    return ::GetStdHandle(STD_OUTPUT_HANDLE);
+  if (fd == STDERR_FILENO)
+    return ::GetStdHandle(STD_ERROR_HANDLE);
+  return INVALID_HANDLE_VALUE;
+}
+
+static HANDLE GetStandardFileHandle(FILE *fh) {
+  if (fh == stdin)
+    return ::GetStdHandle(STD_INPUT_HANDLE);
+  if (fh == stdout)
+    return ::GetStdHandle(STD_OUTPUT_HANDLE);
+  if (fh == stderr)
+    return ::GetStdHandle(STD_ERROR_HANDLE);
+  return INVALID_HANDLE_VALUE;
+}
+
+static bool IsWindowsConsoleHandle(HANDLE handle) {
+  if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
+    return false;
+
+  DWORD mode = 0;
+  return ::GetConsoleMode(handle, &mode) != 0;
+}
+
+static HANDLE GetWindowsConsoleHandle(int fd) {
+  HANDLE handle = GetStandardFileHandle(fd);
+  if (!IsWindowsConsoleHandle(handle) && File::DescriptorIsValid(fd))
+    handle = reinterpret_cast<HANDLE>(::_get_osfhandle(fd));
+
+  return IsWindowsConsoleHandle(handle) ? handle : nullptr;
+}
+
+static HANDLE GetWindowsConsoleHandle(FILE *fh) {
+  HANDLE handle = GetStandardFileHandle(fh);
+  if (!IsWindowsConsoleHandle(handle) && fh != nullptr)
+    handle = GetWindowsConsoleHandle(::_fileno(fh));
+
+  return IsWindowsConsoleHandle(handle) ? handle : nullptr;
+}
+
+static bool WriteUTF8ToWindowsConsole(HANDLE handle, const void *buf,
+                                      size_t num_bytes) {
+  if (!IsWindowsConsoleHandle(handle))
+    return false;
+
+  llvm::SmallVector<wchar_t, 256> wide_text;
+  if (auto ec = llvm::sys::windows::UTF8ToUTF16(
+          llvm::StringRef(static_cast<const char *>(buf), num_bytes),
+          wide_text))
+    return false;
+
+  size_t written = 0;
+  constexpr size_t max_write_size = 32767;
+  while (written < wide_text.size()) {
+    DWORD chars_to_write =
+        static_cast<DWORD>(
+            std::min(max_write_size, wide_text.size() - written));
+    DWORD chars_written = 0;
+    if (!::WriteConsoleW(handle, &wide_text[written], chars_to_write,
+                         &chars_written, nullptr))
+      return false;
+    if (chars_written == 0)
+      return false;
+    written += chars_written;
+  }
+  return true;
+}
+#endif
 
 Expected<const char *>
 File::GetStreamOpenModeFromOptions(File::OpenOptions options) {
@@ -252,20 +327,7 @@ NativeFile::NativeFile() = default;
 NativeFile::NativeFile(FILE *fh, OpenOptions options, bool transfer_ownership)
     : m_stream(fh), m_options(options), m_own_stream(transfer_ownership) {
 #ifdef _WIN32
-  // In order to properly display non ASCII characters in Windows, we need to
-  // use Windows APIs to print to the console. This is only required if the
-  // stream outputs to a console.
-  {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    if (fh == stdin)
-      h = ::GetStdHandle(STD_INPUT_HANDLE);
-    else if (fh == stdout)
-      h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-    else if (fh == stderr)
-      h = ::GetStdHandle(STD_ERROR_HANDLE);
-    is_windows_console =
-        h != INVALID_HANDLE_VALUE && ::GetFileType(h) == FILE_TYPE_CHAR;
-  }
+  m_windows_console_handle = GetWindowsConsoleHandle(fh);
 #else
 #ifndef NDEBUG
   int fd = fileno(fh);
@@ -293,20 +355,7 @@ NativeFile::NativeFile(int fd, OpenOptions options, bool transfer_ownership)
     : m_descriptor(fd), m_own_descriptor(transfer_ownership),
       m_options(options) {
 #ifdef _WIN32
-  // In order to properly display non ASCII characters in Windows, we need to
-  // use Windows APIs to print to the console. This is only required if the
-  // file outputs to a console.
-  {
-    HANDLE h = INVALID_HANDLE_VALUE;
-    if (fd == STDIN_FILENO)
-      h = ::GetStdHandle(STD_INPUT_HANDLE);
-    else if (fd == STDOUT_FILENO)
-      h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-    else if (fd == STDERR_FILENO)
-      h = ::GetStdHandle(STD_ERROR_HANDLE);
-    is_windows_console =
-        h != INVALID_HANDLE_VALUE && ::GetFileType(h) == FILE_TYPE_CHAR;
-  }
+  m_windows_console_handle = GetWindowsConsoleHandle(fd);
 #endif
 }
 
@@ -412,6 +461,9 @@ Status NativeFile::Close() {
   m_descriptor = kInvalidDescriptor;
   m_own_descriptor = false;
   m_options = OpenOptions(0);
+#ifdef _WIN32
+  m_windows_console_handle = nullptr;
+#endif
   m_is_interactive = eLazyBoolCalculate;
   m_is_real_terminal = eLazyBoolCalculate;
   return error;
@@ -691,6 +743,10 @@ Status NativeFile::Write(const void *buf, size_t &num_bytes) {
 
   ssize_t bytes_written = -1;
   if (ValueGuard descriptor_guard = DescriptorIsValid()) {
+#ifdef _WIN32
+    if (WriteUTF8ToWindowsConsole(m_windows_console_handle, buf, num_bytes))
+      return error;
+#endif
     bytes_written =
         llvm::sys::RetryAfterSignal(-1, ::write, m_descriptor, buf, num_bytes);
     if (bytes_written == -1) {
@@ -703,11 +759,8 @@ Status NativeFile::Write(const void *buf, size_t &num_bytes) {
 
   if (ValueGuard stream_guard = StreamIsValid()) {
 #ifdef _WIN32
-    if (is_windows_console) {
-      llvm::raw_fd_ostream(_fileno(m_stream), false)
-          .write((const char *)buf, num_bytes);
+    if (WriteUTF8ToWindowsConsole(m_windows_console_handle, buf, num_bytes))
       return error;
-    }
 #endif
     bytes_written = ::fwrite(buf, 1, num_bytes, m_stream);
 
@@ -852,6 +905,10 @@ Status NativeFile::Write(const void *buf, size_t &num_bytes, off_t &offset) {
 }
 
 size_t NativeFile::PrintfVarArg(const char *format, va_list args) {
+#ifdef _WIN32
+  if (m_windows_console_handle)
+    return File::PrintfVarArg(format, args);
+#endif
   if (StreamIsValid()) {
     return ::vfprintf(m_stream, format, args);
   } else {

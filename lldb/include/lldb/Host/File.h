@@ -454,7 +454,9 @@ protected:
   bool m_own_stream = false;
   std::mutex offset_access_mutex;
 
-  bool is_windows_console = false;
+#if defined(_WIN32)
+  void *m_windows_console_handle = nullptr;
+#endif
 
 private:
   NativeFile(const NativeFile &) = delete;
