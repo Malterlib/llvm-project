@@ -128,7 +128,6 @@ ProcessLauncherWindows::LaunchProcess(const ProcessLaunchInfo &launch_info,
 
   STARTUPINFOEXW startupinfoex = {};
   startupinfoex.StartupInfo.cb = sizeof(STARTUPINFOEXW);
-  startupinfoex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
   PseudoConsole::Mode pty_mode = launch_info.ShouldUsePTY()
                                      ? launch_info.GetPTY().GetMode()
@@ -165,6 +164,7 @@ ProcessLauncherWindows::LaunchProcess(const ProcessLaunchInfo &launch_info,
   }
   case PseudoConsole::Mode::Pipe: {
     PseudoConsole &pty = launch_info.GetPTY();
+    startupinfoex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
     startupinfoex.StartupInfo.hStdInput = pty.GetChildStdinHandle();
     startupinfoex.StartupInfo.hStdOutput = pty.GetChildStdoutHandle();
     startupinfoex.StartupInfo.hStdError = pty.GetChildStdoutHandle();
@@ -179,14 +179,16 @@ ProcessLauncherWindows::LaunchProcess(const ProcessLaunchInfo &launch_info,
     break;
   }
   case PseudoConsole::Mode::None: {
-    auto inherited_handles_or_err =
-        GetInheritedHandles(startupinfoex, &launch_info, stdout_handle,
-                            stderr_handle, stdin_handle);
-    if (!inherited_handles_or_err) {
-      error = Status(inherited_handles_or_err.getError());
-      return HostProcess();
+    if (launch_info.GetNumFileActions() != 0) {
+      auto inherited_handles_or_err =
+          GetInheritedHandles(startupinfoex, &launch_info, stdout_handle,
+                              stderr_handle, stdin_handle);
+      if (!inherited_handles_or_err) {
+        error = Status(inherited_handles_or_err.getError());
+        return HostProcess();
+      }
+      inherited_handles = std::move(*inherited_handles_or_err);
     }
-    inherited_handles = std::move(*inherited_handles_or_err);
     break;
   }
   }
@@ -269,6 +271,7 @@ llvm::ErrorOr<std::vector<HANDLE>> ProcessLauncherWindows::GetInheritedHandles(
     HANDLE stdout_handle, HANDLE stderr_handle, HANDLE stdin_handle) {
   std::vector<HANDLE> inherited_handles;
 
+  startupinfoex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
   startupinfoex.StartupInfo.hStdInput =
       stdin_handle ? stdin_handle : GetStdHandle(STD_INPUT_HANDLE);
   startupinfoex.StartupInfo.hStdOutput =
