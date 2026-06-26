@@ -28,6 +28,8 @@ public:
 
   lldb::RegisterContextSP GetRegisterContext() override;
 
+  lldb::addr_t GetThreadPointer() override;
+
   lldb::RegisterContextSP
   CreateRegisterContextForFrame(lldb_private::StackFrame *frame) override;
 
