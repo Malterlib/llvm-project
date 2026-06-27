@@ -92,6 +92,7 @@
 #include <fcntl.h>
 #include <io.h>
 #else
+#include <sys/ioctl.h>
 #include <unistd.h>
 #endif
 
@@ -112,6 +113,29 @@ static std::recursive_mutex *g_debugger_list_mutex_ptr =
 static Debugger::DebuggerList *g_debugger_list_ptr =
     nullptr; // NOTE: intentional leak to avoid issues with C++ destructor chain
 static llvm::DefaultThreadPool *g_thread_pool = nullptr;
+
+#if !defined(_WIN32)
+static void RefreshTerminalSizeFromIOHandler(Debugger &debugger,
+                                             const IOHandlerSP &reader_sp) {
+  if (!reader_sp)
+    return;
+
+  const int fd = reader_sp->GetInputFD();
+  if (fd < 0)
+    return;
+
+  struct winsize window_size;
+  if (::ioctl(fd, TIOCGWINSZ, &window_size) != 0)
+    return;
+
+  if (window_size.ws_col > 0 &&
+      debugger.GetTerminalWidth() != window_size.ws_col)
+    debugger.SetTerminalWidth(window_size.ws_col);
+  if (window_size.ws_row > 0 &&
+      debugger.GetTerminalHeight() != window_size.ws_row)
+    debugger.SetTerminalHeight(window_size.ws_row);
+}
+#endif
 
 static constexpr OptionEnumValueElement g_show_disassembly_enum_values[] = {
     {
@@ -1460,8 +1484,13 @@ bool Debugger::PopIOHandler(const IOHandlerSP &pop_reader_sp) {
   m_io_handler_stack.Pop();
 
   reader_sp = m_io_handler_stack.Top();
-  if (reader_sp)
+  if (reader_sp) {
     reader_sp->Activate();
+#if !defined(_WIN32)
+    RefreshTerminalSizeFromIOHandler(*this, reader_sp);
+#endif
+    reader_sp->TerminalSizeChanged();
+  }
 
   return true;
 }

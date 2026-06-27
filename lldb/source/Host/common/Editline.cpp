@@ -1609,6 +1609,9 @@ bool Editline::Cancel() {
 
 bool Editline::GetLine(std::string &line, bool &interrupted) {
   ConfigureEditor(false);
+  if (m_terminal_size_has_changed)
+    ApplyTerminalSizeChange();
+
   m_input_lines = std::vector<EditLineStringType>();
   m_input_lines.insert(m_input_lines.begin(), EditLineConstString(""));
 
@@ -1654,6 +1657,8 @@ bool Editline::GetLine(std::string &line, bool &interrupted) {
 bool Editline::GetLines(int first_line_number, StringList &lines,
                         bool &interrupted) {
   ConfigureEditor(true);
+  if (m_terminal_size_has_changed)
+    ApplyTerminalSizeChange();
 
   // Print the initial input lines, then move the cursor back up to the start
   // of input
