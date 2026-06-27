@@ -22,6 +22,7 @@
 
 struct winsize {
   long ws_col;
+  long ws_row;
 };
 
 typedef unsigned char cc_t;

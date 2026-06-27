@@ -650,12 +650,10 @@ void Driver::UpdateWindowSize() {
       ::ioctl(STDIN_FILENO, TIOCGWINSZ, &window_size) == 0) {
     if (window_size.ws_col > 0) {
       // Set both dimensions together to avoid recomputing from a stale value.
-#ifndef _WIN32
-      m_debugger.SetTerminalDimensions(window_size.ws_col, window_size.ws_row);
-#else
       m_debugger.SetTerminalDimensions(window_size.ws_col,
-                                       m_debugger.GetTerminalHeight());
-#endif
+                                       window_size.ws_row > 0
+                                           ? window_size.ws_row
+                                           : m_debugger.GetTerminalHeight());
     }
   }
 }
