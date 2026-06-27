@@ -943,8 +943,11 @@ public:
 
   void SetBounds(const Rect &bounds) {
     const bool moving_window = bounds.origin != GetParentOrigin();
-    if (m_is_subwin && moving_window) {
-      // Can't move subwindows, must delete and re-create
+    const bool resizing_window = bounds.size != GetSize();
+    if (m_is_subwin && (moving_window || resizing_window)) {
+      // Re-create subwindows when their geometry changes. Resizing an
+      // existing subwindow can leave stale clipping state in some curses
+      // backends.
       Reset(::subwin(m_parent->m_window, bounds.size.height, bounds.size.width,
                      bounds.origin.y, bounds.origin.x),
             true);
@@ -4385,6 +4388,7 @@ bool Menu::WindowDelegateDraw(Window &window, bool force) {
   switch (menu_type) {
   case Menu::Type::Bar: {
     window.SetBackground(BlackOnWhite);
+    window.Erase();
     window.MoveCursor(0, 0);
     for (size_t i = 0; i < num_submenus; ++i) {
       Menu *menu = submenus[i].get();
@@ -4582,6 +4586,7 @@ public:
     ::curs_set(0);
     ::noecho();
     ::keypad(stdscr, TRUE);
+    m_polled_terminal_size = GetPolledTerminalSize();
   }
 
   void Terminate() {
@@ -4614,6 +4619,9 @@ public:
 #endif
 
     while (!done) {
+      if (CheckForTerminalSizeChange())
+        continue;
+
       if (m_update_screen) {
         m_window_sp->Draw(false);
         // All windows should be calling Window::DeferredRefresh() instead of
@@ -4624,6 +4632,9 @@ public:
         // Cursor hiding isn't working on MacOSX, so hide it in the top left
         // corner
         m_window_sp->MoveCursor(0, 0);
+
+        if (CheckForTerminalSizeChange())
+          continue;
 
         doupdate();
         m_update_screen = false;
@@ -4694,6 +4705,11 @@ public:
           }
         }
       } else {
+        if (ch == KEY_RESIZE) {
+          TerminalSizeChanged();
+          continue;
+        }
+
         if (ch == 3) {
           ExecutionContext exe_ctx =
               debugger.GetCommandInterpreter().GetExecutionContext();
@@ -4734,8 +4750,13 @@ public:
   }
 
   void TerminalSizeChanged() {
+#if PDCURSES
+    ::resize_term(0, 0);
+#else
     ::endwin();
     ::refresh();
+#endif
+    m_polled_terminal_size = GetPolledTerminalSize();
     Rect content_bounds = m_window_sp->GetFrame();
     m_window_sp->SetBounds(content_bounds);
     if (WindowSP menubar_window_sp = m_window_sp->FindSubWindow("Menubar"))
@@ -4785,12 +4806,43 @@ public:
     m_update_screen = true;
   }
 
+  std::optional<Size> GetPolledTerminalSize() const {
+#if defined(_WIN32) && PDCURSES
+    HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (output == INVALID_HANDLE_VALUE)
+      return std::nullopt;
+
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(output, &info))
+      return std::nullopt;
+
+    return Size(info.srWindow.Right - info.srWindow.Left + 1,
+                info.srWindow.Bottom - info.srWindow.Top + 1);
+#else
+    return std::nullopt;
+#endif
+  }
+
+  bool CheckForTerminalSizeChange() {
+    std::optional<Size> size = GetPolledTerminalSize();
+    if (!size)
+      return false;
+
+    if (m_polled_terminal_size && *m_polled_terminal_size == *size)
+      return false;
+
+    m_polled_terminal_size = size;
+    TerminalSizeChanged();
+    return true;
+  }
+
 protected:
   WindowSP m_window_sp;
   WindowDelegates m_window_delegates;
   SCREEN *m_screen = nullptr;
   FILE *m_in;
   FILE *m_out;
+  std::optional<Size> m_polled_terminal_size;
   bool m_update_screen = false;
 };
 

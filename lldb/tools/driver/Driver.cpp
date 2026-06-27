@@ -731,10 +731,8 @@ void Driver::UpdateWindowSize() {
       ::ioctl(STDIN_FILENO, TIOCGWINSZ, &window_size) == 0) {
     if (window_size.ws_col > 0)
       m_debugger.SetTerminalWidth(window_size.ws_col);
-#ifndef _WIN32
     if (window_size.ws_row > 0)
       m_debugger.SetTerminalHeight(window_size.ws_row);
-#endif
   }
 }
 
