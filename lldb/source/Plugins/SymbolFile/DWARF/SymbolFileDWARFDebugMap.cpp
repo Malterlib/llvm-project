@@ -846,6 +846,8 @@ SymbolFileDWARFDebugMap::ResolveSymbolContext(const Address &exe_so_addr,
 
     const DebugMap::Entry *debug_map_entry =
         m_debug_map.FindEntryThatContains(exe_file_addr);
+    if (!debug_map_entry)
+      debug_map_entry = m_debug_map.FindEntryStartsAt(exe_file_addr);
     if (debug_map_entry) {
 
       sc.symbol =
@@ -1418,23 +1420,30 @@ bool SymbolFileDWARFDebugMap::AddOSOFileRange(CompileUnitInfo *cu_info,
                                               lldb::addr_t exe_byte_size,
                                               lldb::addr_t oso_file_addr,
                                               lldb::addr_t oso_byte_size) {
-  const uint32_t debug_map_idx =
-      m_debug_map.FindEntryIndexThatContains(exe_file_addr);
+  DebugMap::Entry *debug_map_entry = nullptr;
+  uint32_t debug_map_idx = m_debug_map.FindEntryIndexThatContains(exe_file_addr);
   if (debug_map_idx != UINT32_MAX) {
-    DebugMap::Entry *debug_map_entry =
-        m_debug_map.FindEntryThatContains(exe_file_addr);
-    debug_map_entry->data.SetOSOFileAddress(oso_file_addr);
-    addr_t range_size = std::min<addr_t>(exe_byte_size, oso_byte_size);
-    if (range_size == 0) {
-      range_size = std::max<addr_t>(exe_byte_size, oso_byte_size);
-      if (range_size == 0)
-        range_size = 1;
-    }
-    cu_info->file_range_map.Append(
-        FileRangeMap::Entry(oso_file_addr, range_size, exe_file_addr));
-    return true;
+    debug_map_entry = m_debug_map.GetMutableEntryAtIndex(debug_map_idx);
+  } else {
+    debug_map_idx = m_debug_map.FindEntryIndexThatContainsOrFollows(exe_file_addr);
+    debug_map_entry = m_debug_map.GetMutableEntryAtIndex(debug_map_idx);
+    if (debug_map_entry && debug_map_entry->GetRangeBase() != exe_file_addr)
+      debug_map_entry = nullptr;
   }
-  return false;
+
+  if (!debug_map_entry)
+    return false;
+
+  debug_map_entry->data.SetOSOFileAddress(oso_file_addr);
+  addr_t range_size = std::min<addr_t>(exe_byte_size, oso_byte_size);
+  if (range_size == 0) {
+    range_size = std::max<addr_t>(exe_byte_size, oso_byte_size);
+    if (range_size == 0)
+      range_size = 1;
+  }
+  cu_info->file_range_map.Append(
+      FileRangeMap::Entry(oso_file_addr, range_size, exe_file_addr));
+  return true;
 }
 
 void SymbolFileDWARFDebugMap::FinalizeOSOFileRanges(CompileUnitInfo *cu_info) {
@@ -1464,6 +1473,8 @@ SymbolFileDWARFDebugMap::LinkOSOFileAddress(SymbolFileDWARF *oso_symfile,
     if (oso_range_entry) {
       const DebugMap::Entry *debug_map_entry =
           m_debug_map.FindEntryThatContains(oso_range_entry->data);
+      if (!debug_map_entry)
+        debug_map_entry = m_debug_map.FindEntryStartsAt(oso_range_entry->data);
       if (debug_map_entry) {
         const lldb::addr_t offset =
             oso_file_addr - oso_range_entry->GetRangeBase();
@@ -1492,6 +1503,8 @@ bool SymbolFileDWARFDebugMap::LinkOSOAddress(Address &addr) {
     if (oso_range_entry) {
       const DebugMap::Entry *debug_map_entry =
           m_debug_map.FindEntryThatContains(oso_range_entry->data);
+      if (!debug_map_entry)
+        debug_map_entry = m_debug_map.FindEntryStartsAt(oso_range_entry->data);
       if (debug_map_entry) {
         const lldb::addr_t offset =
             oso_file_addr - oso_range_entry->GetRangeBase();
@@ -1561,6 +1574,8 @@ Status SymbolFileDWARFDebugMap::CalculateFrameVariableError(StackFrame &frame) {
     if (symtab) {
       const DebugMap::Entry *debug_map_entry =
           m_debug_map.FindEntryThatContains(pc_addr.GetFileAddress());
+      if (!debug_map_entry)
+        debug_map_entry = m_debug_map.FindEntryStartsAt(pc_addr.GetFileAddress());
       if (debug_map_entry) {
         Symbol *symbol =
             symtab->SymbolAtIndex(debug_map_entry->data.GetExeSymbolIndex());

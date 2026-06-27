@@ -2148,6 +2148,30 @@ uint32_t SymbolFileDWARF::ResolveSymbolContext(const Address &so_addr,
       (eSymbolContextCompUnit | eSymbolContextFunction | eSymbolContextBlock |
        eSymbolContextLineEntry | eSymbolContextVariable)) {
     lldb::addr_t file_vm_addr = so_addr.GetFileAddress();
+    auto resolve_global_variable = [&]() -> uint32_t {
+      lldb::addr_t global_file_addr = file_vm_addr;
+      if (SymbolFileDWARFDebugMap *debug_map_symfile = GetDebugMapSymfile()) {
+        global_file_addr =
+            debug_map_symfile->LinkOSOFileAddress(this, file_vm_addr);
+        if (global_file_addr == LLDB_INVALID_ADDRESS)
+          return 0;
+      }
+
+      GlobalVariableMap &map = GetGlobalAranges();
+      const GlobalVariableMap::Entry *entry =
+          map.FindEntryThatContains(global_file_addr);
+      if (!entry || !entry->data)
+        return 0;
+
+      Variable *variable = entry->data;
+      SymbolContextScope *scc = variable->GetSymbolContextScope();
+      if (!scc)
+        return 0;
+
+      scc->CalculateSymbolContext(&sc);
+      sc.variable = variable;
+      return sc.GetResolvedMask();
+    };
 
     DWARFDebugInfo &debug_info = DebugInfo();
     const DWARFDebugAranges &aranges = debug_info.GetCompileUnitAranges();
@@ -2159,18 +2183,9 @@ uint32_t SymbolFileDWARF::ResolveSymbolContext(const Address &so_addr,
       // that point to DW_TAG_variable DIEs and then find the address that
       // matches.
       if (resolve_scope & eSymbolContextVariable) {
-        GlobalVariableMap &map = GetGlobalAranges();
-        const GlobalVariableMap::Entry *entry =
-            map.FindEntryThatContains(file_vm_addr);
-        if (entry && entry->data) {
-          Variable *variable = entry->data;
-          SymbolContextScope *scc = variable->GetSymbolContextScope();
-          if (scc) {
-            scc->CalculateSymbolContext(&sc);
-            sc.variable = variable;
-          }
+        resolved |= resolve_global_variable();
+        if (resolved & eSymbolContextVariable)
           return sc.GetResolvedMask();
-        }
       }
     } else {
       uint32_t cu_idx = DW_INVALID_INDEX;
@@ -2236,6 +2251,10 @@ uint32_t SymbolFileDWARF::ResolveSymbolContext(const Address &so_addr,
         }
       }
     }
+
+    if ((resolve_scope & eSymbolContextVariable) && !sc.variable &&
+        !(resolved & eSymbolContextFunction))
+      resolved |= resolve_global_variable();
   }
   return resolved;
 }
