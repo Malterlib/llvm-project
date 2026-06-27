@@ -10,6 +10,7 @@
 #if defined(_WIN32)
 
 #include <cassert>
+#include <cerrno>
 #include <cstdlib>
 #include <process.h>
 
@@ -26,12 +27,17 @@ int ioctl(int d, int request, ...) {
     winsize *ws = va_arg(vl, winsize *);
     // get screen buffer information
     CONSOLE_SCREEN_BUFFER_INFO info;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info) ==
-        TRUE)
-      // fill in the columns
-      ws->ws_col = info.dwMaximumWindowSize.X;
+    bool success =
+        GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info) ==
+        TRUE;
+    if (success) {
+      ws->ws_col = info.srWindow.Right - info.srWindow.Left + 1;
+      ws->ws_row = info.srWindow.Bottom - info.srWindow.Top + 1;
+    } else {
+      errno = EINVAL;
+    }
     va_end(vl);
-    return 0;
+    return success ? 0 : -1;
   } break;
   default:
     llvm_unreachable("Not implemented!");
