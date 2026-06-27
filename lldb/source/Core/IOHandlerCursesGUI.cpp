@@ -4826,8 +4826,15 @@ struct Row {
 
   std::vector<Row> &GetChildren() {
     ProcessSP process_sp = value.GetProcessSP();
+    if (!process_sp) {
+      children_stop_id = 0;
+      calculated_children = true;
+      children.clear();
+      return children;
+    }
+
     auto stop_id = process_sp->GetStopID();
-    if (process_sp && stop_id != children_stop_id) {
+    if (stop_id != children_stop_id) {
       children_stop_id = stop_id;
       calculated_children = false;
     }
