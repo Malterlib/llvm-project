@@ -3605,6 +3605,58 @@ void FunctionStackPoisoner::processStaticAllocas() {
       ASan.UseAfterReturn != AsanDetectStackUseAfterReturnMode::Never &&
       !ASan.CompileKernel && LocalStackSize <= kMaxStackMallocSize;
   bool DoDynamicAlloca = ClDynamicAllocaStack;
+  bool HasWindowsCxxFuncletThrow = false;
+  if (ASan.TargetTriple.isOSWindows() && F.hasPersonalityFn() &&
+      classifyEHPersonality(F.getPersonalityFn()) == EHPersonality::MSVC_CXX) {
+    auto IsBareRethrow = [](const CallBase *CB) {
+      if (CB->arg_size() < 2)
+        return false;
+
+      auto *Callee =
+          dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+      if (!Callee || Callee->getName() != "_CxxThrowException")
+        return false;
+
+      return isa<ConstantPointerNull>(
+                 CB->getArgOperand(0)->stripPointerCasts()) &&
+             isa<ConstantPointerNull>(
+                 CB->getArgOperand(1)->stripPointerCasts());
+    };
+    auto IsInsideCatchFunclet = [](const CallBase *CB) {
+      auto Bundle = CB->getOperandBundle(LLVMContext::OB_funclet);
+      if (!Bundle)
+        return false;
+
+      // Walk out of nested cleanup pads; only a chain that reaches a catch
+      // pad puts control inside a catch handler at runtime.
+      const Value *Pad = Bundle->Inputs[0];
+      while (auto *CPI = dyn_cast<CleanupPadInst>(Pad))
+        Pad = CPI->getParentPad();
+      return isa<CatchPadInst>(Pad);
+    };
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+
+        // Any call that can raise an exception while control is inside one of
+        // this function's catch funclets makes the EH runtime recover this
+        // frame's state through the funclet's parent-frame link. A bare
+        // rethrow does the same even when it has been moved out of the
+        // funclet. Cleanup funclets outside catch handlers are not affected:
+        // the runtime's catch-handler search does not resolve the parent
+        // frame for control inside them.
+        if ((!CB->doesNotThrow() && IsInsideCatchFunclet(CB)) ||
+            IsBareRethrow(CB)) {
+          HasWindowsCxxFuncletThrow = true;
+          break;
+        }
+      }
+      if (HasWindowsCxxFuncletThrow)
+        break;
+    }
+  }
   // Don't do dynamic alloca or stack malloc if:
   // 1) There is inline asm: too often it makes assumptions on which registers
   //    are available.
@@ -3612,7 +3664,14 @@ void FunctionStackPoisoner::processStaticAllocas() {
   //    optimization-hostile, and doesn't play well with introduced indirect
   //    register-relative calculation of local variable addresses.
   DoDynamicAlloca &= !HasInlineAsm && !HasReturnsTwiceCall;
-  DoStackMalloc &= !HasInlineAsm && !HasReturnsTwiceCall;
+  // Don't use the fake stack when an exception can be dispatched with control
+  // inside one of this function's funclets (bare rethrow, or a call from a
+  // catch/cleanup handler that raises a new exception). The MSVC C++ EH
+  // runtime recovers per-frame EH state through the funclet's parent-frame
+  // link, and ASan's fake-stack UAR path breaks that recovery, crashing or
+  // aborting handler lookup.
+  DoStackMalloc &=
+      !HasInlineAsm && !HasReturnsTwiceCall && !HasWindowsCxxFuncletThrow;
 
   Type *PtrTy = F.getDataLayout().getAllocaPtrType(F.getContext());
   Value *StaticAlloca =
