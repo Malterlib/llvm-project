@@ -105,6 +105,29 @@ COMPILER_RT_VISIBILITY
 unsigned __llvm_profile_get_dir_mode(void) { return lprofDirMode; }
 
 #if COMPILER_RT_HAS_ATOMICS != 1
+/* These software fallbacks are used when the compiler-rt build's atomics
+ * detection (COMPILER_RT_TARGET_HAS_ATOMICS) comes out false. That detection
+ * is a link-time CMake check that can spuriously fail on targets that do in
+ * fact have atomics (observed on AArch64, where the check links outline-atomics
+ * helpers that are not yet available at configure time). The plain non-atomic
+ * implementations below are not safe for the concurrent use the value profiler
+ * makes of them: racing __llvm_profile_instrument_target calls then corrupt the
+ * per-site value-node list into a cycle, hanging multi-threaded instrumented
+ * binaries (e.g. ld.lld during PGO training). When the compiler reports that
+ * pointer-sized atomics are lock-free, use real atomic builtins so these
+ * primitives are correct regardless of the CMake detection. Genuine
+ * no-atomics targets keep the original plain implementation. */
+#if defined(__GCC_ATOMIC_POINTER_LOCK_FREE) && __GCC_ATOMIC_POINTER_LOCK_FREE == 2
+COMPILER_RT_VISIBILITY
+uint32_t lprofBoolCmpXchg(void **Ptr, void *OldV, void *NewV) {
+  return __atomic_compare_exchange_n(Ptr, &OldV, NewV, /*weak=*/0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+COMPILER_RT_VISIBILITY
+void *lprofPtrFetchAdd(void **Mem, long ByteIncr) {
+  return (void *)__atomic_fetch_add((char **)Mem, ByteIncr, __ATOMIC_SEQ_CST);
+}
+#else
 COMPILER_RT_VISIBILITY
 uint32_t lprofBoolCmpXchg(void **Ptr, void *OldV, void *NewV) {
   void *R = *Ptr;
@@ -120,6 +143,7 @@ void *lprofPtrFetchAdd(void **Mem, long ByteIncr) {
   *((char **)Mem) += ByteIncr;
   return Old;
 }
+#endif
 
 #endif
 
