@@ -938,12 +938,22 @@ X86RegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator II,
       return false;
     }
 
-    // ... for 32-bit targets, this is a bug!
+    // ... for 32-bit targets, i386 effective-address arithmetic wraps modulo
+    // 2^32, so a displacement outside the signed 32-bit range still computes
+    // the correct address after truncation. Such displacements arise when
+    // optimizations fold biased induction variables into the addressing mode,
+    // e.g. LSR compensating for UBSan pointer-overflow checks. Only a frame
+    // offset that itself does not fit indicates a genuinely oversized frame,
+    // which is a bug!
     if (!Is64Bit && !FitsIn32Bits) {
-      MI.emitGenericError("64-bit offset calculated but target is 32-bit");
-      // Trap so that the instruction verification pass does not fail if run.
-      BuildMI(MBB, MBBI, DL, TII->get(X86::TRAP));
-      return false;
+      if (!isInt<32>(FIOffset)) {
+        MI.emitGenericError("64-bit offset calculated but target is 32-bit");
+        // Trap so that the instruction verification pass does not fail if run.
+        BuildMI(MBB, MBBI, DL, TII->get(X86::TRAP));
+        return false;
+      }
+
+      Offset = SignExtend64<32>(Offset);
     }
 
     if (Offset != 0 || !tryOptimizeLEAtoMOV(II))
