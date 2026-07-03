@@ -439,6 +439,17 @@ static void collectFrameAlloca(AllocaInst *AI, const coro::Shape &Shape,
   if (AI->hasMetadata(LLVMContext::MD_coro_outside_frame))
     return;
 
+  // An inalloca alloca is the argument memory block of a call on targets like
+  // i386-windows-msvc: the ABI requires it to sit at the top of the stack when
+  // the call executes, so it must stay a stack alloca in the ramp function.
+  // Moving it into the coroutine frame makes the callee read unrelated stack
+  // memory. Its lifetime is bounded by the call it feeds, so it does not have
+  // to live across a suspend point; the conservative escape analysis below
+  // would otherwise put it on the frame because its address is stored into a
+  // local mirror at -O0.
+  if (AI->isUsedWithInAlloca())
+    return;
+
   // The code that uses lifetime.start intrinsic does not work for functions
   // with loops without exit. Disable it on ABIs we know to generate such
   // code.
