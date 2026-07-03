@@ -10365,8 +10365,11 @@ void SemaCodeCompletion::CodeCompleteIncludedFile(llvm::StringRef Dir,
 
     const StringRef &Dirname = llvm::sys::path::filename(Dir);
     const bool isQt = Dirname.starts_with("Qt") || Dirname == "ActiveQt";
-    const bool ExtensionlessHeaders =
-        IsSystem || isQt || Dir.ends_with(".framework/Headers");
+    const bool isMalterlibRootInclude =
+        llvm::sys::path::filename(IncludeDir) == "RootInclude";
+    const bool ExtensionlessHeaders = IsSystem || isQt ||
+                                      isMalterlibRootInclude ||
+                                      Dir.ends_with(".framework/Headers");
     std::error_code EC;
     unsigned Count = 0;
     for (auto It = FS.dir_begin(Dir, EC);
