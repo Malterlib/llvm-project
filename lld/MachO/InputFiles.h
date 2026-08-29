@@ -377,6 +377,7 @@ public:
 
 private:
   void parseLazy();
+  void parseLinkerOptions();
 };
 
 extern llvm::SetVector<InputFile *> inputFiles;
