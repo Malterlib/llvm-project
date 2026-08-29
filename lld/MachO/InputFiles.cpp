@@ -2425,7 +2425,40 @@ BitcodeFile::BitcodeFile(MemoryBufferRef mb, StringRef archiveName,
     parse();
 }
 
+// The options the object LTO produces would carry as LC_LINKER_OPTION, taken
+// from the bitcode so that the archives they name are searched before LTO.
+// Like those of a native object, they only apply once the file is part of the
+// link, and they outlive the bitcode, which LTO consumes.
+void BitcodeFile::parseLinkerOptions() {
+  if (config->ignoreAutoLink)
+    return;
+  SmallVector<StringRef, 4> args;
+  obj->getCOFFLinkerOpts().split(args, '\0', /*MaxSplit=*/-1,
+                                 /*KeepEmpty=*/false);
+  for (StringRef &arg : args)
+    arg = saver().save(arg);
+  for (size_t i = 0; i < args.size(); ++i) {
+    StringRef arg = args[i];
+    StringRef name = arg;
+    unsigned argc = 1;
+    if (!name.consume_front("-l")) {
+      if (arg != "-framework" || i + 1 == args.size()) {
+        error(arg + " is not allowed in LC_LINKER_OPTION");
+        return;
+      }
+      name = args[i + 1];
+      argc = 2;
+    }
+    if (!config->ignoreAutoLinkOptions.contains(name))
+      unprocessedLCLinkerOptions.append(args.begin() + i,
+                                        args.begin() + i + argc);
+    i += argc - 1;
+  }
+}
+
 void BitcodeFile::parse() {
+  parseLinkerOptions();
+
   // Convert LTO Symbols to LLD Symbols in order to perform resolution. The
   // "winning" symbol will then be marked as Prevailing at LTO compilation
   // time.

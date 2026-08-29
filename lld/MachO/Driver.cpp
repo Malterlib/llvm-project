@@ -1609,13 +1609,151 @@ static void foldIdenticalLiterals() {
   in.wordLiteralSection->finalizeContents();
 }
 
-static void addSynthenticMethnames() {
+// Resolves the aliases the file defines, once: a file extracted later, from
+// an archive or in place from --start-lib, brings new ones.
+static void createFileAliases(ObjFile *objFile) {
+  for (const AliasSymbol *alias : std::exchange(objFile->aliases, {})) {
+    if (const auto &aliased = symtab->find(alias->getAliasedName())) {
+      if (const auto &defined = dyn_cast<Defined>(aliased)) {
+        symtab->aliasDefined(defined, alias->getName(), alias->getFile(),
+                             alias->privateExtern);
+      } else {
+        // Common, dylib, and undefined symbols are all valid alias
+        // referents (undefineds can become valid Defined symbols later on
+        // in the link.)
+        error("TODO: support aliasing to symbols of kind " +
+              Twine(aliased->kind()));
+      }
+    } else {
+      // This shouldn't happen since MC generates undefined symbols to
+      // represent the alias referents. Thus we fatal() instead of just
+      // warning here.
+      fatal("unable to find alias referent " + alias->getAliasedName() +
+            " for " + alias->getName());
+    }
+  }
+}
+
+static void createFileAliases() {
+  for (InputFile *file : inputFiles)
+    if (auto *objFile = dyn_cast<ObjFile>(file))
+      createFileAliases(objFile);
+}
+
+static SmallVector<std::pair<Symbol *, ObjCStubsSection::ObjCClassStubNames>, 0>
+collectObjCClassStubs() {
+  SmallVector<std::pair<Symbol *, ObjCStubsSection::ObjCClassStubNames>, 0>
+      classStubs;
+  if (!target->supportsObjCClassStubs())
+    return classStubs;
+  for (Symbol *sym : symtab->getSymbols()) {
+    if (!isa<Undefined>(sym) || !ObjCStubsSection::isObjCClassStubSymbol(sym))
+      continue;
+    std::optional<ObjCStubsSection::ObjCClassStubNames> parsed =
+        ObjCStubsSection::parseObjCClassStubSymbol(sym);
+    if (parsed)
+      classStubs.emplace_back(sym, *parsed);
+  }
+  return classStubs;
+}
+
+// A class stub needs the class object, which only its own symbol references.
+// Extract the archive members that define those classes before LTO, so that a
+// class in a bitcode member is compiled with the rest, and repeat until no
+// extracted member introduces a stub for another class. A class that bitcode
+// already defines has to survive LTO for the stub the linker adds afterwards.
+// Only targets with class stubs pay for the early search of the archives that
+// linker options name.
+static void extractObjCClassStubClasses() {
+  if (!target->supportsObjCClassStubs())
+    return;
+  DenseSet<Symbol *> seen;
+  bool extracted;
+  do {
+    // The archives that linker options name are otherwise only searched
+    // after LTO, too late for the stubs in their members.
+    resolveLCLinkerOptions();
+    extracted = false;
+    for (const auto &[sym, names] : collectObjCClassStubs()) {
+      if (seen.contains(sym))
+        continue;
+      // A class that is still missing, or only referenced, may turn up in
+      // an archive a later round names, so its stub stays unresolved until
+      // then.
+      Symbol *classSym = symtab->find(names.classSymbolName);
+      if (!classSym || isa<Undefined>(classSym))
+        continue;
+      seen.insert(sym);
+      if (isa<LazyArchive>(classSym) || isa<LazyObject>(classSym)) {
+        symtab->addUndefined(names.classSymbolName, /*file=*/nullptr,
+                             /*isWeakRef=*/false);
+        extracted = true;
+      }
+    }
+    // An extracted member may define the class as an alias.
+    createFileAliases();
+  } while (extracted);
+
+  // A member extracted for one class may also define another, which an
+  // earlier round found in a dylib.
+  for (const auto &[sym, names] : collectObjCClassStubs())
+    if (Symbol *classSym = symtab->find(names.classSymbolName);
+        isa_and_nonnull<Defined>(classSym) &&
+        isa_and_nonnull<BitcodeFile>(classSym->getFile()))
+      classSym->isUsedInRegularObj = true;
+}
+
+static void prepareObjCStubs() {
   std::string &data = *make<std::string>();
   llvm::raw_string_ostream os(data);
-  for (Symbol *sym : symtab->getSymbols())
-    if (isa<Undefined>(sym))
-      if (ObjCStubsSection::isObjCStubSymbol(sym))
-        os << ObjCStubsSection::getMethname(sym) << '\0';
+
+  // Archives that linker options name are only searched after LTO, so a
+  // member extracted here may introduce stubs of its own; repeat until none
+  // does.
+  DenseSet<Symbol *> recorded;
+  bool extracted;
+  do {
+    extracted = false;
+    for (const auto &[sym, names] : collectObjCClassStubs()) {
+      if (!recorded.insert(sym).second)
+        continue;
+      Symbol *classSym = symtab->find(names.classSymbolName);
+      bool isLazy = isa_and_nonnull<LazyArchive>(classSym) ||
+                    isa_and_nonnull<LazyObject>(classSym);
+      // Missing symbols need a placeholder for diagnostics, and lazy symbols
+      // need extraction before markLive(). Do not call addUndefined() for
+      // DylibSymbol here: live stubs reference them later in
+      // ObjCStubsSection::addEntry(), and adding them here would mark real
+      // dylib symbols referenced before dead stripping.
+      if (!classSym || isLazy)
+        classSym = symtab->addUndefined(names.classSymbolName,
+                                        /*file=*/nullptr,
+                                        /*isWeakRef=*/false);
+      extracted |= isLazy;
+      in.objcStubs->recordClassSymbol(sym, classSym);
+    }
+    // The extracted members may name archives of their own, and define the
+    // class as an alias.
+    if (extracted) {
+      resolveLCLinkerOptions();
+      createFileAliases();
+    }
+  } while (extracted);
+
+  for (Symbol *sym : symtab->getSymbols()) {
+    if (!isa<Undefined>(sym))
+      continue;
+    if (ObjCStubsSection::isObjCMsgSendStubSymbol(sym)) {
+      os << ObjCStubsSection::getMethname(sym) << '\0';
+      continue;
+    }
+    if (ObjCStubsSection::isObjCClassStubSymbol(sym)) {
+      std::optional<ObjCStubsSection::ObjCClassStubNames> parsed =
+          ObjCStubsSection::parseObjCClassStubSymbol(sym);
+      if (parsed)
+        os << parsed->selectorName << '\0';
+    }
+  }
 
   if (data.empty())
     return;
@@ -1744,6 +1882,13 @@ static void checkMalterlibSizedMarkers() {
   DenseMap<StringRef, SmallVector<DylibFile *, 1>> dylibMarkers, dylibRequired;
   DenseMap<std::pair<DylibFile *, uint64_t>, SmallVector<StringRef, 2>>
       dylibEdges;
+  // An Objective-C class stub references its class only in the writer, which
+  // emits only the stubs dead stripping kept.
+  DenseSet<const DylibFile *> classStubDylibs;
+  for (auto &[stubSym, classSym] : in.objcStubs->getClassSymbols())
+    if (auto *d = dyn_cast_or_null<DylibSymbol>(classSym);
+        d && !d->isDynamicLookup() && stubSym->isLive())
+      classStubDylibs.insert(d->getFile());
   // A dylib the image does not load, as the writer decides, says nothing. One
   // a loaded dylib re-exports binds through that one, and is loaded with it.
   std::function<bool(const DylibFile *)> isLoaded =
@@ -1752,6 +1897,7 @@ static void checkMalterlibSizedMarkers() {
             isLoaded(dylib->umbrella))
           return true;
         return dylib->isReferenced() || dylib->forceNeeded ||
+               classStubDylibs.contains(dylib) ||
                (dylib->isExplicitlyLinked() && !dylib->deadStrippable &&
                 !config->deadStripDylibs);
       };
@@ -2099,30 +2245,7 @@ static void createAliases() {
     }
   }
 
-  for (const InputFile *file : inputFiles) {
-    if (auto *objFile = dyn_cast<ObjFile>(file)) {
-      for (const AliasSymbol *alias : objFile->aliases) {
-        if (const auto &aliased = symtab->find(alias->getAliasedName())) {
-          if (const auto &defined = dyn_cast<Defined>(aliased)) {
-            symtab->aliasDefined(defined, alias->getName(), alias->getFile(),
-                                 alias->privateExtern);
-          } else {
-            // Common, dylib, and undefined symbols are all valid alias
-            // referents (undefineds can become valid Defined symbols later on
-            // in the link.)
-            error("TODO: support aliasing to symbols of kind " +
-                  Twine(aliased->kind()));
-          }
-        } else {
-          // This shouldn't happen since MC generates undefined symbols to
-          // represent the alias referents. Thus we fatal() instead of just
-          // warning here.
-          fatal("unable to find alias referent " + alias->getAliasedName() +
-                " for " + alias->getName());
-        }
-      }
-    }
-  }
+  createFileAliases();
 }
 
 static void handleExplicitExports() {
@@ -2887,6 +3010,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     createSyntheticSymbols();
 
     createAliases();
+    extractObjCClassStubClasses();
     // If we are in "explicit exports" mode, hide everything that isn't
     // explicitly exported. Do this before running LTO so that LTO can better
     // optimize.
@@ -2902,7 +3026,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     if (config->thinLTOIndexOnly || config->emitLLVM)
       return errorCount() == 0;
 
-    addSynthenticMethnames();
+    prepareObjCStubs();
 
     // LTO may emit a non-hidden (extern) object file symbol even if the
     // corresponding bitcode symbol is hidden. In particular, this happens for

@@ -142,14 +142,19 @@ Error Builder::addModule(Module *M) {
   Mod.UncBegin = Uncommons.size();
   Mods.push_back(Mod);
 
-  if (TT.isOSBinFormatCOFF()) {
+  // A Mach-O linker needs the options before LTO as well, to find the
+  // archives they name while their members can still take part in it. Its
+  // options are separate arguments that may contain spaces, so they are
+  // separated by NUL characters.
+  if (TT.isOSBinFormatCOFF() || TT.isOSBinFormatMachO()) {
     if (auto E = M->materializeMetadata())
       return E;
     if (NamedMDNode *LinkerOptions =
             M->getNamedMetadata("llvm.linker.options")) {
       for (MDNode *MDOptions : LinkerOptions->operands())
         for (const MDOperand &MDOption : cast<MDNode>(MDOptions)->operands())
-          COFFLinkerOptsOS << " " << cast<MDString>(MDOption)->getString();
+          COFFLinkerOptsOS << (TT.isOSBinFormatMachO() ? '\0' : ' ')
+                           << cast<MDString>(MDOption)->getString();
     }
   }
 
