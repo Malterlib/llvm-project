@@ -155,6 +155,9 @@ void haiku::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   ToolChain.addProfileRTLibs(Args, CmdArgs);
 
   const char *Exec = Args.MakeArgString(getToolChain().GetLinkerPath());
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this,
                                          ResponseFileSupport::AtFileCurCP(),
                                          Exec, CmdArgs, Inputs, Output));

@@ -203,6 +203,9 @@ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("--keep-section=target_features");
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this,
                                          ResponseFileSupport::AtFileCurCP(),
                                          Linker, CmdArgs, Inputs, Output));

@@ -825,6 +825,9 @@ void darwin::Linker::ConstructJob(Compilation &C, const JobAction &JA,
                        "-filelist"};
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   std::unique_ptr<Command> Cmd = std::make_unique<Command>(
       JA, *this, ResponseSupport, Exec, CmdArgs, Inputs, Output);
   Cmd->setInputFileList(std::move(InputFileList));

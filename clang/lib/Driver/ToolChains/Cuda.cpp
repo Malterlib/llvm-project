@@ -656,6 +656,9 @@ void NVPTX::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back(Args.MakeArgString(P));
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(
       JA, *this,
       ResponseFileSupport{ResponseFileSupport::RF_Full, llvm::sys::WEM_UTF8,

@@ -163,6 +163,9 @@ void SPIRV::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     C.getDriver().Diag(clang::diag::err_drv_no_spv_tools) << getShortName();
     return;
   }
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
                                          Args.MakeArgString(Linker), CmdArgs,
                                          Inputs, Output));

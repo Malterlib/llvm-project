@@ -356,6 +356,9 @@ void aix::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     CmdArgs.push_back("-lpthread");
   }
   const char *Exec = Args.MakeArgString(ToolChain.GetLinkerPath());
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
                                          Exec, CmdArgs, Inputs, Output));
 }

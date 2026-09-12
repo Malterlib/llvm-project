@@ -424,6 +424,9 @@ void visualstudio::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     linkPath = TC.GetProgramPath(Linker.str().c_str());
   }
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   auto LinkCmd = std::make_unique<Command>(
       JA, *this, ResponseFileSupport::AtFileUTF16(),
       Args.MakeArgString(linkPath), CmdArgs, Inputs, Output);

@@ -218,6 +218,9 @@ void tools::PS4cpu::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   std::string LdName = TC.qualifyPSCmdName(TC.getLinkerBaseName());
   const char *Exec = Args.MakeArgString(TC.GetProgramPath(LdName.c_str()));
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this,
                                          ResponseFileSupport::AtFileUTF8(),
                                          Exec, CmdArgs, Inputs, Output));
@@ -452,6 +455,9 @@ void tools::PS5cpu::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   std::string LdName = TC.qualifyPSCmdName(TC.getLinkerBaseName());
   const char *Exec = Args.MakeArgString(TC.GetProgramPath(LdName.c_str()));
+
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
 
   C.addCommand(std::make_unique<Command>(JA, *this,
                                          ResponseFileSupport::AtFileUTF8(),

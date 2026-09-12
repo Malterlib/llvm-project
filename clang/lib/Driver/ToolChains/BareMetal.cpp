@@ -724,6 +724,9 @@ void baremetal::Linker::ConstructJob(Compilation &C, const JobAction &JA,
   CmdArgs.push_back("-o");
   CmdArgs.push_back(Output.getFilename());
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(
       JA, *this, ResponseFileSupport::AtFileCurCP(),
       Args.MakeArgString(TC.GetLinkerPath()), CmdArgs, Inputs, Output));

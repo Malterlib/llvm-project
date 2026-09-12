@@ -313,6 +313,9 @@ void msp430::Linker::ConstructJob(Compilation &C, const JobAction &JA,
 
   Args.AddAllArgs(CmdArgs, options::OPT_T);
 
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(
       JA, *this, ResponseFileSupport::AtFileCurCP(), Args.MakeArgString(Linker),
       CmdArgs, Inputs, Output));

@@ -109,6 +109,9 @@ void tools::uefi::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     Linker = "lld-link";
 
   auto LinkerPath = TC.GetProgramPath(Linker.str().c_str());
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   auto LinkCmd = std::make_unique<Command>(
       JA, *this, ResponseFileSupport::AtFileUTF16(),
       Args.MakeArgString(LinkerPath), CmdArgs, Inputs, Output);

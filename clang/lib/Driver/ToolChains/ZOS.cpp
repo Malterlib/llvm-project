@@ -215,6 +215,9 @@ void zos::Linker::ConstructJob(Compilation &C, const JobAction &JA,
     AddRunTimeLibs(ToolChain, ToolChain.getDriver(), CmdArgs, Args);
 
   const char *Exec = Args.MakeArgString(ToolChain.GetLinkerPath());
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this, ResponseFileSupport::None(),
                                          Exec, CmdArgs, Inputs, Output));
 }

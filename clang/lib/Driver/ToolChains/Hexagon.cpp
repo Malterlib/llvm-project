@@ -493,6 +493,9 @@ constructHexagonLinkArgs(Compilation &C, const JobAction &JA,
           : Find(RootDir, StartSubDir, "/fini.o");
     CmdArgs.push_back(Args.MakeArgString(Fini));
   }
+  if (const Arg *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
 }
 
 void hexagon::Linker::ConstructJob(Compilation &C, const JobAction &JA,
