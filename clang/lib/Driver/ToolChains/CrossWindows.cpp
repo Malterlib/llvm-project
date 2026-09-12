@@ -207,6 +207,9 @@ void tools::CrossWindows::Linker::ConstructJob(
 
   Exec = Args.MakeArgString(TC.GetLinkerPath());
 
+  if (const auto *A = Args.getLastArg(options::OPT_last_object))
+    CmdArgs.push_back(A->getValue());
+
   C.addCommand(std::make_unique<Command>(JA, *this,
                                          ResponseFileSupport::AtFileUTF8(),
                                          Exec, CmdArgs, Inputs, Output));
