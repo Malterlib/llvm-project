@@ -1818,9 +1818,14 @@ bool UnwindCursor<A, R>::getInfoFromDwarfSection(
   }
 #if defined(_LIBUNWIND_SUPPORT_DWARF_INDEX)
   if (!foundFDE && (sects.dwarf_index_section != 0)) {
+    bool hasIndex;
     foundFDE = EHHeaderParser<A>::template findFDE<R>(
         _addressSpace, pc, sects.dwarf_index_section,
-        (uint32_t)sects.dwarf_index_section_length, &fdeInfo, &cieInfo);
+        (uint32_t)sects.dwarf_index_section_length, &fdeInfo, &cieInfo, hasIndex);
+    // The index covers the static FDEs. A miss must not fall through to an
+    // unbounded .eh_frame scan: ELF sections need not have a zero terminator.
+    if (!foundFDE && hasIndex)
+      return false;
   }
 #endif
   if (!foundFDE) {
