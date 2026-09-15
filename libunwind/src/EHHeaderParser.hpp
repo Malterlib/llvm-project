@@ -33,6 +33,7 @@ public:
     size_t fde_count;
     pint_t table;
     uint8_t table_enc;
+    uint8_t fde_count_enc;
   };
 
   static bool decodeEHHdr(A &addressSpace, pint_t ehHdrStart, pint_t ehHdrEnd,
@@ -41,7 +42,8 @@ public:
   static bool findFDE(A &addressSpace, typename R::link_hardened_reg_arg_t pc,
                       pint_t ehHdrStart, uint32_t sectionLength,
                       typename CFI_Parser<A>::FDE_Info *fdeInfo,
-                      typename CFI_Parser<A>::CIE_Info *cieInfo);
+                      typename CFI_Parser<A>::CIE_Info *cieInfo,
+                      bool &hasIndex);
 
 private:
   static bool decodeTableEntry(A &addressSpace, pint_t &tableEntry,
@@ -77,15 +79,15 @@ bool EHHeaderParser<A>::decodeEHHdr(A &addressSpace, pint_t ehHdrStart,
   }
 
   uint8_t eh_frame_ptr_enc = addressSpace.get8(p++);
-  uint8_t fde_count_enc = addressSpace.get8(p++);
+  ehHdrInfo.fde_count_enc = addressSpace.get8(p++);
   ehHdrInfo.table_enc = addressSpace.get8(p++);
 
   ehHdrInfo.eh_frame_ptr =
       addressSpace.getEncodedP(p, ehHdrEnd, eh_frame_ptr_enc, ehHdrStart);
   ehHdrInfo.fde_count =
-      fde_count_enc == DW_EH_PE_omit
+      ehHdrInfo.fde_count_enc == DW_EH_PE_omit
           ? 0
-          : addressSpace.getEncodedP(p, ehHdrEnd, fde_count_enc, ehHdrStart);
+          : addressSpace.getEncodedP(p, ehHdrEnd, ehHdrInfo.fde_count_enc, ehHdrStart);
   ehHdrInfo.table = p;
 
   return true;
@@ -118,7 +120,9 @@ bool EHHeaderParser<A>::findFDE(A &addressSpace,
                                 typename R::link_hardened_reg_arg_t pc,
                                 pint_t ehHdrStart, uint32_t sectionLength,
                                 typename CFI_Parser<A>::FDE_Info *fdeInfo,
-                                typename CFI_Parser<A>::CIE_Info *cieInfo) {
+                                typename CFI_Parser<A>::CIE_Info *cieInfo,
+                                bool &hasIndex) {
+  hasIndex = false;
   pint_t ehHdrEnd = ehHdrStart + sectionLength;
 
   EHHeaderParser<A>::EHHeaderInfo hdrInfo;
@@ -126,7 +130,10 @@ bool EHHeaderParser<A>::findFDE(A &addressSpace,
                                       hdrInfo))
     return false;
 
-  if (hdrInfo.fde_count == 0) return false;
+  hasIndex = hdrInfo.fde_count_enc != DW_EH_PE_omit &&
+             hdrInfo.table_enc != DW_EH_PE_omit;
+  if (!hasIndex || hdrInfo.fde_count == 0)
+    return false;
 
   size_t tableEntrySize = getTableEntrySize(hdrInfo.table_enc);
   pint_t tableEntry;
