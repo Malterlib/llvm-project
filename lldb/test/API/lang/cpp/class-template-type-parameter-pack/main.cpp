@@ -4,6 +4,7 @@ struct TypePack { int a; };
 TypePack<> emptyTypePack;
 TypePack<int> oneElemTypePack;
 TypePack<int, float> twoElemTypePack;
+TypePack<void, int> voidElemTypePack;
 
 // Unnamed type parameter pack.
 template <typename... >
