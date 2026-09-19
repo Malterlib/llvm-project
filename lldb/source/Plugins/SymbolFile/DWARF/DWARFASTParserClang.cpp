@@ -2072,7 +2072,9 @@ bool DWARFASTParserClang::ParseTemplateDIE(
   case DW_TAG_template_type_parameter:
   case DW_TAG_template_value_parameter: {
     DWARFAttributes attributes = die.GetAttributes();
-    if (attributes.Size() == 0)
+    // An unnamed type parameter without a type, such as a parameter pack
+    // element, is a void argument and must not be dropped.
+    if (attributes.Size() == 0 && tag != DW_TAG_template_type_parameter)
       return true;
 
     const char *name = nullptr;

@@ -25,6 +25,11 @@ class TestCaseClassTemplateTypeParameterPack(TestBase):
             result_type="TypePack<int, float>",
             result_children=[ValueCheck(name="a", type="int")],
         )
+        self.expect_expr(
+            "voidElemTypePack",
+            result_type="TypePack<void, int>",
+            result_children=[ValueCheck(name="a", type="int")],
+        )
 
         self.expect_expr(
             "emptyAnonTypePack",
