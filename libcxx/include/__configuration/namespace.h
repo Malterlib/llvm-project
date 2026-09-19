@@ -37,16 +37,17 @@
     _LIBCPP_GCC_DIAGNOSTIC_IGNORED("-Wc++20-extensions")                                                               \
     _LIBCPP_GCC_DIAGNOSTIC_IGNORED("-Wc++23-extensions")
 #  define _LIBCPP_POP_EXTENSION_DIAGNOSTICS _LIBCPP_DIAGNOSTIC_POP
-#  define _LIBCPP_PUSH_ABI_PRAGMA_DIAGNOSTICS                                                                          \
-    _LIBCPP_DIAGNOSTIC_PUSH _LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wpragma-clang-attribute")                               \
-        _LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wignored-attributes")
-#  define _LIBCPP_POP_ABI_PRAGMA_DIAGNOSTICS _LIBCPP_DIAGNOSTIC_POP
 #else
 #  define _LIBCPP_PUSH_EXTENSION_DIAGNOSTICS
 #  define _LIBCPP_POP_EXTENSION_DIAGNOSTICS
-#  define _LIBCPP_PUSH_ABI_PRAGMA_DIAGNOSTICS
-#  define _LIBCPP_POP_ABI_PRAGMA_DIAGNOSTICS
 #endif
+
+// The namespace macros are also expanded outside system headers, for example in the library sources and in code that
+// forward declares standard types, so the ABI annotation diagnostics are always suppressed.
+#define _LIBCPP_PUSH_ABI_PRAGMA_DIAGNOSTICS                                                                            \
+  _LIBCPP_DIAGNOSTIC_PUSH _LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wpragma-clang-attribute")                                 \
+      _LIBCPP_CLANG_DIAGNOSTIC_IGNORED("-Wignored-attributes")
+#define _LIBCPP_POP_ABI_PRAGMA_DIAGNOSTICS _LIBCPP_DIAGNOSTIC_POP
 
 #define _LIBCPP_END_EXPLICIT_ABI_ANNOTATIONS                                                                           \
   _LIBCPP_PUSH_ABI_PRAGMA_DIAGNOSTICS                                                                                  \
