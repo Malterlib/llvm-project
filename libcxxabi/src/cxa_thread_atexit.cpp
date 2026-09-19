@@ -29,7 +29,8 @@ namespace __cxxabiv1 {
 #endif
   int __cxa_thread_atexit_impl(Dtor, void*, void*);
 
-#ifndef HAVE___CXA_THREAD_ATEXIT_IMPL
+// The fallback is only used by __cxa_thread_atexit below.
+#if !defined(HAVE___CXA_THREAD_ATEXIT_IMPL) && (defined(__linux__) || defined(__Fuchsia__))
 
 namespace {
   // This implementation is used if the C library does not provide
@@ -104,7 +105,7 @@ namespace {
   };
 } // namespace
 
-#endif // HAVE___CXA_THREAD_ATEXIT_IMPL
+#endif // !defined(HAVE___CXA_THREAD_ATEXIT_IMPL) && (defined(__linux__) || defined(__Fuchsia__))
 
 #if defined(__linux__) || defined(__Fuchsia__)
 extern "C" {
