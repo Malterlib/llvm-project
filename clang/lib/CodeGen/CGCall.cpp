@@ -28,6 +28,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/TargetInfo.h"
@@ -4969,6 +4970,52 @@ static bool hasInAllocaArgs(CodeGenModule &CGM, CallingConv ExplicitCC,
   });
 }
 
+namespace {
+/// Finds the first coroutine suspend point that evaluating an expression runs.
+struct CoroutineSuspendFinder
+    : ConstEvaluatedExprVisitor<CoroutineSuspendFinder> {
+  const Expr *Suspend = nullptr;
+
+  explicit CoroutineSuspendFinder(const ASTContext &Context)
+      : ConstEvaluatedExprVisitor(Context) {}
+
+  void VisitCoroutineSuspendExpr(const CoroutineSuspendExpr *E) {
+    Suspend = E;
+  }
+
+  void VisitStmt(const Stmt *S) {
+    if (!Suspend)
+      ConstEvaluatedExprVisitor::VisitStmt(S);
+  }
+
+  // The array indices of an offsetof are evaluated.
+  void VisitOffsetOfExpr(const OffsetOfExpr *E) {
+    for (unsigned I = 0, N = E->getNumExpressions(); I != N; ++I)
+      Visit(E->getIndexExpr(I));
+  }
+
+  // A discarded branch of 'if constexpr' generates no code, so it cannot
+  // suspend; its initializer and condition are evaluated like any other.
+  void VisitIfStmt(const IfStmt *If) {
+    std::optional<const Stmt *> Taken = If->getNondiscardedCase(Context);
+    // A coroutine body runs at run time, where 'if consteval' takes its else
+    // branch.
+    if (If->isConsteval())
+      Taken = If->isNegatedConsteval() ? If->getThen() : If->getElse();
+    if (Taken) {
+      if (const Stmt *Init = If->getInit())
+        Visit(Init);
+      if (const DeclStmt *CondVar = If->getConditionVariableDeclStmt())
+        Visit(CondVar);
+      if (*Taken)
+        Visit(*Taken);
+      return;
+    }
+    ConstEvaluatedExprVisitor::VisitIfStmt(If);
+  }
+};
+} // namespace
+
 #ifndef NDEBUG
 // Determine whether the given argument is an Objective-C method
 // that may have type parameters in its signature.
@@ -4987,6 +5034,28 @@ static bool isObjCMethodWithTypeParams(const ObjCMethodDecl *method) {
 #endif
 
 /// EmitCallArgs - Emit call arguments for a function.
+/// The argument block of a call with inalloca arguments is dynamic stack
+/// memory of the function that starts evaluating the arguments. A coroutine
+/// that suspends among them resumes in another function, where the block and
+/// every argument already constructed in it are gone, so the callee would read
+/// uninitialized memory. \p Args are the expressions evaluated while the block
+/// is allocated.
+void CodeGenFunction::checkCoroutineSuspendInInAllocaArgs(
+    llvm::iterator_range<CallExpr::const_arg_iterator> Args) {
+  for (const Expr *Arg : Args) {
+    CoroutineSuspendFinder Finder(getContext());
+    Finder.Visit(Arg);
+    if (!Finder.Suspend)
+      continue;
+    CGM.Error(Finder.Suspend->getExprLoc(),
+              "a coroutine cannot suspend while evaluating the arguments "
+              "of a call that passes an argument in memory on the 32-bit "
+              "x86 Microsoft ABI; store the result of the suspending "
+              "expression in a variable before the call");
+    break;
+  }
+}
+
 void CodeGenFunction::EmitCallArgs(
     CallArgList &Args, PrototypeWrapper Prototype,
     llvm::iterator_range<CallExpr::const_arg_iterator> ArgRange,
@@ -5088,6 +5157,10 @@ void CodeGenFunction::EmitCallArgs(
   if (hasInAllocaArgs(CGM, ExplicitCC, ArgTypes)) {
     assert(getTarget().getTriple().getArch() == llvm::Triple::x86 &&
            "inalloca only supported on x86");
+
+    if (isCoroutine())
+      checkCoroutineSuspendInInAllocaArgs(ArgRange);
+
     Args.allocateArgumentMemory(*this);
   }
 
