@@ -16,7 +16,9 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "lld/Common/Timer.h"
+#include "llvm/BinaryFormat/Magic.h"
 #include "llvm/DebugInfo/DIContext.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/LTO/LTO.h"
@@ -46,6 +48,52 @@ static COFFSyncStream errorOrWarn(COFFLinkerContext &ctx) {
 }
 
 // Causes the file associated with a lazy symbol to be linked in.
+// A marker of -fmalterlib-sized-destructors belongs to the copy of a
+// definition the link chose for the definition's own sake, so a reference to
+// it loads nothing but the import of the marker another image exports.
+static bool loadsForMarker(StringRef name, const Archive::Symbol &sym) {
+  if (!name.ends_with(MalterlibSizedMarkerSuffix))
+    return true;
+  Expected<Archive::Child> child = sym.getMember();
+  if (!child) {
+    consumeError(child.takeError());
+    return true;
+  }
+  Expected<MemoryBufferRef> mb = child->getMemoryBufferRef();
+  if (!mb) {
+    consumeError(mb.takeError());
+    return true;
+  }
+  file_magic magic = identify_magic(mb->getBuffer());
+  if (magic == file_magic::coff_import_library)
+    return true;
+  // A GNU import library holds an ordinary object for each import, with its
+  // thunk and import address table entry in .idata sections.
+  if (magic != file_magic::coff_object)
+    return false;
+  Expected<std::unique_ptr<COFFObjectFile>> obj =
+      COFFObjectFile::create(*mb);
+  if (!obj) {
+    consumeError(obj.takeError());
+    return false;
+  }
+  return llvm::any_of((*obj)->sections(), [](const SectionRef &sec) {
+    Expected<StringRef> name = sec.getName();
+    if (!name) {
+      consumeError(name.takeError());
+      return false;
+    }
+    return name->starts_with(".idata$");
+  });
+}
+
+static bool loadsForMarker(Symbol *s) {
+  if (auto *l = dyn_cast<LazyArchive>(s))
+    return loadsForMarker(s->getName(), l->sym);
+  return !isa<LazyObject>(s) ||
+         !s->getName().ends_with(MalterlibSizedMarkerSuffix);
+}
+
 static void forceLazy(Symbol *s) {
   s->pendingArchiveLoad = true;
   switch (s->kind()) {
@@ -446,6 +494,10 @@ void SymbolTable::reportUnresolvable() {
       continue;
     if (ctx.config.autoImport && impSymbol(name))
       continue;
+    // Only the references of -fmalterlib-sized-destructors name its markers,
+    // and the driver reports the ones it needs.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
     undefs.insert(sym);
   }
 
@@ -472,6 +524,11 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
       aliases.push_back(undef);
       continue;
     }
+
+    // Only the references of -fmalterlib-sized-destructors name its markers,
+    // and the driver reports the ones it needs.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
 
     // If we can resolve a symbol by removing __imp_ prefix, do that.
     // This odd rule is for compatibility with MSVC linker.
@@ -691,7 +748,7 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
     replaceSymbol<Undefined>(s, name);
     return s;
   }
-  if (s->isLazy())
+  if (s->isLazy() && loadsForMarker(s))
     forceLazy(s);
   return s;
 }
@@ -774,7 +831,8 @@ void SymbolTable::addLazyArchive(ArchiveFile *f, const Archive::Symbol &sym) {
     return;
   }
   auto *u = dyn_cast<Undefined>(s);
-  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad)
+  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad ||
+      !loadsForMarker(name, sym))
     return;
   s->pendingArchiveLoad = true;
   f->addMember(sym);
@@ -790,7 +848,8 @@ void SymbolTable::addLazyObject(InputFile *f, StringRef n) {
     return;
   }
   auto *u = dyn_cast<Undefined>(s);
-  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad)
+  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad ||
+      n.ends_with(MalterlibSizedMarkerSuffix))
     return;
   s->pendingArchiveLoad = true;
   f->lazy = false;

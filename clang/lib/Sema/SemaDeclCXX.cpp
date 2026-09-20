@@ -7175,6 +7175,128 @@ void Sema::CheckCompletedCXXClass(Scope *S, CXXRecordDecl *Record) {
           << Context.getCanonicalTagType(Record);
   }
 
+  // A sized deleting destructor returns its object and size in the two
+  // registers a plain return of the pair uses, which a calling convention or
+  // attribute that has the callee preserve the second of them takes away from
+  // callers compiled without the flag. On x86 that register is one the
+  // preserving conventions keep; on AArch64 they keep none of X0-X8.
+  if (LangOpts.MalterlibSizedDestructors && !Record->isDependentType() &&
+      !Record->isInvalidDecl() && Record->isPolymorphic()) {
+    if (CXXDestructorDecl *Dtor = LookupDestructor(Record);
+        Dtor && Dtor->isVirtual()) {
+      CallingConv CC = Dtor->getType()->castAs<FunctionType>()->getCallConv();
+      if ((CC == CC_PreserveMost || CC == CC_PreserveAll) &&
+          Context.getTargetInfo().getTriple().isX86())
+        Diag(Dtor->getLocation(),
+             diag::err_malterlib_sized_destructor_calling_conv)
+            << Context.getCanonicalTagType(Record)
+            << FunctionType::getNameForCallConv(CC) << 0;
+      else if (const auto *A =
+                   Dtor->getAttr<AnyX86NoCallerSavedRegistersAttr>())
+        Diag(A->getLocation(),
+             diag::err_malterlib_sized_destructor_calling_conv)
+            << Context.getCanonicalTagType(Record) << A << 1;
+    }
+  }
+
+  // On the Itanium ABI a sized deleting destructor is selected with bit 0 of
+  // 'this', which a packed class does not leave free: neither in the complete
+  // object nor in any subobject the destructor can be called through, however
+  // deeply a base or member nests it. The Microsoft ABI selects it with the
+  // destructor's flags argument instead.
+  if (LangOpts.MalterlibSizedDestructors &&
+      !Context.getTargetInfo().getCXXABI().isMicrosoft() &&
+      !Record->isDependentType() && !Record->isInvalidDecl()) {
+    llvm::DenseMap<const CXXRecordDecl *, bool> Memo;
+    auto NeedsEvenAddress = [&](const CXXRecordDecl *RD,
+                                auto &Self) -> bool {
+      RD = RD->getDefinition();
+      if (!RD || RD->isDependentType())
+        return false;
+      auto [It, Inserted] = Memo.try_emplace(RD, false);
+      if (!Inserted)
+        return It->second;
+      bool Needs = false;
+      if (const CXXDestructorDecl *Dtor = RD->getDestructor();
+          Dtor && Dtor->isVirtual())
+        Needs = true;
+      for (const CXXBaseSpecifier &Base : RD->bases())
+        if (const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+            !Needs && BaseRD && Self(BaseRD, Self))
+          Needs = true;
+      for (const FieldDecl *Field : RD->fields())
+        if (const CXXRecordDecl *FieldRD =
+                Context.getBaseElementType(Field->getType())
+                    ->getAsCXXRecordDecl();
+            !Needs && FieldRD && Self(FieldRD, Self))
+          Needs = true;
+      Memo[RD] = Needs;
+      return Needs;
+    };
+    CanQualType RecordTy = Context.getCanonicalTagType(Record);
+    CXXDestructorDecl *Dtor =
+        Record->isPolymorphic() ? LookupDestructor(Record) : nullptr;
+    bool HasSizedDtor = Dtor && Dtor->isVirtual();
+    const ASTRecordLayout *Layout = nullptr;
+    // Whatever nests the class, a base or a member, has to keep it at an even
+    // address in every complete object of its own.
+    if ((HasSizedDtor || NeedsEvenAddress(Record, NeedsEvenAddress)) &&
+        Context.getTypeAlignInChars(RecordTy) < CharUnits::fromQuantity(2))
+      Diag(Record->getLocation(), diag::err_malterlib_sized_destructor_align)
+          << RecordTy << !HasSizedDtor;
+    auto CheckBase = [&](const CXXBaseSpecifier &Base, CharUnits Offset) {
+      const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+      if (BaseRD && NeedsEvenAddress(BaseRD, NeedsEvenAddress) &&
+          Offset.getQuantity() % 2)
+        Diag(Base.getBeginLoc(),
+             diag::err_malterlib_sized_destructor_base_offset)
+            << RecordTy << Base.getType() << Offset.getQuantity();
+    };
+    auto BaseNeedsEvenAddress = [&](const CXXBaseSpecifier &Base) {
+      const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+      return BaseRD && NeedsEvenAddress(BaseRD, NeedsEvenAddress);
+    };
+    // The complete class places its indirect virtual bases, which its direct
+    // bases' own layouts do not.
+    if (HasSizedDtor || llvm::any_of(Record->bases(), BaseNeedsEvenAddress) ||
+        llvm::any_of(Record->vbases(), BaseNeedsEvenAddress)) {
+      Layout = &Context.getASTRecordLayout(Record);
+      for (const CXXBaseSpecifier &Base : Record->bases()) {
+        const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+        if (!BaseRD)
+          continue;
+        CheckBase(Base, Base.isVirtual() ? Layout->getVBaseClassOffset(BaseRD)
+                                         : Layout->getBaseClassOffset(BaseRD));
+      }
+      // A direct nonvirtual base of the type of a virtual base is another
+      // subobject.
+      for (const CXXBaseSpecifier &Base : Record->vbases())
+        if (const CXXRecordDecl *BaseRD = Base.getType()->getAsCXXRecordDecl();
+            BaseRD &&
+            llvm::none_of(Record->bases(), [&](const CXXBaseSpecifier &B) {
+              return B.isVirtual() && B.getType()->getAsCXXRecordDecl() == BaseRD;
+            }))
+          CheckBase(Base, Layout->getVBaseClassOffset(BaseRD));
+    }
+
+    // A packed class may place a member at an odd offset whatever the
+    // member's own alignment.
+    for (const FieldDecl *Field : Record->fields()) {
+      const CXXRecordDecl *FieldRD =
+          Context.getBaseElementType(Field->getType())->getAsCXXRecordDecl();
+      if (!FieldRD || Field->isBitField() ||
+          !NeedsEvenAddress(FieldRD, NeedsEvenAddress))
+        continue;
+      if (!Layout)
+        Layout = &Context.getASTRecordLayout(Record);
+      uint64_t Offset = Layout->getFieldOffset(Field->getFieldIndex());
+      if (Offset % (2 * Context.getCharWidth()))
+        Diag(Field->getLocation(),
+             diag::err_malterlib_sized_destructor_member_offset)
+            << RecordTy << Field << Offset / Context.getCharWidth();
+    }
+  }
+
   if (Record->isAbstract()) {
     if (FinalAttr *FA = Record->getAttr<FinalAttr>()) {
       Diag(Record->getLocation(), diag::warn_abstract_final_class)

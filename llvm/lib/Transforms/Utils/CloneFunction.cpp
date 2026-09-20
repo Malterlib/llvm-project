@@ -324,6 +324,15 @@ void llvm::CloneFunctionInto(Function *NewFunc, const Function *OldFunc,
   CloneFunctionAttributesInto(NewFunc, OldFunc, VMap, ModuleLevelChanges,
                               TypeMapper, Materializer);
 
+  // A copy in the same module is another function: the marker of the original
+  // definition, and those of the aliases it lists, belong to it alone.
+  if (Changes < CloneFunctionChangeType::DifferentModule) {
+    NewFunc->removeFnAttr(MalterlibSizedMarkerAttr);
+    NewFunc->removeFnAttr(MalterlibSizedAliasesAttr);
+    NewFunc->eraseMetadata(
+        NewFunc->getContext().getMDKindID(MalterlibSizedDependenciesMD));
+  }
+
   // Everything else beyond this point deals with function instructions,
   // so if we are dealing with a function declaration, we're done.
   if (OldFunc->isDeclaration())

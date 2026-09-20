@@ -317,6 +317,38 @@ CXXNewExpr *CXXNewExpr::Create(
       Ty, AllocatedTypeInfo, Range, DirectInitRange);
 }
 
+const CXXConstructExpr *
+CXXNewExpr::getDirectConstruction(const Expr *Initializer,
+                                  bool ElideConstructors) {
+  while (Initializer) {
+    const Expr *Stripped = Initializer->IgnoreImplicit()->IgnoreParens();
+    if (Stripped != Initializer) {
+      Initializer = Stripped;
+      continue;
+    }
+    if (const auto *List = dyn_cast<InitListExpr>(Initializer);
+        List && List->getNumInits() == 1) {
+      Initializer = List->getInit(0);
+      continue;
+    }
+    // T(x) and static_cast<T>(x) construct a T, or name one another
+    // expression produces.
+    if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Initializer);
+        Cast && (Cast->getCastKind() == CK_ConstructorConversion ||
+                 Cast->getCastKind() == CK_NoOp)) {
+      Initializer = Cast->getSubExpr();
+      continue;
+    }
+    const auto *Construct = dyn_cast<CXXConstructExpr>(Initializer);
+    if (Construct && ElideConstructors && Construct->isElidable()) {
+      Initializer = Construct->getArg(0);
+      continue;
+    }
+    return Construct;
+  }
+  return nullptr;
+}
+
 CXXNewExpr *CXXNewExpr::CreateEmpty(const ASTContext &Ctx, bool IsArray,
                                     bool HasInit, unsigned NumPlacementArgs,
                                     bool IsParenTypeId) {

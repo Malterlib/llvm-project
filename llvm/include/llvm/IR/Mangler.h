@@ -61,6 +61,20 @@ public:
                                          const DataLayout &DL);
 };
 
+/// Appends the symbol of the marker of -fmalterlib-sized-destructors of \p GV,
+/// or of \p GV's alias \p Name, to \p Out: the symbol of the definition,
+/// decorated as the object file spells it, with the marker suffix.
+LLVM_ABI void getMalterlibSizedMarkerName(SmallVectorImpl<char> &Out,
+                                          const GlobalValue *GV,
+                                          StringRef Name = "");
+
+/// Returns the IR name of the marker of -fmalterlib-sized-destructors of \p GV,
+/// or of \p GV's alias \p Name: the name with the marker suffix, or the
+/// decorated symbol with it where the symbol of a plain global of that name
+/// would differ.
+LLVM_ABI std::string getMalterlibSizedMarkerIRName(const GlobalValue *GV,
+                                                   StringRef Name = "");
+
 LLVM_ABI void emitLinkerFlagsForGlobalCOFF(raw_ostream &OS,
                                            const GlobalValue *GV,
                                            const Triple &TT, Mangler &Mangler);

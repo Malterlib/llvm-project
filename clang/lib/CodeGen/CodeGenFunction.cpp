@@ -1447,7 +1447,9 @@ QualType CodeGenFunction::BuildFunctionArgList(GlobalDecl GD,
 
   const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD);
   if (MD && MD->isImplicitObjectMemberFunction()) {
-    if (CGM.getCXXABI().HasThisReturn(GD))
+    if (CGM.getCXXABI().hasMalterlibSizedDestructor(GD))
+      ResTy = CGM.getContext().getMalterlibSizedDestroyResultType();
+    else if (CGM.getCXXABI().HasThisReturn(GD))
       ResTy = MD->getThisType();
     else if (CGM.getCXXABI().hasMostDerivedReturn(GD))
       ResTy = CGM.getContext().VoidPtrTy;

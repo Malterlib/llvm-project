@@ -337,6 +337,10 @@ public:
                             DeleteOrMemberCallExpr E,
                             llvm::CallBase **CallOrInvoke) override;
 
+  std::pair<llvm::Value *, llvm::Value *>
+  EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                            QualType ObjectTy) override;
+
   void emitVirtualInheritanceTables(const CXXRecordDecl *RD) override;
 
   bool canSpeculativelyEmitVTable(const CXXRecordDecl *RD) const override;
@@ -1381,6 +1385,9 @@ ItaniumCXXABI::EmitMemberPointerIsNotNull(CodeGenFunction &CGF,
 }
 
 bool ItaniumCXXABI::classifyReturnType(CGFunctionInfo &FI) const {
+  if (classifyMalterlibSizedDestroyReturn(FI))
+    return true;
+
   const CXXRecordDecl *RD = FI.getReturnType()->getAsCXXRecordDecl();
   if (!RD)
     return false;
@@ -1985,7 +1992,38 @@ void ItaniumCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
 
   /// Initialize the 'this' slot. In the Itanium C++ ABI, no prologue
   /// adjustments are required, because they are all handled by thunks.
-  setCXXABIThisValue(CGF, loadIncomingCXXThis(CGF));
+  llvm::Value *ThisValue = loadIncomingCXXThis(CGF);
+
+  /// A sized deleting destructor is called in one of two modes, which the
+  /// caller selects with bit 0 of 'this': clear destroys the object and frees
+  /// it as before, set destroys it and returns its memory and size instead. A
+  /// polymorphic object is at least pointer aligned, so every caller that
+  /// predates -fmalterlib-sized-destructors selects the first mode.
+  ///
+  /// A thunk only adjusts 'this' and passes the mode on to the destructor it
+  /// forwards to.
+  if (!CGF.CurFuncIsThunk && hasMalterlibSizedDestructor(CGF.CurGD)) {
+    llvm::Value *Tag = CGF.Builder.CreateAnd(
+        CGF.Builder.CreatePtrToInt(ThisValue, CGF.IntPtrTy),
+        llvm::ConstantInt::get(CGF.IntPtrTy, 1), "dtor.sized");
+
+    ThisValue = CGF.Builder.CreateIntrinsic(
+        ThisValue->getType(), llvm::Intrinsic::ptrmask,
+        {ThisValue, llvm::ConstantInt::getSigned(CGF.IntPtrTy, -2)}, nullptr,
+        "this");
+
+    // Keep the untagged pointer in the slot 'this' is described by, so that
+    // debug info, sanitizer checks and the destructor body all see the object
+    // at its real address.
+    CGF.Builder.CreateStore(ThisValue, CGF.GetAddrOfLocalVar(getThisDecl(CGF)));
+
+    // The deleting destructor's "should call operator delete" flag is exactly
+    // the inverse of the tag.
+    getStructorImplicitParamValue(CGF) = CGF.Builder.CreateXor(
+        Tag, llvm::ConstantInt::get(CGF.IntPtrTy, 1), "dtor.should_delete");
+  }
+
+  setCXXABIThisValue(CGF, ThisValue);
 
   /// Initialize the 'vtt' slot if needed.
   if (getStructorImplicitParamDecl(CGF)) {
@@ -2149,10 +2187,21 @@ void ItaniumCXXABI::emitVTableDefinitions(CodeGenVTables &CGVT,
     }
   }
 
+  std::string VTableName = VTable->getName().str();
   if (CGM.getLangOpts().RelativeCXXABIVTables) {
     CGVT.RemoveHwasanMetadata(VTable);
     if (!VTable->isDSOLocal())
       CGVT.GenerateRelativeVTableAlias(VTable, VTable->getName());
+  }
+
+  // Prove to the linker that this vtable was compiled with
+  // -fmalterlib-sized-destructors, which it believes when the deleting
+  // destructors and thunks in its slots were too. The vtable a relative
+  // vtable renamed has an alias with its name.
+  if (CGM.getCXXABI().needsMalterlibSizedMarker(RD)) {
+    llvm::GlobalValue *Named = CGM.getModule().getNamedValue(VTableName);
+    CGM.EmitMalterlibSizedMarker(Named);
+    CGVT.addMalterlibSizedSlotReferences(RD, Named);
   }
 
   // Emit symbol for debugger only if requested debug info.
@@ -2386,6 +2435,32 @@ llvm::Value *ItaniumCXXABI::EmitVirtualDestructorCall(
   return nullptr;
 }
 
+std::pair<llvm::Value *, llvm::Value *>
+ItaniumCXXABI::EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                                         QualType ObjectTy) {
+  const CXXRecordDecl *RD = ObjectTy->getAsCXXRecordDecl();
+  const CXXDestructorDecl *Dtor = RD->getDestructor();
+
+  GlobalDecl GD(Dtor, Dtor_Deleting);
+  const CGFunctionInfo *FInfo =
+      &CGM.getTypes().arrangeCXXStructorDeclaration(GD);
+  llvm::FunctionType *Ty = CGM.getTypes().GetFunctionType(*FInfo);
+  CGCallee Callee = CGCallee::forVirtual(/*CE=*/nullptr, GD, This, Ty);
+
+  // Bit 0 of 'this' selects the sized mode. The vtable is loaded through the
+  // untagged address that the callee was built with.
+  llvm::Value *Tagged = CGF.Builder.CreateConstInBoundsGEP1_64(
+      CGF.Int8Ty, This.emitRawPointer(CGF), 1, "this.sized");
+
+  llvm::CallBase *Call = nullptr;
+  RValue Result = CGF.EmitCXXDestructorCall(GD, Callee, Tagged, ObjectTy,
+                                            /*ImplicitParam=*/nullptr,
+                                            QualType(), /*CE=*/nullptr, &Call);
+  keepMalterlibSizedDestructorCall(Call);
+
+  return loadMalterlibSizedDestroyResult(CGF, Result);
+}
+
 void ItaniumCXXABI::emitVirtualInheritanceTables(const CXXRecordDecl *RD) {
   CodeGenVTables &VTables = CGM.getVTables();
   llvm::GlobalVariable *VTT = VTables.GetAddrOfVTT(RD);
@@ -2522,6 +2597,30 @@ llvm::Value *
 ItaniumCXXABI::performThisAdjustment(CodeGenFunction &CGF, Address This,
                                      const CXXRecordDecl *UnadjustedClass,
                                      const ThunkInfo &TI) {
+  // A thunk for a sized deleting destructor is passed 'this' with the caller's
+  // mode in bit 0. A non-virtual adjustment is a multiple of the alignment of a
+  // polymorphic base and preserves it, but a virtual adjustment reads the vptr
+  // through 'this' and has to see the object's real address.
+  if (TI.This.Virtual.Itanium.VCallOffsetOffset &&
+      hasMalterlibSizedDestructor(CGF.CurGD)) {
+    llvm::Value *ThisPtr = This.emitRawPointer(CGF);
+    llvm::Value *Tag = CGF.Builder.CreateAnd(
+        CGF.Builder.CreatePtrToInt(ThisPtr, CGF.IntPtrTy),
+        llvm::ConstantInt::get(CGF.IntPtrTy, 1), "dtor.sized");
+    llvm::Value *Untagged = CGF.Builder.CreateIntrinsic(
+        ThisPtr->getType(), llvm::Intrinsic::ptrmask,
+        {ThisPtr, llvm::ConstantInt::getSigned(CGF.IntPtrTy, -2)}, nullptr,
+        "this");
+
+    llvm::Value *Adjusted = performTypeAdjustment(
+        CGF, Address(Untagged, CGF.Int8Ty, This.getAlignment()),
+        UnadjustedClass, TI.This.NonVirtual,
+        TI.This.Virtual.Itanium.VCallOffsetOffset,
+        /*IsReturnAdjustment=*/false);
+
+    return CGF.Builder.CreateGEP(CGF.Int8Ty, Adjusted, Tag, "this.tagged");
+  }
+
   return performTypeAdjustment(CGF, This, UnadjustedClass, TI.This.NonVirtual,
                                TI.This.Virtual.Itanium.VCallOffsetOffset,
                                /*IsReturnAdjustment=*/false);
@@ -4834,6 +4933,11 @@ static void emitConstructorDestructorAlias(CodeGenModule &CGM,
 
   // Finally, set up the alias with its proper name and attributes.
   CGM.SetCommonAttributes(AliasDecl, Alias);
+
+  // A complete constructor that is an alias of the base one is what a
+  // construction site of -fmalterlib-sized-destructors calls.
+  if (CGM.getCXXABI().needsMalterlibSizedMarker(AliasDecl))
+    CGM.EmitMalterlibSizedMarker(Alias);
 }
 
 void ItaniumCXXABI::emitCXXStructor(GlobalDecl GD) {

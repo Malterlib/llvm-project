@@ -53,6 +53,7 @@
 #include "llvm/ABI/TargetInfo.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -61,6 +62,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ProfileSummary.h"
 #include "llvm/ProfileData/InstrProfReader.h"
@@ -1182,6 +1184,7 @@ void CodeGenModule::Release() {
   EmitCtorList(GlobalCtors, "llvm.global_ctors");
   EmitCtorList(GlobalDtors, "llvm.global_dtors");
   EmitGlobalAnnotations();
+  EmitMalterlibSizedReferences();
   EmitStaticExternCAliases();
   checkAliases();
   EmitDeferredUnusedCoverageMappings();
@@ -3704,6 +3707,205 @@ void CodeGenModule::addUsedGlobal(llvm::GlobalValue *GV) {
   assert((isa<llvm::Function>(GV) || !GV->isDeclaration()) &&
          "Only globals with definition can force usage.");
   LLVMUsed.emplace_back(GV);
+}
+
+static void addMalterlibSizedAttr(llvm::GlobalObject *GO, llvm::StringRef Kind,
+                                  llvm::StringRef Value = llvm::StringRef()) {
+  if (auto *F = dyn_cast<llvm::Function>(GO))
+    F->addFnAttr(Kind, Value);
+  else
+    cast<llvm::GlobalVariable>(GO)->addAttribute(Kind, Value);
+}
+
+static llvm::StringRef getMalterlibSizedAttr(llvm::GlobalObject *GO,
+                                             llvm::StringRef Kind) {
+  llvm::Attribute A = isa<llvm::Function>(GO)
+                          ? cast<llvm::Function>(GO)->getFnAttribute(Kind)
+                          : cast<llvm::GlobalVariable>(GO)->getAttribute(Kind);
+  return A.isStringAttribute() ? A.getValueAsString() : llvm::StringRef();
+}
+
+/// The IR name of the marker of \p GV, which is how both its references and
+/// a local marker alias spell it.
+std::string
+CodeGenModule::getMalterlibSizedMarkerIRName(llvm::GlobalValue *GV) {
+  return llvm::getMalterlibSizedMarkerIRName(GV);
+}
+
+/// Gives a definition compiled with -fmalterlib-sized-destructors its marker,
+/// which the construction sites that depend on it reference. The marker of an
+/// external definition is a symbol the backend emits inside it, in its section
+/// or COMDAT, so that the linker keeps the marker of the copy of an inline
+/// definition it keeps, and link-time optimization drops the marker with a
+/// copy it does not keep. A local definition has no other copies, and its
+/// marker is an alias, which the IR keeps apart from other local definitions
+/// of the same name.
+void CodeGenModule::EmitMalterlibSizedMarker(llvm::GlobalValue *GV) {
+  if (!LangOpts.MalterlibSizedDestructors || GV->isDeclarationForLinker())
+    return;
+
+  if (GV->hasLocalLinkage()) {
+    llvm::Constant *Aliasee = GV;
+    if (auto *GA = dyn_cast<llvm::GlobalAlias>(GV))
+      Aliasee = GA->getAliasee();
+    auto *Marker = llvm::GlobalAlias::create(
+        GV->getValueType(), GV->getAddressSpace(),
+        llvm::GlobalValue::InternalLinkage, getMalterlibSizedMarkerIRName(GV),
+        Aliasee, &getModule());
+    Marker->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::None);
+    return;
+  }
+
+  // An alias, such as a complete constructor that is the base one, a vector
+  // deleting destructor that is the scalar one on the Microsoft ABI, or the
+  // vftable symbol inside its variable, gets its marker from the definition
+  // it names, at its offset into it.
+  if (auto *GA = dyn_cast<llvm::GlobalAlias>(GV)) {
+    auto *GO = dyn_cast_or_null<llvm::GlobalObject>(GA->getAliaseeObject());
+    if (!GO)
+      return;
+    llvm::APInt Offset(
+        getDataLayout().getIndexTypeSizeInBits(GA->getType()), 0);
+    GA->getAliasee()->stripAndAccumulateConstantOffsets(
+        getDataLayout(), Offset, /*AllowNonInbounds=*/true);
+    std::string List = getMalterlibSizedAttr(GO, llvm::MalterlibSizedAliasesAttr).str();
+    if (!List.empty())
+      List += ',';
+    List += (GA->getName() + "=" + llvm::Twine(Offset.getZExtValue())).str();
+    addMalterlibSizedAttr(GO, llvm::MalterlibSizedAliasesAttr, List);
+    return;
+  }
+
+  addMalterlibSizedAttr(cast<llvm::GlobalObject>(GV),
+                        llvm::MalterlibSizedMarkerAttr);
+}
+
+void CodeGenModule::AddMalterlibSizedReference(llvm::GlobalValue *GV,
+                                               llvm::GlobalValue *Owner) {
+  if (!LangOpts.MalterlibSizedDestructors)
+    return;
+  MalterlibSizedTarget Target{GV->getName().str(), GV};
+  if (Owner)
+    MalterlibSizedDependencies.emplace_back(
+        MalterlibSizedTarget{Owner->getName().str(), Owner}, Target);
+  else
+    MalterlibSizedReferences.push_back(Target);
+}
+
+void CodeGenModule::EmitMalterlibSizedReferences() {
+  if (MalterlibSizedReferences.empty() && MalterlibSizedDependencies.empty())
+    return;
+
+  // A declaration that became an alias, or a vtable a relative vtable renamed,
+  // keeps the name with another value; one code generation replaced keeps its
+  // value in the handle.
+  auto Resolve = [&](const MalterlibSizedTarget &Target) {
+    llvm::GlobalValue *GV = getModule().getNamedValue(Target.Name);
+    if (!GV && Target.Value)
+      GV = dyn_cast<llvm::GlobalValue>(Target.Value->stripPointerCasts());
+    assert(GV && "a definition a construction site depends on disappeared");
+    return GV;
+  };
+  // A demangler treats the marker's suffix as a clone suffix, so a diagnostic
+  // shows it as "D::~D() (.mib_sized)". The marker of an external definition
+  // is a symbol of the object file, which a reference names; one another
+  // image exports resolves to its import thunk.
+  auto Marker = [&](llvm::GlobalValue *GV) -> llvm::GlobalValue * {
+    std::string Name = getMalterlibSizedMarkerIRName(GV);
+    if (llvm::GlobalValue *Existing = getModule().getNamedValue(Name))
+      return Existing;
+    return new llvm::GlobalVariable(getModule(), Int8Ty, /*isConstant=*/true,
+                                    llvm::GlobalValue::ExternalLinkage,
+                                    /*Initializer=*/nullptr, Name);
+  };
+  // The references are ordinary data, in a section of their own so that the
+  // linker finds them before it drops anything. The linker reads it as nothing
+  // but references, so neither a sanitizer nor the alignment of an array that
+  // follows another in it may pad it.
+  auto Emit = [&](llvm::ArrayRef<llvm::Constant *> References,
+                  llvm::StringRef Name, llvm::StringRef MachOSection,
+                  llvm::StringRef COFFSection, llvm::StringRef ELFSection) {
+    if (References.empty())
+      return;
+    auto *ArrayTy = llvm::ArrayType::get(GlobalsInt8PtrTy, References.size());
+    auto *GV = new llvm::GlobalVariable(
+        getModule(), ArrayTy, /*isConstant=*/true,
+        llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantArray::get(ArrayTy, References), Name);
+    GV->setAlignment(getPointerAlign().getAsAlign());
+    if (getTriple().isOSBinFormatMachO())
+      GV->setSection(MachOSection);
+    else if (getTriple().isOSBinFormatCOFF())
+      GV->setSection(COFFSection);
+    else
+      GV->setSection(ELFSection);
+    getSanitizerMetadata()->disableSanitizerForGlobal(GV);
+    addCompilerUsedGlobal(GV);
+  };
+
+  // A site's references are pairs of a definition and its marker.
+  llvm::SmallVector<llvm::Constant *, 16> References;
+  llvm::StringSet<> Seen;
+  for (const MalterlibSizedTarget &Target : MalterlibSizedReferences) {
+    llvm::GlobalValue *GV = Resolve(Target);
+    if (!GV || !Seen.insert(GV->getName()).second)
+      continue;
+    References.push_back(GV);
+    References.push_back(Marker(GV));
+  }
+  Emit(References, "__mib_sized_ref", "__DATA_CONST,__mib_sized_ref",
+       ".rdata$mibszf", ".data.rel.ro.__mib_sized_ref");
+
+  // An owner's dependencies are metadata of the definition that holds it, at
+  // the owner's offset into it: the backend records them with the definition
+  // it emits, so that the linker checks them against the copy it keeps and an
+  // owner the optimizer removed has none. Each is a definition and its
+  // marker: the marker alias of a local definition, which the optimizer and
+  // the linking of modules may rename apart from it and which stays only
+  // while in use, or null for the symbol the backend derives from the
+  // definition's.
+  llvm::MapVector<std::pair<llvm::GlobalObject *, uint64_t>,
+                  llvm::SetVector<llvm::GlobalValue *>>
+      Dependencies;
+  for (const auto &[OwnerTarget, Target] : MalterlibSizedDependencies) {
+    llvm::GlobalValue *Owner = Resolve(OwnerTarget);
+    llvm::GlobalValue *GV = Resolve(Target);
+    auto *GO = Owner ? Owner->getAliaseeObject() : nullptr;
+    if (!GO || !GV || GO->isDeclaration())
+      continue;
+    llvm::APInt Offset(
+        getDataLayout().getIndexTypeSizeInBits(Owner->getType()), 0);
+    if (auto *GA = dyn_cast<llvm::GlobalAlias>(Owner))
+      GA->getAliasee()->stripAndAccumulateConstantOffsets(
+          getDataLayout(), Offset, /*AllowNonInbounds=*/true);
+    Dependencies[{GO, Offset.getZExtValue()}].insert(GV);
+  }
+  llvm::SmallPtrSet<llvm::GlobalValue *, 16> KeptDependencies;
+  for (auto &[Owner, GVs] : Dependencies) {
+    llvm::SmallVector<llvm::Metadata *, 4> Operands;
+    Operands.push_back(llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Int64Ty, Owner.second)));
+    for (llvm::GlobalValue *GV : GVs) {
+      // A definition stays, as it is, for the backend to name, whether this
+      // module has it or link-time optimization links it in from another: a
+      // pass that replaces or removes one would otherwise leave nothing, such
+      // as for the constructor another one forwards to.
+      if (KeptDependencies.insert(GV).second)
+        LLVMCompilerUsed.emplace_back(GV);
+      Operands.push_back(llvm::ConstantAsMetadata::get(GV));
+      auto *LocalMarker =
+          GV->hasLocalLinkage()
+              ? dyn_cast_or_null<llvm::GlobalAlias>(getModule().getNamedValue(
+                    getMalterlibSizedMarkerIRName(GV)))
+              : nullptr;
+      if (LocalMarker)
+        addCompilerUsedGlobal(LocalMarker);
+      Operands.push_back(LocalMarker ? llvm::ConstantAsMetadata::get(LocalMarker)
+                                     : nullptr);
+    }
+    Owner.first->addMetadata(llvm::MalterlibSizedDependenciesMD,
+                             *llvm::MDNode::get(getLLVMContext(), Operands));
+  }
 }
 
 void CodeGenModule::addCompilerUsedGlobal(llvm::GlobalValue *GV) {

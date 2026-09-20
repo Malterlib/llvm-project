@@ -813,6 +813,11 @@ void CodeGenFunction::EmitConstructorBody(FunctionArgList &Args) {
   if (CtorType == Ctor_Complete && IsConstructorDelegationValid(Ctor) &&
       CGM.getTarget().getCXXABI().hasConstructorVariants()) {
     EmitDelegateCXXConstructorCall(Ctor, Ctor_Base, Args, Ctor->getEndLoc());
+    // The base constructor installs the vtable, and the marker of this one
+    // proves its claim only when that one's does (see
+    // -fmalterlib-sized-destructors).
+    if (CGM.getCXXABI().needsMalterlibSizedMarker(CurGD))
+      CGM.AddMalterlibSizedConstructorReference(Ctor, Ctor_Base, CurFn);
     return;
   }
 
@@ -1520,6 +1525,26 @@ static void EmitConditionalArrayDtorCall(const CXXDestructorDecl *DD,
   CGF.EmitBlock(ScalarBB);
 }
 
+/// Stores the address of the complete object and the size of the destructor's
+/// class into the result slot of a sized deleting destructor.
+void CodeGenFunction::EmitMalterlibSizedDestructorResult(
+    const CXXDestructorDecl *Dtor) {
+  QualType ResultTy = getContext().getMalterlibSizedDestroyResultType();
+  const RecordDecl *ResultRD = ResultTy->getAsRecordDecl();
+  auto Field = ResultRD->field_begin();
+
+  LValue Result = MakeAddrLValue(ReturnValue, ResultTy);
+
+  EmitStoreOfScalar(LoadCXXThis(), EmitLValueForField(Result, *Field));
+
+  QualType ClassTy = getContext().getCanonicalTagType(Dtor->getParent());
+  llvm::Value *Size = llvm::ConstantInt::get(
+      ConvertType(getContext().getSizeType()),
+      getContext().getTypeSizeInChars(ClassTy).getQuantity());
+
+  EmitStoreOfScalar(Size, EmitLValueForField(Result, *++Field));
+}
+
 /// EmitDestructorBody - Emits the body of the current destructor.
 void CodeGenFunction::EmitDestructorBody(FunctionArgList &Args) {
   const CXXDestructorDecl *Dtor = cast<CXXDestructorDecl>(CurGD.getDecl());
@@ -1550,6 +1575,12 @@ void CodeGenFunction::EmitDestructorBody(FunctionArgList &Args) {
   // possible to delegate the destructor body to the complete
   // destructor.  Do so.
   if (DtorType == Dtor_Deleting || DtorType == Dtor_VectorDeleting) {
+    // A sized deleting destructor hands the caller the size and the address of
+    // the complete object. Both are constants here, because a deleting
+    // destructor only ever runs for its own class as the most derived one.
+    if (CGM.getCXXABI().hasMalterlibSizedDestructor(CurGD))
+      EmitMalterlibSizedDestructorResult(Dtor);
+
     if (CXXStructorImplicitParamValue && DtorType == Dtor_VectorDeleting)
       EmitConditionalArrayDtorCall(Dtor, *this, CXXStructorImplicitParamValue);
     RunCleanupsScope DtorEpilogue(*this);
@@ -2325,27 +2356,46 @@ void CodeGenFunction::EmitCXXConstructorCall(
                          ThisAVS.isSanitizerChecked());
 }
 
-static bool canEmitDelegateCallArgs(CodeGenFunction &CGF,
+static bool canEmitDelegateCallArgs(CodeGenModule &CGM,
                                     const CXXConstructorDecl *Ctor,
-                                    CXXCtorType Type, CallArgList &Args) {
+                                    llvm::function_ref<bool()> UsesInAlloca) {
   // We can't forward a variadic call.
   if (Ctor->isVariadic())
     return false;
 
-  if (CGF.getTarget().getCXXABI().areArgsDestroyedLeftToRightInCallee()) {
+  if (CGM.getTarget().getCXXABI().areArgsDestroyedLeftToRightInCallee()) {
     // If the parameters are callee-cleanup, it's not safe to forward.
     for (auto *P : Ctor->parameters())
-      if (P->needsDestruction(CGF.getContext()))
+      if (P->needsDestruction(CGM.getContext()))
         return false;
 
     // Likewise if they're inalloca.
-    const CGFunctionInfo &Info =
-        CGF.CGM.getTypes().arrangeCXXConstructorCall(Args, Ctor, Type, 0, 0);
-    if (Info.usesInAlloca())
+    if (UsesInAlloca())
       return false;
   }
 
   // Anything else should be OK.
+  return true;
+}
+
+bool CodeGenModule::AddMalterlibSizedConstructorReference(
+    const CXXConstructorDecl *Ctor, CXXCtorType Type,
+    llvm::GlobalValue *Owner) {
+  // A call emits an inheriting constructor whose arguments it cannot forward
+  // inline, as EmitCXXConstructorCall does, and the address of a definition
+  // would have one emitted that cannot be.
+  if (auto Inherited = Ctor->getInheritedConstructor();
+      Inherited && getTypes().inheritingCtorHasParams(Inherited, Type) &&
+      !canEmitDelegateCallArgs(*this, Ctor, [&] {
+        return getTypes()
+            .arrangeCXXStructorDeclaration(GlobalDecl(Ctor, Type))
+            .usesInAlloca();
+      }))
+    return false;
+  AddMalterlibSizedReference(
+      cast<llvm::GlobalValue>(
+          GetAddrOfGlobal(GlobalDecl(Ctor, Type))->stripPointerCasts()),
+      Owner);
   return true;
 }
 
@@ -2385,7 +2435,11 @@ void CodeGenFunction::EmitCXXConstructorCall(
   // Check whether we can actually emit the constructor before trying to do so.
   if (auto Inherited = D->getInheritedConstructor()) {
     PassPrototypeArgs = getTypes().inheritingCtorHasParams(Inherited, Type);
-    if (PassPrototypeArgs && !canEmitDelegateCallArgs(*this, D, Type, Args)) {
+    if (PassPrototypeArgs && !canEmitDelegateCallArgs(CGM, D, [&] {
+          return CGM.getTypes()
+              .arrangeCXXConstructorCall(Args, D, Type, 0, 0)
+              .usesInAlloca();
+        })) {
       EmitInlinedInheritingCXXConstructorCall(D, Type, ForVirtualBase,
                                               Delegating, Args);
       return;

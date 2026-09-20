@@ -21,6 +21,87 @@ using namespace CodeGen;
 
 CGCXXABI::~CGCXXABI() { }
 
+std::pair<llvm::Value *, llvm::Value *>
+CGCXXABI::EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                                    QualType ObjectTy) {
+  ErrorUnsupportedABI(CGF, "sized deleting destructors");
+  llvm::Type *SizeTy = CGF.ConvertType(getContext().getSizeType());
+  return {llvm::PoisonValue::get(CGF.VoidPtrTy),
+          llvm::PoisonValue::get(SizeTy)};
+}
+
+llvm::Value *CGCXXABI::loadMalterlibSizedDestroyField(CodeGenFunction &CGF,
+                                                      RValue Result,
+                                                      unsigned Index) {
+  QualType ResultTy = getContext().getMalterlibSizedDestroyResultType();
+  const RecordDecl *ResultRD = ResultTy->getAsRecordDecl();
+  auto Field = std::next(ResultRD->field_begin(), Index);
+
+  LValue LV = CGF.MakeAddrLValue(Result.getAggregateAddress(), ResultTy);
+
+  return CGF.EmitLoadOfScalar(CGF.EmitLValueForField(LV, *Field),
+                              SourceLocation());
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+CGCXXABI::loadMalterlibSizedDestroyResult(CodeGenFunction &CGF, RValue Result) {
+  return {loadMalterlibSizedDestroyField(CGF, Result, 0),
+          loadMalterlibSizedDestroyField(CGF, Result, 1)};
+}
+
+/// A sized deleting destructor returns the complete-object pointer and the
+/// size in registers on every target, including the ones whose C ABI returns
+/// a two-word struct in memory. No existing caller of a deleting destructor
+/// reads more than the first register, so this stays compatible with code
+/// compiled without -fmalterlib-sized-destructors. It is decided here, before
+/// the arguments are classified, so that no target reserves an argument
+/// register for a hidden return pointer.
+bool CGCXXABI::classifyMalterlibSizedDestroyReturn(CGFunctionInfo &FI) const {
+  if (!CGM.getContext().isMalterlibSizedDestroyResultType(FI.getReturnType()))
+    return false;
+  FI.getReturnInfo() =
+      ABIArgInfo::getDirect(CGM.getTypes().ConvertType(FI.getReturnType()));
+  return true;
+}
+
+/// The linker checks the destructor the builtin reaches by looking at its
+/// definition. LTO may devirtualize the call, and inlining the destructor
+/// would then let the definition disappear: from code compiled without the
+/// flag, it would misread the tagged 'this' with nothing left to report.
+void CGCXXABI::keepMalterlibSizedDestructorCall(llvm::CallBase *Call) {
+  if (!Call)
+    return;
+  // A flattened caller asks for the opposite; the check comes first.
+  Call->removeFnAttr(llvm::Attribute::AlwaysInline);
+  Call->addFnAttr(llvm::Attribute::NoInline);
+}
+
+bool CGCXXABI::hasMalterlibSizedDestructor(GlobalDecl GD) const {
+  if (!getContext().getLangOpts().MalterlibSizedDestructors)
+    return false;
+
+  const auto *DD = dyn_cast<CXXDestructorDecl>(GD.getDecl());
+  if (!DD || !DD->isVirtual())
+    return false;
+
+  CXXDtorType Type = GD.getDtorType();
+  return Type == Dtor_Deleting || Type == Dtor_VectorDeleting;
+}
+
+bool CGCXXABI::needsMalterlibSizedMarker(const CXXRecordDecl *RD) const {
+  if (!getContext().getLangOpts().MalterlibSizedDestructors)
+    return false;
+  const CXXDestructorDecl *DD = RD->getDestructor();
+  return DD && DD->isVirtual();
+}
+
+bool CGCXXABI::needsMalterlibSizedMarker(GlobalDecl GD) const {
+  if (hasMalterlibSizedDestructor(GD))
+    return true;
+  const auto *CD = dyn_cast<CXXConstructorDecl>(GD.getDecl());
+  return CD && needsMalterlibSizedMarker(CD->getParent());
+}
+
 Address CGCXXABI::getThisAddress(CodeGenFunction &CGF) {
   return CGF.makeNaturalAddressForPointer(
       CGF.CXXABIThisValue, CGF.CXXABIThisDecl->getType()->getPointeeType(),

@@ -35,6 +35,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/IR/GlobalValue.h"
 #include <cstring>
 #include <optional>
 #include <utility>
@@ -567,6 +568,12 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
     // (e.g. the undefined weak alias), linking will fail due to undefined
     // references at the end.
     if (symtab.ctx.config.mingw && name.starts_with(".weak."))
+      return nullptr;
+    // Likewise for the marker of -fmalterlib-sized-destructors in a copy of
+    // its definition the link did not keep: the copy it kept defines the
+    // marker if compiled with the flag, and a reference to the marker fails
+    // otherwise.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
       return nullptr;
     return symtab.addUndefined(name, this, false);
   }

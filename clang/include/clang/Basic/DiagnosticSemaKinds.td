@@ -13404,6 +13404,33 @@ def err_builtin_launder_invalid_arg : Error<
 def err_builtin_assume_aligned_invalid_arg : Error<
   "non-pointer argument to '__builtin_assume_aligned' is not allowed">;
 
+def err_builtin_malterlib_destroy_disabled : Error<
+  "'__builtin_malterlib_destroy' requires '-fmalterlib-sized-destructors'">;
+def err_builtin_malterlib_destroy_invalid_arg : Error<
+  "first argument to '__builtin_malterlib_destroy' must be a pointer to a "
+  "class with a virtual destructor, not %0">;
+def err_malterlib_sized_destructor_align : Error<
+  "%0 %select{has|holds a class with}1 a virtual destructor but an alignment "
+  "below 2, which '-fmalterlib-sized-destructors' needs to select the "
+  "destructor's mode">;
+def err_malterlib_sized_construction_prvalue : Error<
+  "a function with the 'malterlib::sized_construction' attribute cannot "
+  "construct %0 from a value another function produces, whose vtable "
+  "'-fmalterlib-sized-destructors' cannot check; construct it with a "
+  "constructor">;
+def err_malterlib_sized_destructor_calling_conv : Error<
+  "the virtual destructor of %0 %select{uses the '%1' calling convention|"
+  "has the %1 attribute}2, which preserves a register "
+  "'-fmalterlib-sized-destructors' returns the size in">;
+def err_malterlib_sized_destructor_member_offset : Error<
+  "%0 has its member %1, which holds a class with a virtual destructor, at "
+  "the odd offset %2, which '-fmalterlib-sized-destructors' needs to be even "
+  "to select the destructor's mode">;
+def err_malterlib_sized_destructor_base_offset : Error<
+  "%0 has its base %1, which holds a class with a virtual destructor, at the "
+  "odd offset %2, which '-fmalterlib-sized-destructors' needs to be even to "
+  "select the destructor's mode">;
+
 def err_builtin_is_within_lifetime_invalid_arg : Error<
   "%select{non-|function }0pointer argument to '__builtin_is_within_lifetime' "
   "is not allowed">;

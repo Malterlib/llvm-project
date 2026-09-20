@@ -29,6 +29,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/GlobalValue.h"
 #include <optional>
 
 using namespace llvm;
@@ -949,7 +950,15 @@ void ObjFile<ELFT>::initializeSections(bool ignoreComdats,
     }
 
     // A SHF_LINK_ORDER section is discarded if its linked-to section is
-    // discarded.
+    // discarded. InputSection::discarded is shared by every file, which are
+    // initialized in parallel, so it must not collect dependent sections.
+    if (linkSec == &InputSection::discarded) {
+      if (InputSectionBase *s = this->sections[i];
+          ctx.arg.copyRelocs && s->relSecIdx != 0)
+        this->sections[s->relSecIdx] = &InputSection::discarded;
+      this->sections[i] = &InputSection::discarded;
+      continue;
+    }
     InputSection *isec = cast<InputSection>(this->sections[i]);
     linkSec->dependentSections.push_back(isec);
     if (!isa<InputSection>(linkSec))

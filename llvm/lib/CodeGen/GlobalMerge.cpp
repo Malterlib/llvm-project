@@ -172,7 +172,11 @@ private:
   /// \pre setMustKeepGlobalVariables must have been called on the Module that
   ///      contains GV
   bool isMustKeepGlobalVariable(const GlobalVariable *GV) const {
-    return MustKeepGlobalVariables.count(GV);
+    // The marker of -fmalterlib-sized-destructors a global carries, or those
+    // of the aliases it lists, go with it.
+    return MustKeepGlobalVariables.count(GV) ||
+           GV->hasAttribute(MalterlibSizedMarkerAttr) ||
+           GV->hasAttribute(MalterlibSizedAliasesAttr);
   }
 
   /// Collect every variables marked as "used" or used in a landing pad

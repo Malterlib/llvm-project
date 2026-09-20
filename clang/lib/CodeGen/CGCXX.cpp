@@ -235,6 +235,13 @@ void CodeGenModule::EmitDefinitionAsAlias(GlobalDecl AliasDecl,
 
   // Set any additional necessary attributes for the alias.
   SetCommonAttributes(AliasDecl, Alias);
+
+  // A vector deleting destructor that is an alias of the scalar one is what
+  // the vtable points to, and a complete constructor that is an alias of the
+  // base one is what a construction site calls, so they are what the
+  // references of -fmalterlib-sized-destructors name.
+  if (getCXXABI().needsMalterlibSizedMarker(AliasDecl))
+    EmitMalterlibSizedMarker(Alias);
 }
 
 // For an implicit __host__ __device__ destructor, this trap body is reachable
@@ -275,6 +282,25 @@ llvm::Function *CodeGenModule::codegenCXXStructor(GlobalDecl GD) {
     CodeGenFunction(*this).GenerateCode(GD, Fn, FnInfo);
   setNonAliasAttributes(GD, Fn);
   SetLLVMFunctionAttributesForDefinition(cast<CXXMethodDecl>(GD.getDecl()), Fn);
+
+  // Prove to the linker that this deleting destructor returns a size, or that
+  // this constructor installs a vtable that does (see
+  // -fmalterlib-sized-destructors).
+  if (getCXXABI().needsMalterlibSizedMarker(GD)) {
+    EmitMalterlibSizedMarker(Fn);
+    // A constructor installs the vtable of its image, or has the constructor
+    // it delegates to install it, and its marker proves its claim only when
+    // that one's does, which the link of this image checks. A delegating
+    // constructor depends on the vtable too: the optimizer may inline the one
+    // it delegates to and remove it.
+    if (const auto *CD = dyn_cast<CXXConstructorDecl>(GD.getDecl())) {
+      getVTables().addMalterlibSizedVTableReferences(CD->getParent(), Fn);
+      if (CD->isDelegatingConstructor())
+        if (const CXXConstructorDecl *Target = CD->getTargetConstructor())
+          AddMalterlibSizedConstructorReference(Target, GD.getCtorType(), Fn);
+    }
+  }
+
   return Fn;
 }
 

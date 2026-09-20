@@ -2550,6 +2550,14 @@ public:
     return dyn_cast_or_null<CXXConstructExpr>(getInitializer());
   }
 
+  /// Returns the constructor call that initializes the object of a
+  /// new-expression with \p Initializer at the new-expression itself, looking
+  /// through parentheses, braces and temporaries, and through a copy or move
+  /// that is elided when \p ElideConstructors, or null when a value another
+  /// expression produces, such as a call's result, initializes it.
+  static const CXXConstructExpr *
+  getDirectConstruction(const Expr *Initializer, bool ElideConstructors);
+
   /// Indicates whether the required alignment should be implicitly passed to
   /// the allocation function.
   bool passAlignment() const { return CXXNewExprBits.ShouldPassAlignment; }

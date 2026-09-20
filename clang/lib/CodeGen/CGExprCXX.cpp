@@ -18,6 +18,7 @@
 #include "ConstantEmitter.h"
 #include "TargetInfo.h"
 #include "clang/Basic/CodeGenOptions.h"
+#include "clang/Basic/DiagnosticSema.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "llvm/IR/Intrinsics.h"
 
@@ -1343,6 +1344,41 @@ static void EmitNewInitializer(CodeGenFunction &CGF, const CXXNewExpr *E,
                             AggValueSlot::DoesNotOverlap);
 }
 
+/// Records what a construction site of -fmalterlib-sized-destructors depends
+/// on having been compiled with the flag: the constructor the site calls,
+/// which depends on the vtables it installs, which depend on the deleting
+/// destructors and thunks in them. Each is checked in the image that defines
+/// it, so a library may hide what its exported constructor installs. Sema has
+/// rejected any other initializer.
+static void EmitMalterlibSizedConstructionReferences(CodeGenFunction &CGF,
+                                                     const CXXNewExpr *E) {
+  const CXXRecordDecl *RD = E->getAllocatedType()->getAsCXXRecordDecl();
+  if (!RD || E->isArray())
+    return;
+
+  const CXXDestructorDecl *Dtor = RD->getDestructor();
+  if (!Dtor || !Dtor->isVirtual())
+    return;
+
+  CodeGenModule &CGM = CGF.CGM;
+  // Sema checks a new-expression where it appears, which for a default
+  // argument or a default member initializer is not the site that evaluates
+  // it.
+  const CXXConstructExpr *Construct = CXXNewExpr::getDirectConstruction(
+      E->getInitializer(), CGM.getLangOpts().ElideConstructors);
+  if (!Construct) {
+    if (E->getInitializer())
+      CGM.getDiags().Report(E->getInitializer()->getExprLoc(),
+                            diag::err_malterlib_sized_construction_prvalue)
+          << E->getAllocatedType();
+    return;
+  }
+  // An inheriting constructor emitted inline installs the vtables here.
+  if (!CGM.AddMalterlibSizedConstructorReference(Construct->getConstructor(),
+                                                 Ctor_Complete))
+    CGM.getVTables().addMalterlibSizedVTableReferences(RD);
+}
+
 /// Emit a call to an operator new or operator delete function, as implicitly
 /// created by new-expressions and delete-expressions.
 static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
@@ -1781,6 +1817,10 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
                 E->getAllocatedTypeSourceInfo()->getTypeLoc().getBeginLoc(),
                 result, allocType, result.getAlignment(), SkippedChecks,
                 numElements);
+
+  if (getLangOpts().MalterlibSizedDestructors && CurFuncDecl &&
+      CurFuncDecl->hasAttr<MalterlibSizedConstructionAttr>())
+    EmitMalterlibSizedConstructionReferences(*this, E);
 
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);

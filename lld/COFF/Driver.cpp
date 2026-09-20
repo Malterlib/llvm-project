@@ -22,11 +22,16 @@
 #include "lld/Common/Filesystem.h"
 #include "lld/Common/Timer.h"
 #include "lld/Common/Version.h"
+#include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/COFFImportFile.h"
 #include "llvm/Object/IRObjectFile.h"
@@ -36,6 +41,7 @@
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Parallel.h"
@@ -49,7 +55,9 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/ToolDrivers/llvm-lib/LibDriver.h"
 #include <algorithm>
+#include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -1596,6 +1604,287 @@ constexpr const char *lldsaveTempsValues[] = {
     "resolution", "preopt",     "promote", "internalize",  "import",
     "opt",        "precodegen", "prelink", "combinedindex"};
 
+namespace {
+// A reference of -fmalterlib-sized-destructors: the symbol it names, or for
+// the marker of an object's own copy of a definition the link did not keep,
+// which has no symbol, the symbol of that name.
+struct MalterlibSizedReference {
+  Symbol *sym = nullptr;
+  StringRef name;
+  uint64_t addend = 0;
+  // The section of a reference to a local label, which names this object's
+  // copy of a definition.
+  Chunk *chunk = nullptr;
+};
+} // namespace
+
+// A definition compiled with -fmalterlib-sized-destructors carries a marker,
+// which the construction sites that depend on it reference. The marker of a
+// constructor or a vtable proves its claim only when what it binds in this
+// image does too: a constructor installs its image's vtable, which binds its
+// image's deleting destructors. A marker whose claim is not proven is not
+// exported, and is only an error where a site depends on it. Symbol
+// resolution does the rest, except for three things: an undefined marker has
+// to be an error whatever /force says, the marker the link resolved may not
+// belong to the definition it resolved, and another image's marker stands in
+// for its definition only in its own image; the marker of a definition
+// another image exports is imported through its import thunk. The sections
+// do not reach the output, so the reference of an object's own copy of a
+// definition the link did not keep, which has no symbol, is not relocated.
+static void checkMalterlibSizedMarkers(COFFLinkerContext &ctx,
+                                       SymbolTable &symtab) {
+  constexpr StringRef suffix = llvm::MalterlibSizedMarkerSuffix;
+  std::vector<std::array<MalterlibSizedReference, 2>> sites;
+  std::vector<std::array<MalterlibSizedReference, 3>> dependencies;
+  uint64_t wordSize = ctx.config.wordsize;
+  for (ObjFile *file : ctx.objFileInstances) {
+    if (&file->symtab != &symtab)
+      continue;
+    DenseMap<uint32_t, SectionChunk *> chunkOfSection;
+    for (Chunk *c : file->getChunks()) {
+      auto *sc = dyn_cast_or_null<SectionChunk>(c);
+      if (!sc)
+        continue;
+      size_t width;
+      if (sc->getSectionName() == ".rdata$mibszf")
+        width = 2;
+      else if (sc->getSectionName() == ".rdata$mibszd")
+        width = 3;
+      else
+        continue;
+      sc->live = false;
+      ArrayRef<uint8_t> contents = sc->getContents();
+      std::map<uint64_t, SmallVector<MalterlibSizedReference, 3>> groups;
+      for (const coff_relocation &rel : sc->getRelocs()) {
+        uint64_t entry = rel.VirtualAddress / wordSize;
+        auto &group = groups[entry / width];
+        group.resize(width);
+        MalterlibSizedReference &ref = group[entry % width];
+        ref.sym = file->getSymbol(rel.SymbolTableIndex);
+        if (ref.sym) {
+          ref.name = ref.sym->getName();
+        } else if (Expected<COFFSymbolRef> coffSym =
+                       file->getCOFFObj()->getSymbol(rel.SymbolTableIndex)) {
+          ref.name = check(file->getCOFFObj()->getSymbolName(*coffSym));
+          // A COMDAT section's own symbol has no symbol of the link.
+          if (coffSym->isSectionDefinition()) {
+            if (chunkOfSection.empty())
+              for (Chunk *c : file->getChunks())
+                if (auto *sc = dyn_cast_or_null<SectionChunk>(c))
+                  chunkOfSection[sc->getSectionNumber()] = sc;
+            ref.chunk = chunkOfSection.lookup(coffSym->getSectionNumber());
+            if (!ref.chunk)
+              ref.name = {};
+          }
+        } else {
+          consumeError(coffSym.takeError());
+        }
+        if (!ref.sym && !ref.chunk && !ref.name.empty())
+          ref.sym = symtab.find(ref.name);
+        if (rel.VirtualAddress + wordSize <= contents.size())
+          ref.addend = wordSize == 8
+                           ? support::endian::read64le(contents.data() +
+                                                       rel.VirtualAddress)
+                           : support::endian::read32le(contents.data() +
+                                                       rel.VirtualAddress);
+      }
+      for (auto &[index, group] : groups) {
+        if (!llvm::all_of(group, [](auto &ref) { return !ref.name.empty(); }))
+          continue;
+        if (width == 2) {
+          sites.push_back({group[0], group[1]});
+          continue;
+        }
+        // A record belongs to its object's copy of the owner, and says
+        // nothing of a copy of another object that the link kept.
+        Symbol *owner = group[0].sym;
+        if (auto *undef = dyn_cast_or_null<Undefined>(owner))
+          if (Defined *d = undef->getDefinedWeakAlias())
+            owner = d;
+        auto *d = dyn_cast_or_null<DefinedRegular>(owner);
+        if (group[0].chunk || (d && d->getFile() == file))
+          dependencies.push_back({group[0], group[1], group[2]});
+      }
+    }
+  }
+  auto isMarkerExport = [&](const Export &e) {
+    return e.name.ends_with(suffix);
+  };
+  // A weak alias, such as the vector deleting destructor the Microsoft ABI
+  // makes of the scalar one, and a variable MinGW imports automatically from
+  // another image are resolved later in the link.
+  auto resolve = [&](Symbol *sym) -> Symbol * {
+    if (auto *undef = dyn_cast_or_null<Undefined>(sym)) {
+      if (Defined *d = undef->getDefinedWeakAlias())
+        return d;
+      if (ctx.config.autoImport && !undef->getName().starts_with("__imp_"))
+        if (auto *imp = dyn_cast_or_null<DefinedImportData>(
+                symtab.find(("__imp_" + undef->getName()).str())))
+          return imp;
+    }
+    return sym;
+  };
+  // A definition is exported with its marker, which link-time optimization
+  // defines only after the link chose the exports, and which a definition
+  // exported without dllexport has no directive for.
+  DenseSet<StringRef> exported;
+  for (const Export &e : symtab.exports)
+    exported.insert(e.name);
+  std::vector<Export> markerExports;
+  for (const Export &e : symtab.exports) {
+    if (!e.forwardTo.empty() || !e.sym || isMarkerExport(e))
+      continue;
+    StringRef name = saver().save(e.name + suffix);
+    Symbol *sym = symtab.find(saver().save(e.sym->getName() + suffix));
+    if (!isa_and_nonnull<DefinedRegular>(resolve(sym)) ||
+        !exported.insert(name).second)
+      continue;
+    Export &m = markerExports.emplace_back();
+    m.name = name;
+    if (!e.extName.empty())
+      m.extName = saver().save(e.extName + suffix);
+    m.sym = sym;
+    m.symbolName = sym->getName();
+    m.isPrivate = e.isPrivate;
+    m.source = e.source;
+  }
+  llvm::append_range(symtab.exports, markerExports);
+  if (sites.empty() && dependencies.empty() &&
+      llvm::none_of(symtab.exports, isMarkerExport))
+    return;
+
+  using Location = std::pair<Chunk *, uint64_t>;
+  auto locationOf =
+      [&](const MalterlibSizedReference &ref) -> std::optional<Location> {
+    if (ref.chunk)
+      return Location(ref.chunk, ref.addend);
+    if (auto *d = dyn_cast_or_null<DefinedRegular>(resolve(ref.sym)))
+      return Location(d->getChunk(), d->getValue() + ref.addend);
+    return std::nullopt;
+  };
+  // The image a definition another image exports comes from.
+  // A GNU import library holds an object for each import, whose thunk and
+  // import address table entry are ordinary definitions in .idata sections;
+  // the library stands for the DLL.
+  DenseMap<InputFile *, bool> gnuImports;
+  auto gnuImportLibraryOf = [&](Symbol *sym) -> StringRef {
+    auto *d = dyn_cast_or_null<DefinedRegular>(sym);
+    if (!d || !d->getFile())
+      return {};
+    auto *file = dyn_cast<ObjFile>(d->getFile());
+    if (!file)
+      return {};
+    auto [it, inserted] = gnuImports.try_emplace(file, false);
+    if (inserted)
+      it->second = llvm::any_of(file->getChunks(), [](Chunk *c) {
+        auto *sc = dyn_cast_or_null<SectionChunk>(c);
+        return sc && sc->getSectionName().starts_with(".idata$");
+      });
+    return it->second ? StringRef(file->parentName) : StringRef();
+  };
+  auto dllOf = [&](const MalterlibSizedReference &ref) -> StringRef {
+    Symbol *sym = resolve(ref.sym);
+    if (auto *thunk = dyn_cast_or_null<DefinedImportThunk>(sym))
+      return thunk->wrappedSym->getDLLName();
+    if (auto *data = dyn_cast_or_null<DefinedImportData>(sym))
+      return data->getDLLName();
+    return gnuImportLibraryOf(sym);
+  };
+
+  DenseMap<Location, SmallVector<std::array<MalterlibSizedReference, 2>, 1>>
+      dependenciesOf;
+  for (auto &[owner, def, marker] : dependencies)
+    if (auto location = locationOf(owner))
+      dependenciesOf[*location].push_back({def, marker});
+
+  auto nameOf = [&](const MalterlibSizedReference &marker) -> std::string {
+    StringRef name = marker.name;
+    name.consume_back(suffix);
+    name.consume_front("__imp_");
+    return ctx.config.demangle ? llvm::demangle(name) : name.str();
+  };
+
+  // Why a definition and its marker do not prove the definition was compiled
+  // with the flag, or an empty string when they do. A marker whose claim
+  // depends on itself is taken at its word.
+  DenseMap<Location, std::string> proven;
+  std::function<std::string(const MalterlibSizedReference &,
+                            const MalterlibSizedReference &)>
+      checkPair;
+  auto provenAt = [&](Location location, const std::string &name) {
+    if (auto it = proven.find(location); it != proven.end())
+      return it->second;
+    proven[location] = {};
+    std::string why;
+    for (auto &[depDef, depMarker] : dependenciesOf.lookup(location))
+      if (std::string depWhy = checkPair(depDef, depMarker); !depWhy.empty()) {
+        why = name + " depends on " + nameOf(depMarker) + "\n>>> " + depWhy;
+        break;
+      }
+    return proven[location] = why;
+  };
+  checkPair = [&](const MalterlibSizedReference &def,
+                  const MalterlibSizedReference &marker) -> std::string {
+    // The optimizer folds a marker it sees into its definition, which proves
+    // that the marker belongs to it, and leaves its dependencies to check.
+    if (def.sym && def.sym == marker.sym && def.addend == marker.addend) {
+      if (auto location = locationOf(def))
+        return provenAt(*location, nameOf(marker));
+      return {};
+    }
+    Symbol *markerSym = resolve(marker.sym);
+    if (!markerSym || isa<Undefined, LazyArchive, LazyObject>(markerSym))
+      return nameOf(marker) +
+             " was not compiled with -fmalterlib-sized-destructors\n>>> its "
+             "marker " +
+             marker.name.str() + " is undefined";
+    if (StringRef dll = dllOf(marker); !dll.empty()) {
+      if (dllOf(def) == dll)
+        return {};
+    } else if (auto location = locationOf(marker);
+               location && location == locationOf(def)) {
+      return provenAt(*location, nameOf(marker));
+    }
+    Symbol *defSym = resolve(def.sym);
+    return nameOf(marker) +
+           " was compiled both with and without "
+           "-fmalterlib-sized-destructors, and the link keeps a copy compiled "
+           "without\n>>> defined in " +
+           (defSym ? toString(defSym->getFile()) : std::string("no file")) +
+           "\n>>> marked in " + toString(markerSym->getFile());
+  };
+
+  std::vector<std::string> errors;
+  DenseSet<std::tuple<Symbol *, uint64_t, StringRef, uint64_t>> seen;
+  for (auto &[def, marker] : sites)
+    if (seen.insert({def.sym, def.addend, marker.name, marker.addend}).second)
+      if (std::string why = checkPair(def, marker); !why.empty())
+        errors.push_back(why);
+  llvm::sort(errors);
+  for (const std::string &why : errors)
+    Err(ctx) << why
+             << "\n>>> an object a construction site makes is destroyed with "
+                "the size its deleting destructor returns";
+
+  // A marker the image does not prove is not exported: one whose claim is
+  // not proven, and one left behind by a copy of its definition the link did
+  // not keep.
+  llvm::erase_if(symtab.exports, [&](const Export &e) {
+    if (!isMarkerExport(e))
+      return false;
+    // The symbol the export names, not the one a weak alias resolves it to.
+    Symbol *sym = e.sym ? e.sym : symtab.find(e.name);
+    if (!sym || !sym->getName().ends_with(suffix))
+      return false;
+    MalterlibSizedReference marker{sym, sym->getName()};
+    MalterlibSizedReference def{
+        symtab.find(sym->getName().drop_back(suffix.size()))};
+    auto location = locationOf(marker);
+    return !location || location != locationOf(def) ||
+           !provenAt(*location, nameOf(marker)).empty();
+  });
+}
+
 void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   ScopedTimer rootTimer(ctx.rootTimer);
   Configuration *config = &ctx.config;
@@ -2827,6 +3116,10 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (!symtab.wrapped.empty())
       wrapSymbols(symtab);
   });
+
+  // Every object that takes part in the link is loaded now.
+  ctx.forEachSymtab(
+      [&](SymbolTable &symtab) { checkMalterlibSizedMarkers(ctx, symtab); });
 
   if (isArm64EC(config->machine))
     createECExportThunks();

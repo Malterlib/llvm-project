@@ -67,6 +67,10 @@ class CodeGenVTables {
                           unsigned vtableAddressPoint,
                           bool vtableHasLocalLinkage);
 
+  /// Computes the mangled name of the thunk \p TI for \p GD.
+  void getThunkName(GlobalDecl GD, const ThunkInfo &TI,
+                    SmallString<256> &Name);
+
   /// Add a 32-bit offset to a component relative to the vtable when using the
   /// relative vtables ABI. The array builder points to the start of the vtable.
   void addRelativeComponent(ConstantArrayBuilder &builder,
@@ -81,6 +85,18 @@ public:
   void createVTableInitializer(ConstantStructBuilder &builder,
                                const VTableLayout &layout, llvm::Constant *rtti,
                                bool vtableHasLocalLinkage);
+
+  /// Records the vtables of \p RD as definitions that must have been compiled
+  /// with -fmalterlib-sized-destructors, for a construction site or for the
+  /// marker of \p Owner.
+  void addMalterlibSizedVTableReferences(const CXXRecordDecl *RD,
+                                         llvm::GlobalValue *Owner = nullptr);
+
+  /// Records the deleting destructors and thunks in the vtables of \p RD as
+  /// definitions that must have been compiled with
+  /// -fmalterlib-sized-destructors for the marker of the vtable \p Owner.
+  void addMalterlibSizedSlotReferences(const CXXRecordDecl *RD,
+                                       llvm::GlobalValue *Owner);
 
   CodeGenVTables(CodeGenModule &CGM);
 

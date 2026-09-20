@@ -429,8 +429,13 @@ static bool hasDistinctMetadataIntrinsic(const Function &F) {
 
 /// Check whether \p F is eligible for function merging.
 static bool isEligibleForMerging(Function &F) {
+  // A definition that carries the marker of -fmalterlib-sized-destructors is
+  // referenced together with its marker, which the linker expects at the
+  // definition's address.
   return !F.isDeclaration() && !F.hasAvailableExternallyLinkage() &&
          !F.hasFnAttribute(Attribute::NoIPA) &&
+         !F.hasFnAttribute(MalterlibSizedMarkerAttr) &&
+         !F.hasFnAttribute(MalterlibSizedAliasesAttr) &&
          !hasDistinctMetadataIntrinsic(F);
 }
 

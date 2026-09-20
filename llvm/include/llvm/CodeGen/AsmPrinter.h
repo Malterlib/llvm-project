@@ -644,6 +644,23 @@ public:
 
   virtual void emitFunctionEntryLabel();
 
+  MCSymbol *getMalterlibSizedMarker(const GlobalValue *GV,
+                                    StringRef Name) const;
+  void emitMalterlibSizedMarkerAttributes(const GlobalValue *GV,
+                                          MCSymbol *Marker, bool IsLocal,
+                                          bool IsFunction);
+  void emitMalterlibSizedMarker(const GlobalValue *GV, bool IsFunction);
+  void emitMalterlibSizedAliasMarkers(const GlobalObject *GO, MCSymbol *Sym,
+                                      StringRef List, bool IsFunction);
+  void emitMalterlibSizedOwnerLabel(const GlobalObject *GO);
+  MCSection *getMalterlibSizedDependencySection(const GlobalObject *GO);
+  void emitMalterlibSizedDependencies();
+
+  /// The local label at each definition that holds owners of
+  /// -fmalterlib-sized-destructors, which their dependency records name.
+  SmallVector<std::pair<const GlobalObject *, MCSymbol *>, 0>
+      MalterlibSizedOwnerLabels;
+
   virtual void emitFunctionDescriptor() {
     llvm_unreachable("Function descriptor is target-specific.");
   }

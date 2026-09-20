@@ -447,10 +447,13 @@ CodeGenTypes::arrangeCXXStructorDeclaration(GlobalDecl GD) {
                                       : RequiredArgs::All);
 
   FunctionType::ExtInfo extInfo = FTP->getExtInfo();
-  CanQualType resultType = getCXXABI().HasThisReturn(GD) ? argTypes.front()
-                           : getCXXABI().hasMostDerivedReturn(GD)
-                               ? CGM.getContext().VoidPtrTy
-                               : Context.VoidTy;
+  CanQualType resultType =
+      getCXXABI().hasMalterlibSizedDestructor(GD)
+          ? Context.getCanonicalType(
+                Context.getMalterlibSizedDestroyResultType())
+      : getCXXABI().HasThisReturn(GD)        ? argTypes.front()
+      : getCXXABI().hasMostDerivedReturn(GD) ? CGM.getContext().VoidPtrTy
+                                             : Context.VoidTy;
   return arrangeLLVMFunctionInfo(resultType, FnInfoOpts::IsInstanceMethod,
                                  argTypes, extInfo, paramInfos, required);
 }
@@ -1061,7 +1064,11 @@ const CGFunctionInfo &CodeGenTypes::arrangeLLVMFunctionInfo(
     computeSPIRKernelABIInfo(CGM, *FI);
   } else if (info.getCC() == CC_Swift || info.getCC() == CC_SwiftAsync) {
     swiftcall::computeABIInfo(CGM, *FI);
-  } else if (CGM.shouldUseLLVMABILowering(CC)) {
+  } else if (CGM.shouldUseLLVMABILowering(CC) &&
+             !getContext().isMalterlibSizedDestroyResultType(
+                 FI->getReturnType())) {
+    // The experimental lowering does not know the register return of a sized
+    // deleting destructor (see -fmalterlib-sized-destructors).
     CGM.computeABIInfoUsingLib(*FI);
   } else {
     CGM.getABIInfo().computeInfo(*FI);
@@ -3032,8 +3039,12 @@ void CodeGenModule::ConstructAttributeList(StringRef Name,
   // unless this is a thunk function. Add dead_on_return to the `this` argument
   // in base class destructors to aid in DSE.
   // FIXME: fix this properly, https://reviews.llvm.org/D100388
+  // A sized deleting destructor is passed 'this' with the caller's mode in
+  // bit 0, so it is neither aligned nor dereferenceable as the class's layout
+  // would suggest.
   if (FI.isInstanceMethod() && !IRFunctionArgs.hasInallocaArg() &&
-      !FI.arg_begin()->type->isVoidPointerType() && !IsThunk) {
+      !FI.arg_begin()->type->isVoidPointerType() && !IsThunk &&
+      !getContext().isMalterlibSizedDestroyResultType(FI.getReturnType())) {
     auto IRArgs = IRFunctionArgs.getIRArgs(0);
 
     assert(IRArgs.second == 1 && "Expected only a single `this` pointer.");

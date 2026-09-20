@@ -5919,6 +5919,43 @@ override declarations with only a function declaration.
   }];
 }
 
+def MalterlibSizedConstructionDocs : Documentation {
+  let Category = DocCatFunction;
+  let Content = [{
+The ``[[malterlib::sized_construction]]`` attribute marks the functions that
+construct objects which are later destroyed with
+``__builtin_malterlib_destroy``, such as the allocating helpers of a library
+with custom allocators.
+
+Every new-expression in such a function that constructs a class with a virtual
+destructor makes the module refer to the marker symbol that code compiled with
+``-fmalterlib-sized-destructors`` gives the constructor the expression calls.
+That marker proves its claim only when the vtables the constructor installs,
+and the deleting destructors and thunks in their slots, have markers too, which
+the link of the image that defines each checks, so a library may hide what its
+exported constructor installs. A definition compiled without the flag has no
+marker, so the link fails with an undefined symbol, ``Foreign::Foreign()
+(.mib_sized)``, that names the definition and the object referring to it; the
+linker adds what that means. A marker follows the
+copy of an inline definition the linker keeps, and the linker rejects a copy
+compiled without the flag that displaced a marked one.
+
+A shared library or dylib also names the definitions its construction sites,
+and the proofs of the constructors and vtables it exports, depend on that
+another image may take the place of at runtime: through symbol preemption on
+ELF, or when dyld coalesces a weak definition. A later link that loads the
+library rejects a copy of such a definition compiled without the flag.
+
+The object is constructed by the constructor the expression names: a prvalue
+another function produces is constructed by that function, with the vtable of
+its image, and is rejected.
+
+New-expressions in other functions refer to nothing, so constructing a class
+from a library that was built without the flag is only an error where the
+object is also destroyed through the builtin.
+  }];
+}
+
 def LeafDocs : Documentation {
   let Category = DocCatVariable;
   let Content = [{

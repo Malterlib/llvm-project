@@ -2326,6 +2326,8 @@ OptimizeGlobalAliases(Module &M,
 
     if (RenameTarget) {
       // Give the aliasee the name, linkage and other attributes of the alias.
+      if (auto *GO = dyn_cast<GlobalObject>(Target))
+        keepMalterlibSizedMarker(*GO, GO->getName());
       Target->takeName(&J);
       Target->setLinkage(J.getLinkage());
       Target->setDSOLocal(J.isDSOLocal());

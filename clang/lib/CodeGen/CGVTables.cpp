@@ -65,6 +65,20 @@ static void setThunkProperties(CodeGenModule &CGM, const ThunkInfo &Thunk,
     ThunkFn->setComdat(CGM.getModule().getOrInsertComdat(ThunkFn->getName()));
 }
 
+// A thunk for a deleting destructor is part of the same proof as the
+// destructor it forwards to (see -fmalterlib-sized-destructors), whose copy the
+// link resolves apart from the thunk's.
+static void emitMalterlibSizedThunkMarker(CodeGenModule &CGM,
+                                          llvm::Function *ThunkFn,
+                                          GlobalDecl GD) {
+  if (!CGM.getCXXABI().hasMalterlibSizedDestructor(GD))
+    return;
+  CGM.EmitMalterlibSizedMarker(ThunkFn);
+  CGM.AddMalterlibSizedReference(
+      cast<llvm::GlobalValue>(CGM.GetAddrOfGlobal(GD)->stripPointerCasts()),
+      ThunkFn);
+}
+
 #ifndef NDEBUG
 static bool similar(const ABIArgInfo &infoL, CanQualType typeL,
                     const ABIArgInfo &infoR, CanQualType typeR) {
@@ -284,6 +298,8 @@ void CodeGenFunction::StartThunk(llvm::Function *Fn, GlobalDecl GD,
   QualType ResultType;
   if (IsUnprototyped)
     ResultType = CGM.getContext().VoidTy;
+  else if (CGM.getCXXABI().hasMalterlibSizedDestructor(GD))
+    ResultType = CGM.getContext().getMalterlibSizedDestroyResultType();
   else if (CGM.getCXXABI().HasThisReturn(GD))
     ResultType = ThisType;
   else if (CGM.getCXXABI().hasMostDerivedReturn(GD))
@@ -399,11 +415,12 @@ void CodeGenFunction::EmitCallAndReturnForThunk(llvm::FunctionCallee Callee,
 #endif
 
   // Determine whether we have a return value slot to use.
-  QualType ResultType = CGM.getCXXABI().HasThisReturn(CurGD)
-                            ? ThisType
-                            : CGM.getCXXABI().hasMostDerivedReturn(CurGD)
-                                  ? CGM.getContext().VoidPtrTy
-                                  : FPT->getReturnType();
+  QualType ResultType =
+      CGM.getCXXABI().hasMalterlibSizedDestructor(CurGD)
+          ? CGM.getContext().getMalterlibSizedDestroyResultType()
+      : CGM.getCXXABI().HasThisReturn(CurGD)        ? ThisType
+      : CGM.getCXXABI().hasMostDerivedReturn(CurGD) ? CGM.getContext().VoidPtrTy
+                                                    : FPT->getReturnType();
   ReturnValueSlot Slot;
   if (!ResultType->isVoidType() &&
       (CurFnInfo->getReturnInfo().getKind() == ABIArgInfo::Indirect ||
@@ -526,15 +543,9 @@ static bool shouldEmitVTableThunk(CodeGenModule &CGM, const CXXMethodDecl *MD,
   return true;
 }
 
-llvm::Constant *CodeGenVTables::maybeEmitThunk(GlobalDecl GD,
-                                               const ThunkInfo &TI,
-                                               bool ForVTable) {
+void CodeGenVTables::getThunkName(GlobalDecl GD, const ThunkInfo &TI,
+                                  SmallString<256> &Name) {
   const CXXMethodDecl *MD = cast<CXXMethodDecl>(GD.getDecl());
-
-  // First, get a declaration. Compute the mangled name. Don't worry about
-  // getting the function prototype right, since we may only need this
-  // declaration to fill in a vtable slot.
-  SmallString<256> Name;
   MangleContext &MCtx = CGM.getCXXABI().getMangleContext();
   llvm::raw_svector_ostream Out(Name);
 
@@ -552,6 +563,99 @@ llvm::Constant *CodeGenVTables::maybeEmitThunk(GlobalDecl GD,
     else
       MCtx.mangleThunk(MD, TI, /* elideOverrideInfo */ true, Out);
   }
+}
+
+void CodeGenVTables::addMalterlibSizedVTableReferences(
+    const CXXRecordDecl *RD, llvm::GlobalValue *Owner) {
+  // A class whose constructors leave the vtable pointers to a derived class,
+  // such as a Microsoft novtable class, installs no vtable of its own, which
+  // then need not exist.
+  if (!CGM.getCXXABI().doStructorsInitializeVPtrs(RD))
+    return;
+  if (CGM.getTarget().getCXXABI().isMicrosoft()) {
+    // The vftable symbol is an alias into the variable when the vftable has
+    // RTTI data, so it is found by name.
+    MicrosoftVTableContext &Context = CGM.getMicrosoftVTableContext();
+    for (const std::unique_ptr<VPtrInfo> &Info : Context.getVFPtrOffsets(RD)) {
+      SmallString<256> Name;
+      llvm::raw_svector_ostream Out(Name);
+      cast<MicrosoftMangleContext>(CGM.getCXXABI().getMangleContext())
+          .mangleCXXVFTable(RD, Info->MangledPath, Out);
+      CGM.getCXXABI().getAddrOfVTable(RD, Info->FullOffsetInMDC);
+      if (llvm::GlobalValue *VFTable = CGM.getModule().getNamedValue(Name))
+        CGM.AddMalterlibSizedReference(VFTable, Owner);
+    }
+  } else {
+    // A relative vtable a definition renames to a local name keeps its marker
+    // on the public alias of the original name.
+    llvm::GlobalValue *VTable =
+        CGM.getCXXABI().getAddrOfVTable(RD, CharUnits::Zero());
+    SmallString<256> Name;
+    llvm::raw_svector_ostream Out(Name);
+    cast<ItaniumMangleContext>(CGM.getCXXABI().getMangleContext())
+        .mangleCXXVTable(RD, Out);
+    if (llvm::GlobalValue *Named = CGM.getModule().getNamedValue(Name))
+      VTable = Named;
+    CGM.AddMalterlibSizedReference(VTable, Owner);
+  }
+}
+
+void CodeGenVTables::addMalterlibSizedSlotReferences(const CXXRecordDecl *RD,
+                                                     llvm::GlobalValue *Owner) {
+  auto addLayout = [&](const VTableLayout &Layout) {
+    unsigned NextThunkIndex = 0;
+    for (unsigned I = 0, E = Layout.vtable_components().size(); I != E; ++I) {
+      const VTableComponent &Component = Layout.vtable_components()[I];
+      if (!Component.isUsedFunctionPointerKind())
+        continue;
+
+      GlobalDecl GD = Component.getGlobalDecl(
+          CGM.getContext().getTargetInfo().emitVectorDeletingDtors(
+              CGM.getContext().getLangOpts()));
+      const bool IsThunk =
+          NextThunkIndex < Layout.vtable_thunks().size() &&
+          Layout.vtable_thunks()[NextThunkIndex].first == I;
+      const ThunkInfo *TI =
+          IsThunk ? &Layout.vtable_thunks()[NextThunkIndex++].second : nullptr;
+
+      const auto *MD = cast<CXXMethodDecl>(GD.getDecl());
+      if (Component.getKind() != VTableComponent::CK_DeletingDtorPointer ||
+          MD->isPureVirtual() || MD->isDeleted())
+        continue;
+
+      llvm::Constant *Required;
+      if (TI) {
+        SmallString<256> ThunkName;
+        getThunkName(GD, *TI, ThunkName);
+        Required = CGM.GetAddrOfThunk(
+            ThunkName, CGM.getTypes().GetFunctionTypeForVTable(GD), GD);
+      } else {
+        Required = CGM.GetAddrOfGlobal(GD);
+      }
+      CGM.AddMalterlibSizedReference(
+          cast<llvm::GlobalValue>(Required->stripPointerCasts()), Owner);
+    }
+  };
+
+  if (CGM.getTarget().getCXXABI().isMicrosoft()) {
+    MicrosoftVTableContext &Context = CGM.getMicrosoftVTableContext();
+    for (const std::unique_ptr<VPtrInfo> &Info : Context.getVFPtrOffsets(RD))
+      addLayout(Context.getVFTableLayout(RD, Info->FullOffsetInMDC));
+  } else {
+    addLayout(getItaniumVTableContext().getVTableLayout(RD));
+  }
+}
+
+llvm::Constant *CodeGenVTables::maybeEmitThunk(GlobalDecl GD,
+                                               const ThunkInfo &TI,
+                                               bool ForVTable) {
+  const CXXMethodDecl *MD = cast<CXXMethodDecl>(GD.getDecl());
+
+  // First, get a declaration. Compute the mangled name. Don't worry about
+  // getting the function prototype right, since we may only need this
+  // declaration to fill in a vtable slot.
+  SmallString<256> Name;
+  getThunkName(GD, TI, Name);
 
   llvm::Type *ThunkVTableTy = CGM.getTypes().GetFunctionTypeForVTable(GD);
   llvm::Constant *Thunk = CGM.GetAddrOfThunk(Name, ThunkVTableTy, GD);
@@ -600,7 +704,11 @@ llvm::Constant *CodeGenVTables::maybeEmitThunk(GlobalDecl GD,
       return ThunkFn;
     }
 
+    // The thunk was emitted for a vtable as available externally and becomes
+    // a definition here, so it gets the marker of one now (see
+    // -fmalterlib-sized-destructors).
     setThunkProperties(CGM, TI, ThunkFn, ForVTable, GD);
+    emitMalterlibSizedThunkMarker(CGM, ThunkFn, GD);
     return ThunkFn;
   }
 
@@ -645,6 +753,9 @@ llvm::Constant *CodeGenVTables::maybeEmitThunk(GlobalDecl GD,
   }
 
   setThunkProperties(CGM, TI, ThunkFn, ForVTable, GD);
+
+  emitMalterlibSizedThunkMarker(CGM, ThunkFn, GD);
+
   return ThunkFn;
 }
 
@@ -754,13 +865,11 @@ static void AddRelativeLayoutOffset(const CodeGenModule &CGM,
   builder.add(llvm::ConstantInt::getSigned(CGM.Int32Ty, offset.getQuantity()));
 }
 
-void CodeGenVTables::addVTableComponent(ConstantArrayBuilder &builder,
-                                        const VTableLayout &layout,
-                                        unsigned componentIndex,
-                                        llvm::Constant *rtti,
-                                        unsigned &nextVTableThunkIndex,
-                                        unsigned vtableAddressPoint,
-                                        bool vtableHasLocalLinkage) {
+void CodeGenVTables::addVTableComponent(
+    ConstantArrayBuilder &builder, const VTableLayout &layout,
+    unsigned componentIndex, llvm::Constant *rtti,
+    unsigned &nextVTableThunkIndex, unsigned vtableAddressPoint,
+    bool vtableHasLocalLinkage) {
   auto &component = layout.vtable_components()[componentIndex];
 
   bool RelativeCXXABIVTables = CGM.getLangOpts().RelativeCXXABIVTables;

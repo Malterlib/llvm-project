@@ -15,6 +15,7 @@
 #include "ObjC.h"
 #include "OutputSection.h"
 #include "OutputSegment.h"
+#include "Relocations.h"
 #include "SectionPriorities.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -31,6 +32,7 @@
 #include "lld/Common/Reproduce.h"
 #include "lld/Common/Version.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -38,6 +40,8 @@
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/CGData/CodeGenDataWriter.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Option/ArgList.h"
@@ -46,6 +50,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TargetSelect.h"
@@ -54,6 +59,10 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/PackedVersion.h"
+
+#include <functional>
+#include <map>
+#include <optional>
 
 #if !_WIN32
 #include <sys/mman.h>
@@ -1528,6 +1537,11 @@ static void gatherInputSections() {
       // Addrsig sections contain metadata only needed at link time.
       if (section->name == section_names::addrSig)
         continue;
+      // So do the references of -fmalterlib-sized-destructors.
+      if (section->segname == segment_names::dataConst &&
+          (section->name == "__mib_sized_ref" ||
+           section->name == "__mib_sized_dep"))
+        continue;
       for (const Subsection &subsection : section->subsections)
         addInputSection(subsection.isec);
     }
@@ -1637,6 +1651,436 @@ static void referenceStubBinder() {
   // StubHelperSection::setUp() adds a reference and errors out if
   // dyld_stub_binder doesn't exist in case it is actually needed.
   symtab->addUndefined("dyld_stub_binder", /*file=*/nullptr, /*isWeak=*/false);
+}
+
+namespace {
+// A reference of -fmalterlib-sized-destructors. A reference to a local
+// symbol may name its section instead, with the offset from it.
+struct MalterlibSizedReference {
+  llvm::PointerUnion<Symbol *, InputSection *> target;
+  int64_t addend = 0;
+
+  std::optional<std::pair<const InputSection *, uint64_t>> location() const {
+    if (auto *isec = dyn_cast_if_present<InputSection *>(target))
+      return std::make_pair(isec, uint64_t(addend));
+    if (auto *d = dyn_cast_if_present<Defined>(
+            dyn_cast_if_present<Symbol *>(target)))
+      return std::make_pair(d->isec(), d->value + addend);
+    return std::nullopt;
+  }
+  Symbol *symbol() const { return dyn_cast_if_present<Symbol *>(target); }
+  std::string file() const {
+    if (Symbol *sym = symbol())
+      return toString(sym->getFile());
+    return toString(cast<InputSection *>(target)->getFile());
+  }
+};
+} // namespace
+
+// A definition compiled with -fmalterlib-sized-destructors carries a marker,
+// which the construction sites that depend on it reference. The marker of a
+// constructor or a vtable proves its claim only when what it binds in this
+// image does too: a constructor installs its image's vtable, which binds its
+// image's deleting destructors. A marker whose claim is not proven does not
+// leave the image, and is only an error where a site depends on it. Symbol
+// resolution does the rest, except for three things: the references are in a
+// section that does not reach the output, where an undefined marker would not
+// be reported, the marker the link resolved may not belong to the definition
+// it resolved, and a dylib's marker stands in for its definition only in its
+// own image.
+static void checkMalterlibSizedMarkers() {
+  SmallVector<std::array<MalterlibSizedReference, 2>, 0> sites;
+  SmallVector<std::array<MalterlibSizedReference, 3>, 0> dependencies;
+  for (const InputFile *file : inputFiles) {
+    const auto *objFile = dyn_cast<ObjFile>(file);
+    if (!objFile)
+      continue;
+    for (const Section *sec : objFile->sections) {
+      size_t width;
+      if (sec->segname != segment_names::dataConst)
+        continue;
+      if (sec->name == "__mib_sized_ref")
+        width = 2;
+      else if (sec->name == "__mib_sized_dep")
+        width = 3;
+      else
+        continue;
+      std::map<uint64_t, SmallVector<MalterlibSizedReference, 3>> groups;
+      for (const Subsection &sub : sec->subsections)
+        for (const Relocation &r : sub.isec->relocs) {
+          uint64_t entry = (sub.offset + r.offset) / target->wordSize;
+          auto &group = groups[entry / width];
+          group.resize(width);
+          group[entry % width] = {r.referent, r.addend};
+        }
+      for (auto &[index, group] : groups) {
+        if (!llvm::all_of(group, [](auto &ref) { return bool(ref.target); }))
+          continue;
+        if (width == 2) {
+          sites.push_back({group[0], group[1]});
+          continue;
+        }
+        // A record belongs to its object's copy of the owner, and says
+        // nothing of a copy of another object that the link kept.
+        const InputFile *ownerFile = nullptr;
+        if (auto *isec = dyn_cast<InputSection *>(group[0].target))
+          ownerFile = isec->getFile();
+        else if (auto *d = dyn_cast<Defined>(group[0].symbol()))
+          ownerFile = d->getFile();
+        if (ownerFile == objFile)
+          dependencies.push_back({group[0], group[1], group[2]});
+      }
+    }
+  }
+  // The symbols a dylib defines, by the name of a definition another image
+  // may take the place of: for one its construction sites depend on, and for
+  // one the proof of an owner it exports depends on, followed by a hash of
+  // the owner's name.
+  constexpr StringRef requiredSuffix = ".mib_sized_required";
+  constexpr StringRef edgeInfix = ".mib_sized_edge.";
+  // What the dylibs of the link say, by the names of definitions: the dylibs
+  // that export a marker of one, those whose sites depend on one, and what
+  // the proof of an owner a dylib exports depends on.
+  DenseMap<StringRef, SmallVector<DylibFile *, 1>> dylibMarkers, dylibRequired;
+  DenseMap<std::pair<DylibFile *, uint64_t>, SmallVector<StringRef, 2>>
+      dylibEdges;
+  // A dylib the image does not load, as the writer decides, says nothing. One
+  // a loaded dylib re-exports binds through that one, and is loaded with it.
+  std::function<bool(const DylibFile *)> isLoaded =
+      [&](const DylibFile *dylib) {
+        if (dylib->umbrella && dylib->umbrella != dylib &&
+            isLoaded(dylib->umbrella))
+          return true;
+        return dylib->isReferenced() || dylib->forceNeeded ||
+               (dylib->isExplicitlyLinked() && !dylib->deadStrippable &&
+                !config->deadStripDylibs);
+      };
+  for (InputFile *file : inputFiles) {
+    auto *dylib = dyn_cast<DylibFile>(file);
+    if (!dylib || !isLoaded(dylib))
+      continue;
+    // The symbols of a dylib an umbrella re-exports are the umbrella's.
+    DylibFile *exporting = dylib->exportingFile ? dylib->exportingFile : dylib;
+    for (Symbol *sym : dylib->symbols) {
+      if (!sym)
+        continue;
+      StringRef name = sym->getName();
+      if (name.consume_back(llvm::MalterlibSizedMarkerSuffix)) {
+        dylibMarkers[name].push_back(exporting);
+      } else if (name.consume_back(requiredSuffix)) {
+        dylibRequired[name].push_back(exporting);
+      } else if (auto [dep, hash] = name.rsplit(edgeInfix);
+                 dep.size() != name.size()) {
+        uint64_t owner;
+        if (!hash.getAsInteger(16, owner))
+          dylibEdges[{exporting, owner}].push_back(dep);
+      }
+    }
+  }
+
+  using Location = std::pair<const InputSection *, uint64_t>;
+  DenseMap<Location, SmallVector<std::array<MalterlibSizedReference, 2>, 1>>
+      dependenciesOf;
+  for (auto &[owner, def, marker] : dependencies)
+    if (auto location = owner.location())
+      dependenciesOf[*location].push_back({def, marker});
+
+  auto nameOf = [](const MalterlibSizedReference &def,
+                   const MalterlibSizedReference &marker) {
+    StringRef name;
+    if (Symbol *sym = marker.symbol();
+        sym && sym->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      name = sym->getName().drop_back(llvm::MalterlibSizedMarkerSuffix.size());
+    else if (Symbol *sym = def.symbol())
+      name = sym->getName();
+    return config->demangle ? llvm::demangle(name) : name.str();
+  };
+
+  auto mixed = [&](const MalterlibSizedReference &def,
+                   const MalterlibSizedReference &marker) {
+    return nameOf(def, marker) +
+           " was compiled both with and without "
+           "-fmalterlib-sized-destructors, and the link keeps a copy compiled "
+           "without\n>>> defined in " +
+           def.file() + "\n>>> marked in " + marker.file();
+  };
+
+  // Why a definition and its marker do not prove the definition was compiled
+  // with the flag, or an empty string when they do. A marker whose claim
+  // depends on itself is taken at its word.
+  DenseMap<Location, std::string> proven;
+  std::function<std::string(const MalterlibSizedReference &,
+                            const MalterlibSizedReference &)>
+      check;
+  auto provenAt = [&](Location location, const std::string &name) {
+    if (auto it = proven.find(location); it != proven.end())
+      return it->second;
+    proven[location] = {};
+    std::string why;
+    for (auto &[depDef, depMarker] : dependenciesOf.lookup(location))
+      if (std::string depWhy = check(depDef, depMarker); !depWhy.empty()) {
+        why = name + " depends on " + nameOf(depDef, depMarker) + "\n>>> " +
+              depWhy;
+        break;
+      }
+    return proven[location] = why;
+  };
+  check = [&](const MalterlibSizedReference &def,
+              const MalterlibSizedReference &marker) -> std::string {
+    // The optimizer folds a marker it sees into its definition, which proves
+    // that the marker belongs to it, and leaves its dependencies to check.
+    if (def.target == marker.target && def.addend == marker.addend) {
+      if (auto location = def.location())
+        return provenAt(*location, nameOf(def, marker));
+      return {};
+    }
+    Symbol *markerSym = marker.symbol();
+    if (isa_and_present<Undefined, LazyArchive, LazyObject>(markerSym))
+      return nameOf(def, marker) +
+             " was not compiled with -fmalterlib-sized-destructors\n>>> its "
+             "marker " +
+             markerSym->getName().str() + " is undefined";
+    if (auto *m = dyn_cast_if_present<DylibSymbol>(markerSym)) {
+      auto *d = dyn_cast_if_present<DylibSymbol>(def.symbol());
+      if (d && !m->isDynamicLookup() && !d->isDynamicLookup() &&
+          m->getFile() == d->getFile())
+        return {};
+    } else if (auto location = marker.location();
+               location && location == def.location()) {
+      return provenAt(*location, nameOf(def, marker));
+    }
+    return mixed(def, marker);
+  };
+
+  // Local references may name one section with different addends.
+  DenseSet<std::tuple<void *, int64_t, void *, int64_t>> seen;
+  for (auto &[def, marker] : sites) {
+    if (!seen.insert({def.target.getOpaqueValue(), def.addend,
+                      marker.target.getOpaqueValue(), marker.addend})
+             .second)
+      continue;
+    if (std::string why = check(def, marker); !why.empty())
+      error(why + "\n>>> an object a construction site makes is destroyed "
+                  "with the size its deleting destructor returns");
+  }
+
+  bool isDylib =
+      config->outputType == MH_DYLIB || config->outputType == MH_BUNDLE;
+  // Whether another image may take the place of a definition at runtime: one
+  // this image imports, or a weak one a dylib exports, which dyld coalesces
+  // across images, as it does every definition with a flat namespace.
+  auto isBoundary = [&](Symbol *sym) {
+    if (auto *d = dyn_cast_if_present<DylibSymbol>(sym))
+      return !d->isDynamicLookup();
+    auto *d = dyn_cast_if_present<Defined>(sym);
+    return d && isDylib && d->isExternal() && !d->privateExtern &&
+           (d->isWeakDef() || config->namespaceKind == NamespaceKind::flat);
+  };
+  // The definitions another image may take the place of that the proof of
+  // \p work depends on, through the definitions this image binds.
+  auto boundaryOf = [&](SmallVector<MalterlibSizedReference, 0> work) {
+    SetVector<Symbol *> boundary;
+    DenseSet<Location> visited;
+    while (!work.empty()) {
+      MalterlibSizedReference ref = work.pop_back_val();
+      if (isBoundary(ref.symbol())) {
+        boundary.insert(ref.symbol());
+        continue;
+      }
+      if (auto location = ref.location();
+          location && visited.insert(*location).second)
+        for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+          work.push_back(depDef);
+    }
+    return boundary.takeVector();
+  };
+  auto dependenciesAt = [&](Symbol *sym) {
+    SmallVector<MalterlibSizedReference, 0> deps;
+    if (auto location = MalterlibSizedReference{sym}.location())
+      for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+        deps.push_back(depDef);
+    return deps;
+  };
+
+  // A dylib's sites bind at runtime to the copy of a definition its link
+  // bound, unless dyld coalesces it, or this image overrides it, and so do
+  // the definitions a dylib's owner binds. The copy must carry the marker,
+  // and the definitions its dylib's proof of it depends on must too.
+  DenseSet<StringRef> followed;
+  std::function<void(StringRef, DylibFile *)> followEdges;
+  std::function<void(StringRef, DylibFile *)> follow =
+      [&](StringRef name, DylibFile *requirer) {
+        if (!followed.insert(name).second)
+          return;
+        Symbol *x = symtab->find(name);
+        if (!x)
+          return;
+        Symbol *m =
+            symtab->find((name + llvm::MalterlibSizedMarkerSuffix).str());
+        MalterlibSizedReference def{x}, marker{m ? m : x};
+        std::string why;
+        if (auto *d = dyn_cast<Defined>(x)) {
+          if (!(d->isWeakDef() || d->overridesWeakDef ||
+                config->namespaceKind == NamespaceKind::flat) ||
+              !d->isExternal() || d->privateExtern || !d->isLive())
+            return;
+          if (!m || isa<Undefined, LazyArchive, LazyObject>(m))
+            why = nameOf(def, def) +
+                  " was not compiled with -fmalterlib-sized-destructors";
+          else if (auto location = marker.location();
+                   location && location == def.location())
+            why = provenAt(*location, nameOf(def, marker));
+          else
+            why = mixed(def, marker);
+          if (why.empty())
+            for (Symbol *n : boundaryOf(dependenciesAt(x)))
+              if (isa<DylibSymbol>(n))
+                follow(n->getName(), requirer);
+        } else if (auto *d = dyn_cast<DylibSymbol>(x)) {
+          if (d->isDynamicLookup())
+            return;
+          SmallVector<DylibFile *, 1> marking = dylibMarkers.lookup(name);
+          if (llvm::is_contained(marking, d->getFile()))
+            followEdges(name, requirer);
+          else if (marking.empty())
+            why = nameOf(def, def) +
+                  " was not compiled with -fmalterlib-sized-destructors\n>>> "
+                  "defined in " +
+                  toString(d->getFile());
+          else
+            why = nameOf(def, def) +
+                  " was compiled both with and without "
+                  "-fmalterlib-sized-destructors, and the link keeps a copy "
+                  "compiled without\n>>> defined in " +
+                  toString(d->getFile()) + "\n>>> marked in " +
+                  toString(marking.front());
+        }
+        if (why.empty())
+          return;
+        if (requirer)
+          error(why + "\n>>> the construction sites of " +
+                toString(requirer) +
+                " bind to the copy the link keeps at runtime");
+        else
+          error(why + "\n>>> an object a construction site makes is "
+                      "destroyed with the size its deleting destructor "
+                      "returns");
+      };
+  followEdges = [&](StringRef name, DylibFile *requirer) {
+    auto *d = cast<DylibSymbol>(symtab->find(name));
+    for (StringRef dep : dylibEdges.lookup({d->getFile(), xxh3_64bits(name)}))
+      follow(dep, requirer);
+  };
+  // The site checks proved what this image's sites import; what the proofs
+  // of the dylibs they come from depend on remains.
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : sites)
+      siteDefs.push_back(def);
+    for (Symbol *n : boundaryOf(std::move(siteDefs)))
+      if (auto *d = dyn_cast<DylibSymbol>(n);
+          d && followed.insert(n->getName()).second &&
+          llvm::is_contained(dylibMarkers.lookup(n->getName()), d->getFile()))
+        followEdges(n->getName(), nullptr);
+  }
+  SmallVector<StringRef, 0> requiredNames;
+  for (auto &[name, requirers] : dylibRequired)
+    requiredNames.push_back(name);
+  llvm::sort(requiredNames);
+  for (StringRef name : requiredNames)
+    for (DylibFile *requirer : dylibRequired.lookup(name))
+      follow(name, requirer);
+
+  // A marker leaves the image with its definition, whatever the lists of
+  // exported symbols say, unless the image does not prove it: its claim is
+  // not proven, or a copy of its definition the link did not keep left it.
+  SmallVector<Defined *, 0> owners;
+  for (Symbol *sym : symtab->getSymbols()) {
+    auto *m = dyn_cast<Defined>(sym);
+    if (!m || !m->isExternal() ||
+        !m->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
+    Symbol *x = symtab->find(
+        m->getName().drop_back(llvm::MalterlibSizedMarkerSuffix.size()));
+    MalterlibSizedReference marker{sym}, def{x};
+    auto location = marker.location();
+    if (!location || location != def.location() ||
+        !provenAt(*location, nameOf(def, marker)).empty()) {
+      m->privateExtern = true;
+    } else {
+      // Dead stripping may have taken a marker an export list hid for dead.
+      m->privateExtern = cast<Defined>(x)->privateExtern;
+      m->used = x->used;
+      if (!m->privateExtern)
+        owners.push_back(cast<Defined>(x));
+    }
+  }
+
+  // A dylib names what another image may take the place of: the definitions
+  // its sites depend on, and those the proof of each owner it exports
+  // depends on.
+  if (!isDylib)
+    return;
+  // Another image takes the place of a definition by name only where dyld
+  // coalesces it. A strong import binds to the dylib this link found it in,
+  // and what that dylib's proof of it depends on stands in for it.
+  auto byName = [&](ArrayRef<Symbol *> syms) {
+    SetVector<Symbol *> out;
+    DenseSet<Symbol *> visited;
+    SmallVector<Symbol *, 0> work(syms.begin(), syms.end());
+    while (!work.empty()) {
+      Symbol *sym = work.pop_back_val();
+      if (!sym || !visited.insert(sym).second)
+        continue;
+      auto *d = dyn_cast<DylibSymbol>(sym);
+      if (!d || d->isWeakDef() ||
+          config->namespaceKind == NamespaceKind::flat) {
+        out.insert(sym);
+        continue;
+      }
+      if (!d->isDynamicLookup())
+        for (StringRef dep : dylibEdges.lookup(
+                 {d->getFile(), xxh3_64bits(d->getName())}))
+          work.push_back(symtab->find(dep));
+    }
+    return out.takeVector();
+  };
+  SetVector<StringRef> names;
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : sites)
+      siteDefs.push_back(def);
+    for (Symbol *n : byName(boundaryOf(std::move(siteDefs))))
+      names.insert(saver().save(n->getName() + requiredSuffix));
+  }
+  // What the dylibs it loads require, and what that led to, go on to the
+  // links of the images that load it, which may not load those dylibs.
+  for (StringRef name : requiredNames)
+    names.insert(saver().save(name + requiredSuffix));
+  {
+    SmallVector<Symbol *, 0> reached;
+    for (StringRef name : followed)
+      if (Symbol *sym = symtab->find(name); isBoundary(sym))
+        reached.push_back(sym);
+    llvm::sort(reached, [](Symbol *a, Symbol *b) {
+      return a->getName() < b->getName();
+    });
+    for (Symbol *n : byName(reached))
+      names.insert(saver().save(n->getName() + requiredSuffix));
+  }
+  for (Defined *x : owners)
+    for (Symbol *n : byName(boundaryOf(dependenciesAt(x))))
+      names.insert(saver().save(n->getName() + edgeInfix +
+                                utohexstr(xxh3_64bits(x->getName()))));
+  SmallVector<StringRef, 0> sortedNames(names.begin(), names.end());
+  llvm::sort(sortedNames);
+  // The symbols come after dead stripping, which they are not subject to.
+  for (StringRef name : sortedNames)
+    symtab
+        ->addSynthetic(name, /*isec=*/nullptr, /*value=*/0,
+                       /*isPrivateExtern=*/false, /*includeInSymtab=*/true,
+                       /*referencedDynamically=*/false)
+        ->used = true;
 }
 
 static void createAliases() {
@@ -2501,6 +2945,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
     if (config->deadStrip)
       markLive();
+
+    // A definition dead stripping removed takes nobody's place.
+    checkMalterlibSizedMarkers();
 
     // Ensure that no symbols point inside __mod_init_func sections if they are
     // removed due to -init_offsets. This must run after dead stripping.

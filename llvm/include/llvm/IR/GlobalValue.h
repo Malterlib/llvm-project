@@ -46,6 +46,47 @@ typedef unsigned ID;
 // Objective-C functions which commonly have :'s in their names.
 inline constexpr char GlobalIdentifierDelimiter = ';';
 
+// The attribute of an external definition compiled with
+// -fmalterlib-sized-destructors. The AsmPrinter emits a marker symbol, the
+// definition's name with this suffix, at the definition's address, which the
+// construction sites that depend on the definition reference. Being part of
+// the definition, the marker follows the copy the linker keeps of an inline
+// definition, and the copy LTO keeps. A local definition gets an alias as its
+// marker instead, which the IR keeps apart from other local definitions of
+// the same name.
+inline constexpr StringLiteral MalterlibSizedMarkerAttr = "malterlib-sized";
+inline constexpr StringLiteral MalterlibSizedMarkerSuffix = ".mib_sized";
+// The aliases of a definition that get a marker of their own, as a
+// comma-separated list of name=offset, the alias's offset into the definition.
+inline constexpr StringLiteral MalterlibSizedAliasesAttr =
+    "malterlib-sized-aliases";
+// The dependencies of an owner the definition holds at an offset, as metadata
+// nodes of the offset and pairs of a definition the owner's marker depends on
+// and that definition's marker, or null for the one named after its symbol.
+inline constexpr StringLiteral MalterlibSizedDependenciesMD =
+    "malterlib.sized.deps";
+
+class GlobalObject;
+/// Moves the markers of -fmalterlib-sized-destructors of \p From to \p To, a
+/// global that holds its contents at \p Offset, as markers of the aliases
+/// that take \p From's place: \p Name, \p From's own, and those of the
+/// aliases \p From lists, with the dependencies of each. A pass that rebuilds
+/// a global with the contents of another calls it before it replaces the
+/// original with an alias.
+LLVM_ABI void transferMalterlibSizedMarkers(const GlobalObject &From,
+                                            GlobalObject &To, uint64_t Offset,
+                                            StringRef Name);
+
+/// Renames the marker of -fmalterlib-sized-destructors of \p GV, which a pass
+/// renamed from \p OldName: the references to it, and its entry among the
+/// aliases its definition lists.
+LLVM_ABI void renameMalterlibSizedMarker(GlobalValue &GV, StringRef OldName);
+
+/// Keeps the marker of -fmalterlib-sized-destructors \p GO has under \p Name,
+/// a name it gives up, as the marker of an alias of that name. A pass that
+/// renames a definition calls it first.
+LLVM_ABI void keepMalterlibSizedMarker(GlobalObject &GO, StringRef Name);
+
 class GlobalValue : public Constant {
 public:
   /// An enumeration for the kinds of linkage for global values.

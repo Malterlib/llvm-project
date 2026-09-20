@@ -492,6 +492,23 @@ private:
   std::vector<llvm::WeakTrackingVH> LLVMUsed;
   std::vector<llvm::WeakTrackingVH> LLVMCompilerUsed;
 
+  /// The definitions the construction sites of -fmalterlib-sized-destructors
+  /// in this module depend on, by IR name: code generation replaces a
+  /// declaration whose type it refines, or that becomes an alias.
+  /// A definition that must have been compiled with
+  /// -fmalterlib-sized-destructors, by name and value: code generation may
+  /// replace a declaration, or give its name to an alias.
+  struct MalterlibSizedTarget {
+    std::string Name;
+    llvm::WeakTrackingVH Value;
+  };
+  /// The definitions the construction sites in this module depend on, and,
+  /// with the definition that depends on each, what the constructors and
+  /// vtables this module defines depend on.
+  std::vector<MalterlibSizedTarget> MalterlibSizedReferences;
+  std::vector<std::pair<MalterlibSizedTarget, MalterlibSizedTarget>>
+      MalterlibSizedDependencies;
+
   /// Store the list of global constructors and their respective priorities to
   /// be emitted when the translation unit is complete.
   CtorList GlobalCtors;
@@ -1365,6 +1382,33 @@ public:
   /// to the expected name.
   template<typename SomeDecl>
   void MaybeHandleStaticInExternC(const SomeDecl *D, llvm::GlobalValue *GV);
+
+  /// Gives \p GV the marker of -fmalterlib-sized-destructors, which proves to
+  /// the linker that it was compiled with the flag: deleting destructors,
+  /// their thunks, the vtables that point to them and the constructors that
+  /// install those.
+  void EmitMalterlibSizedMarker(llvm::GlobalValue *GV);
+
+  /// Returns the IR name of the marker of \p GV.
+  std::string getMalterlibSizedMarkerIRName(llvm::GlobalValue *GV);
+
+  /// Records that \p GV must have been compiled with
+  /// -fmalterlib-sized-destructors: for a construction site of this module,
+  /// or, with \p Owner, for the marker of \p Owner to prove what it claims.
+  void AddMalterlibSizedReference(llvm::GlobalValue *GV,
+                                  llvm::GlobalValue *Owner = nullptr);
+
+  /// Records, as AddMalterlibSizedReference does, the definition of \p Ctor
+  /// as \p Type that a call reaches. Returns false for an inheriting
+  /// constructor a call emits inline, which leaves the vtables to the caller.
+  bool AddMalterlibSizedConstructorReference(const CXXConstructorDecl *Ctor,
+                                             CXXCtorType Type,
+                                             llvm::GlobalValue *Owner = nullptr);
+
+  /// Emits the references of the construction sites, and those of the owners
+  /// of markers, to the definitions they depend on and the markers those
+  /// carry when compiled with the flag, which the linker checks.
+  void EmitMalterlibSizedReferences();
 
   /// Add a global to a list to be added to the llvm.used metadata.
   void addUsedGlobal(llvm::GlobalValue *GV);

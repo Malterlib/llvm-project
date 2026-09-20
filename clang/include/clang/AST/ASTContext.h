@@ -510,6 +510,12 @@ class ASTContext : public RefCountedBase<ASTContext> {
   /// serialized.
   mutable RecordDecl *BlockDescriptorExtendedType = nullptr;
 
+  /// Result type of a deleting destructor compiled with
+  /// -fmalterlib-sized-destructors. It is never written by the user and only
+  /// exists so that the two returned values can be arranged as a single
+  /// function result.
+  mutable RecordDecl *MalterlibSizedDestroyResultType = nullptr;
+
   /// Declaration for the CUDA cudaConfigureCall function.
   FunctionDecl *cudaConfigureCallDecl = nullptr;
   /// Declaration for the CUDA cudaGetParameterBuffer function.
@@ -1675,6 +1681,14 @@ public:
   /// Gets the struct used to keep track of the descriptor for pointer to
   /// blocks.
   QualType getBlockDescriptorType() const;
+
+  /// Gets the struct a deleting destructor returns when it is compiled with
+  /// -fmalterlib-sized-destructors: the address of the complete object and
+  /// its size.
+  QualType getMalterlibSizedDestroyResultType() const;
+
+  /// Whether \p T is the result type of a sized deleting destructor.
+  bool isMalterlibSizedDestroyResultType(QualType T) const;
 
   /// Return a read_only pipe type for the specified type.
   QualType getReadPipeType(QualType T) const;

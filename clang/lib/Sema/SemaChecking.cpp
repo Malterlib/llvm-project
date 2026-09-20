@@ -2070,6 +2070,70 @@ static ExprResult BuiltinLaunder(Sema &S, CallExpr *TheCall) {
   return TheCall;
 }
 
+/// __builtin_malterlib_destroy(p, &pMemory) runs the destructor of the dynamic
+/// type of *p through the deleting destructor in its sized mode, which does not
+/// free the object. It returns the size of the dynamic type and stores the
+/// address of the complete object in *pMemory.
+static ExprResult BuiltinMalterlibDestroy(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCount(TheCall, 2))
+    return ExprError();
+
+  SourceLocation Loc = TheCall->getBeginLoc();
+
+  if (!S.getLangOpts().MalterlibSizedDestructors) {
+    S.Diag(Loc, diag::err_builtin_malterlib_destroy_disabled);
+    return ExprError();
+  }
+
+  TheCall->setType(S.Context.getSizeType());
+
+  ExprResult Object =
+      S.DefaultFunctionArrayLvalueConversion(TheCall->getArg(0));
+  if (Object.isInvalid())
+    return ExprError();
+  TheCall->setArg(0, Object.get());
+
+  QualType ObjectPtrTy = Object.get()->getType();
+  if (!ObjectPtrTy->isPointerType() || ObjectPtrTy->isVoidPointerType()) {
+    S.Diag(Loc, diag::err_builtin_malterlib_destroy_invalid_arg)
+        << ObjectPtrTy << TheCall->getSourceRange();
+    return ExprError();
+  }
+
+  QualType ObjectTy = ObjectPtrTy->getPointeeType();
+  if (ObjectTy->isIncompleteType()) {
+    if (S.RequireCompleteType(Loc, ObjectTy, diag::err_incomplete_type))
+      return ExprError();
+  }
+
+  CXXRecordDecl *Class = ObjectTy->getAsCXXRecordDecl();
+  CXXDestructorDecl *Destructor = Class ? S.LookupDestructor(Class) : nullptr;
+  if (!Destructor || !Destructor->isVirtual()) {
+    S.Diag(Loc, diag::err_builtin_malterlib_destroy_invalid_arg)
+        << ObjectPtrTy << TheCall->getSourceRange();
+    return ExprError();
+  }
+
+  // The builtin destroys the object, so it needs the same access and use
+  // checks as a destructor call.
+  S.CheckDestructorAccess(Loc, Destructor,
+                          S.PDiag(diag::err_access_dtor) << ObjectTy);
+  if (S.DiagnoseUseOfDecl(Destructor, Loc))
+    return ExprError();
+  S.MarkFunctionReferenced(Loc, Destructor);
+
+  QualType MemoryPtrTy = S.Context.getPointerType(S.Context.VoidPtrTy);
+  InitializedEntity Entity =
+      InitializedEntity::InitializeParameter(S.Context, MemoryPtrTy, false);
+  ExprResult Memory =
+      S.PerformCopyInitialization(Entity, SourceLocation(), TheCall->getArg(1));
+  if (Memory.isInvalid())
+    return ExprError();
+  TheCall->setArg(1, Memory.get());
+
+  return TheCall;
+}
+
 static ExprResult BuiltinIsWithinLifetime(Sema &S, CallExpr *TheCall) {
   if (S.checkArgCount(TheCall, 1))
     return ExprError();
@@ -3214,6 +3278,8 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
   }
   case Builtin::BI__builtin_launder:
     return BuiltinLaunder(*this, TheCall);
+  case Builtin::BI__builtin_malterlib_destroy:
+    return BuiltinMalterlibDestroy(*this, TheCall);
   case Builtin::BI__builtin_is_within_lifetime:
     return BuiltinIsWithinLifetime(*this, TheCall);
   case Builtin::BI__builtin_trivially_relocate:

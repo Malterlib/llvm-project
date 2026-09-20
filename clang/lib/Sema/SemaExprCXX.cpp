@@ -2650,6 +2650,29 @@ ExprResult Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
     MarkFunctionReferenced(StartLoc, OperatorDelete);
   }
 
+  // A construction site of -fmalterlib-sized-destructors keeps a reference
+  // to the class's vtable, which is used as a constructor of the class
+  // defined here would use it. The object has to be constructed here: a
+  // prvalue a call produces is constructed in place by the callee, with
+  // whatever vtable the callee's image has.
+  if (getLangOpts().MalterlibSizedDestructors && !ArraySize) {
+    const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(CurContext);
+    if (FD && FD->hasAttr<MalterlibSizedConstructionAttr>())
+      if (CXXRecordDecl *RD = AllocType->getAsCXXRecordDecl();
+          RD && RD->getDestructor() && RD->getDestructor()->isVirtual()) {
+        MarkVTableUsed(StartLoc, RD);
+        // An unevaluated operand, such as that of decltype, constructs
+        // nothing.
+        if (Initializer && !Initializer->isTypeDependent() &&
+            !isUnevaluatedContext() &&
+            !CXXNewExpr::getDirectConstruction(
+                Initializer, getLangOpts().ElideConstructors))
+          Diag(Initializer->getExprLoc(),
+               diag::err_malterlib_sized_construction_prvalue)
+              << AllocType;
+      }
+  }
+
   // new[] will trigger vector deleting destructor emission if the class has
   // virtual destructor for MSVC compatibility. Perform necessary checks.
   if (Context.getTargetInfo().emitVectorDeletingDtors(Context.getLangOpts())) {

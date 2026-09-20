@@ -354,6 +354,10 @@ public:
                             DeleteOrMemberCallExpr E,
                             llvm::CallBase **CallOrInvoke) override;
 
+  std::pair<llvm::Value *, llvm::Value *>
+  EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                            QualType ObjectTy) override;
+
   void adjustCallArgsForDestructorThunk(CodeGenFunction &CGF, GlobalDecl GD,
                                         CallArgList &CallArgs) override {
     assert((GD.getDtorType() == Dtor_VectorDeleting ||
@@ -1185,6 +1189,9 @@ static bool isTrivialForMSVC(const CXXRecordDecl *RD, QualType Ty,
 }
 
 bool MicrosoftCXXABI::classifyReturnType(CGFunctionInfo &FI) const {
+  if (classifyMalterlibSizedDestroyReturn(FI))
+    return true;
+
   const CXXRecordDecl *RD = FI.getReturnType()->getAsCXXRecordDecl();
   if (!RD)
     return false;
@@ -1641,7 +1648,10 @@ void MicrosoftCXXABI::EmitInstanceFunctionProlog(CodeGenFunction &CGF) {
   // 1) getThisValue is currently protected
   // 2) in theory, an ABI could implement 'this' returns some other way;
   //    HasThisReturn only specifies a contract, not the implementation
-  if (HasThisReturn(CGF.CurGD) || hasMostDerivedReturn(CGF.CurGD))
+  // A sized deleting destructor returns 'this' as the first half of its result
+  // instead, which the destructor body stores.
+  if ((HasThisReturn(CGF.CurGD) || hasMostDerivedReturn(CGF.CurGD)) &&
+      !hasMalterlibSizedDestructor(CGF.CurGD))
     CGF.Builder.CreateStore(getThisValue(CGF), CGF.ReturnValue);
 
   if (isa<CXXConstructorDecl>(MD) && MD->getParent()->getNumVBases()) {
@@ -1794,6 +1804,10 @@ void MicrosoftCXXABI::emitVTableTypeMetadata(const VPtrInfo &Info,
     CGM.AddVTableTypeMetadata(VTable, AddressPoint, RD);
 }
 
+static void mangleVFTableName(MicrosoftMangleContext &MangleContext,
+                              const CXXRecordDecl *RD, const VPtrInfo &VFPtr,
+                              SmallString<256> &Name);
+
 void MicrosoftCXXABI::emitVTableDefinitions(CodeGenVTables &CGVT,
                                             const CXXRecordDecl *RD) {
   MicrosoftVTableContext &VFTContext = CGM.getMicrosoftVTableContext();
@@ -1819,6 +1833,18 @@ void MicrosoftCXXABI::emitVTableDefinitions(CodeGenVTables &CGVT,
     components.finishAndSetAsInitializer(VTable);
 
     emitVTableTypeMetadata(*Info, RD, VTable);
+
+    // Prove to the linker that this vftable was compiled with
+    // -fmalterlib-sized-destructors, which it believes when the deleting
+    // destructors and thunks in the slots were too. The vftable symbol is an
+    // alias into the variable when it has RTTI data.
+    if (needsMalterlibSizedMarker(RD)) {
+      SmallString<256> VFTableName;
+      mangleVFTableName(getMangleContext(), RD, *Info, VFTableName);
+      llvm::GlobalValue *Named = CGM.getModule().getNamedValue(VFTableName);
+      CGM.EmitMalterlibSizedMarker(Named);
+      CGVT.addMalterlibSizedSlotReferences(RD, Named);
+    }
   }
 }
 
@@ -2083,7 +2109,43 @@ llvm::Value *MicrosoftCXXABI::EmitVirtualDestructorCall(
   RValue RV =
       CGF.EmitCXXDestructorCall(GD, Callee, This.emitRawPointer(CGF), ThisTy,
                                 ImplicitParam, Context.IntTy, CE, CallOrInvoke);
+
+  // A sized deleting destructor returns the complete-object pointer as the
+  // first half of its result.
+  if (hasMalterlibSizedDestructor(GD))
+    return loadMalterlibSizedDestroyField(CGF, RV, /*Index=*/0);
+
   return RV.getScalarVal();
+}
+
+std::pair<llvm::Value *, llvm::Value *>
+MicrosoftCXXABI::EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                                           QualType ObjectTy) {
+  ASTContext &Context = getContext();
+  const CXXRecordDecl *RD = ObjectTy->getAsCXXRecordDecl();
+  const CXXDestructorDecl *Dtor = RD->getDestructor();
+
+  GlobalDecl GD(Dtor, Context.getTargetInfo().emitVectorDeletingDtors(
+                          Context.getLangOpts())
+                          ? Dtor_VectorDeleting
+                          : Dtor_Deleting);
+  const CGFunctionInfo *FInfo =
+      &CGM.getTypes().arrangeCXXStructorDeclaration(GD);
+  llvm::FunctionType *Ty = CGM.getTypes().GetFunctionType(*FInfo);
+  CGCallee Callee = CGCallee::forVirtual(/*CE=*/nullptr, GD, This, Ty);
+
+  // Flags 0 destroys the object without freeing it, which is what the sized
+  // mode is on this ABI.
+  llvm::Value *ImplicitParam = CGF.Builder.getInt32(0);
+
+  This = adjustThisArgumentForVirtualFunctionCall(CGF, GD, This, true);
+  llvm::CallBase *Call = nullptr;
+  RValue Result = CGF.EmitCXXDestructorCall(
+      GD, Callee, This.emitRawPointer(CGF), ObjectTy, ImplicitParam,
+      Context.IntTy, /*CE=*/nullptr, &Call);
+  keepMalterlibSizedDestructorCall(Call);
+
+  return loadMalterlibSizedDestroyResult(CGF, Result);
 }
 
 const VBTableGlobals &
