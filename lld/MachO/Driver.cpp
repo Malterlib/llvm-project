@@ -15,6 +15,7 @@
 #include "ObjC.h"
 #include "OutputSection.h"
 #include "OutputSegment.h"
+#include "Relocations.h"
 #include "SectionPriorities.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -32,12 +33,15 @@
 #include "lld/Common/Version.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/CGData/CodeGenDataWriter.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Option/ArgList.h"
@@ -47,13 +51,19 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TextAPI/Architecture.h"
 #include "llvm/TextAPI/PackedVersion.h"
+
+#include <functional>
+#include <map>
+#include <optional>
 
 #if !_WIN32
 #include <sys/mman.h>
@@ -1528,6 +1538,11 @@ static void gatherInputSections() {
       // Addrsig sections contain metadata only needed at link time.
       if (section->name == section_names::addrSig)
         continue;
+      // So do the references of -fmalterlib-sized-destructors.
+      if (section->segname == segment_names::dataConst &&
+          (section->name == "__mib_sized_ref" ||
+           section->name == "__mib_sized_dep"))
+        continue;
       for (const Subsection &subsection : section->subsections)
         addInputSection(subsection.isec);
     }
@@ -1637,6 +1652,1351 @@ static void referenceStubBinder() {
   // StubHelperSection::setUp() adds a reference and errors out if
   // dyld_stub_binder doesn't exist in case it is actually needed.
   symtab->addUndefined("dyld_stub_binder", /*file=*/nullptr, /*isWeak=*/false);
+}
+
+namespace {
+// A reference of -fmalterlib-sized-destructors. A reference to a local
+// symbol may name its section instead, with the offset from it.
+struct MalterlibSizedReference {
+  llvm::PointerUnion<Symbol *, InputSection *> target;
+  int64_t addend = 0;
+
+  std::optional<std::pair<const InputSection *, uint64_t>> location() const {
+    if (auto *isec = dyn_cast_if_present<InputSection *>(target))
+      return std::make_pair(isec, uint64_t(addend));
+    if (auto *d = dyn_cast_if_present<Defined>(
+            dyn_cast_if_present<Symbol *>(target)))
+      return std::make_pair(d->isec(), d->value + addend);
+    return std::nullopt;
+  }
+  Symbol *symbol() const { return dyn_cast_if_present<Symbol *>(target); }
+  std::string file() const {
+    if (Symbol *sym = symbol())
+      return toString(sym->getFile());
+    return toString(cast<InputSection *>(target)->getFile());
+  }
+};
+} // namespace
+
+// A definition compiled with -fmalterlib-sized-destructors carries a marker,
+// which the construction sites that depend on it reference. The marker of a
+// constructor or a vtable proves its claim only when what it binds in this
+// image does too: a constructor installs its image's vtable, which binds its
+// image's deleting destructors. A marker whose claim is not proven does not
+// leave the image, and is only an error where a site depends on it. Symbol
+// resolution does the rest, except for three things: the references are in a
+// section that does not reach the output, where an undefined marker would not
+// be reported, the marker the link resolved may not belong to the definition
+// it resolved, and a dylib's marker stands in for its definition only in its
+// own image.
+static void checkMalterlibSizedMarkers() {
+  SmallVector<std::array<MalterlibSizedReference, 2>, 0> sites;
+  SmallVector<std::array<MalterlibSizedReference, 3>, 0> dependencies;
+  for (const InputFile *file : inputFiles) {
+    const auto *objFile = dyn_cast<ObjFile>(file);
+    if (!objFile)
+      continue;
+    for (const Section *sec : objFile->sections) {
+      size_t width;
+      if (sec->segname != segment_names::dataConst)
+        continue;
+      if (sec->name == "__mib_sized_ref")
+        width = 2;
+      else if (sec->name == "__mib_sized_dep")
+        width = 3;
+      else
+        continue;
+      std::map<uint64_t, SmallVector<MalterlibSizedReference, 3>> groups;
+      for (const Subsection &sub : sec->subsections)
+        for (const Relocation &r : sub.isec->relocs) {
+          uint64_t entry = (sub.offset + r.offset) / target->wordSize;
+          auto &group = groups[entry / width];
+          group.resize(width);
+          group[entry % width] = {r.referent, r.addend};
+        }
+      for (auto &[index, group] : groups) {
+        if (!llvm::all_of(group, [](auto &ref) { return bool(ref.target); }))
+          continue;
+        if (width == 2) {
+          sites.push_back({group[0], group[1]});
+          continue;
+        }
+        // A record belongs to its object's copy of the owner, and says
+        // nothing of a copy of another object that the link kept.
+        const InputFile *ownerFile = nullptr;
+        if (auto *isec = dyn_cast<InputSection *>(group[0].target))
+          ownerFile = isec->getFile();
+        else if (auto *d = dyn_cast<Defined>(group[0].symbol()))
+          ownerFile = d->getFile();
+        if (ownerFile == objFile)
+          dependencies.push_back({group[0], group[1], group[2]});
+      }
+    }
+  }
+  // The symbols a dylib defines, by the name of a definition another image
+  // may take the place of: for one its construction sites depend on, and for
+  // one the proof of an owner it exports depends on, followed by a hash of
+  // the owner's name.
+  constexpr StringRef requiredSuffix = ".mib_sized_required";
+  // Or for one that the dylib a proof is of binds by weak lookup, which dyld
+  // coalesces in the images flagged with MH_WEAK_DEFINES, also where the dylib
+  // that gives it on binds in a flat namespace.
+  constexpr StringRef requiredWeakSuffix = ".mib_sized_required_weak";
+  // Either given on by a dylib of what a dylib it loads requires, for the
+  // images that may not load that one, which binds none of it itself.
+  constexpr StringRef givenSuffix = "_given";
+  constexpr StringRef edgeInfix = ".mib_sized_edge.";
+  // Or for one that the dylib binds by weak lookup.
+  constexpr StringRef edgeWeakInfix = ".mib_sized_edge_weak.";
+  // Or for a strong one that the dylib imports in its two-level namespace,
+  // which binds to the dylib it loads that has it, by the ordinal its link
+  // recorded, and so to another file of that install name than the one its
+  // link checked, like one rebuilt without the flag: which the link of an
+  // image that loads it checks as that dylib binds it, where it has that file.
+  constexpr StringRef requiredBoundSuffix = ".mib_sized_required_bound";
+  constexpr StringRef edgeBoundInfix = ".mib_sized_edge_bound.";
+  // How a dylib binds a definition it names.
+  enum Binding : unsigned { ByName, ByWeakLookup, ByOrdinal };
+  // What the dylibs of the link say, by the names of definitions: the dylibs
+  // that export a marker of one, those whose sites depend on one, and what
+  // the proof of an owner a dylib exports depends on.
+  DenseMap<StringRef, SmallVector<DylibFile *, 1>> dylibMarkers, dylibRequired,
+      dylibRequiredWeak, dylibRequiredGiven, dylibRequiredWeakGiven,
+      dylibRequiredBound;
+  // Each with how the dylib binds it.
+  DenseMap<std::pair<DylibFile *, uint64_t>,
+           SmallVector<std::pair<StringRef, Binding>, 2>>
+      dylibEdges;
+  // Whether the writer emits a load command for \p dylib, as it decides.
+  auto commandsLoad = [&](const DylibFile *dylib) {
+    return !dylib->isBundleLoader &&
+           (dylib->isReferenced() || dylib->forceNeeded ||
+            (dylib->isExplicitlyLinked() && !dylib->deadStrippable &&
+             !config->deadStripDylibs));
+  };
+  // Of the dylibs of an install name, the first the writer emits a load
+  // command for, whose ordinal the others share, and dyld loads: another of
+  // the same name, like a prebuilt and a rebuilt copy of one, is never loaded,
+  // also when it is first but unused. Or else the first, which a dylib that
+  // is loaded can load in turn.
+  DenseMap<StringRef, DylibFile *> linkedByInstallName;
+  for (InputFile *file : inputFiles)
+    if (auto *dylib = dyn_cast<DylibFile>(file); dylib && commandsLoad(dylib))
+      linkedByInstallName.try_emplace(dylib->installName, dylib);
+  for (InputFile *file : inputFiles)
+    if (auto *dylib = dyn_cast<DylibFile>(file))
+      linkedByInstallName.try_emplace(dylib->installName, dylib);
+  auto loadedAs = [&](DylibFile *dylib) {
+    if (!dylib || dylib->installName.empty())
+      return dylib;
+    DylibFile *first = linkedByInstallName.lookup(dylib->installName);
+    return first ? first : dylib;
+  };
+  // A dylib the image does not load, as the writer decides, says nothing. One
+  // a loaded dylib re-exports binds through that one, and is loaded with it,
+  // and so is one any loaded dylib loads, like one a façade forwards to, or
+  // one the executable a bundle is loaded into loads, also when the image
+  // doesn't load it itself, like with -dead_strip_dylibs. Also the executable
+  // a bundle is loaded into, which is there first.
+  // Found from those surely loaded, each dylib once, rather than by asking of
+  // each whether one that loads it is, which asks again for each way to it.
+  // Through what each re-exports itself, as the dylib of its install name that
+  // dyld loads, not all that its outermost umbrella does: what a dylib that
+  // another of its install name takes the place of re-exports isn't loaded.
+  DenseSet<const DylibFile *> loaded;
+  {
+    SmallVector<DylibFile *, 16> pending;
+    auto reach = [&](DylibFile *dylib) {
+      if (!dylib || (!dylib->installName.empty() &&
+                     linkedByInstallName.lookup(dylib->installName) != dylib))
+        return;
+      if (loaded.insert(dylib).second)
+        pending.push_back(dylib);
+    };
+    for (InputFile *file : inputFiles)
+      if (auto *dylib = dyn_cast<DylibFile>(file);
+          dylib && (dylib->isBundleLoader || commandsLoad(dylib)))
+        reach(dylib);
+    while (!pending.empty()) {
+      DylibFile *dylib = pending.pop_back_val();
+      for (DylibFile *reexport : dylib->reexports)
+        reach(loadedAs(reexport));
+      for (StringRef name : dylib->loadedInstallNames)
+        reach(linkedByInstallName.lookup(name));
+    }
+  }
+  auto isLoaded = [&](const DylibFile *dylib) {
+    return loaded.contains(dylib);
+  };
+  for (InputFile *file : inputFiles) {
+    auto *dylib = dyn_cast<DylibFile>(file);
+    if (!dylib || !isLoaded(dylib))
+      continue;
+    // Of the dylib that has them, also one an umbrella re-exports, whose
+    // symbols bind as the umbrella's: a marker belongs to the copy of its own
+    // image.
+    for (Symbol *sym : dylib->symbols) {
+      // Not what its export trie forwards to a dylib it re-exports, which
+      // that dylib has.
+      if (!sym || dylib->reexportedExports.contains(
+                      CachedHashStringRef(sym->getName())))
+        continue;
+      StringRef name = sym->getName();
+      const StringRef ungiven = name.ends_with(givenSuffix)
+                                    ? name.drop_back(givenSuffix.size())
+                                    : StringRef();
+      const bool given = ungiven.ends_with(requiredSuffix) ||
+                         ungiven.ends_with(requiredWeakSuffix);
+      if (given)
+        name = name.drop_back(givenSuffix.size());
+      if (name.consume_back(llvm::MalterlibSizedMarkerSuffix)) {
+        // Not one at another address than its definition's.
+        if (!dylib->misplacedMarkers.contains(
+                CachedHashStringRef(sym->getName())))
+          dylibMarkers[name].push_back(dylib);
+      } else if (name.consume_back(requiredSuffix)) {
+        (given ? dylibRequiredGiven : dylibRequired)[name].push_back(dylib);
+      } else if (name.consume_back(requiredWeakSuffix)) {
+        (given ? dylibRequiredWeakGiven : dylibRequiredWeak)[name].push_back(
+            dylib);
+      } else if (name.consume_back(requiredBoundSuffix)) {
+        dylibRequiredBound[name].push_back(dylib);
+      } else {
+        for (auto [infix, binding] : {std::pair{edgeWeakInfix, ByWeakLookup},
+                                      std::pair{edgeBoundInfix, ByOrdinal},
+                                      std::pair{edgeInfix, ByName}})
+          if (auto [dep, hash] = name.rsplit(infix);
+              dep.size() != name.size()) {
+            uint64_t owner;
+            if (!hash.getAsInteger(16, owner))
+              dylibEdges[{dylib, owner}].push_back({dep, binding});
+            break;
+          }
+      }
+    }
+  }
+  // The dylibs in the order dyld loads them: the executable a bundle is loaded
+  // into, `-bundle_loader`, which dyld looks in first, and the dylibs it
+  // loads, then those this image loads, in the order of its load commands,
+  // then for each of those in turn the dylibs it loads, re-exported or not, in
+  // the order of its load commands, and then, depth first, what each of those
+  // loads, each dylib once, and what it loads once: also what a dylib loads
+  // that the image or another dylib loaded before, the first time a dylib
+  // that loads it is gone through, like one an umbrella re-exports that the
+  // image loads itself. Not the order the link parses them in, which puts
+  // what an umbrella re-exports right after it, before the dylibs this image
+  // loads after the umbrella, nor what a dylib re-exports before what it only
+  // loads.
+  SmallVector<DylibFile *, 0> loadOrder;
+  // How many of them dyld has loaded before this image: the executable a
+  // bundle is loaded into, and what it loads.
+  size_t loadedBeforeImage = 0;
+  {
+    // Those the writer emits a load command for, as it decides: also one an
+    // umbrella re-exports that the link names too, whose umbrella is still
+    // the one it was first loaded through.
+    SmallVector<DylibFile *, 8> direct;
+    DenseSet<StringRef> commanded;
+    for (InputFile *file : inputFiles)
+      if (auto *dylib = dyn_cast<DylibFile>(file);
+          dylib && commandsLoad(dylib) &&
+          commanded.insert(dylib->installName).second)
+        direct.push_back(dylib);
+    // Each one's own re-exports, also of one an umbrella re-exports, which
+    // re-exports others in turn, not all that the outermost umbrella does.
+    DenseSet<const DylibFile *> placed;
+    SmallVector<DylibFile *, 1> host;
+    for (InputFile *file : inputFiles)
+      if (auto *dylib = dyn_cast<DylibFile>(file);
+          dylib && dylib->isBundleLoader)
+        host.push_back(dylib);
+    // What dyld loads with \p dylib, in the order of its load commands: a
+    // dylib it re-exports, as the link has it, and of one it only loads, the
+    // dylib of the link of that install name. A text-based stub has only its
+    // re-exports. Each as the dylib of its install name that dyld loads, also
+    // when the link has another file of it first, like an unused copy by
+    // another path, which takes the place of this one.
+    auto dependenciesOf = [&](DylibFile *dylib) {
+      SmallVector<DylibFile *, 8> dependencies;
+      for (StringRef name : dylib->loadedInstallNames) {
+        DylibFile *dependency = nullptr;
+        for (DylibFile *reexport : dylib->reexports)
+          if (reexport->installName == name) {
+            dependency = loadedAs(reexport);
+            break;
+          }
+        if (!dependency)
+          dependency = linkedByInstallName.lookup(name);
+        if (dependency)
+          dependencies.push_back(dependency);
+      }
+      for (DylibFile *reexport : dylib->reexports)
+        if (DylibFile *loaded = loadedAs(reexport);
+            !llvm::is_contained(dependencies, loaded))
+          dependencies.push_back(loaded);
+      return dependencies;
+    };
+    // The dylibs whose dependencies dyld loaded.
+    DenseSet<const DylibFile *> expanded;
+    std::function<void(ArrayRef<DylibFile *>)> load =
+        [&](ArrayRef<DylibFile *> dylibs) {
+          for (DylibFile *dylib : dylibs)
+            if (isLoaded(dylib) && placed.insert(dylib).second)
+              loadOrder.push_back(dylib);
+          for (DylibFile *dylib : dylibs)
+            if (isLoaded(dylib) && expanded.insert(dylib).second)
+              load(dependenciesOf(dylib));
+        };
+    // The executable first, with what it loads, before the bundle.
+    load(host);
+    loadedBeforeImage = loadOrder.size();
+    load(direct);
+    // Then any other that is loaded, which the link can't tell the place of.
+    SmallVector<DylibFile *, 2> forwarded;
+    for (InputFile *file : inputFiles)
+      if (auto *dylib = dyn_cast<DylibFile>(file);
+          dylib && !placed.contains(dylib) && isLoaded(dylib))
+        forwarded.push_back(dylib);
+    load(forwarded);
+  }
+  // The dylibs that export a definition the others require or depend on, or
+  // a weak one of this image that its proofs depend on, in the order they are
+  // loaded, of which dyld coalesces a weak one to the first strong one, or
+  // else the first, of those flagged with MH_WEAK_DEFINES.
+  DenseMap<StringRef, SmallVector<DylibFile *, 1>> dylibDefiners;
+  {
+    DenseSet<StringRef> named;
+    for (auto &[name, files] : dylibRequired)
+      named.insert(name);
+    for (auto *required : {&dylibRequiredWeak, &dylibRequiredGiven,
+                           &dylibRequiredWeakGiven, &dylibRequiredBound})
+      for (auto &[name, files] : *required)
+        named.insert(name);
+    for (auto &[owner, deps] : dylibEdges)
+      for (auto [dep, binding] : deps)
+        named.insert(dep);
+    // Also one this image binds to a dylib, of which the dylib that has it
+    // is told.
+    // Also a strong one of an image linked with -flat_namespace, or one it
+    // exports linked with -interposable, which binds it where dyld finds it
+    // first.
+    auto nameWeak = [&](const MalterlibSizedReference &def) {
+      if (auto *d = dyn_cast_if_present<Defined>(def.symbol());
+          d &&
+          (d->isExternalWeakDef() ||
+           ((config->namespaceKind == NamespaceKind::flat || d->interposable) &&
+            d->isExternal() && !d->privateExtern)))
+        named.insert(d->getName());
+      if (auto *d = dyn_cast_if_present<DylibSymbol>(def.symbol()))
+        named.insert(d->getName());
+    };
+    for (auto &[def, marker] : sites)
+      nameWeak(def);
+    for (auto &[owner, def, marker] : dependencies)
+      nameWeak(def);
+    if (!named.empty())
+      for (DylibFile *dylib : loadOrder) {
+        for (Symbol *sym : dylib->symbols)
+          if (sym && named.contains(sym->getName()) &&
+              !dylib->reexportedExports.contains(
+                  CachedHashStringRef(sym->getName()))) {
+            SmallVector<DylibFile *, 1> &definers =
+                dylibDefiners[sym->getName()];
+            if (!llvm::is_contained(definers, dylib))
+              definers.push_back(dylib);
+          }
+      }
+  }
+
+  // Of \p having, the dylib dyld finds a symbol in that this image binds to
+  // \p umbrella: the umbrella itself, or else the dylibs it re-exports, each
+  // with those it re-exports in turn before the next, in order, the first that
+  // has it.
+  // One whose export trie forwards it to a dylib it re-exports, `-exported_
+  // symbol` of a symbol of a re-exported dylib, has it from that dylib, which
+  // dyld looks in instead, also when another of them comes first, and so
+  // does one that forwards it to a dylib it only loads, a façade, which the
+  // link has too; one that forwards it under another name, or to a dylib that
+  // can't be told, has none of \p having.
+  // With \p shallow, as dyld's lookup to coalesce a weak definition or in a
+  // flat namespace looks in each image it has loaded: through what an export
+  // trie forwards, but not into the dylibs one re-exports otherwise, which it
+  // looks in as images of their own.
+  auto throughUmbrella = [&](DylibFile *umbrella, ArrayRef<DylibFile *> having,
+                             StringRef name,
+                             bool shallow = false) -> DylibFile * {
+    DenseSet<const DylibFile *> looked;
+    std::function<DylibFile *(DylibFile *)> find =
+        [&](DylibFile *dylib) -> DylibFile * {
+      if (!dylib || !looked.insert(dylib).second)
+        return nullptr;
+      if (llvm::is_contained(having, dylib))
+        return dylib;
+      if (auto forward = dylib->reexportTargets.find(CachedHashStringRef(name));
+          forward != dylib->reexportTargets.end()) {
+        const auto [ordinal, importName] = forward->second;
+        if ((!importName.empty() && importName != name) || ordinal == 0 ||
+            ordinal > dylib->loadedInstallNames.size())
+          return nullptr;
+        const StringRef target = dylib->loadedInstallNames[ordinal - 1];
+        for (DylibFile *reexport : dylib->reexports)
+          if (reexport->installName == target)
+            return find(loadedAs(reexport));
+        return find(linkedByInstallName.lookup(target));
+      }
+      // Each as the dylib of its install name that dyld loads, also when the
+      // link has another file of it first, like a rebuilt copy, or the same
+      // one by another path.
+      if (!shallow)
+        for (DylibFile *reexport : dylib->reexports)
+          if (DylibFile *found = find(loadedAs(reexport)))
+            return found;
+      return nullptr;
+    };
+    return find(umbrella);
+  };
+  // The dylib whose copy a symbol this image binds to a dylib binds to at
+  // runtime: of the dylib itself, or else of the dylib it re-exports that dyld
+  // finds it in, also when it binds as the umbrella's.
+  auto providerOf = [&](const DylibSymbol *d) {
+    DylibFile *umbrella = loadedAs(d->getFile());
+    if (DylibFile *found = throughUmbrella(
+            umbrella, dylibDefiners.lookup(d->getName()), d->getName()))
+      return found;
+    return umbrella;
+  };
+
+  // The dylib a strong import of \p name in \p dylib binds to, which the link
+  // of \p dylib bound by its ordinal: the dylib its symbol table names, of
+  // those it loads, or that one re-exports, also when another it loads comes
+  // first, whose weak copy that link took a strong one over. Without such an
+  // entry, the first of the dylibs it loads, in the order of its load
+  // commands, that has it.
+  auto loadedBy = [&](const DylibFile *dylib, StringRef name) -> DylibFile * {
+    const SmallVector<DylibFile *, 1> definers = dylibDefiners.lookup(name);
+    if (const uint32_t ordinal = dylib->importOrdinal(name);
+        ordinal && ordinal <= dylib->loadedInstallNames.size())
+      return throughUmbrella(
+          linkedByInstallName.lookup(dylib->loadedInstallNames[ordinal - 1]),
+          definers, name);
+    for (StringRef installName : dylib->loadedInstallNames)
+      if (DylibFile *loaded = linkedByInstallName.lookup(installName))
+        if (DylibFile *found = throughUmbrella(loaded, definers, name))
+          return found;
+    return nullptr;
+  };
+
+  // Whether the references of this image bind in a flat namespace, linked
+  // with -flat_namespace.
+  const bool imageFlat = config->namespaceKind == NamespaceKind::flat;
+  // Whether dyld looks in \p dylib for a definition by name: to coalesce weak
+  // definitions in one flagged with MH_WEAK_DEFINES, and in every one for the
+  // references of an image that binds in a flat namespace, with \p flat:
+  // this one linked with -flat_namespace for its own, or a dylib that was
+  // for its own, not one that binds in its two-level namespace.
+  auto coalesces = [&](const DylibFile *dylib, bool flat) {
+    return dylib->weakDefines || flat;
+  };
+  // The dylib whose copy dyld coalesces a symbol to, of those it looks in, in
+  // load order: the first that exports a strong one, or else the first that
+  // exports one, also through the export trie of one that forwards it to a
+  // dylib, a façade, which dyld follows to that dylib's definition, whether
+  // or not that one is flagged. With \p strongOnly, only a strong one. A
+  // lookup in a flat namespace, \p flat, takes the first that exports one,
+  // also a weak one before a strong one.
+  auto coalescedDefiner = [&](StringRef name, bool strongOnly,
+                              bool flat) -> DylibFile * {
+    const SmallVector<DylibFile *, 1> definers = dylibDefiners.lookup(name);
+    if (definers.empty())
+      return nullptr;
+    DylibFile *first = nullptr;
+    for (DylibFile *dylib : loadOrder) {
+      if (!coalesces(dylib, flat))
+        continue;
+      DylibFile *definer = nullptr;
+      if (llvm::is_contained(definers, dylib))
+        definer = dylib;
+      else if (dylib->reexportTargets.contains(CachedHashStringRef(name)))
+        definer = throughUmbrella(dylib, definers, name, /*shallow=*/true);
+      if (!definer)
+        continue;
+      if ((flat && !strongOnly) ||
+          !definer->weakDefExports.contains(CachedHashStringRef(name)))
+        return definer;
+      if (!first)
+        first = definer;
+    }
+    return strongOnly ? nullptr : first;
+  };
+  // The dylib of the link whose strong definition dyld coalesces a weak one
+  // this image exports to, which takes its place also in an executable.
+  // dyld looks for it only in the images flagged with MH_WEAK_DEFINES, also
+  // where the image binds in a flat namespace, whose references to a weak
+  // definition bind by weak lookup.
+  auto strongDefiner = [&](StringRef name) -> DylibFile * {
+    return coalescedDefiner(name, /*strongOnly=*/true, /*flat=*/false);
+  };
+  // Of the dylibs dyld loaded before this image, like the executable a bundle
+  // is loaded into, the first that exports a definition, of those dyld looks
+  // in: those flagged with MH_WEAK_DEFINES, or with \p flat, every one. With
+  // \p strongOnly, only a strong one.
+  auto earlierDefiner = [&](StringRef name, bool strongOnly,
+                            bool flat) -> DylibFile * {
+    const SmallVector<DylibFile *, 1> definers = dylibDefiners.lookup(name);
+    if (definers.empty())
+      return nullptr;
+    for (DylibFile *dylib : ArrayRef(loadOrder).take_front(loadedBeforeImage)) {
+      if (!coalesces(dylib, flat))
+        continue;
+      DylibFile *definer = nullptr;
+      if (llvm::is_contained(definers, dylib))
+        definer = dylib;
+      else if (dylib->reexportTargets.contains(CachedHashStringRef(name)))
+        definer = throughUmbrella(dylib, definers, name, /*shallow=*/true);
+      if (definer && (!strongOnly || !definer->weakDefExports.contains(
+                                         CachedHashStringRef(name))))
+        return definer;
+    }
+    return nullptr;
+  };
+  // The dylib whose definition dyld binds to instead of one this image
+  // exports, which is weak with \p weak: of a weak one, which dyld binds by
+  // weak lookup also in a flat namespace, the strong one of strongDefiner, or
+  // else the weak one of a dylib loaded before this image, which dyld finds
+  // first, and of a strong one, a strong one of a dylib loaded before this
+  // image, or else, bound in a flat namespace, \p flat, any of one.
+  auto takesPlaceOf = [&](StringRef name, bool weak, bool flat) -> DylibFile * {
+    if (!weak)
+      return earlierDefiner(name, /*strongOnly=*/!flat, flat);
+    if (DylibFile *file = strongDefiner(name))
+      return file;
+    return earlierDefiner(name, /*strongOnly=*/false, /*flat=*/false);
+  };
+  using Location = std::pair<const InputSection *, uint64_t>;
+  DenseMap<Location, SmallVector<std::array<MalterlibSizedReference, 2>, 1>>
+      dependenciesOf;
+  for (auto &[owner, def, marker] : dependencies)
+    if (auto location = owner.location())
+      dependenciesOf[*location].push_back({def, marker});
+
+  auto nameOf = [](const MalterlibSizedReference &def,
+                   const MalterlibSizedReference &marker) {
+    StringRef name;
+    if (Symbol *sym = marker.symbol();
+        sym && sym->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      name = sym->getName().drop_back(llvm::MalterlibSizedMarkerSuffix.size());
+    else if (Symbol *sym = def.symbol())
+      name = sym->getName();
+    return config->demangle ? llvm::demangle(name) : name.str();
+  };
+
+  // Of a dylib, the one that has the copy, also one an umbrella re-exports.
+  auto mixed = [&](const MalterlibSizedReference &def,
+                   const MalterlibSizedReference &marker) {
+    std::string defFile = def.file(), markerFile = marker.file();
+    if (auto *d = dyn_cast_if_present<DylibSymbol>(def.symbol()))
+      defFile = toString(providerOf(d));
+    if (auto *m = dyn_cast_if_present<DylibSymbol>(marker.symbol()))
+      if (DylibFile *file =
+              throughUmbrella(m->getFile(),
+                              dylibMarkers.lookup(m->getName().drop_back(
+                                  llvm::MalterlibSizedMarkerSuffix.size())),
+                              m->getName()))
+        markerFile = toString(file);
+    return nameOf(def, marker) +
+           " was compiled both with and without "
+           "-fmalterlib-sized-destructors, and the link keeps a copy compiled "
+           "without\n>>> defined in " +
+           defFile + "\n>>> marked in " + markerFile;
+  };
+
+  // Why a definition and its marker do not prove the definition was compiled
+  // with the flag, or an empty string when they do. A marker whose claim
+  // depends on itself is taken at its word.
+  DenseMap<Location, std::string> proven;
+  std::function<std::string(const MalterlibSizedReference &,
+                            const MalterlibSizedReference &)>
+      check;
+  auto provenAt = [&](Location location, const std::string &name) {
+    if (auto it = proven.find(location); it != proven.end())
+      return it->second;
+    proven[location] = {};
+    std::string why;
+    for (auto &[depDef, depMarker] : dependenciesOf.lookup(location))
+      if (std::string depWhy = check(depDef, depMarker); !depWhy.empty()) {
+        why = name + " depends on " + nameOf(depDef, depMarker) + "\n>>> " +
+              depWhy;
+        break;
+      }
+    return proven[location] = why;
+  };
+  check = [&](const MalterlibSizedReference &def,
+              const MalterlibSizedReference &marker) -> std::string {
+    // A weak one this image exports that a dylib's strong one takes the
+    // place of binds to that copy at runtime, which is checked where what
+    // another image may take the place of is followed, but the image's own
+    // copy must hold too: a site can have inlined its body, which binds what
+    // it depends on, like the vtable a constructor installs, in this image.
+    //
+    // The optimizer folds a marker it sees into its definition, which proves
+    // that the marker belongs to it, and leaves its dependencies to check.
+    if (def.target == marker.target && def.addend == marker.addend) {
+      if (auto location = def.location())
+        return provenAt(*location, nameOf(def, marker));
+      return {};
+    }
+    Symbol *markerSym = marker.symbol();
+    if (isa_and_present<Undefined, LazyArchive, LazyObject>(markerSym))
+      return nameOf(def, marker) +
+             " was not compiled with -fmalterlib-sized-destructors\n>>> its "
+             "marker " +
+             markerSym->getName().str() + " is undefined";
+    if (auto *m = dyn_cast_if_present<DylibSymbol>(markerSym)) {
+      // One an image linked with -flat_namespace imports binds to the first
+      // dylib that exports it, not to the one this link bound it to, which
+      // can be a later strong copy: the check of what its sites import
+      // follows it there.
+      // So does a weak one, which binds by weak lookup to the copy dyld
+      // coalesces to, which can be another dylib's than the one this link
+      // bound it to, like a flagged one loaded before an umbrella that
+      // re-exports a dylib with one compiled without.
+      auto *d = dyn_cast_if_present<DylibSymbol>(def.symbol());
+      if (d && (imageFlat || d->isWeakDef()) && !d->isDynamicLookup())
+        return {};
+      // The copy the definition binds to has the marker, which binds to that
+      // copy's dylib too, also when the definition binds through a façade
+      // that forwards it there and the marker to that dylib directly.
+      if (d && !m->isDynamicLookup() && !d->isDynamicLookup()) {
+        DylibFile *provider = providerOf(d);
+        DylibFile *markerFile = loadedAs(m->getFile());
+        DylibFile *markerProvider = markerFile;
+        if (DylibFile *found = throughUmbrella(
+                markerFile, dylibMarkers.lookup(d->getName()), m->getName()))
+          markerProvider = found;
+        if ((markerFile == loadedAs(d->getFile()) ||
+             provider == markerProvider) &&
+            llvm::is_contained(dylibMarkers.lookup(d->getName()), provider))
+          return {};
+        // A dylib linked by a linker that doesn't check the markers can
+        // export one of a copy it didn't keep, at another address.
+        if (markerProvider->misplacedMarkers.contains(
+                CachedHashStringRef(m->getName())))
+          return nameOf(def, marker) +
+                 " was compiled both with and without "
+                 "-fmalterlib-sized-destructors, and the link keeps a copy "
+                 "compiled without\n>>> defined in " +
+                 toString(provider) + "\n>>> its marker " + m->getName().str() +
+                 " in " + toString(markerProvider) +
+                 " is at another address, of a copy that dylib's link didn't "
+                 "keep";
+      }
+    } else if (auto location = marker.location();
+               location && location == def.location()) {
+      return provenAt(*location, nameOf(def, marker));
+    }
+    return mixed(def, marker);
+  };
+
+  // Local references may name one section with different addends.
+  DenseSet<std::tuple<void *, int64_t, void *, int64_t>> seen;
+  for (auto &[def, marker] : sites) {
+    if (!seen.insert({def.target.getOpaqueValue(), def.addend,
+                      marker.target.getOpaqueValue(), marker.addend})
+             .second)
+      continue;
+    if (std::string why = check(def, marker); !why.empty())
+      error(why + "\n>>> an object a construction site makes is destroyed "
+                  "with the size its deleting destructor returns");
+  }
+
+  // An image another image binds into: a dylib, a bundle, or an executable,
+  // which a bundle is loaded into, `-bundle_loader`, and whose weak
+  // definitions dyld coalesces with the bundle's.
+  bool isLoadedInto = config->outputType == MH_DYLIB ||
+                      config->outputType == MH_BUNDLE ||
+                      config->outputType == MH_EXECUTE;
+  // Whether another image may take the place of a definition at runtime: one
+  // this image imports, or a weak one it exports, which dyld coalesces
+  // across images, as it does every definition with a flat namespace, also a
+  // weak one of an executable that a dylib's strong one takes the place of.
+  auto isBoundary = [&](Symbol *sym) {
+    if (auto *d = dyn_cast_if_present<DylibSymbol>(sym))
+      return !d->isDynamicLookup();
+    auto *d = dyn_cast_if_present<Defined>(sym);
+    // Not one -dead_strip removed, like a constructor a site inlined, which
+    // nothing binds: what it depends on, which the site binds, is followed.
+    if (d && !d->isLive())
+      return false;
+    if (d && d->isExternalWeakDef() &&
+        takesPlaceOf(d->getName(), /*weak=*/true, /*flat=*/false))
+      return true;
+    return d && isLoadedInto && d->isExternal() && !d->privateExtern &&
+           (d->isWeakDef() || config->namespaceKind == NamespaceKind::flat ||
+            d->interposable);
+  };
+  // The definitions another image may take the place of that the proof of
+  // \p work depends on, through the definitions this image binds.
+  auto boundaryOf = [&](SmallVector<MalterlibSizedReference, 0> work) {
+    SetVector<Symbol *> boundary;
+    DenseSet<Location> visited;
+    while (!work.empty()) {
+      MalterlibSizedReference ref = work.pop_back_val();
+      if (isBoundary(ref.symbol())) {
+        boundary.insert(ref.symbol());
+        continue;
+      }
+      if (auto location = ref.location();
+          location && visited.insert(*location).second)
+        for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+          work.push_back(depDef);
+    }
+    return boundary.takeVector();
+  };
+  auto dependenciesAt = [&](Symbol *sym) {
+    SmallVector<MalterlibSizedReference, 0> deps;
+    if (auto location = MalterlibSizedReference{sym}.location())
+      for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+        deps.push_back(depDef);
+    return deps;
+  };
+
+  // A dylib's sites bind at runtime to the copy of a definition its link
+  // bound, unless dyld coalesces it, or this image overrides it, and so do
+  // the definitions a dylib's owner binds. The copy must carry the marker,
+  // and the definitions its dylib's proof of it depends on must too.
+  DenseSet<StringRef> followed;
+  // The ones followed only as what a dylib requires binds them, which go on
+  // as given on, not as this image's own.
+  DenseSet<StringRef> followedGiven;
+  // Of those, the ones a dylib binds by weak lookup, which go on so too, as
+  // the copy its proof was checked against is one dyld coalesces to, not
+  // only the one this link binds.
+  DenseSet<StringRef> followedWeak, followedWeakGiven;
+  // Each once as it binds: by name, where dyld coalesces it, and to the dylib
+  // the link bound, which can be different copies, and in the two-level
+  // namespace of each dylib that binds it there, to the dylib that one loads,
+  // which can be another for each.
+  DenseSet<std::tuple<StringRef, unsigned, const DylibFile *>> followedAs;
+  // The definitions no copy of this image takes the place of, which the
+  // copies of dylibs bind to, and another image may take the place of, as
+  // what binds them binds them: by its own lookup, or by weak lookup.
+  DenseSet<StringRef> behindLibraries, behindLibrariesWeak;
+  // A requirement a dylib gives on that the dylib a proof is of binds by weak
+  // lookup, which is followed so: the name and the dylib that requires it.
+  std::pair<StringRef, const DylibFile *> weakRequirement;
+  // And one it binds by the ordinal its link recorded, which is followed to
+  // the file of that install name this link has: the name and the dylib.
+  std::pair<StringRef, const DylibFile *> boundRequirement;
+  std::function<void(StringRef, DylibFile *, DylibFile *)> followEdges;
+  // With \p byName, the dylib that binds it, of a definition that what
+  // requires it binds by name, where dyld coalesces it, like what a dylib
+  // requires or its proof of an owner depends on.
+  std::function<void(StringRef, DylibFile *, const DylibFile *)> follow;
+  // Whether dyld looks in this image to coalesce weak definitions, which
+  // MH_WEAK_DEFINES flags: it exports a weak one, or has a strong one that
+  // overrides a weak one, also one it doesn't export (Writer::scanSymbols).
+  // A weak marker it exports is at its definition, which says the same, and
+  // one that isn't, of a copy the link did not keep, is hidden below.
+  const bool imageCoalesces =
+      llvm::any_of(symtab->getSymbols(), [](const Symbol *sym) {
+        const auto *d = dyn_cast<Defined>(sym);
+        return d && d->isExternal() && d->isLive() &&
+               (d->overridesWeakDef ||
+                (!d->privateExtern && d->isWeakDef() &&
+                 !d->getName().ends_with(llvm::MalterlibSizedMarkerSuffix)));
+      });
+  // Whether the proof of \p provider of \p name binds what it depends on by
+  // name, where it looks at runtime: in a flat namespace, of one linked with
+  // -flat_namespace, or of a strong definition of its own, which it binds
+  // only so, linked with -interposable, as follow() has it. A dylib that
+  // imports it from that one binds it to that one's copy, whose proof binds
+  // what it depends on as that one does there.
+  auto bindsProofByName = [&](DylibFile *provider, StringRef name) {
+    if (provider->flatNamespace)
+      return true;
+    for (auto [dep, weak] : dylibEdges.lookup({provider, xxh3_64bits(name)}))
+      if (!weak &&
+          !provider->weakDefExports.contains(CachedHashStringRef(dep)) &&
+          llvm::is_contained(dylibDefiners.lookup(dep), provider))
+        return true;
+    return false;
+  };
+  // The copy of \p file binds at runtime, which must carry the marker, and
+  // what its dylib's proof depends on must hold.
+  // Another dylib that marks it says so.
+  // Unless bound in a flat namespace, \p flat, which looks in every image, a
+  // strong copy of a text stub binds as the stub's dylib is taken to be
+  // flagged with MH_WEAK_DEFINES, which the stub can't tell, as the error says.
+  auto followCopy = [&](StringRef name, DylibFile *file, DylibFile *requirer,
+                        bool flat) {
+    SmallVector<DylibFile *, 1> marking = dylibMarkers.lookup(name);
+    if (llvm::is_contained(marking, file)) {
+      followEdges(name, requirer, file);
+      return;
+    }
+    std::string demangled =
+        config->demangle ? llvm::demangle(name) : name.str();
+    std::string why =
+        marking.empty()
+            ? demangled +
+                  " was not compiled with -fmalterlib-sized-destructors\n>>> "
+                  "defined in " +
+                  toString(file)
+            : demangled +
+                  " was compiled both with and without "
+                  "-fmalterlib-sized-destructors, and the link keeps a copy "
+                  "compiled without\n>>> defined in " +
+                  toString(file) + "\n>>> marked in " +
+                  toString(marking.front());
+    if (file->fromStub && !flat &&
+        !file->weakDefExports.contains(CachedHashStringRef(name)))
+      why += "\n>>> " + toString(file) +
+             " is a text stub, which doesn't tell whether its dylib is flagged "
+             "with MH_WEAK_DEFINES, where dyld coalesces weak definitions to "
+             "its strong ones, so it is taken to be; link the dylib itself to "
+             "check what it does";
+    if (requirer)
+      error(why + "\n>>> the construction sites of " + toString(requirer) +
+            " bind to the copy the link keeps at runtime");
+    else
+      error(why + "\n>>> an object a construction site makes is destroyed "
+                  "with the size its deleting destructor returns");
+  };
+  follow =
+      [&](StringRef name, DylibFile *requirer, const DylibFile *byName) {
+        // Whether a dylib binds it by weak lookup, which dyld coalesces in
+        // the images flagged with MH_WEAK_DEFINES also in a flat namespace:
+        // one it exports a weak copy of, or imports as a weak definition.
+        const bool byWeakLookup =
+            byName &&
+            (byName->weakDefExports.contains(CachedHashStringRef(name)) ||
+             byName->importsByWeakLookup(name) ||
+             weakRequirement == std::make_pair(name, byName));
+        // Whether a dylib binds it in a flat namespace: one linked with
+        // -flat_namespace, and one that requires a strong definition it
+        // defines itself, which it binds only so, linked with -interposable.
+        const bool byFlatLookup =
+            byName && !byWeakLookup &&
+            (byName->flatNamespace ||
+             llvm::is_contained(dylibDefiners.lookup(name), byName));
+        // Whether a dylib binds it by the ordinal its link recorded, to the
+        // file of that install name this link has, which the link of the
+        // dylib checked another file of.
+        const bool byOrdinal = byName && !byWeakLookup &&
+                               boundRequirement == std::make_pair(name, byName);
+        // Each once for each way a reference binds it: of this image, by a
+        // dylib in its two-level namespace or in a flat one, by weak lookup,
+        // or by a dylib's ordinal.
+        const unsigned lookup = !byName        ? 0u
+                                : byWeakLookup ? 3u
+                                : byOrdinal    ? 4u
+                                               : 1u + byFlatLookup;
+        if (!followedAs
+                 .insert({name, lookup,
+                          lookup == 1 || lookup == 4 ? byName : nullptr})
+                 .second)
+          return;
+        // Which the images that load this one don't bind so, and are not
+        // given on to.
+        if (!byOrdinal)
+          (requirer ? followedGiven : followed).insert(name);
+        if (byWeakLookup)
+          (requirer ? followedWeakGiven : followedWeak).insert(name);
+        // Where nothing here takes the place of a dylib's copy, also when
+        // nothing here defines it, like a hidden constructor the optimizer
+        // inlined everywhere, which leaves it undefined, the copy that dyld
+        // coalesces to binds: of the dylibs it looks in, the first loaded
+        // that exports a strong one, or else the first that exports one, or
+        // in a flat namespace, the first loaded that exports one.
+        auto followLibraries = [&](bool weakLookup = false) {
+          // What a dylib binds by name, what it requires or its proof of an
+          // owner depends on, also one this image's sites import, binds where
+          // that dylib does: in its own two-level namespace, or in a flat one
+          // when it was linked with -flat_namespace, but for a weak definition
+          // this image imports, \p weakLookup, which dyld coalesces also in a
+          // flat namespace.
+          // So does one a dylib requires that it binds by weak lookup too.
+          weakLookup |= byWeakLookup;
+          (weakLookup ? behindLibrariesWeak : behindLibraries).insert(name);
+          const bool flat = !weakLookup && (byName ? byFlatLookup : imageFlat);
+          if (DylibFile *file =
+                  coalescedDefiner(name, /*strongOnly=*/false, flat))
+            followCopy(name, file, requirer, flat);
+        };
+        // One a dylib binds by its ordinal is of the dylib it loads, whatever
+        // this image's copy is, also one LTO internalized, which takes no
+        // place of it.
+        Symbol *x = symtab->find(name);
+        if (byOrdinal && !x)
+          return;
+        if (!byOrdinal && (!x || !isa<Defined, DylibSymbol>(x))) {
+          // Nothing here defines it, like a hidden constructor LTO removed:
+          // a dylib that imports it in its own two-level namespace binds it
+          // to the dylib it loads that has it, by the ordinal its link
+          // recorded, whose proof of it, of a dylib linked with
+          // -flat_namespace, binds what it depends on where that one looks,
+          // as below.
+          if (DylibFile *provider = byName && !byFlatLookup && !byWeakLookup &&
+                                            byName->importOrdinal(name)
+                                        ? loadedBy(byName, name)
+                                        : nullptr;
+              provider && bindsProofByName(provider, name)) {
+            followCopy(name, provider, requirer, /*flat=*/true);
+            return;
+          }
+          followLibraries();
+          return;
+        }
+        Symbol *m =
+            symtab->find((name + llvm::MalterlibSizedMarkerSuffix).str());
+        MalterlibSizedReference def{x}, marker{m ? m : x};
+        std::string why;
+        // Why the copy of \p provider that a reference binds doesn't prove
+        // it, or else what its proof depends on is followed.
+        auto ofProvider = [&](DylibFile *provider) -> std::string {
+          SmallVector<DylibFile *, 1> marking = dylibMarkers.lookup(name);
+          if (llvm::is_contained(marking, provider)) {
+            followEdges(name, requirer, provider);
+            return {};
+          }
+          if (marking.empty())
+            return nameOf(def, def) +
+                   " was not compiled with -fmalterlib-sized-destructors\n>>> "
+                   "defined in " +
+                   toString(provider);
+          return nameOf(def, def) +
+                 " was compiled both with and without "
+                 "-fmalterlib-sized-destructors, and the link keeps a copy "
+                 "compiled without\n>>> defined in " +
+                 toString(provider) + "\n>>> marked in " +
+                 toString(marking.front());
+        };
+        // A strong one a dylib imports in its own two-level namespace binds
+        // to the dylib it loads that has it, by the ordinal its link
+        // recorded, never to this image's copy, also where dyld coalesces in
+        // this image: of a dylib linked with -flat_namespace as that one
+        // gives it, and else where dyld coalesces it, if it does.
+        // One it imports, as its symbol table records, not one it only names
+        // for what the proof of a dylib it loads depends on.
+        // One it binds by its ordinal, of the dylibs this link has, as a
+        // dylib requires it so, is of that dylib's copy, whose proof is
+        // followed, also where this image has one; nothing where this link
+        // doesn't have the dylib.
+        DylibFile *ordinalProvider = byOrdinal ? loadedBy(byName, name)
+                                     : isa<Defined>(x) && byName &&
+                                             !byFlatLookup && !byWeakLookup &&
+                                             byName->importOrdinal(name)
+                                         ? loadedBy(byName, name)
+                                         : nullptr;
+        if (byOrdinal && !ordinalProvider)
+          return;
+        if (ordinalProvider && !byOrdinal &&
+            !bindsProofByName(ordinalProvider, name)) {
+          followLibraries();
+          return;
+        }
+        if (ordinalProvider) {
+          why = ofProvider(ordinalProvider);
+        } else if (auto *d = dyn_cast<Defined>(x)) {
+          // One that doesn't take the place of a dylib's copy leaves it
+          // binding there, and what that dylib's proof depends on must hold.
+          // A strong one does where dyld looks in this image, also when the
+          // link can't tell that it overrides a weak one, like after LTO or
+          // of a dylib that only another one loads, and where what binds it
+          // looks in every image, in a flat namespace, but for a weak lookup:
+          // also this image's own references to what it exports when it is
+          // linked with -interposable.
+          const bool flat =
+              !byWeakLookup &&
+              (byName ? byFlatLookup : imageFlat || d->interposable);
+          if (!(d->isWeakDef() || d->overridesWeakDef || imageCoalesces ||
+                flat) ||
+              !d->isExternal() || d->privateExtern || !d->isLive()) {
+            followLibraries();
+            return;
+          }
+          // A dylib's strong copy takes the place of a weak one at runtime,
+          // whatever it is compiled with, and so does a copy of a dylib dyld
+          // loaded before this image, like the executable a bundle is loaded
+          // into, which dyld finds first: a weak one of a weak one, a strong
+          // one of a strong one, or any of one bound in a flat namespace.
+          // A dylib's strong import that binds in a flat namespace binds to
+          // the first image that exports it, also a weak one, which isn't a
+          // weak lookup: this image's own references to its weak one are.
+          if (DylibFile *file = takesPlaceOf(
+                  name, d->isWeakDef() && !(byName && byFlatLookup), flat)) {
+            followCopy(name, file, requirer, flat);
+            // But a site can have inlined this image's own copy, whose body
+            // binds what it depends on in this image, like the vtable it
+            // installs, which another image may take the place of in turn.
+            for (Symbol *n : boundaryOf(dependenciesAt(x)))
+              if (isa<DylibSymbol, Defined>(n))
+                follow(n->getName(), requirer, /*byName=*/nullptr);
+            return;
+          }
+          if (!m || isa<Undefined, LazyArchive, LazyObject>(m))
+            why = nameOf(def, def) +
+                  " was not compiled with -fmalterlib-sized-destructors";
+          else if (auto location = marker.location();
+                   location && location == def.location())
+            why = provenAt(*location, nameOf(def, marker));
+          else
+            why = mixed(def, marker);
+          // Also through the weak ones it depends on that another image may
+          // take the place of, which a dylib's strong copy can, also deeper,
+          // like the deleting destructor of the vtable a constructor
+          // installs.
+          if (why.empty())
+            for (Symbol *n : boundaryOf(dependenciesAt(x)))
+              if (isa<DylibSymbol, Defined>(n))
+                follow(n->getName(), requirer, /*byName=*/nullptr);
+          // The checks of this image's sites prove its own copies, and
+          // report what doesn't hold.
+          if (!why.empty() && !requirer && !byName)
+            return;
+        } else if (auto *d = dyn_cast<DylibSymbol>(x)) {
+          if (d->isDynamicLookup())
+            return;
+          // One bound by name, also a weak one this image binds, binds to the
+          // copy dyld coalesces to, not to the dylib this link bound: that
+          // can be a strong one of a dylib it doesn't look in. So does a
+          // strong one of an image linked with -flat_namespace, to the first
+          // dylib that exports it.
+          // But a strong one that a dylib linked in its two-level namespace
+          // requires of a dylib linked with -flat_namespace, which the dylib
+          // gives as it is, binds to that dylib, whose own references bind by
+          // name, where its proof is followed.
+          // That dylib is the one of the dylibs the requiring one loads, in
+          // the order of its load commands, that has it, not the one this
+          // link binds it to, which can be another.
+          DylibFile *provider = providerOf(d);
+          if (byName && !byFlatLookup && !byWeakLookup && !d->isWeakDef())
+            if (DylibFile *loaded = loadedBy(byName, name))
+              provider = loaded;
+          const bool ofFlatDylib = byName && !byFlatLookup && !byWeakLookup &&
+                                   !d->isWeakDef() &&
+                                   bindsProofByName(provider, name);
+          if ((byName && !ofFlatDylib) || d->isWeakDef() || imageFlat) {
+            followLibraries(/*weakLookup=*/!byName && d->isWeakDef());
+            return;
+          }
+          why = ofProvider(provider);
+        }
+        if (why.empty())
+          return;
+        if (requirer)
+          error(why + "\n>>> the construction sites of " +
+                toString(requirer) +
+                " bind to the copy the link keeps at runtime");
+        else
+          error(why + "\n>>> an object a construction site makes is "
+                      "destroyed with the size its deleting destructor "
+                      "returns");
+      };
+  // Each as the dylib binds it, also by weak lookup where its link found it
+  // does, like a weak definition of another dylib that the proof of a
+  // definition of its own depends on, which a strong one of its own doesn't
+  // take the place of unless dyld coalesces in it.
+  followEdges = [&](StringRef name, DylibFile *requirer, DylibFile *provider) {
+    for (auto [dep, binding] :
+         dylibEdges.lookup({provider, xxh3_64bits(name)})) {
+      const llvm::SaveAndRestore Weak(
+          weakRequirement,
+          binding == ByWeakLookup
+              ? std::make_pair(dep, (const DylibFile *)provider)
+              : std::pair<StringRef, const DylibFile *>());
+      const llvm::SaveAndRestore Bound(
+          boundRequirement,
+          binding == ByOrdinal
+              ? std::make_pair(dep, (const DylibFile *)provider)
+              : std::pair<StringRef, const DylibFile *>());
+      follow(dep, requirer, /*byName=*/provider);
+    }
+  };
+  // The site checks proved what this image's sites import; what the proofs
+  // of the dylibs they come from depend on remains.
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : sites)
+      siteDefs.push_back(def);
+    // A weak one they import binds to the copy dyld coalesces to, and one an
+    // image linked with -flat_namespace imports to the first dylib that
+    // exports it.
+    for (Symbol *n : boundaryOf(std::move(siteDefs)))
+      if (auto *d = dyn_cast<DylibSymbol>(n);
+          d && (d->isWeakDef() || imageFlat) && !d->isDynamicLookup())
+        follow(n->getName(), nullptr, /*byName=*/nullptr);
+      else if (d) {
+        if (followedAs.insert({n->getName(), 0u, nullptr}).second) {
+          followed.insert(n->getName());
+          if (llvm::is_contained(dylibMarkers.lookup(n->getName()),
+                                 providerOf(d)))
+            followEdges(n->getName(), nullptr, providerOf(d));
+        }
+      } else if (isa<Defined>(n))
+        follow(n->getName(), nullptr, /*byName=*/nullptr);
+  }
+  SmallVector<StringRef, 0> requiredNames;
+  {
+    SetVector<StringRef> names;
+    for (auto *required : {&dylibRequired, &dylibRequiredWeak,
+                           &dylibRequiredGiven, &dylibRequiredWeakGiven})
+      for (auto &[name, requirers] : *required)
+        names.insert(name);
+    requiredNames = names.takeVector();
+  }
+  llvm::sort(requiredNames);
+  // The dylibs \p dylib loads, also through those, each as the dylib of its
+  // install name that dyld loads.
+  DenseMap<const DylibFile *, DenseSet<const DylibFile *>> loadedThrough;
+  auto loads = [&](DylibFile *dylib, const DylibFile *other) {
+    auto [it, inserted] = loadedThrough.try_emplace(dylib);
+    if (inserted) {
+      SmallVector<DylibFile *, 8> pending{dylib};
+      while (!pending.empty()) {
+        DylibFile *current = pending.pop_back_val();
+        auto add = [&](DylibFile *next) {
+          if (next && it->second.insert(next).second)
+            pending.push_back(next);
+        };
+        for (StringRef installName : current->loadedInstallNames)
+          add(linkedByInstallName.lookup(installName));
+        for (DylibFile *reexport : current->reexports)
+          add(loadedAs(reexport));
+      }
+    }
+    return it->second.contains(other);
+  };
+  for (StringRef name : requiredNames) {
+    // Each dylib that requires it, whether as bound by weak lookup, and
+    // whether given on from a dylib it loads.
+    struct Requirement {
+      DylibFile *requirer;
+      bool weak;
+      bool given;
+    };
+    SmallVector<Requirement, 2> requirements;
+    for (auto [required, weak, given] :
+         {std::tuple{&dylibRequired, false, false},
+          std::tuple{&dylibRequiredWeak, true, false},
+          std::tuple{&dylibRequiredGiven, false, true},
+          std::tuple{&dylibRequiredWeakGiven, true, true}})
+      for (DylibFile *requirer : required->lookup(name))
+        requirements.push_back({requirer, weak, given});
+    for (const Requirement &requirement : requirements) {
+      DylibFile *requirer = requirement.requirer;
+      // One that only gives on what a dylib it loads requires, for the
+      // images that may not load that one, binds none of it itself: where
+      // that one requires it too, it is followed as that one binds it, not
+      // as this one would, also when this one imports it for its own use,
+      // like a construction without the builtin.
+      // Only where that one requires it the same way: one that binds it by
+      // weak lookup binds another copy than one that binds it by name.
+      if (requirement.given &&
+          llvm::any_of(requirements, [&](const Requirement &other) {
+            return other.requirer != requirer &&
+                   other.weak == requirement.weak &&
+                   loads(requirer, other.requirer);
+          }))
+        continue;
+      // One it requires as bound by weak lookup is followed so.
+      weakRequirement = requirement.weak
+                            ? std::make_pair(name, (const DylibFile *)requirer)
+                            : std::pair<StringRef, const DylibFile *>();
+      follow(name, requirer, /*byName=*/requirer);
+      weakRequirement = {};
+    }
+  }
+  // And what each binds by its ordinal, as it binds it.
+  {
+    SmallVector<StringRef, 0> boundNames;
+    for (auto &[name, requirers] : dylibRequiredBound)
+      boundNames.push_back(name);
+    llvm::sort(boundNames);
+    for (StringRef name : boundNames)
+      for (DylibFile *requirer : dylibRequiredBound.lookup(name)) {
+        const llvm::SaveAndRestore Bound(
+            boundRequirement,
+            std::make_pair(name, (const DylibFile *)requirer));
+        follow(name, requirer, /*byName=*/requirer);
+      }
+  }
+
+  // A marker leaves the image with its definition, whatever the lists of
+  // exported symbols say, unless the image does not prove it: its claim is
+  // not proven, or a copy of its definition the link did not keep left it.
+  SmallVector<Defined *, 0> owners;
+  for (Symbol *sym : symtab->getSymbols()) {
+    auto *m = dyn_cast<Defined>(sym);
+    if (!m || !m->isExternal() ||
+        !m->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
+    Symbol *x = symtab->find(
+        m->getName().drop_back(llvm::MalterlibSizedMarkerSuffix.size()));
+    MalterlibSizedReference marker{sym}, def{x};
+    auto location = marker.location();
+    if (!location || location != def.location() ||
+        !provenAt(*location, nameOf(def, marker)).empty()) {
+      m->privateExtern = true;
+    } else {
+      // Dead stripping may have taken a marker an export list hid for dead.
+      m->privateExtern = cast<Defined>(x)->privateExtern;
+      m->used = x->used;
+      if (!m->privateExtern)
+        owners.push_back(cast<Defined>(x));
+    }
+  }
+
+  // A dylib, a bundle or an executable names what another image may take the
+  // place of: the definitions its sites depend on, and those the proof of
+  // each owner it exports depends on, which the link of a bundle loaded into
+  // an executable checks against its own copies.
+  if (!isLoadedInto)
+    return;
+  // Another image takes the place of a definition by name only where dyld
+  // coalesces it. A strong import binds to the dylib this link found it in,
+  // and what that dylib's proof of it depends on stands in for it, bound as
+  // that dylib binds it: by name where it binds it in a flat namespace or by
+  // weak lookup, which another image can take the place of, and else to the
+  // dylib it loads that has it, by the ordinal its link recorded, whose proof
+  // of it stands in for it in turn, not to the copy this link binds it to,
+  // which can be another dylib's.
+  // The names, each with how the dylib a proof is of binds it, by weak
+  // lookup, which the images that load this one follow so, or by name. And
+  // the strong ones this image imports in its two-level namespace, each also
+  // as bound by its ordinal, which the images that load this one follow to
+  // the file of that install name they have, also another than this link's.
+  auto byName = [&](ArrayRef<Symbol *> syms) {
+    SetVector<std::pair<StringRef, Binding>> out;
+    // Each name, with the dylib whose references bind it, or none for this
+    // image's.
+    DenseSet<std::tuple<StringRef, const DylibFile *, unsigned>> visited;
+    // Also whether the proof of a dylib it is of says it binds it by weak
+    // lookup.
+    SmallVector<std::tuple<StringRef, DylibFile *, bool>, 0> work;
+    for (Symbol *sym : syms)
+      if (sym)
+        work.push_back({sym->getName(), nullptr, false});
+    auto followProof = [&](DylibFile *provider, StringRef name) {
+      for (auto [dep, binding] :
+           dylibEdges.lookup({provider, xxh3_64bits(name)}))
+        work.push_back({dep, provider, binding == ByWeakLookup});
+    };
+    while (!work.empty()) {
+      auto [name, binder, weakEdge] = work.pop_back_val();
+      if (!visited.insert({name, binder, weakEdge}).second)
+        continue;
+      if (binder) {
+        const bool weak =
+            weakEdge ||
+            binder->weakDefExports.contains(CachedHashStringRef(name)) ||
+            binder->importsByWeakLookup(name);
+        if (binder->flatNamespace || weak) {
+          out.insert({name, weak ? ByWeakLookup : ByName});
+          continue;
+        }
+        DylibFile *provider = loadedBy(binder, name);
+        if (!provider)
+          if (auto *d = dyn_cast_or_null<DylibSymbol>(symtab->find(name));
+              d && !d->isDynamicLookup())
+            provider = providerOf(d);
+        if (!provider || bindsProofByName(provider, name))
+          out.insert({name, ByName});
+        else
+          followProof(provider, name);
+        continue;
+      }
+      // Also a strong import of a dylib linked with -flat_namespace, whose
+      // own references bind by name: the links of the images that load this
+      // one follow it to that dylib, which binds them where they look.
+      auto *d = dyn_cast_or_null<DylibSymbol>(symtab->find(name));
+      if (!d || d->isWeakDef() ||
+          config->namespaceKind == NamespaceKind::flat ||
+          (!d->isDynamicLookup() && bindsProofByName(providerOf(d), name))) {
+        // A weak definition binds by weak lookup, also one this image
+        // doesn't import itself, which the proof of a dylib it imports from
+        // depends on, and one of its own, like a vtable it exports weak.
+        auto *own = dyn_cast_or_null<Defined>(symtab->find(name));
+        out.insert({name, (d && d->isWeakDef()) || (own && own->isWeakDef())
+                              ? ByWeakLookup
+                              : ByName});
+        continue;
+      }
+      if (!d->isDynamicLookup()) {
+        out.insert({name, ByOrdinal});
+        followProof(providerOf(d), name);
+      }
+    }
+    return out.takeVector();
+  };
+  auto required = [&](std::pair<StringRef, Binding> name, bool given = false) {
+    return saver().save(name.first +
+                        (name.second == ByWeakLookup ? requiredWeakSuffix
+                         : name.second == ByOrdinal  ? requiredBoundSuffix
+                                                     : requiredSuffix) +
+                        (given ? givenSuffix : StringRef()));
+  };
+  SetVector<StringRef> names;
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : sites)
+      siteDefs.push_back(def);
+    for (std::pair<StringRef, Binding> n :
+         byName(boundaryOf(std::move(siteDefs))))
+      names.insert(required(n));
+  }
+  // What the dylibs it loads require, and what that led to, go on to the
+  // links of the images that load it, which may not load those dylibs, as
+  // they require it.
+  for (StringRef name : requiredNames) {
+    if (dylibRequired.contains(name) || dylibRequiredGiven.contains(name))
+      names.insert(required({name, ByName}, /*given=*/true));
+    if (dylibRequiredWeak.contains(name) ||
+        dylibRequiredWeakGiven.contains(name))
+      names.insert(required({name, ByWeakLookup}, /*given=*/true));
+  }
+  for (bool given : {false, true}) {
+    SmallVector<Symbol *, 0> reached;
+    for (StringRef name : given ? followedGiven : followed) {
+      if (given && followed.contains(name))
+        continue;
+      if ((given ? followedWeakGiven : followedWeak).contains(name))
+        names.insert(required({name, ByWeakLookup}, given));
+      if (Symbol *sym = symtab->find(name); isBoundary(sym))
+        reached.push_back(sym);
+      else {
+        if (behindLibraries.contains(name))
+          names.insert(required({name, ByName}, given));
+        if (behindLibrariesWeak.contains(name))
+          names.insert(required({name, ByWeakLookup}, given));
+      }
+    }
+    llvm::sort(reached, [](Symbol *a, Symbol *b) {
+      return a->getName() < b->getName();
+    });
+    // What it binds by its ordinal for what a dylib it loads requires is
+    // that dylib's to bind, which isn't given on.
+    for (std::pair<StringRef, Binding> n : byName(reached))
+      if (!given || n.second != ByOrdinal)
+        names.insert(required(n, given));
+  }
+  for (Defined *x : owners)
+    for (std::pair<StringRef, Binding> n :
+         byName(boundaryOf(dependenciesAt(x))))
+      names.insert(saver().save(n.first +
+                                (n.second == ByWeakLookup ? edgeWeakInfix
+                                 : n.second == ByOrdinal  ? edgeBoundInfix
+                                                          : edgeInfix) +
+                                utohexstr(xxh3_64bits(x->getName()))));
+  SmallVector<StringRef, 0> sortedNames(names.begin(), names.end());
+  llvm::sort(sortedNames);
+  // The symbols come after dead stripping, which they are not subject to.
+  for (StringRef name : sortedNames)
+    symtab
+        ->addSynthetic(name, /*isec=*/nullptr, /*value=*/0,
+                       /*isPrivateExtern=*/false, /*includeInSymtab=*/true,
+                       /*referencedDynamically=*/false)
+        ->used = true;
 }
 
 static void createAliases() {
@@ -2501,6 +3861,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
 
     if (config->deadStrip)
       markLive();
+
+    // A definition dead stripping removed takes nobody's place.
+    checkMalterlibSizedMarkers();
 
     // Ensure that no symbols point inside __mod_init_func sections if they are
     // removed due to -init_offsets. This must run after dead stripping.

@@ -44,11 +44,15 @@
 #include "lld/Common/Memory.h"
 #include "lld/Common/Strings.h"
 #include "lld/Common/Version.h"
+#include "llvm/ADT/CachedHashString.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/IRObjectFile.h"
@@ -60,12 +64,15 @@
 #include "llvm/Support/LEB128.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <tuple>
 #include <utility>
 
@@ -3239,6 +3246,725 @@ static void postParseObjectFile(ELFFileBase *file) {
   }
 }
 
+namespace {
+// A reference of -fmalterlib-sized-destructors: the symbol it names, and the
+// offset from it. A reference to a local symbol may name its section instead.
+struct MalterlibSizedReference {
+  Symbol *sym = nullptr;
+  int64_t addend = 0;
+
+  // The address the reference names. Bit 0 of an ARM function's value
+  // selects Thumb, which a local label at the function does not have.
+  std::optional<std::pair<SectionBase *, uint64_t>> location() const {
+    auto *d = dyn_cast_or_null<Defined>(sym);
+    if (!d)
+      return std::nullopt;
+    uint64_t value = d->value + addend;
+    if (d->isFunc() && d->file && d->file->emachine == EM_ARM)
+      value &= ~uint64_t(1);
+    return std::make_pair(d->section, value);
+  }
+};
+
+struct MalterlibSizedReferences {
+  // The references of the construction sites: a definition and its marker.
+  SmallVector<std::array<MalterlibSizedReference, 2>, 0> sites;
+  // The dependencies of markers: an owner's marker, a definition and the
+  // definition's marker.
+  SmallVector<std::array<MalterlibSizedReference, 3>, 0> dependencies;
+  // The sections the references are in, and their relocation sections.
+  DenseSet<InputSectionBase *> sections;
+};
+} // namespace
+
+// Reads the references of -fmalterlib-sized-destructors from the sections the
+// compiler puts them in, which are metadata of the link and do not reach an
+// output that is not relocatable.
+template <class ELFT>
+static void collectMalterlibSizedReferences(Ctx &ctx,
+                                            MalterlibSizedReferences &refs) {
+  for (ELFFileBase *file : ctx.objectFiles) {
+    auto *obj = dyn_cast<ObjFile<ELFT>>(file);
+    if (!obj)
+      continue;
+    for (InputSectionBase *sec : obj->getSections()) {
+      if (!sec || sec == &InputSection::discarded)
+        continue;
+      size_t width;
+      if (sec->name == ".data.rel.ro.__mib_sized_ref")
+        width = 2;
+      else if (sec->name == ".data.rel.ro.__mib_sized_dep")
+        width = 3;
+      else
+        continue;
+      auto collect = [&](ObjFile<ELFT> *file, auto rels) {
+        std::map<uint64_t, SmallVector<MalterlibSizedReference, 3>> groups;
+        for (const auto &rel : rels) {
+          using RelTy = std::remove_cv_t<std::remove_reference_t<decltype(rel)>>;
+          uint64_t entry = rel.r_offset / ctx.arg.wordsize;
+          auto &group = groups[entry / width];
+          group.resize(width);
+          int64_t addend = getAddend<ELFT>(rel);
+          if constexpr (std::is_same_v<RelTy, typename ELFT::Rel>)
+            addend = ctx.target->getImplicitAddend(
+                sec->content().data() + rel.r_offset,
+                rel.getType(ctx.arg.isMips64EL));
+          group[entry % width] = {&file->getRelocTargetSym(rel), addend};
+        }
+        for (auto &[index, group] : groups) {
+          if (!llvm::all_of(group, [](auto &ref) { return ref.sym; }))
+            continue;
+          if (width == 2)
+            refs.sites.push_back({group[0], group[1]});
+          // A record belongs to its object's copy of the owner, and says
+          // nothing of a copy of another object that the link kept.
+          else if (group[0].sym->file == file && isa<Defined>(group[0].sym))
+            refs.dependencies.push_back({group[0], group[1], group[2]});
+        }
+      };
+      invokeOnRelocs(*sec, collect, obj);
+      refs.sections.insert(sec);
+      if (sec->relSecIdx)
+        refs.sections.insert(obj->getSections()[sec->relSecIdx]);
+    }
+  }
+}
+
+namespace {
+// What the shared libraries of a link say of -fmalterlib-sized-destructors, by
+// the names of definitions: the libraries that export a marker of one, those
+// whose construction sites depend on one, and what the proof of an owner a
+// library exports depends on, by the hash of the owner's name.
+struct MalterlibSizedShared {
+  // The libraries the dynamic loader loads.
+  DenseSet<const SharedFile *> loaded;
+  DenseMap<StringRef, SmallVector<SharedFile *, 1>> markers;
+  DenseMap<StringRef, SmallVector<SharedFile *, 1>> required;
+  DenseMap<std::pair<SharedFile *, uint64_t>, SmallVector<StringRef, 2>> edges;
+  // The libraries that define a definition the others require or depend on,
+  // in the order they are loaded.
+  DenseMap<StringRef, SmallVector<SharedFile *, 1>> definers;
+  // The address of a library's definition of a name, where its marker is, and
+  // the addresses of the markers of the name it exports.
+  DenseMap<std::pair<SharedFile *, StringRef>, uint64_t> values;
+  DenseMap<std::pair<SharedFile *, StringRef>, SmallVector<uint64_t, 1>>
+      markerValues;
+  // A library's definitions of those names, and its references to them, of a
+  // symbol version, `name@@VER` or `name@VER`, which the check doesn't
+  // support.
+  SmallVector<std::tuple<SharedFile *, StringRef, StringRef>, 0> versioned;
+};
+} // namespace
+
+template <class ELFT>
+static void collectMalterlibSizedShared(Ctx &ctx,
+                                        MalterlibSizedShared &shared) {
+  // The libraries the dynamic loader loads, in its order: those this image
+  // needs, then breadth first those each of them needs in turn, also one
+  // --as-needed drops from this image's own, which another one can need.
+  SmallVector<SharedFile *, 0> loaded;
+  {
+    DenseMap<StringRef, SharedFile *> bySoName;
+    for (SharedFile *file : ctx.sharedFiles)
+      bySoName.try_emplace(file->soName, file);
+    DenseSet<SharedFile *> seen;
+    for (SharedFile *file : ctx.sharedFiles)
+      if (file->isNeeded && seen.insert(file).second)
+        loaded.push_back(file);
+    for (size_t i = 0; i != loaded.size(); ++i)
+      for (StringRef needed : loaded[i]->dtNeeded)
+        if (SharedFile *file = bySoName.lookup(needed);
+            file && seen.insert(file).second)
+          loaded.push_back(file);
+  }
+  shared.loaded.insert(loaded.begin(), loaded.end());
+  for (SharedFile *file : loaded) {
+    for (const typename ELFT::Sym &sym :
+         file->template getGlobalELFSyms<ELFT>()) {
+      if (sym.st_shndx == SHN_UNDEF)
+        continue;
+      StringRef name = CHECK2(sym.getName(file->getStringTable()), file);
+      if (name.consume_back(llvm::MalterlibSizedMarkerSuffix)) {
+        shared.markers[name].push_back(file);
+      } else if (name.consume_back(".mib_sized_required")) {
+        shared.required[name].push_back(file);
+      } else if (auto [dep, hash] = name.rsplit(".mib_sized_edge.");
+                 dep.size() != name.size()) {
+        uint64_t owner;
+        if (!hash.getAsInteger(16, owner))
+          shared.edges[{file, owner}].push_back(dep);
+      }
+    }
+  }
+  DenseSet<StringRef> named;
+  for (auto &[name, files] : shared.required)
+    named.insert(name);
+  for (auto &[owner, deps] : shared.edges)
+    named.insert(deps.begin(), deps.end());
+  // Also what this image imports that has a marker, which its own sites, and
+  // the copies of its own a library's sites bind, depend on: which library
+  // binds it depends on the order the dynamic loader loads them in.
+  for (Symbol *sym : ctx.symtab->getSymbols())
+    if (isa<SharedSymbol>(sym)) {
+      StringRef name = sym->getName().split('@').first;
+      if (ctx.symtab->find((name + llvm::MalterlibSizedMarkerSuffix).str()))
+        named.insert(name);
+    }
+  if (named.empty())
+    return;
+  for (SharedFile *file : loaded) {
+    // The versions of its symbols, by the index of each global one, which tell
+    // the ones of a version.
+    llvm::object::ELFFile<ELFT> obj = file->template getObj<ELFT>();
+    typename ELFT::SymRange globals = file->template getGlobalELFSyms<ELFT>();
+    const size_t firstGlobal =
+        file->template getELFSyms<ELFT>().size() - globals.size();
+    ArrayRef<typename ELFT::Versym> versyms;
+    DenseMap<unsigned, StringRef> definedVersions, neededVersions;
+    for (const typename ELFT::Shdr &sec : file->template getELFShdrs<ELFT>()) {
+      if (sec.sh_type == SHT_GNU_versym) {
+        if (auto contents =
+                obj.template getSectionContentsAsArray<typename ELFT::Versym>(
+                    sec))
+          versyms = contents->size() > firstGlobal
+                        ? contents->slice(firstGlobal)
+                        : ArrayRef<typename ELFT::Versym>();
+        else
+          consumeError(contents.takeError());
+      } else if (sec.sh_type == SHT_GNU_verdef) {
+        if (auto defs = obj.getVersionDefinitions(sec))
+          for (const llvm::object::VerDef &def : *defs)
+            definedVersions[def.Ndx] = ctx.saver.save(def.Name.c_str());
+        else
+          consumeError(defs.takeError());
+      } else if (sec.sh_type == SHT_GNU_verneed) {
+        if (auto needs = obj.getVersionDependencies(sec))
+          for (const llvm::object::VerNeed &need : *needs)
+            for (const llvm::object::VernAux &aux : need.AuxV)
+              neededVersions[aux.Other] = ctx.saver.save(aux.Name.c_str());
+        else
+          consumeError(needs.takeError());
+      }
+    }
+    for (size_t i = 0, e = globals.size(); i != e; ++i) {
+      const typename ELFT::Sym &sym = globals[i];
+      StringRef name = CHECK2(sym.getName(file->getStringTable()), file);
+      if (StringRef marked = name;
+          sym.st_shndx != SHN_UNDEF &&
+          marked.consume_back(llvm::MalterlibSizedMarkerSuffix) &&
+          named.contains(marked)) {
+        shared.markerValues[{file, marked}].push_back(sym.st_value);
+        continue;
+      }
+      if (!named.contains(name))
+        continue;
+      const unsigned index = (i < versyms.size() ? uint16_t(versyms[i].vs_index)
+                                                 : uint16_t(VER_NDX_GLOBAL)) &
+                             ~VERSYM_HIDDEN;
+      // The base version, of the library itself, is no version of a symbol.
+      if (StringRef version = index <= VER_NDX_GLOBAL ? StringRef()
+                              : sym.st_shndx == SHN_UNDEF
+                                  ? neededVersions.lookup(index)
+                                  : definedVersions.lookup(index);
+          !version.empty())
+        shared.versioned.push_back({file, name, version});
+      if (sym.st_shndx == SHN_UNDEF)
+        continue;
+      shared.values.try_emplace({file, name}, sym.st_value);
+      // Also a protected one, which binds the references of other images as
+      // a default one does, and only its own library's to itself.
+      if (sym.getVisibility() != llvm::ELF::STV_DEFAULT &&
+          sym.getVisibility() != llvm::ELF::STV_PROTECTED)
+        continue;
+      if (SmallVector<SharedFile *, 1> &files = shared.definers[name];
+          files.empty() || files.back() != file)
+        files.push_back(file);
+    }
+  }
+}
+
+// Takes the references out of the link, before garbage collection or a linker
+// script that keeps their sections brings them back.
+static void takeMalterlibSizedReferences(Ctx &ctx,
+                                         MalterlibSizedReferences &refs) {
+  invokeELFT(collectMalterlibSizedReferences, ctx, refs);
+  if (refs.sections.empty())
+    return;
+  for (InputSectionBase *sec : refs.sections) {
+    if (!sec)
+      continue;
+    sec->markDead();
+    // A record of an owner in a section group is a member of the group, which
+    // garbage collection keeps whole.
+    if (InputSectionBase *next = sec->nextInSectionGroup) {
+      InputSectionBase *prev = next;
+      while (prev->nextInSectionGroup != sec)
+        prev = prev->nextInSectionGroup;
+      prev->nextInSectionGroup = prev == sec ? nullptr : next;
+      sec->nextInSectionGroup = nullptr;
+    }
+  }
+  llvm::erase_if(ctx.inputSections, [&](InputSectionBase *sec) {
+    return refs.sections.contains(sec);
+  });
+}
+
+// A definition compiled with -fmalterlib-sized-destructors carries a marker,
+// which the construction sites that depend on it reference. The marker of a
+// constructor or a vtable proves its claim only when what it binds in this
+// image does too: a constructor installs its image's vtable, which binds its
+// image's deleting destructors. A marker whose claim is not proven does not
+// leave the image, and is only an error where a site depends on it. Symbol
+// resolution does the rest, except for three things: the references are in a
+// section that does not reach the output, where an undefined marker would not
+// be reported, the marker the link resolved may not belong to the definition
+// it resolved, and a shared library's marker stands in for its definition
+// only in its own image.
+static void checkMalterlibSizedMarkers(Ctx &ctx,
+                                       const MalterlibSizedReferences &refs) {
+  // The symbols a shared library defines, by the name of a definition another
+  // image may take the place of: for one its construction sites, or those of
+  // a library it loads, depend on, and for one the proof of an owner it
+  // exports depends on, followed by a hash of the owner's name.
+  constexpr StringRef requiredSuffix = ".mib_sized_required";
+  constexpr StringRef edgeInfix = ".mib_sized_edge.";
+
+  using Location = std::pair<SectionBase *, uint64_t>;
+  DenseMap<Location, SmallVector<std::array<MalterlibSizedReference, 2>, 1>>
+      dependenciesOf;
+  for (auto &[owner, def, marker] : refs.dependencies)
+    if (auto location = owner.location())
+      dependenciesOf[*location].push_back({def, marker});
+
+  // A reference the optimizer made to a section symbol, which has no name,
+  // is named by a symbol defined where it points, a global one if there is
+  // one, found only for what is reported.
+  DenseMap<Location, Symbol *> namedAt;
+  bool namedAtFilled = false;
+  auto nameAt = [&](Location location) -> StringRef {
+    if (!namedAtFilled) {
+      namedAtFilled = true;
+      for (ELFFileBase *file : ctx.objectFiles)
+        for (Symbol *sym : file->getSymbols()) {
+          auto *d = dyn_cast_or_null<Defined>(sym);
+          if (!d || d->isSection() || d->getName().empty() || !d->section)
+            continue;
+          Symbol *&named = namedAt[{d->section, d->value}];
+          if (!named || (named->isLocal() && !d->isLocal()))
+            named = d;
+        }
+    }
+    Symbol *named = namedAt.lookup(location);
+    return named ? named->getName() : StringRef();
+  };
+  auto nameOf = [&](const MalterlibSizedReference &def,
+                    const MalterlibSizedReference &marker) {
+    StringRef name = marker.sym->getName();
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      name = name.drop_back(llvm::MalterlibSizedMarkerSuffix.size());
+    else
+      name = def.sym->getName();
+    if (name.empty())
+      if (auto location = def.location())
+        name = nameAt(*location);
+    return ctx.arg.demangle ? llvm::demangle(name) : name.str();
+  };
+
+  auto mixed = [&](const MalterlibSizedReference &def,
+                   const MalterlibSizedReference &marker) {
+    return nameOf(def, marker) +
+           " was compiled both with and without "
+           "-fmalterlib-sized-destructors, and the link keeps a copy compiled "
+           "without\n>>> defined in " +
+           toStr(ctx, def.sym->file) + "\n>>> marked in " +
+           toStr(ctx, marker.sym->file);
+  };
+
+  // Why a definition and its marker do not prove the definition was compiled
+  // with the flag, or an empty string when they do. A marker whose claim
+  // depends on itself is taken at its word.
+  DenseMap<Location, std::string> proven;
+  // A shared library's sites bind at runtime to the copy of a definition the
+  // dynamic loader finds first, which may be this image's or another
+  // library's, and so do the definitions a library's owner binds. The copy
+  // must carry the marker, and the definitions its library's proof of it
+  // depends on must too.
+  MalterlibSizedShared shared;
+  invokeELFT(collectMalterlibSizedShared, ctx, shared);
+  // Symbol versions of the definitions the check follows aren't supported: a
+  // library's definition or reference of a version, and this image's.
+  DenseSet<std::pair<StringRef, StringRef>> reportedVersions;
+  auto reportVersion = [&](StringRef name, StringRef version,
+                           const std::string &where) {
+    if (!reportedVersions.insert({name, version}).second)
+      return;
+    ErrAlways(ctx) << (ctx.arg.demangle ? llvm::demangle(name) : name.str())
+                   << " has symbol version " << version
+                   << ", which -fmalterlib-sized-destructors doesn't support\n"
+                   << ">>> " << where;
+  };
+  for (auto &[file, name, version] : shared.versioned)
+    reportVersion(name, version,
+                  "defined or referenced in " + toStr(ctx, file));
+  // The version of a symbol of this image, \p x: the one it is defined by, of
+  // its version script or `.symver`, or that a reference asks for, `name@VER`.
+  auto versionOf = [&](Symbol *x) -> StringRef {
+    if (auto [base, version] = x->getName().split('@'); !version.empty())
+      return version.ltrim('@');
+    if (StringRef suffix = x->getVersionSuffix(); suffix.starts_with("@"))
+      return suffix.ltrim('@');
+    if (isa<Defined>(x)) {
+      const unsigned index = x->versionId & ~VERSYM_HIDDEN;
+      if (index > VER_NDX_GLOBAL && index < ctx.arg.versionDefinitions.size())
+        return ctx.arg.versionDefinitions[index].name;
+    }
+    return {};
+  };
+  auto checkVersion = [&](Symbol *x) {
+    if (StringRef version = versionOf(x); !version.empty())
+      reportVersion(x->getName().split('@').first, version,
+                    x->file ? "defined or referenced in " + toStr(ctx, x->file)
+                            : std::string("defined by the link"));
+  };
+  // Whether the copy of \p file of \p name carries the marker, at its address.
+  auto marks = [&](SharedFile *file, StringRef name) {
+    if (!llvm::is_contained(shared.markers.lookup(name), file))
+      return false;
+    auto it = shared.values.find({file, name});
+    return it == shared.values.end() ||
+           llvm::is_contained(shared.markerValues.lookup({file, name}),
+                              it->second);
+  };
+  std::function<std::string(const MalterlibSizedReference &,
+                            const MalterlibSizedReference &)>
+      check;
+  auto provenAt = [&](Location location, const std::string &name) {
+    if (auto it = proven.find(location); it != proven.end())
+      return it->second;
+    proven[location] = {};
+    std::string why;
+    for (auto &[depDef, depMarker] : dependenciesOf.lookup(location))
+      if (std::string depWhy = check(depDef, depMarker); !depWhy.empty()) {
+        why = name + " depends on " + nameOf(depDef, depMarker) + "\n>>> " +
+              depWhy;
+        break;
+      }
+    return proven[location] = why;
+  };
+  check = [&](const MalterlibSizedReference &def,
+              const MalterlibSizedReference &marker) -> std::string {
+    checkVersion(def.sym);
+    // The optimizer folds a marker it sees into its definition, which proves
+    // that the marker belongs to it, and leaves its dependencies to check.
+    if (def.sym == marker.sym && def.addend == marker.addend) {
+      if (auto location = def.location())
+        return provenAt(*location, nameOf(def, marker));
+      return {};
+    }
+    if (isa<Undefined, LazySymbol>(marker.sym))
+      return nameOf(def, marker) +
+             " was not compiled with -fmalterlib-sized-destructors\n>>> its "
+             "marker " +
+             marker.sym->getName().str() + " is undefined";
+    // One this image imports binds to the copy of the first library the
+    // dynamic loader loads that defines it, which can be another than the one
+    // the link chose, and which the check of what this image's sites import
+    // follows.
+    if (isa<SharedSymbol>(def.sym) && isa<SharedSymbol>(marker.sym))
+      return {};
+    if (auto *m = dyn_cast<SharedSymbol>(marker.sym)) {
+      auto *d = dyn_cast<SharedSymbol>(def.sym);
+      if (d && m->file == d->file && m->value == d->value)
+        return {};
+    } else if (auto location = marker.location();
+               location && location == def.location()) {
+      return provenAt(*location, nameOf(def, marker));
+    }
+    return mixed(def, marker);
+  };
+
+  // Local references may name one section symbol with different addends.
+  DenseSet<std::tuple<Symbol *, int64_t, Symbol *, int64_t>> seen;
+  for (auto &[def, marker] : refs.sites) {
+    if (!seen.insert({def.sym, def.addend, marker.sym, marker.addend}).second)
+      continue;
+    if (std::string why = check(def, marker); !why.empty())
+      ErrAlways(ctx) << why
+                     << "\n>>> an object a construction site makes is "
+                        "destroyed with the size its deleting destructor "
+                        "returns";
+  }
+
+  // Whether another image may take the place of a definition at runtime:
+  // one this image imports, or one a shared library exports that the dynamic
+  // loader may preempt.
+  auto isBoundary = [&](Symbol *sym) {
+    if (isa<SharedSymbol>(sym))
+      return true;
+    return isa<Defined>(sym) && ctx.arg.shared &&
+           sym->computeBinding(ctx) != STB_LOCAL &&
+           computeIsPreemptible(ctx, *sym);
+  };
+  // The definitions another image may take the place of that the proof of
+  // \p starts depends on, through the definitions this image binds.
+  auto boundaryOf = [&](SmallVector<MalterlibSizedReference, 0> work) {
+    SetVector<Symbol *> boundary;
+    DenseSet<Location> visited;
+    while (!work.empty()) {
+      MalterlibSizedReference ref = work.pop_back_val();
+      if (isBoundary(ref.sym)) {
+        boundary.insert(ref.sym);
+        continue;
+      }
+      if (auto location = ref.location();
+          location && visited.insert(*location).second)
+        for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+          work.push_back(depDef);
+    }
+    return boundary.takeVector();
+  };
+  auto dependenciesAt = [&](Symbol *sym) {
+    SmallVector<MalterlibSizedReference, 0> deps;
+    if (auto location = MalterlibSizedReference{sym}.location())
+      for (auto &[depDef, depMarker] : dependenciesOf.lookup(*location))
+        deps.push_back(depDef);
+    return deps;
+  };
+  // The name of what this image imports, without the version a reference
+  // asks for, which checkVersion reports.
+  auto importName = [&](Symbol *n) {
+    checkVersion(n);
+    return n->getName().split('@').first;
+  };
+
+  DenseSet<StringRef> followed;
+  // The definitions no copy of this image takes the place of, which the
+  // copies of libraries bind to, and another image may take the place of.
+  DenseSet<StringRef> behindLibraries;
+  std::function<void(StringRef, SharedFile *, SharedFile *)> followEdges;
+  // What this image's own copy of a definition, which another image may take
+  // the place of, depends on binds by this image's own references, not by
+  // those of a library it takes the place of: its sites can have inlined it,
+  // like the vtable a constructor installs. Also through its own copies of
+  // those.
+  std::function<void(Symbol *, SharedFile *)> followOwnImports;
+  // What \p requirer requires, or this image's sites when it is null, each
+  // once.
+  std::function<void(StringRef, SharedFile *)> follow =
+      [&](StringRef name, SharedFile *requirer) {
+        if (!followed.insert(name).second)
+          return;
+        // Where nothing here takes the place of a library's copy, also when
+        // nothing here defines it, like a hidden constructor the optimizer
+        // inlined everywhere, which leaves it undefined, the copy of the first
+        // library loaded that defines it binds, which must carry the marker,
+        // and what its library's proof depends on must hold.
+        auto followLibraries = [&] {
+          behindLibraries.insert(name);
+          SmallVector<SharedFile *, 1> definers = shared.definers.lookup(name);
+          if (definers.empty())
+            return;
+          SharedFile *file = definers.front();
+          if (marks(file, name)) {
+            followEdges(name, requirer, file);
+            return;
+          }
+          std::string why =
+              (ctx.arg.demangle ? llvm::demangle(name) : name.str()) +
+              " was not compiled with "
+              "-fmalterlib-sized-destructors\n>>> defined in " +
+              toStr(ctx, file);
+          if (requirer)
+            ErrAlways(ctx) << why << "\n>>> the construction sites of "
+                           << toStr(ctx, requirer)
+                           << " bind to the copy the link keeps at runtime";
+          else
+            ErrAlways(ctx) << why
+                           << "\n>>> an object a construction site makes is "
+                              "destroyed with the size its deleting destructor "
+                              "returns";
+        };
+        Symbol *x = ctx.symtab->find(name);
+        if (!x || !isa<Defined, SharedSymbol>(x)) {
+          followLibraries();
+          return;
+        }
+        checkVersion(x);
+        Symbol *m =
+            ctx.symtab->find((name + llvm::MalterlibSizedMarkerSuffix).str());
+        MalterlibSizedReference def{x}, marker{m ? m : x};
+        std::string why;
+        if (auto *d = dyn_cast<Defined>(x)) {
+          // A definition garbage collection removed takes nobody's place, nor
+          // does one that isn't exported: the copy of a library that exports
+          // it still binds there, and what its library's proof depends on
+          // must hold.
+          if (!x->isExported || x->computeBinding(ctx) == STB_LOCAL ||
+              (d->section && !d->section->isLive())) {
+            followLibraries();
+            return;
+          }
+          if (!m || isa<Undefined, LazySymbol>(m))
+            why = nameOf(def, def) +
+                  " was not compiled with -fmalterlib-sized-destructors";
+          else if (auto location = marker.location();
+                   location && location == def.location())
+            why = provenAt(*location, nameOf(def, marker));
+          else
+            why = mixed(def, marker);
+          if (why.empty())
+            followOwnImports(x, requirer);
+        } else if (auto *s = dyn_cast<SharedSymbol>(x)) {
+          // A reference binds to the first library the dynamic loader loads
+          // that defines it, which can be a later library than the link's
+          // symbol's, or one --as-needed drops, which isn't loaded.
+          SmallVector<SharedFile *, 1> definers = shared.definers.lookup(name);
+          SharedFile *first = definers.empty() ? nullptr : definers.front();
+          if (first && first != s->file) {
+            followLibraries();
+            return;
+          }
+          // Nothing binds a definition no library loaded has, of one
+          // --as-needed drops, which nothing this image keeps refers to, like
+          // the sites of a function --gc-sections removes.
+          if (!first && !shared.loaded.contains(cast<SharedFile>(s->file)))
+            return;
+          SmallVector<SharedFile *, 1> marking = shared.markers.lookup(name);
+          if (marks(cast<SharedFile>(s->file), name))
+            followEdges(name, requirer, cast<SharedFile>(s->file));
+          else if (marking.empty())
+            why = nameOf(def, def) +
+                  " was not compiled with -fmalterlib-sized-destructors\n>>> "
+                  "defined in " +
+                  toStr(ctx, s->file);
+          else
+            why = nameOf(def, def) +
+                  " was compiled both with and without "
+                  "-fmalterlib-sized-destructors, and the link keeps a copy "
+                  "compiled without\n>>> defined in " +
+                  toStr(ctx, s->file) + "\n>>> marked in " +
+                  toStr(ctx, marking.front());
+        }
+        if (why.empty())
+          return;
+        if (requirer)
+          ErrAlways(ctx) << why << "\n>>> the construction sites of "
+                         << toStr(ctx, requirer)
+                         << " bind to the copy the link keeps at runtime";
+        else
+          ErrAlways(ctx) << why
+                         << "\n>>> an object a construction site makes is "
+                            "destroyed with the size its deleting destructor "
+                            "returns";
+      };
+  followOwnImports = [&](Symbol *x, SharedFile *requirer) {
+    DenseSet<Symbol *> seen{x};
+    SmallVector<Symbol *, 4> pending{x};
+    while (!pending.empty())
+      for (Symbol *n : boundaryOf(dependenciesAt(pending.pop_back_val())))
+        if (isa<SharedSymbol>(n))
+          follow(importName(n), requirer);
+        else if (seen.insert(n).second)
+          pending.push_back(n);
+  };
+  // What the proof of \p provider's copy of \p name depends on.
+  followEdges = [&](StringRef name, SharedFile *requirer,
+                    SharedFile *provider) {
+    for (StringRef dep : shared.edges.lookup({provider, xxh3_64bits(name)}))
+      follow(dep, requirer);
+  };
+  // The site checks proved what this image's sites define; what they import
+  // and what the proofs of the libraries it comes from depend on remain.
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : refs.sites)
+      siteDefs.push_back(def);
+    // Each as this image's references bind it, to the first library loaded
+    // that defines it, and of this image's own copy, which another image may
+    // take the place of, also what it depends on.
+    for (Symbol *n : boundaryOf(std::move(siteDefs)))
+      if (isa<SharedSymbol>(n))
+        follow(importName(n), nullptr);
+      else
+        followOwnImports(n, nullptr);
+  }
+  SmallVector<StringRef, 0> requiredNames;
+  for (auto &[name, requirers] : shared.required)
+    requiredNames.push_back(name);
+  llvm::sort(requiredNames);
+  for (StringRef name : requiredNames)
+    for (SharedFile *requirer : shared.required.lookup(name))
+      follow(name, requirer);
+
+  // A marker leaves the image with its definition, whatever the lists of
+  // exported symbols say, unless the image does not prove it: its claim is
+  // not proven, or a copy of its definition the link did not keep left it.
+  SmallVector<Symbol *, 0> owners;
+  for (Symbol *m : ctx.symtab->getSymbols()) {
+    StringRef name = m->getName();
+    if (!isa<Defined>(m) || !name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
+    Symbol *x = ctx.symtab->find(
+        name.drop_back(llvm::MalterlibSizedMarkerSuffix.size()));
+    MalterlibSizedReference def{x}, marker{m};
+    auto location = marker.location();
+    if (!location || location != def.location() ||
+        !provenAt(*location, nameOf(def, marker)).empty()) {
+      m->versionId = VER_NDX_LOCAL;
+    } else if (x->computeBinding(ctx) != STB_LOCAL &&
+               m->visibility() == x->visibility()) {
+      checkVersion(x);
+      m->versionId = x->versionId;
+      m->isExported = x->isExported;
+      owners.push_back(x);
+    }
+  }
+
+  // A marker the link leaves unresolved, such as that of a constructor the
+  // optimizer inlined everywhere, is referenced only from the sections that
+  // left the link, and is not an import of the output.
+  for (Symbol *m : ctx.symtab->getSymbols())
+    if (isa<Undefined, LazySymbol>(m) &&
+        m->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      m->isUsedInRegularObj = false;
+
+  // A shared library names what another image may take the place of: the
+  // definitions its sites depend on, and those the proof of each owner it
+  // exports depends on.
+  if (!ctx.arg.shared)
+    return;
+  SetVector<StringRef> names;
+  {
+    SmallVector<MalterlibSizedReference, 0> siteDefs;
+    for (auto &[def, marker] : refs.sites)
+      siteDefs.push_back(def);
+    for (Symbol *n : boundaryOf(std::move(siteDefs)))
+      names.insert(ctx.saver.save(importName(n) + requiredSuffix));
+  }
+  // What the libraries it loads require, and what that led to, go on to the
+  // links of the images that load it, which may not load those libraries.
+  for (StringRef name : requiredNames)
+    names.insert(ctx.saver.save(name + requiredSuffix));
+  for (StringRef name : followed)
+    if (Symbol *x = ctx.symtab->find(name);
+        (x && isBoundary(x)) || behindLibraries.contains(name))
+      names.insert(ctx.saver.save(name + requiredSuffix));
+  for (Symbol *x : owners)
+    for (Symbol *n : boundaryOf(dependenciesAt(x)))
+      names.insert(ctx.saver.save(importName(n) + edgeInfix +
+                                  utohexstr(xxh3_64bits(x->getName()))));
+  SmallVector<StringRef, 0> sortedNames(names.begin(), names.end());
+  llvm::sort(sortedNames);
+  for (StringRef name : sortedNames) {
+    Symbol *r = ctx.symtab->addSymbol(Defined{ctx, ctx.internalFile, name,
+                                              STB_GLOBAL, STV_DEFAULT,
+                                              STT_NOTYPE, 0, 0, nullptr});
+    r->versionId = VER_NDX_GLOBAL;
+    r->isExported = true;
+    r->isUsedInRegularObj = true;
+  }
+}
+
 // Do actual linking. Note that when this function is called,
 // all linker scripts have already been parsed.
 template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
@@ -3502,6 +4228,12 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
   // values such as a default image base address.
   setTarget(ctx);
 
+  // A relocatable output keeps the references for the final link. Reading
+  // them needs the target, for the implicit addends of REL relocations.
+  MalterlibSizedReferences sizedReferences;
+  if (!ctx.arg.relocatable)
+    takeMalterlibSizedReferences(ctx, sizedReferences);
+
   ctx.arg.eflags = ctx.target->calcEFlags();
   // maxPageSize (sometimes called abi page size) is the maximum page size that
   // the output can be run on. For example if the OS can use 4k or 64k page
@@ -3526,6 +4258,11 @@ template <class ELFT> void LinkerDriver::link(opt::InputArgList &args) {
 
   // Garbage collection and removal of shared symbols from unused shared objects.
   markLive<ELFT>(ctx);
+
+  // The requirements of a shared library count once the link knows it loads
+  // the library.
+  if (!ctx.arg.relocatable)
+    checkMalterlibSizedMarkers(ctx, sizedReferences);
 
   if (canHaveMemtagGlobals(ctx)) {
     llvm::TimeTraceScope timeScope("Process memory tagged symbols");

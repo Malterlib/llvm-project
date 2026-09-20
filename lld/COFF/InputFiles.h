@@ -128,6 +128,10 @@ public:
   // which ensures that we don't load the same member more than once.
   void addMember(const Archive::Symbol &sym);
 
+  // Whether each member, by its offset, is an import, which a reference to a
+  // marker of -fmalterlib-sized-destructors loads, looked at once.
+  llvm::DenseMap<uint64_t, bool> importMembers;
+
 private:
   std::unique_ptr<Archive> file;
   llvm::DenseSet<uint64_t> seen;
@@ -149,6 +153,10 @@ public:
   createCOFFObject(COFFLinkerContext &ctx, MemoryBufferRef mb);
 
   static bool classof(const InputFile *f) { return f->kind() == ObjectKind; }
+
+  // The definitions the records of -fmalterlib-sized-destructors name, `X`,
+  // that the rest of the object reaches only through their import, `__imp_X`.
+  llvm::DenseSet<StringRef> importedInRecords;
   void parse() override;
   void parseLazy();
   MachineTypes getMachineType() const override;
@@ -286,7 +294,8 @@ private:
                     &comdatDefs,
                 bool &prevailingComdat);
   Symbol *createRegular(COFFSymbolRef sym);
-  Symbol *createUndefined(COFFSymbolRef sym, bool overrideLazy);
+  Symbol *createUndefined(COFFSymbolRef sym, bool overrideLazy,
+                          bool recordOnly = false);
 
   std::unique_ptr<COFFObjectFile> coffObj;
 

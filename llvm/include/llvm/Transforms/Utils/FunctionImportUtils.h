@@ -62,6 +62,12 @@ class FunctionImportGlobalProcessing {
   /// with new name.
   DenseMap<const Comdat *, Comdat *> RenamedComdats;
 
+  /// The original names of the local definitions promoted, also of aliases,
+  /// like a vftable symbol inside its variable, and whether each was renamed,
+  /// whose local markers of -fmalterlib-sized-destructors are promoted with
+  /// them.
+  SmallVector<std::pair<std::string, bool>, 0> PromotedDefinitions;
+
   /// Check if we should promote the given local value to global scope.
   bool shouldPromoteLocalToGlobal(const GlobalValue *SGV,
                                   GlobalValueSummary *Summary);

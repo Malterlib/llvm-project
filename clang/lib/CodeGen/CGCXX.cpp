@@ -235,6 +235,13 @@ void CodeGenModule::EmitDefinitionAsAlias(GlobalDecl AliasDecl,
 
   // Set any additional necessary attributes for the alias.
   SetCommonAttributes(AliasDecl, Alias);
+
+  // A vector deleting destructor that is an alias of the scalar one is what
+  // the vtable points to, and a complete constructor that is an alias of the
+  // base one is what a construction site calls, so they are what the
+  // references of -fmalterlib-sized-destructors name.
+  if (getCXXABI().needsMalterlibSizedMarker(AliasDecl))
+    EmitMalterlibSizedMarker(Alias);
 }
 
 // For an implicit __host__ __device__ destructor, this trap body is reachable
@@ -275,6 +282,49 @@ llvm::Function *CodeGenModule::codegenCXXStructor(GlobalDecl GD) {
     CodeGenFunction(*this).GenerateCode(GD, Fn, FnInfo);
   setNonAliasAttributes(GD, Fn);
   SetLLVMFunctionAttributesForDefinition(cast<CXXMethodDecl>(GD.getDecl()), Fn);
+
+  // Prove to the linker that this deleting destructor returns a size, or that
+  // this constructor installs a vtable that does (see
+  // -fmalterlib-sized-destructors).
+  if (getCXXABI().needsMalterlibSizedMarker(GD)) {
+    EmitMalterlibSizedMarker(Fn);
+    // A constructor installs the vtable of its image, or has the constructor
+    // it delegates to install it, and its marker proves its claim only when
+    // that one's does, which the link of this image checks. A delegating
+    // constructor depends on the vtable too, as the optimizer may inline the
+    // one it delegates to, also an inheriting one, which isn't a function of
+    // its own; not where that one has no definition here, an out-of-line one,
+    // nor where it is one of another image, like a dllimport one, which
+    // installs the vtable of its own image, which its proof there checks: of
+    // one this module only has the body of to inline, what it installs is
+    // what it depends on, which the owner depends on only where it inlined
+    // it.
+    // Of the one the chain of those it delegates to ends with that this
+    // module defines, `A() : A(0)` of `A(int) : A(0L)` of a dllimport
+    // `A(long)`, which installs the vtable of that one's image.
+    if (const auto *CD = dyn_cast<CXXConstructorDecl>(GD.getDecl())) {
+      const CXXConstructorDecl *Target =
+          CD->isDelegatingConstructor() ? CD->getTargetConstructor() : nullptr;
+      auto Defined = [&](const CXXConstructorDecl *Constructor) {
+        return Constructor->hasBody() &&
+               getContext().GetGVALinkageForFunction(Constructor) !=
+                   GVA_AvailableExternally;
+      };
+      // To its end, however long, each once: Sema rejects a cycle.
+      const CXXConstructorDecl *Installs = Target;
+      llvm::SmallPtrSet<const CXXConstructorDecl *, 8> Followed;
+      while (Installs && Installs->isDelegatingConstructor() &&
+             Defined(Installs) &&
+             Followed.insert(Installs->getCanonicalDecl()).second)
+        Installs = Installs->getTargetConstructor();
+      if (!Target || !Installs || Installs->isInheritingConstructor() ||
+          Defined(Installs))
+        getVTables().addMalterlibSizedVTableReferences(CD->getParent(), Fn);
+      if (Target)
+        AddMalterlibSizedConstructorReference(Target, GD.getCtorType(), Fn);
+    }
+  }
+
   return Fn;
 }
 

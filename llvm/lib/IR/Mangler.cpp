@@ -211,6 +211,74 @@ static bool canBeUnquotedInDirective(StringRef Name) {
   return true;
 }
 
+/// Whether the backend emits the marker of -fmalterlib-sized-destructors for
+/// \p GV: a definition that carries the attribute, or an alias its aliasee
+/// lists.
+static bool hasMalterlibSizedMarker(const GlobalValue &GV) {
+  auto Attr = [](const GlobalObject &GO, StringRef Kind) {
+    if (const auto *F = dyn_cast<Function>(&GO))
+      return F->getFnAttribute(Kind);
+    if (const auto *V = dyn_cast<GlobalVariable>(&GO))
+      return V->getAttribute(Kind);
+    return Attribute();
+  };
+  if (const auto *GO = dyn_cast<GlobalObject>(&GV))
+    return Attr(*GO, MalterlibSizedMarkerAttr).isValid();
+  const auto *GA = dyn_cast<GlobalAlias>(&GV);
+  const GlobalObject *GO = GA ? GA->getAliaseeObject() : nullptr;
+  if (!GO)
+    return false;
+  Attribute A = Attr(*GO, MalterlibSizedAliasesAttr);
+  if (!A.isStringAttribute())
+    return false;
+  SmallVector<StringRef, 2> Aliases;
+  A.getValueAsString().split(Aliases, ',', /*MaxSplit=*/-1,
+                             /*KeepEmpty=*/false);
+  return llvm::any_of(Aliases, [&](StringRef Alias) {
+    return Alias.rsplit('=').first == GA->getName();
+  });
+}
+
+void llvm::getMalterlibSizedMarkerName(SmallVectorImpl<char> &Out,
+                                       const GlobalValue *GV, StringRef Name) {
+  SmallString<128> Symbol;
+  Mangler().getNameWithPrefix(Symbol, GV, /*CannotUsePrivateLabel=*/false);
+  if (Name.empty() || Name == GV->getName()) {
+    Out.append(Symbol.begin(), Symbol.end());
+  } else {
+    // An alias of a function is decorated as the function is, around its own
+    // name; that of a variable, which may have no name, is not decorated.
+    SmallString<128> Plain;
+    if (isa<Function>(GV) && GV->hasName())
+      Mangler::getNameWithPrefix(Plain, GV->getName(), GV->getDataLayout());
+    size_t Core =
+        Plain.empty() ? StringRef::npos : Symbol.str().find(GV->getName());
+    if (Plain.empty() || Symbol == Plain ||
+        GV->getName().starts_with("\01") || Core == StringRef::npos) {
+      Mangler::getNameWithPrefix(Out, Name, GV->getDataLayout());
+    } else {
+      Out.append(Symbol.begin(), Symbol.begin() + Core);
+      Out.append(Name.begin(), Name.end());
+      Out.append(Symbol.begin() + Core + GV->getName().size(), Symbol.end());
+    }
+  }
+  Out.append(MalterlibSizedMarkerSuffix.begin(),
+             MalterlibSizedMarkerSuffix.end());
+}
+
+std::string llvm::getMalterlibSizedMarkerIRName(const GlobalValue *GV,
+                                               StringRef Name) {
+  if (Name.empty())
+    Name = GV->getName();
+  std::string IRName = (Name + MalterlibSizedMarkerSuffix).str();
+  SmallString<128> Symbol, Plain;
+  getMalterlibSizedMarkerName(Symbol, GV, Name);
+  Mangler::getNameWithPrefix(Plain, IRName, GV->getDataLayout());
+  if (Symbol != Plain)
+    return ("\01" + Symbol).str();
+  return IRName;
+}
+
 void llvm::emitLinkerFlagsForGlobalCOFF(raw_ostream &OS, const GlobalValue *GV,
                                         const Triple &TT, Mangler &Mangler) {
   if (GV->hasDLLExportStorageClass() && !GV->isDeclaration()) {
@@ -252,6 +320,21 @@ void llvm::emitLinkerFlagsForGlobalCOFF(raw_ostream &OS, const GlobalValue *GV,
         OS << ",DATA";
       else
         OS << ",data";
+    }
+
+    // The marker of -fmalterlib-sized-destructors of an exported definition,
+    // which exists only in the object file, is exported with it, as code, so
+    // that a reference to it resolves to its import thunk whatever it marks.
+    if (hasMalterlibSizedMarker(*GV)) {
+      SmallString<128> Marker;
+      getMalterlibSizedMarkerName(Marker, GV);
+      StringRef Name = Marker;
+      if ((TT.isWindowsGNUEnvironment() || TT.isWindowsCygwinEnvironment()) &&
+          Name.front() == GV->getDataLayout().getGlobalPrefix())
+        Name = Name.drop_front();
+      OS << ((TT.isWindowsMSVCEnvironment() || TT.isUEFI()) ? " /EXPORT:\""
+                                                             : " -export:\"")
+         << Name << "\"";
     }
   }
   if (GV->hasHiddenVisibility() && !GV->isDeclaration() && TT.isOSCygMing()) {

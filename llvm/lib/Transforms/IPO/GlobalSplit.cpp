@@ -41,6 +41,14 @@ static bool splitGlobal(GlobalVariable &GV) {
   if (!GV.hasLocalLinkage())
     return false;
 
+  // The markers of -fmalterlib-sized-destructors a global carries, or those
+  // of the aliases it lists, and the dependencies of their owners, go with
+  // it.
+  if (GV.hasAttribute(MalterlibSizedMarkerAttr) ||
+      GV.hasAttribute(MalterlibSizedAliasesAttr) ||
+      GV.hasMetadata(MalterlibSizedDependenciesMD))
+    return false;
+
   // We currently only know how to split ConstantStructs.
   auto *Init = dyn_cast_or_null<ConstantStruct>(GV.getInitializer());
   if (!Init)

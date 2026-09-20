@@ -36,6 +36,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/Allocator.h"
@@ -491,6 +492,39 @@ private:
   /// otherwise be optimized out.
   std::vector<llvm::WeakTrackingVH> LLVMUsed;
   std::vector<llvm::WeakTrackingVH> LLVMCompilerUsed;
+
+  /// The definitions the construction sites of -fmalterlib-sized-destructors
+  /// in this module depend on, by IR name: code generation replaces a
+  /// declaration whose type it refines, or that becomes an alias.
+  /// A definition that must have been compiled with
+  /// -fmalterlib-sized-destructors, by name and value: code generation may
+  /// replace a declaration, or give its name to an alias.
+  struct MalterlibSizedTarget {
+    std::string Name;
+    llvm::WeakTrackingVH Value;
+    /// The constructors of a site whose delegation reached an instantiation
+    /// that didn't have its body yet: the reference is left out when each
+    /// installs the vtables in a constructor no site inlines.
+    SmallVector<const CXXConstructorDecl *, 1> Unless = {};
+  };
+  /// The definitions the construction sites in this module depend on, and,
+  /// with the definition that depends on each, what the constructors and
+  /// vtables this module defines depend on.
+  std::vector<MalterlibSizedTarget> MalterlibSizedReferences;
+  /// Those they reach only in a result of a condition that isn't constant.
+  std::vector<MalterlibSizedTarget> MalterlibSizedConditionalReferences;
+  /// The deleting destructors in the slots of vtables another module defines,
+  /// which a site uses only where it calls one directly, devirtualized.
+  std::vector<MalterlibSizedTarget> MalterlibSizedSlotReferences;
+  /// The classes of this module whose deleting destructors in the slots of
+  /// their vtables construction sites depend on, which are recorded at the
+  /// end of the module, when those have been made.
+  llvm::SetVector<const CXXRecordDecl *> MalterlibSizedLocalSlotClasses;
+  /// The definitions whose declarations say they aren't inlined, which every
+  /// translation unit then agrees on, by name.
+  llvm::StringSet<> MalterlibSizedDeclaredNoInline;
+  std::vector<std::pair<MalterlibSizedTarget, MalterlibSizedTarget>>
+      MalterlibSizedDependencies;
 
   /// Store the list of global constructors and their respective priorities to
   /// be emitted when the translation unit is complete.
@@ -1365,6 +1399,60 @@ public:
   /// to the expected name.
   template<typename SomeDecl>
   void MaybeHandleStaticInExternC(const SomeDecl *D, llvm::GlobalValue *GV);
+
+  /// Gives \p GV the marker of -fmalterlib-sized-destructors, which proves to
+  /// the linker that it was compiled with the flag: deleting destructors,
+  /// their thunks, the vtables that point to them and the constructors that
+  /// install those.
+  void EmitMalterlibSizedMarker(llvm::GlobalValue *GV);
+
+  /// Returns the IR name of the marker of \p GV.
+  std::string getMalterlibSizedMarkerIRName(llvm::GlobalValue *GV);
+
+  /// Records that \p GV must have been compiled with
+  /// -fmalterlib-sized-destructors: for a construction site of this module,
+  /// or, with \p Owner, for the marker of \p Owner to prove what it claims.
+  /// With \p Conditional, for a site that reaches it only in a result of a
+  /// condition that isn't constant, which the optimizer can leave out: only
+  /// while what is emitted uses it, or what it depends on.
+  /// With \p Slot, a deleting destructor in a slot of a vtable another
+  /// module defines. With \p Unless, left out when each of those constructors
+  /// installs the vtables in one no site inlines.
+  void
+  AddMalterlibSizedReference(llvm::GlobalValue *GV,
+                             llvm::GlobalValue *Owner = nullptr,
+                             bool Conditional = false, bool Slot = false,
+                             ArrayRef<const CXXConstructorDecl *> Unless = {});
+
+  /// Whether \p Ctor installs the vtables in a constructor that no site
+  /// inlines, also with link-time optimization, which installs them itself,
+  /// which its own proof covers: itself or one its delegation leads to, `A()
+  /// : A(0L)`, that another image has the body of, a dllimport `A(long);`, or
+  /// that isn't inlined, `__attribute__((noinline))` or `optnone`.
+  /// std::nullopt while the delegation reaches an instantiation that doesn't
+  /// have its body yet.
+  std::optional<bool>
+  installsMalterlibSizedVTablesUninlined(const CXXConstructorDecl *Ctor);
+
+  /// Records, as AddMalterlibSizedReference does, the definition of \p Ctor
+  /// as \p Type that a call reaches. Returns false for an inheriting
+  /// constructor a call emits inline, which leaves the vtables to the caller.
+  bool AddMalterlibSizedConstructorReference(const CXXConstructorDecl *Ctor,
+                                             CXXCtorType Type,
+                                             llvm::GlobalValue *Owner = nullptr,
+                                             bool Conditional = false);
+
+  /// Records, at the end of the module, the deleting destructors in the slots
+  /// of the vtables of \p RD, which this module defines, as definitions a
+  /// construction site depends on while what is emitted uses them.
+  void addMalterlibSizedLocalSlotReferences(const CXXRecordDecl *RD) {
+    MalterlibSizedLocalSlotClasses.insert(RD);
+  }
+
+  /// Emits the references of the construction sites, and those of the owners
+  /// of markers, to the definitions they depend on and the markers those
+  /// carry when compiled with the flag, which the linker checks.
+  void EmitMalterlibSizedReferences();
 
   /// Add a global to a list to be added to the llvm.used metadata.
   void addUsedGlobal(llvm::GlobalValue *GV);

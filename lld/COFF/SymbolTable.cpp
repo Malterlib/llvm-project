@@ -16,7 +16,9 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "lld/Common/Timer.h"
+#include "llvm/BinaryFormat/Magic.h"
 #include "llvm/DebugInfo/DIContext.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/LTO/LTO.h"
@@ -43,6 +45,85 @@ StringRef ltrim1(StringRef s, const char *chars) {
 
 static COFFSyncStream errorOrWarn(COFFLinkerContext &ctx) {
   return {ctx, ctx.config.forceUnresolved ? DiagLevel::Warn : DiagLevel::Err};
+}
+
+// Whether an archive member is an import, of a short import library or a GNU
+// one.
+static bool isImportMember(const Archive::Child &child) {
+  Expected<MemoryBufferRef> mb = child.getMemoryBufferRef();
+  if (!mb) {
+    consumeError(mb.takeError());
+    return true;
+  }
+  file_magic magic = identify_magic(mb->getBuffer());
+  if (magic == file_magic::coff_import_library)
+    return true;
+  // A GNU import library holds an ordinary object for each import, with its
+  // thunk and import address table entry in .idata sections.
+  if (magic != file_magic::coff_object)
+    return false;
+  Expected<std::unique_ptr<COFFObjectFile>> obj =
+      COFFObjectFile::create(*mb);
+  if (!obj) {
+    consumeError(obj.takeError());
+    return false;
+  }
+  return llvm::any_of((*obj)->sections(), [](const SectionRef &sec) {
+    Expected<StringRef> name = sec.getName();
+    if (!name) {
+      consumeError(name.takeError());
+      return false;
+    }
+    return name->starts_with(".idata$");
+  });
+}
+
+// Whether the member of \p f that defines \p sym is an import, looked at once
+// for each member, of the many symbols it can define.
+static bool definesImport(ArchiveFile *f, const Archive::Symbol &sym) {
+  Expected<Archive::Child> child = sym.getMember();
+  if (!child) {
+    consumeError(child.takeError());
+    return true;
+  }
+  auto [it, inserted] =
+      f->importMembers.try_emplace(child->getChildOffset(), false);
+  if (inserted)
+    it->second = isImportMember(*child);
+  return it->second;
+}
+
+// A marker of -fmalterlib-sized-destructors belongs to the copy of a
+// definition the link chose for the definition's own sake, so a reference to
+// it loads nothing but the import of the marker another image exports. So
+// does a reference only the records of -fmalterlib-sized-destructors make,
+// \p recordOnly, to what a site or a proof depends on: the import of it, but
+// no other member, which the object without the flag wouldn't load.
+static bool loadsForMarker(ArchiveFile *f, StringRef name,
+                           const Archive::Symbol &sym,
+                           bool recordOnly = false) {
+  if (!recordOnly && !name.ends_with(MalterlibSizedMarkerSuffix))
+    return true;
+  return definesImport(f, sym);
+}
+
+static bool loadsForMarker(Symbol *s, bool recordOnly = false) {
+  if (auto *l = dyn_cast<LazyArchive>(s))
+    return loadsForMarker(l->file, s->getName(), l->sym, recordOnly);
+  return !isa<LazyObject>(s) ||
+         (!recordOnly && !s->getName().ends_with(MalterlibSizedMarkerSuffix));
+}
+
+// Whether \p name is a marker of -fmalterlib-sized-destructors whose
+// definition a member that isn't an import is loading for, which defines the
+// marker with it, if it was compiled with the flag, and not the import of
+// another image's.
+bool SymbolTable::markerComesWithDefinition(StringRef name) {
+  if (!name.ends_with(MalterlibSizedMarkerSuffix))
+    return false;
+  Symbol *def = find(name.drop_back(MalterlibSizedMarkerSuffix.size()));
+  return def && def->isLazy() && def->pendingArchiveLoad &&
+         !loadsForMarker(def, /*recordOnly=*/true);
 }
 
 // Causes the file associated with a lazy symbol to be linked in.
@@ -313,6 +394,25 @@ void SymbolTable::loadMinGWSymbols() {
   }
 }
 
+bool SymbolTable::loadMinGWImports(llvm::function_ref<bool(StringRef)> wanted) {
+  std::vector<Symbol *> lazy;
+  for (auto &i : symMap) {
+    auto *undef = dyn_cast<Undefined>(i.second);
+    if (!undef || undef->getWeakAlias() || !wanted(undef->getName()) ||
+        undef->getName().starts_with("__imp_"))
+      continue;
+    Symbol *l = find(("__imp_" + undef->getName()).str());
+    if (l && !l->pendingArchiveLoad && l->isLazy())
+      lazy.push_back(l);
+  }
+  for (Symbol *l : lazy) {
+    Log(ctx) << "Loading lazy " << l->getName() << " from "
+             << l->getFile()->getName() << " for automatic import";
+    forceLazy(l);
+  }
+  return !lazy.empty();
+}
+
 Defined *SymbolTable::impSymbol(StringRef name) {
   if (name.starts_with("__imp_"))
     return nullptr;
@@ -446,6 +546,10 @@ void SymbolTable::reportUnresolvable() {
       continue;
     if (ctx.config.autoImport && impSymbol(name))
       continue;
+    // Only the references of -fmalterlib-sized-destructors name its markers,
+    // and the driver reports the ones it needs.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
     undefs.insert(sym);
   }
 
@@ -472,6 +576,11 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
       aliases.push_back(undef);
       continue;
     }
+
+    // Only the references of -fmalterlib-sized-destructors name its markers,
+    // and the driver reports the ones it needs.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
 
     // If we can resolve a symbol by removing __imp_ prefix, do that.
     // This odd rule is for compatibility with MSVC linker.
@@ -685,14 +794,35 @@ void SymbolTable::initializeSameAddressThunks() {
 }
 
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
-                                  bool overrideLazy) {
+                                  bool overrideLazy, bool recordOnly) {
   auto [s, wasInserted] = insert(name, f);
   if (wasInserted || (s->isLazy() && overrideLazy)) {
     replaceSymbol<Undefined>(s, name);
+    cast<Undefined>(s)->recordOnly = recordOnly;
     return s;
   }
-  if (s->isLazy())
+  if (auto *u = dyn_cast<Undefined>(s); u && !recordOnly)
+    u->recordOnly = false;
+  if (!s->isLazy() || s->pendingArchiveLoad)
+    return s;
+  if (loadsForMarker(s, recordOnly)) {
     forceLazy(s);
+    return s;
+  }
+  // Of a member that isn't an import, which a reference to a marker or one
+  // only the records make doesn't load, the import another archive has, or
+  // has later.
+  if (auto it = importsOfLazy.find(s); it != importsOfLazy.end()) {
+    auto [file, sym] = it->second;
+    importsOfLazy.erase(it);
+    if (!markerComesWithDefinition(name)) {
+      replaceSymbol<LazyArchive>(s, file, sym);
+      s->pendingArchiveLoad = true;
+      file->addMember(sym);
+    }
+    return s;
+  }
+  recordOnlyLazy.insert(s);
   return s;
 }
 
@@ -773,8 +903,38 @@ void SymbolTable::addLazyArchive(ArchiveFile *f, const Archive::Symbol &sym) {
     replaceSymbol<LazyArchive>(s, f, sym);
     return;
   }
+  // One only the records of -fmalterlib-sized-destructors refer to, that a
+  // member which isn't an import made lazy, loads the import of another.
+  if (s->isLazy() && !s->pendingArchiveLoad && recordOnlyLazy.contains(s) &&
+      loadsForMarker(f, name, sym, /*recordOnly=*/true)) {
+    recordOnlyLazy.erase(s);
+    if (markerComesWithDefinition(name))
+      return;
+    replaceSymbol<LazyArchive>(s, f, sym);
+    s->pendingArchiveLoad = true;
+    f->addMember(sym);
+    return;
+  }
+  // And one nothing refers to yet keeps the import for a reference that
+  // loads it.
+  if (s->isLazy() && !s->pendingArchiveLoad &&
+      !loadsForMarker(s, /*recordOnly=*/true) &&
+      loadsForMarker(f, name, sym, /*recordOnly=*/true)) {
+    importsOfLazy.try_emplace(s, f, sym);
+    return;
+  }
   auto *u = dyn_cast<Undefined>(s);
-  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad)
+  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad ||
+      !loadsForMarker(f, name, sym))
+    return;
+  // It loads no member but an import, and stays lazy for a reference that
+  // does.
+  if (u->recordOnly && !loadsForMarker(f, name, sym, /*recordOnly=*/true)) {
+    replaceSymbol<LazyArchive>(s, f, sym);
+    recordOnlyLazy.insert(s);
+    return;
+  }
+  if (markerComesWithDefinition(name))
     return;
   s->pendingArchiveLoad = true;
   f->addMember(sym);
@@ -790,8 +950,14 @@ void SymbolTable::addLazyObject(InputFile *f, StringRef n) {
     return;
   }
   auto *u = dyn_cast<Undefined>(s);
-  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad)
+  if (!u || (u->weakAlias && !u->isECAlias(machine)) || s->pendingArchiveLoad ||
+      n.ends_with(MalterlibSizedMarkerSuffix))
     return;
+  if (u->recordOnly) {
+    replaceSymbol<LazyObject>(s, f, n);
+    recordOnlyLazy.insert(s);
+    return;
+  }
   s->pendingArchiveLoad = true;
   f->lazy = false;
   ctx.driver.addFile(f);
@@ -968,6 +1134,11 @@ Defined *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
     replaceSymbol<DefinedImportThunk>(s, ctx, name, id, chunk);
     return cast<Defined>(s);
   }
+  // A marker of -fmalterlib-sized-destructors that an object defines with the
+  // copy of its definition the link chose takes the place of its import, as
+  // it does when it comes after it.
+  if (name.ends_with(MalterlibSizedMarkerSuffix) && isa<DefinedRegular>(s))
+    return nullptr;
 
   reportDuplicate(s, id->file);
   return nullptr;

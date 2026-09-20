@@ -1810,6 +1810,12 @@ void HWAddressSanitizer::instrumentGlobals() {
     if (GV.hasSanitizerMetadata() && GV.getSanitizerMetadata().NoHWAddress)
       continue;
 
+    // The marker of -fmalterlib-sized-destructors is at the untagged address
+    // of the global, which its references compare with the global's.
+    if (GV.hasAttribute(MalterlibSizedMarkerAttr) ||
+        GV.hasAttribute(MalterlibSizedAliasesAttr))
+      continue;
+
     if (GV.isDeclarationForLinker() || GV.getName().starts_with("llvm.") ||
         GV.isThreadLocal())
       continue;
