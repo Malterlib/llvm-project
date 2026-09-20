@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -std=c++20 %s -Wno-coroutines-unsupported-target
+// RUN: %clang_cc1 -fsyntax-only -verify -Wthread-safety -std=c++20 %s
 
 // expected-no-diagnostics
 
