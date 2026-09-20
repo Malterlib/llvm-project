@@ -14,6 +14,7 @@
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -76,6 +77,11 @@ public:
   // Load lazy objects that are needed for MinGW automatic import and for
   // doing stdcall fixups.
   void loadMinGWSymbols();
+  // Loads the import of each undefined symbol \p wanted names that a lazy
+  // `__imp_` symbol of it can import automatically, like loadMinGWSymbols
+  // does before link-time optimization, for what the optimization's objects
+  // refer to. Returns whether it loaded any.
+  bool loadMinGWImports(llvm::function_ref<bool(StringRef)> wanted);
   bool handleMinGWAutomaticImport(Symbol *sym, StringRef name);
 
   // Returns a symbol for a given name. Returns a nullptr if not found.
@@ -120,7 +126,9 @@ public:
   Symbol *addSynthetic(StringRef n, Chunk *c);
   Symbol *addAbsolute(StringRef n, uint64_t va);
 
-  Symbol *addUndefined(StringRef name, InputFile *f, bool overrideLazy);
+  bool markerComesWithDefinition(StringRef name);
+  Symbol *addUndefined(StringRef name, InputFile *f, bool overrideLazy,
+                       bool recordOnly = false);
   void addLazyArchive(ArchiveFile *f, const Archive::Symbol &sym);
   void addLazyObject(InputFile *f, StringRef n);
   void addLazyDLLSymbol(DLLFile *f, DLLFile::Symbol *sym, StringRef n);
@@ -132,6 +140,25 @@ public:
   std::pair<DefinedRegular *, bool>
   addComdat(InputFile *f, StringRef n,
             const llvm::object::coff_symbol_generic *s = nullptr);
+
+  // The lazy symbols that only records of -fmalterlib-sized-destructors refer
+  // to, which a member that isn't an import made lazy, and which an import
+  // another archive has loads, as the reference of a site through `__imp_`
+  // binds to it.
+  llvm::DenseSet<const Symbol *> recordOnlyLazy;
+
+  // The import another archive has of a symbol that a member which isn't an
+  // import made lazy before, which a reference to its marker of
+  // -fmalterlib-sized-destructors, or one only the records make, loads
+  // instead of the member.
+  llvm::DenseMap<const Symbol *,
+                 std::pair<ArchiveFile *, llvm::object::Archive::Symbol>>
+      importsOfLazy;
+
+  // The sections of IMAGE_COMDAT_SELECT_LARGEST that a larger copy took the
+  // place of, whose markers of -fmalterlib-sized-destructors the markers of
+  // that copy take the place of in turn.
+  llvm::DenseSet<const Chunk *> replacedLargestComdats;
   Symbol *addCommon(InputFile *f, StringRef n, uint64_t size,
                     const llvm::object::coff_symbol_generic *s = nullptr,
                     CommonChunk *c = nullptr);

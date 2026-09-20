@@ -133,7 +133,8 @@ bool ICF::assocEquals(const SectionChunk *a, const SectionChunk *b) {
   auto considerForICF = [](const SectionChunk &assoc) {
     StringRef Name = assoc.getSectionName();
     return !(Name.starts_with(".debug") || Name == ".gfids$y" ||
-             Name == ".giats$y" || Name == ".gljmp$y");
+             Name == ".giats$y" || Name == ".gljmp$y" ||
+             Name.starts_with(".rdata$mibsz"));
   };
   auto ra = make_filter_range(a->children(), considerForICF);
   auto rb = make_filter_range(b->children(), considerForICF);

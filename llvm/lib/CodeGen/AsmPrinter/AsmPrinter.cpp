@@ -22,6 +22,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -969,6 +970,15 @@ void AsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
   MCSymbol *LocalAlias = getSymbolPreferLocal(*GV);
   if (LocalAlias != EmittedInitSym)
     OutStreamer->emitLabel(LocalAlias);
+  if (GV->hasAttribute(MalterlibSizedMarkerAttr))
+    emitMalterlibSizedMarker(GV, /*IsFunction=*/false);
+  if (GV->hasAttribute(MalterlibSizedAliasesAttr))
+    emitMalterlibSizedAliasMarkers(
+        GV, EmittedInitSym,
+        GV->getAttribute(MalterlibSizedAliasesAttr).getValueAsString(),
+        /*IsFunction=*/false);
+  if (GV->hasMetadata(MalterlibSizedDependenciesMD))
+    emitMalterlibSizedOwnerLabel(GV);
 
   emitGlobalConstant(GV->getDataLayout(), GV->getInitializer());
 
@@ -1116,6 +1126,15 @@ void AsmPrinter::emitFunctionHeader() {
   // Emit the CurrentFnSym. This is a virtual function to allow targets to do
   // their wild and crazy things as required.
   emitFunctionEntryLabel();
+  if (F.hasFnAttribute(MalterlibSizedMarkerAttr))
+    emitMalterlibSizedMarker(&F, /*IsFunction=*/true);
+  if (F.hasFnAttribute(MalterlibSizedAliasesAttr))
+    emitMalterlibSizedAliasMarkers(
+        &F, CurrentFnSym,
+        F.getFnAttribute(MalterlibSizedAliasesAttr).getValueAsString(),
+        /*IsFunction=*/true);
+  if (F.hasMetadata(MalterlibSizedDependenciesMD))
+    emitMalterlibSizedOwnerLabel(&F);
 
   // If the function had address-taken blocks that got deleted, then we have
   // references to the dangling symbols.  Emit them at the start of the function
@@ -1151,6 +1170,514 @@ void AsmPrinter::emitFunctionHeader() {
   // Emit the prologue data.
   if (F.hasPrologueData())
     emitGlobalConstant(F.getDataLayout(), F.getPrologueData());
+}
+
+/// The marker of a definition compiled with -fmalterlib-sized-destructors,
+/// or of its alias \p Name: the definition's symbol with the marker suffix,
+/// which is how the references to it are spelled.
+MCSymbol *AsmPrinter::getMalterlibSizedMarker(const GlobalValue *GV,
+                                              StringRef Name) const {
+  SmallString<128> MarkerName;
+  getMalterlibSizedMarkerName(MarkerName, GV, Name);
+  return OutContext.getOrCreateSymbol(MarkerName);
+}
+
+/// The marker of a definition the optimizer replaced with its own marker,
+/// which is then its own, \p GV, or null for one that isn't a marker. One
+/// link-time optimization renamed apart from another module's of the same
+/// name, `A.mib_sized.7`, gets a marker named as markers are, at it.
+MCSymbol *AsmPrinter::getMalterlibSizedOwnMarker(const GlobalValue *GV) {
+  const StringRef Name = GV->getName();
+  if (Name.ends_with(MalterlibSizedMarkerSuffix))
+    return getSymbol(GV);
+  const auto [Marked, Unique] = Name.rsplit('.');
+  if (Unique.empty() || !llvm::all_of(Unique, llvm::isDigit) ||
+      !Marked.ends_with(MalterlibSizedMarkerSuffix))
+    return nullptr;
+  MCSymbol *Marker = getMalterlibSizedMarker(GV, Name);
+  if (Marker->isUndefined() && !Marker->isVariable())
+    OutStreamer->emitAssignment(
+        Marker, MCSymbolRefExpr::create(getSymbol(GV), OutContext));
+  return Marker;
+}
+
+/// Emits the binding and type of a marker. A marker is part of its
+/// definition, in its section or COMDAT, so the linker keeps the marker of
+/// the copy of an inline definition it keeps, and it binds as its definition
+/// does: on COFF, where a weak symbol is an alias that resolves late, the
+/// marker of a COMDAT's definition is an ordinary external symbol of the
+/// COMDAT, and the marker of a weak alias is one too, which another copy's
+/// marker overrides as the copy overrides the alias. So is the marker of an
+/// alias that link-time optimization left declared: on COFF the linker
+/// resolves a weak alias of bitcode late, as it does any weak alias, and
+/// defines it with the alias or a copy that overrides it. A definition
+/// link-time optimization made local keeps a local marker, which the
+/// references in its own object resolve to.
+void AsmPrinter::emitMalterlibSizedMarkerAttributes(const GlobalValue *GV,
+                                                    MCSymbol *Marker,
+                                                    bool IsLocal,
+                                                    bool IsFunction) {
+  bool IsCOFF = TM.getTargetTriple().isOSBinFormatCOFF();
+  if (!IsLocal) {
+    if (IsCOFF && MAI.getWeakRefDirective() &&
+        (GV->isDeclaration() ||
+         (isa<GlobalAlias>(GV) && !GV->hasExternalLinkage())))
+      OutStreamer->emitSymbolAttribute(Marker, MCSA_WeakReference);
+    else if (IsCOFF && GV->hasComdat())
+      OutStreamer->emitSymbolAttribute(Marker, MCSA_Global);
+    else
+      emitLinkage(GV, Marker);
+    emitVisibility(Marker, GV->getVisibility());
+  }
+  if (IsCOFF) {
+    OutStreamer->beginCOFFSymbolDef(Marker);
+    OutStreamer->emitCOFFSymbolStorageClass(
+        IsLocal ? COFF::IMAGE_SYM_CLASS_STATIC
+                : COFF::IMAGE_SYM_CLASS_EXTERNAL);
+    OutStreamer->emitCOFFSymbolType(IsFunction ? COFF::IMAGE_SYM_DTYPE_FUNCTION
+                                                     << COFF::SCT_COMPLEX_TYPE_SHIFT
+                                               : COFF::IMAGE_SYM_DTYPE_NULL);
+    OutStreamer->endCOFFSymbolDef();
+  } else if (MAI.hasDotTypeDotSizeDirective()) {
+    OutStreamer->emitSymbolAttribute(
+        Marker, IsFunction ? MCSA_ELF_TypeFunction : MCSA_ELF_TypeObject);
+  }
+}
+
+void AsmPrinter::emitMalterlibSizedMarker(const GlobalValue *GV,
+                                          bool IsFunction) {
+  MCSymbol *Marker = getMalterlibSizedMarker(GV, GV->getName());
+  emitMalterlibSizedMarkerAttributes(GV, Marker, GV->hasLocalLinkage(),
+                                     IsFunction);
+  // A function with prefix data is an alternative entry of the atom that
+  // starts with the data, and the marker at the same address must not
+  // start another.
+  if (IsFunction && MAI.hasSubsectionsViaSymbols()) {
+    const Function &F = MF->getFunction();
+    if (F.hasPrefixData() || F.getMetadata(LLVMContext::MD_func_sanitize))
+      OutStreamer->emitSymbolAttribute(Marker, MCSA_AltEntry);
+  }
+  OutStreamer->emitLabel(Marker);
+}
+
+/// Emits the markers of the aliases of a definition compiled with
+/// -fmalterlib-sized-destructors, listed as name=offset: an alias may name a
+/// point inside the definition, such as the Microsoft vftable symbol. The
+/// marker is at the definition plus the offset whether or not the alias
+/// survived optimization, which removes only an alias it made local.
+void AsmPrinter::emitMalterlibSizedAliasMarkers(const GlobalObject *GO,
+                                                MCSymbol *Sym, StringRef List,
+                                                bool IsFunction) {
+  SmallVector<StringRef, 2> Aliases;
+  List.split(Aliases, ',', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
+  bool IsCOFF = TM.getTargetTriple().isOSBinFormatCOFF();
+  bool HasMarker =
+      isa<Function>(GO)
+          ? cast<Function>(GO)->hasFnAttribute(MalterlibSizedMarkerAttr)
+          : cast<GlobalVariable>(GO)->hasAttribute(MalterlibSizedMarkerAttr);
+  for (StringRef Alias : Aliases) {
+    auto [Name, OffsetStr] = Alias.rsplit('=');
+    uint64_t Offset = 0;
+    OffsetStr.getAsInteger(10, Offset);
+    // An alias the optimizer replaced with its aliasee may have given it its
+    // name, and the definition's own marker is that alias's.
+    if (Name == GO->getName() && HasMarker)
+      continue;
+    // A name another definition took, such as a vector deleting destructor
+    // that link-time optimization chose over this alias of the scalar one,
+    // carries its own marker. On COFF, a name only declared is the alias's
+    // that link-time optimization left to the linker.
+    const GlobalValue *Named = GO->getParent()->getNamedValue(Name);
+    const auto *GA = dyn_cast_or_null<GlobalAlias>(Named);
+    bool Declared = IsCOFF && Named && Named->isDeclaration();
+    if (Named && Named != GO && !Declared &&
+        (!GA || GA->getAliaseeObject() != GO))
+      continue;
+    // An alias that is gone left only a local marker, unless it gave the
+    // definition its name and linkage.
+    const GlobalValue *Owner = Declared ? Named : GA;
+    if (!Owner && Name == GO->getName())
+      Owner = GO;
+    MCSymbol *Marker = getMalterlibSizedMarker(GO, Name);
+    // On MachO, which has no weak aliases, a weak alias is emitted as a weak
+    // reference that stays in its object, like the vtable of
+    // -fexperimental-relative-c++-abi-vtables, and so does its marker.
+    const bool LocalAlias =
+        TM.getTargetTriple().isOSBinFormatMachO() && Owner &&
+        isa<GlobalAlias>(Owner) &&
+        (Owner->hasWeakLinkage() || Owner->hasLinkOnceLinkage());
+    emitMalterlibSizedMarkerAttributes(
+        Owner ? Owner : GO, Marker,
+        !Owner || Owner->hasLocalLinkage() || LocalAlias, IsFunction);
+    // On COFF, where the marker of a weak alias resolves to the symbol it
+    // names in the copy the linker keeps, it names the definition's own
+    // marker, which a copy compiled without the flag does not have.
+    const MCExpr *Value =
+        MCSymbolRefExpr::create(IsCOFF && HasMarker && !Offset
+                                    ? getMalterlibSizedMarker(GO, GO->getName())
+                                    : Sym,
+                                OutContext);
+    if (Offset)
+      Value = MCBinaryExpr::createAdd(
+          Value, MCConstantExpr::create(Offset, OutContext), OutContext);
+    OutStreamer->emitAssignment(Marker, Value);
+  }
+}
+
+/// Marks where a definition that holds owners of -fmalterlib-sized-destructors
+/// starts, for their dependency records. The label is local, so a record
+/// names this object's copy of the definition, whichever copy the link keeps.
+void AsmPrinter::emitMalterlibSizedOwnerLabel(const GlobalObject *GO) {
+  MCSymbol *Label = OutContext.createTempSymbol("mib_sized_owner");
+  OutStreamer->emitLabel(Label);
+  MalterlibSizedOwnerLabels.push_back({GO, Label});
+}
+
+/// The section of the dependency records of the owners \p GO holds, which the
+/// linker discards with a copy of \p GO it discards.
+MCSection *
+AsmPrinter::getMalterlibSizedDependencySection(const GlobalObject *GO) {
+  const Triple &TT = TM.getTargetTriple();
+  if (TT.isOSBinFormatMachO())
+    return OutContext.getMachOSection("__DATA_CONST", "__mib_sized_dep", 0,
+                                      SectionKind::getData());
+  if (TT.isOSBinFormatCOFF()) {
+    MCSectionCOFF *Section = OutContext.getCOFFSection(
+        ".rdata$mibszd",
+        COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_READ);
+    if (const Comdat *C = GO->getComdat())
+      if (const GlobalValue *Key =
+              GO->getParent()->getNamedValue(C->getName()))
+        return OutContext.getAssociativeCOFFSection(Section, getSymbol(Key));
+    return Section;
+  }
+  if (TT.isOSBinFormatELF()) {
+    unsigned Flags = ELF::SHF_ALLOC | ELF::SHF_WRITE;
+    if (const Comdat *C = GO->getComdat())
+      return OutContext.getELFSection(".data.rel.ro.__mib_sized_dep",
+                                      ELF::SHT_PROGBITS, Flags | ELF::SHF_GROUP,
+                                      0, C->getName(), /*IsComdat=*/true);
+    return OutContext.getELFSection(".data.rel.ro.__mib_sized_dep",
+                                    ELF::SHT_PROGBITS, Flags);
+  }
+  return nullptr;
+}
+
+static bool hasEmittedUse(const Constant *C);
+static bool isUsedBy(const Constant *C, const GlobalObject *Owner);
+
+/// Whether the anchor of dependency records, `__mib_sized_kept`, keeps \p C,
+/// which then is emitted, also where nothing in the module uses it.
+static bool keptByAnchor(const Constant *C, int Depth = 0) {
+  if (Depth > 4)
+    return false;
+  for (const User *U : C->users()) {
+    if (const auto *GV = dyn_cast<GlobalVariable>(U)) {
+      if (GV->getName() == "__mib_sized_kept")
+        return true;
+    } else if (const auto *Inner = dyn_cast<Constant>(U);
+               Inner && !isa<GlobalValue>(Inner) &&
+               keptByAnchor(Inner, Depth + 1))
+      return true;
+  }
+  return false;
+}
+
+/// Emits the dependency records of the owners the definitions this module
+/// emitted hold: triples of the owner, a definition its marker depends on,
+/// and that definition's marker.
+void AsmPrinter::emitMalterlibSizedDependencies() {
+  unsigned PointerSize = getDataLayout().getPointerSize();
+  // The definitions the module only had the body of to inline, which an owner
+  // depends on only while something emitted still calls them.
+  SmallPtrSet<const GlobalValue *, 4> Inlinable;
+  if (const NamedMDNode *MDs =
+          MMI->getModule()->getNamedMetadata(MalterlibSizedInlinableMD))
+    for (const MDNode *MD : MDs->operands())
+      if (MD->getNumOperands())
+        if (auto *GV =
+                mdconst::dyn_extract_or_null<GlobalValue>(MD->getOperand(0)))
+          Inlinable.insert(GV);
+  for (auto [GO, Label] : MalterlibSizedOwnerLabels) {
+    MCSection *Section = getMalterlibSizedDependencySection(GO);
+    if (!Section)
+      continue;
+    OutStreamer->switchSection(Section);
+    emitAlignment(Align(PointerSize));
+    SmallVector<MDNode *, 2> Owners;
+    GO->getMetadata(MalterlibSizedDependenciesMD, Owners);
+    for (MDNode *MD : Owners) {
+      uint64_t Offset =
+          mdconst::extract<ConstantInt>(MD->getOperand(0))->getZExtValue();
+      const MCExpr *Owner = MCSymbolRefExpr::create(Label, OutContext);
+      if (Offset)
+        Owner = MCBinaryExpr::createAdd(
+            Owner, MCConstantExpr::create(Offset, OutContext), OutContext);
+      for (unsigned I = 1; I + 1 < MD->getNumOperands(); I += 2) {
+        auto *GV = mdconst::dyn_extract_or_null<GlobalValue>(MD->getOperand(I));
+        // A function it depends on only while something emitted calls it,
+        // which nothing calls where a pass removed it.
+        const auto *MayGo = dyn_cast_or_null<MDString>(MD->getOperand(I + 1));
+        // The owner, not something else of the module, `ordinary()` calling
+        // the import an exported constructor inlined.
+        if (MayGo && MayGo->getString() == MalterlibSizedMayGoMD) {
+          if (!GV)
+            continue;
+          GV->removeDeadConstantUsers();
+          if (!isUsedBy(GV, GO))
+            continue;
+        }
+        if (GV && Inlinable.contains(GV)) {
+          GV->removeDeadConstantUsers();
+          if (!isUsedBy(GV, GO))
+            continue;
+        }
+        // A pass removed a definition the owner depends on, which the
+        // frontend keeps for this: the owner proves nothing.
+        if (!GV) {
+          MCSymbol *Lost = OutContext.getOrCreateSymbol(
+              Twine("__malterlib_sized_dependency_lost") +
+              MalterlibSizedMarkerSuffix);
+          OutStreamer->emitValue(Owner, PointerSize);
+          OutStreamer->emitValue(Owner, PointerSize);
+          OutStreamer->emitValue(MCSymbolRefExpr::create(Lost, OutContext),
+                                 PointerSize);
+          continue;
+        }
+        auto *Marker =
+            mdconst::dyn_extract_or_null<GlobalValue>(MD->getOperand(I + 1));
+        // The optimizer may have replaced a local definition with its marker.
+        MCSymbol *MarkerSymbol =
+            Marker ? getMalterlibSizedOwnMarker(Marker)
+                   : getMalterlibSizedOwnMarker(GV);
+        if (!MarkerSymbol)
+          MarkerSymbol = Marker ? getSymbol(Marker)
+                                : getMalterlibSizedMarker(GV, GV->getName());
+        OutStreamer->emitValue(Owner, PointerSize);
+        OutStreamer->emitValue(
+            MCSymbolRefExpr::create(getSymbol(GV), OutContext), PointerSize);
+        OutStreamer->emitValue(
+            MCSymbolRefExpr::create(MarkerSymbol, OutContext), PointerSize);
+      }
+    }
+  }
+  MalterlibSizedOwnerLabels.clear();
+}
+
+/// Whether \p C is used by more than the globals that aren't emitted, like the
+/// anchor that keeps the definitions dependency records name, in
+/// llvm.metadata, and the bodies of definitions of another image that the
+/// module only has to inline, `available_externally`, which code generation
+/// skips, also where nothing inlined them, like with full link-time
+/// optimization at a low level.
+/// A global that may be discarded where nothing uses it, like a vftable of
+/// the module that the anchor keeps but no code installs, uses it only where
+/// it is used in turn, and so does the code of a function that may be
+/// discarded where nothing uses it, unless it is a construction site, whose
+/// code uses it wherever it is emitted, or other code the anchor keeps: each
+/// once. A destructor's store of a vtable pointer, like that of a deleting
+/// destructor in that vftable, doesn't use it.
+static bool hasEmittedUse(const Constant *C,
+                          SmallPtrSetImpl<const GlobalObject *> &Looked) {
+  for (const User *U : C->users()) {
+    if (const auto *GV = dyn_cast<GlobalVariable>(U)) {
+      // What `llvm.used` or `llvm.compiler.used` keeps is emitted, like a
+      // table of factories, `[[gnu::used]]`, also one of the module's own that
+      // only it uses, and the references of construction sites, which keep
+      // what they reference, like a constructor its callers inlined; not by
+      // the anchor itself.
+      if (GV->getSection() == "llvm.metadata") {
+        if (GV->getName() == "llvm.used" ||
+            GV->getName() == "llvm.compiler.used")
+          return true;
+        continue;
+      }
+      if (GV->hasAvailableExternallyLinkage())
+        continue;
+      if (!GV->isDiscardableIfUnused())
+        return true;
+      if (Looked.insert(GV).second && hasEmittedUse(GV, Looked))
+        return true;
+    } else if (const auto *Alias = dyn_cast<GlobalAlias>(U)) {
+      // Nor by the marker of a local definition, which `llvm.compiler.used`
+      // keeps while the definition is; but by another alias that is emitted
+      // whatever uses it, like one another object can call, `makeBox` of
+      // `alias("_ZL4makePv")`.
+      if (Alias->getName().contains(MalterlibSizedMarkerSuffix))
+        continue;
+      // Also one that may be replaced, `weak`, which another object can
+      // still call, `make` of `weak, alias("wrapper")`, but not one of a
+      // destructor, like the vector deleting destructor of the MS ABI, whose
+      // installing of vtables constructs nothing, which is used only where it
+      // is used in turn.
+      const auto *Aliased =
+          dyn_cast_or_null<Function>(Alias->getAliaseeObject());
+      if (!Alias->isDiscardableIfUnused() &&
+          !(Alias->isWeakForLinker() && Aliased &&
+            Aliased->hasFnAttribute(MalterlibSizedDestructorAttr)))
+        return true;
+      if (hasEmittedUse(Alias, Looked))
+        return true;
+    } else if (const auto *Inner = dyn_cast<Constant>(U)) {
+      if (hasEmittedUse(Inner, Looked))
+        return true;
+    } else if (const auto *I = dyn_cast<Instruction>(U)) {
+      const Function *In = I->getFunction();
+      // Not the store of a vtable pointer a destructor makes while it
+      // destroys, in the destructor itself, which constructs nothing, but
+      // where it is inlined in other code, or where a site is inlined in the
+      // destructor, which is then a site too, whose construction of an object
+      // in the same storage the optimizer can make rely on it, `p->~A(); new
+      // (p) A;`, which leaves out the redundant store of the constructor.
+      if (const auto *Store = dyn_cast<StoreInst>(I);
+          Store && Store->getValueOperand() == C &&
+          Store->getMetadata(MalterlibSizedDestructorVPtrMD) && In &&
+          In->hasFnAttribute(MalterlibSizedDestructorAttr) &&
+          !In->hasFnAttribute(MalterlibSizedSiteAttr))
+        continue;
+      if (!In || !In->isDiscardableIfUnused())
+        return true;
+      if (In->hasAvailableExternallyLinkage())
+        continue;
+      // A construction site whose code is emitted, also where only the anchor
+      // keeps it, as another object can call the copy the link keeps, and
+      // other code the anchor keeps, which a site can be inlined in, like a
+      // delegating constructor or a destructor, also a destructor another
+      // object can call through a weak alias, like the vector deleting
+      // destructor of the MS ABI.
+      if (In->hasFnAttribute(MalterlibSizedSiteAttr) || keptByAnchor(In) ||
+          (In->hasFnAttribute(MalterlibSizedDestructorAttr) &&
+           any_of(In->users(), [](const User *U) {
+             const auto *Alias = dyn_cast<GlobalAlias>(U);
+             return Alias &&
+                    !Alias->getName().contains(MalterlibSizedMarkerSuffix) &&
+                    !Alias->isDiscardableIfUnused();
+           })))
+        return true;
+      if (Looked.insert(In).second && hasEmittedUse(In, Looked))
+        return true;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool hasEmittedUse(const Constant *C) {
+  SmallPtrSet<const GlobalObject *, 8> Looked;
+  return hasEmittedUse(C, Looked);
+}
+
+/// Whether \p Owner uses \p C: its code, or its initializer, also through a
+/// global that may be discarded where nothing uses it, like a vftable it
+/// installs, and through a function of the module's own that it calls, like
+/// a specialization of a constructor it calls that a pass made in place of
+/// the one it called, each once.
+static bool isUsedBy(const Constant *C, const GlobalObject *Owner,
+                     SmallPtrSetImpl<const Constant *> &Looked) {
+  for (const User *U : C->users()) {
+    if (const auto *I = dyn_cast<Instruction>(U)) {
+      const Function *In = I->getFunction();
+      if (In == Owner)
+        return true;
+      if (In && In->hasLocalLinkage() && Looked.insert(In).second &&
+          isUsedBy(In, Owner, Looked))
+        return true;
+    } else if (const auto *GV = dyn_cast<GlobalVariable>(U)) {
+      if (GV == Owner)
+        return true;
+      if (GV->getSection() != "llvm.metadata" &&
+          !GV->hasAvailableExternallyLinkage() && GV->isDiscardableIfUnused() &&
+          Looked.insert(GV).second && isUsedBy(GV, Owner, Looked))
+        return true;
+    } else if (const auto *Inner = dyn_cast<Constant>(U)) {
+      if (Looked.insert(Inner).second && isUsedBy(Inner, Owner, Looked))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isUsedBy(const Constant *C, const GlobalObject *Owner) {
+  SmallPtrSet<const Constant *, 8> Looked;
+  return isUsedBy(C, Owner, Looked);
+}
+
+/// Emits the site references of the definitions \p M only had the body of to
+/// inline that its construction sites still call, pairs of the definition and
+/// its marker, with the references the frontend emitted: a site that inlined
+/// one everywhere neither calls nor depends on another image's copy of it.
+/// And those of the deleting destructors `__builtin_malterlib_destroy` calls
+/// directly.
+void AsmPrinter::emitMalterlibSizedInlinableReferences(const Module &M) {
+  SetVector<const GlobalValue *> Required;
+  if (const NamedMDNode *Inlinable =
+          M.getNamedMetadata(MalterlibSizedInlinableMD))
+    for (const MDNode *MD : Inlinable->operands()) {
+      auto *GV =
+          MD->getNumOperands()
+              ? mdconst::dyn_extract_or_null<GlobalValue>(MD->getOperand(0))
+              : nullptr;
+      // Also by its name, of a declaration the module didn't use before it
+      // was optimized, which removed it, but that code imported from another
+      // module with link-time optimization uses, like the vtable a constructor
+      // inlined from there installs.
+      if (const auto *Name = !GV && MD->getNumOperands() > 1
+                                 ? dyn_cast_or_null<MDString>(MD->getOperand(1))
+                                 : nullptr)
+        GV = const_cast<GlobalValue *>(M.getNamedValue(Name->getString()));
+      if (!GV)
+        continue;
+      GV->removeDeadConstantUsers();
+      if (hasEmittedUse(GV))
+        Required.insert(GV);
+    }
+  // And the deleting destructor that a call of `__builtin_malterlib_destroy`
+  // calls directly, which devirtualization made direct, also in a module that
+  // has none of the construction sites: the object can be of a site anywhere.
+  for (const Function &F : M) {
+    if (F.isDeclaration() || F.hasAvailableExternallyLinkage())
+      continue;
+    for (const BasicBlock &BB : F)
+      for (const Instruction &I : BB)
+        if (const auto *Call = dyn_cast<CallBase>(&I);
+            Call && Call->getMetadata(MalterlibSizedDestroyCallMD))
+          if (const auto *Callee = dyn_cast<GlobalValue>(
+                  Call->getCalledOperand()->stripPointerCasts()))
+            Required.insert(Callee);
+  }
+  MCSection *Section = nullptr;
+  unsigned PointerSize = getDataLayout().getPointerSize();
+  for (const GlobalValue *GV : Required) {
+    if (!Section) {
+      const Triple &TT = TM.getTargetTriple();
+      if (TT.isOSBinFormatMachO())
+        Section = OutContext.getMachOSection("__DATA_CONST", "__mib_sized_ref",
+                                             0, SectionKind::getData());
+      else if (TT.isOSBinFormatCOFF())
+        Section = OutContext.getCOFFSection(
+            ".rdata$mibszf",
+            COFF::IMAGE_SCN_CNT_INITIALIZED_DATA | COFF::IMAGE_SCN_MEM_READ);
+      else if (TT.isOSBinFormatELF())
+        Section = OutContext.getELFSection(".data.rel.ro.__mib_sized_ref",
+                                           ELF::SHT_PROGBITS,
+                                           ELF::SHF_ALLOC | ELF::SHF_WRITE);
+      if (!Section)
+        return;
+      OutStreamer->switchSection(Section);
+      emitAlignment(Align(PointerSize));
+    }
+    OutStreamer->emitValue(MCSymbolRefExpr::create(getSymbol(GV), OutContext),
+                           PointerSize);
+    // The optimizer may have replaced a local definition with its marker,
+    // which is then its own.
+    MCSymbol *Marker = getMalterlibSizedOwnMarker(GV);
+    OutStreamer->emitValue(
+        MCSymbolRefExpr::create(
+            Marker ? Marker : getMalterlibSizedMarker(GV, GV->getName()),
+            OutContext),
+        PointerSize);
+  }
 }
 
 /// EmitFunctionEntryLabel - Emit the label that is the entrypoint for the
@@ -2915,6 +3442,11 @@ bool AsmPrinter::doFinalization(Module &M) {
 
   // Emit remaining GOT equivalent globals.
   emitGlobalGOTEquivs();
+
+  // The definitions of this module that hold owners of
+  // -fmalterlib-sized-destructors are all emitted now.
+  emitMalterlibSizedDependencies();
+  emitMalterlibSizedInlinableReferences(M);
 
   const TargetLoweringObjectFile &TLOF = getObjFileLowering();
 

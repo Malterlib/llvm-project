@@ -1195,6 +1195,13 @@ def Launder : Builtin {
   let Prototype = "void*(void*)";
 }
 
+def MalterlibDestroy : LangBuiltin<"CXX_LANG"> {
+  let Spellings = ["__builtin_malterlib_destroy"];
+  // The destructor it calls may throw.
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "size_t(void*, void**)";
+}
+
 def IsConstantEvaluated : LangBuiltin<"CXX_LANG"> {
   let Spellings = ["__builtin_is_constant_evaluated"];
   let Attributes = [NoThrow, Constexpr];

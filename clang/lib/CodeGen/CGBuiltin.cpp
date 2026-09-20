@@ -5464,6 +5464,18 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
 
     return RValue::get(Ptr);
   }
+  case Builtin::BI__builtin_malterlib_destroy: {
+    const Expr *Object = E->getArg(0);
+    Address This = EmitPointerWithAlignment(Object);
+    Address Memory = EmitPointerWithAlignment(E->getArg(1));
+
+    auto [CompleteObject, Size] = CGM.getCXXABI().EmitMalterlibSizedDestroy(
+        *this, This, Object->getType()->getPointeeType());
+
+    Builder.CreateStore(CompleteObject, Memory);
+
+    return RValue::get(Size);
+  }
   case Builtin::BI__builtin_clear_padding: {
     Address Src = EmitPointerWithAlignment(E->getArg(0));
     auto PointeeTy = E->getArg(0)->getType()->getPointeeType();

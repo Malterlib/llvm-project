@@ -44,6 +44,22 @@ using TrieEntryCallback =
 void parseTrie(const std::string &fileName, const uint8_t *buf, size_t size,
                const TrieEntryCallback &);
 
+// Of an entry that forwards to a dylib it re-exports: the ordinal of that
+// dylib among the dylibs its image loads, and the name there, empty when it is
+// the same.
+using TrieReexportCallback =
+    llvm::function_ref<void(const llvm::Twine & /*name*/, uint64_t /*ordinal*/,
+                            llvm::StringRef /*importName*/)>;
+
+// Of an entry of a definition of the image: its address, from the image's
+// base.
+using TrieAddressCallback = llvm::function_ref<void(
+    const llvm::Twine & /*name*/, uint64_t /*address*/)>;
+
+void parseTrie(const std::string &fileName, const uint8_t *buf, size_t size,
+               const TrieEntryCallback &, const TrieReexportCallback &,
+               const TrieAddressCallback &);
+
 } // namespace lld::macho
 
 #endif

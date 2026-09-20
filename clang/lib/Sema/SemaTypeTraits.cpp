@@ -455,6 +455,7 @@ static bool CheckUnaryTypeTraitTypeCompleteness(Sema &S, TypeTrait UTT,
   case UTT_HasTrivialCopy:
   case UTT_HasTrivialDestructor:
   case UTT_HasVirtualDestructor:
+  case UTT_HasMalterlibSizedDestructor:
     ArgTy = QualType(ArgTy->getBaseElementTypeUnsafe(), 0);
     [[fallthrough]];
   // C++1z [meta.unary.prop]:
@@ -1037,6 +1038,16 @@ static bool EvaluateUnaryTypeTrait(Sema &Self, TypeTrait UTT,
     // http://gcc.gnu.org/onlinedocs/gcc/Type-Traits.html:
     //   If type is a class type with a virtual destructor ([class.dtor])
     //   then the trait is true, else it is false.
+    if (CXXRecordDecl *RD = T->getAsCXXRecordDecl())
+      if (CXXDestructorDecl *Destructor = Self.LookupDestructor(RD))
+        return Destructor->isVirtual();
+    return false;
+  case UTT_HasMalterlibSizedDestructor:
+    // The deleting destructor of a class with a virtual destructor returns the
+    // size and the address of the complete object when the translation unit is
+    // compiled with -fmalterlib-sized-destructors.
+    if (!Self.getLangOpts().MalterlibSizedDestructors)
+      return false;
     if (CXXRecordDecl *RD = T->getAsCXXRecordDecl())
       if (CXXDestructorDecl *Destructor = Self.LookupDestructor(RD))
         return Destructor->isVirtual();

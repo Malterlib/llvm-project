@@ -25,6 +25,7 @@
 #include "llvm/Support/Threading.h"
 #include "llvm/TextAPI/TextAPIReader.h"
 
+#include <optional>
 #include <vector>
 
 namespace llvm {
@@ -239,7 +240,51 @@ public:
 
   StringRef installName;
   DylibFile *exportingFile = nullptr;
+  // The symbols it exports as weak definitions, which dyld coalesces to a
+  // strong definition another image exports, for the check of
+  // -fmalterlib-sized-destructors, of this dylib itself, also one an umbrella
+  // re-exports, whose symbols bind as the umbrella's.
+  llvm::DenseSet<llvm::CachedHashStringRef> weakDefExports;
+  // The markers of -fmalterlib-sized-destructors it exports at another
+  // address than their definition's, which prove nothing of the copy it
+  // exports.
+  llvm::DenseSet<llvm::CachedHashStringRef> misplacedMarkers;
+  // The symbols its export trie forwards to a dylib it re-exports, `-exported_
+  // symbol` of a symbol of a re-exported dylib, which that dylib defines, for
+  // the check of -fmalterlib-sized-destructors.
+  llvm::DenseSet<llvm::CachedHashStringRef> reexportedExports;
+  // Of each of them, the ordinal of the dylib it forwards to among the dylibs
+  // it loads, and the name there, empty when the same.
+  llvm::DenseMap<llvm::CachedHashStringRef, std::pair<uint64_t, StringRef>>
+      reexportTargets;
+  // The install names of the dylibs it loads, in the order of its load
+  // commands, which the ordinals of its export trie index from 1.
+  SmallVector<StringRef, 4> loadedInstallNames;
+  // Of a symbol it imports in its two-level namespace, the ordinal its link
+  // bound it by among the dylibs it loads, which index loadedInstallNames from
+  // 1, from the library ordinal of its entry in its symbol table, or of its
+  // bind, in its chained fixups or dyld info, which strip keeps, for the
+  // check of -fmalterlib-sized-destructors: 0 when it has neither.
+  uint32_t importOrdinal(StringRef name) const;
+  // Whether it imports \p name by weak lookup, which dyld coalesces in the
+  // images flagged with MH_WEAK_DEFINES, in its two-level namespace or a flat
+  // one: a reference to a weak definition, whose entry in its symbol table is
+  // N_REF_TO_WEAK, and whose bind is a weak lookup, or a weak bind.
+  bool importsByWeakLookup(StringRef name) const;
+  // Whether dyld looks in it to coalesce weak definitions, which it does in
+  // the images flagged with MH_WEAK_DEFINES, and only them, each by its own
+  // header. A text stub, \p fromStub, has no header, and is taken to.
+  bool weakDefines = false;
+  bool fromStub = false;
+  // Whether it binds its own references in a flat namespace, without
+  // MH_TWOLEVEL, looking in every image dyld has loaded, as dyld does for an
+  // image linked with -flat_namespace.
+  bool flatNamespace = false;
   DylibFile *umbrella;
+  // The dylibs it re-exports itself, in the order of its load commands, which
+  // dyld loads with it, for the check of -fmalterlib-sized-destructors: not
+  // those they re-export in turn, whose umbrella is this one's too.
+  SmallVector<DylibFile *, 2> reexports;
   SmallVector<StringRef, 2> rpaths;
   SmallVector<StringRef> allowableClients;
   uint32_t compatibilityVersion = 0;
@@ -270,6 +315,17 @@ public:
 private:
   DylibFile *getSyntheticDylib(StringRef installName, uint32_t currentVersion,
                                uint32_t compatVersion);
+  template <class LP> void parseImports() const;
+  void parseBoundImports(bool is64) const;
+
+  // What importOrdinal() and importsByWeakLookup() read, parsed when first
+  // asked for.
+  struct Imports {
+    llvm::DenseMap<llvm::CachedHashStringRef, uint32_t> ordinals;
+    llvm::DenseSet<llvm::CachedHashStringRef> weakLookups;
+  };
+  mutable std::optional<Imports> parsedImports;
+  const Imports &getImports() const;
 
   bool handleLDSymbol(StringRef originalName);
   void handleLDPreviousSymbol(StringRef name, StringRef originalName);

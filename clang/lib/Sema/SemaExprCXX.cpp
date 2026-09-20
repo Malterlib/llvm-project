@@ -2149,6 +2149,168 @@ void Sema::diagnoseUnavailableAlignedAllocation(const FunctionDecl &FD,
   }
 }
 
+/// The check of a construction site of -fmalterlib-sized-destructors of what
+/// it allocates, \p AllocType, with \p Initializer: a class with a virtual
+/// destructor keeps a reference to its vtable, which is used as a constructor
+/// of the class defined here would use it, and has to be constructed here: a
+/// prvalue a call produces is constructed in place by the callee, with
+/// whatever vtable the callee's image has. So does each element of an array.
+/// Not before a template is instantiated, whose arguments can choose a
+/// construction, `t_bDirect ? T() : fg_Produce()`.
+static void checkMalterlibSizedConstruction(Sema &S, QualType AllocType,
+                                            Expr *Initializer,
+                                            SourceLocation StartLoc) {
+  ASTContext &Context = S.getASTContext();
+  CXXRecordDecl *RD =
+      Context.getBaseElementType(AllocType)->getAsCXXRecordDecl();
+  if (!RD || !RD->getDestructor() || !RD->getDestructor()->isVirtual())
+    return;
+  S.MarkVTableUsed(StartLoc, RD);
+  SmallVector<const CXXConstructExpr *, 2> Constructions;
+  if (Initializer && !Initializer->isTypeDependent() &&
+      !Initializer->isValueDependent() &&
+      !CXXNewExpr::getDirectConstructions(Initializer,
+                                          S.getLangOpts().ElideConstructors,
+                                          Constructions, &Context))
+    S.Diag(Initializer->getExprLoc(),
+           diag::err_malterlib_sized_construction_prvalue)
+        << Context.getBaseElementType(AllocType);
+}
+
+void Sema::CheckMalterlibSizedConstructorInitializers(
+    const CXXConstructorDecl *Constructor) {
+  // Not that of a virtual base of an abstract class, which no construction
+  // runs, as the most derived class initializes its virtual bases.
+  for (const CXXCtorInitializer *Initializer : Constructor->inits())
+    if (!(Initializer->isBaseInitializer() && Initializer->isBaseVirtual() &&
+          Constructor->getParent()->isAbstract()))
+      CheckMalterlibSizedConstructionsIn(Constructor, Initializer->getInit());
+}
+
+void Sema::CheckMalterlibSizedConstructionsIn(const FunctionDecl *FD,
+                                              const Stmt *S) {
+  // Each new-expression it evaluates, also in the defaults it uses, as the
+  // complete body tells which of them it evaluates, not one of the body of a
+  // lambda it makes, which isn't evaluated here, but of what the lambda
+  // captures, `[pValue = new CValue] { ... }`, nor one of an operand that
+  // isn't evaluated, like of `sizeof` or `decltype`, or of `typeid` of what
+  // isn't polymorphic, or of `__uuidof`, nor one of an association `_Generic`
+  // or `__builtin_choose_expr` doesn't choose, nor of an immediate
+  // invocation, nor of a builtin that only asks something of it, nor of a
+  // discarded branch of an `if constexpr` or the branch of an `if consteval`
+  // only constant evaluation runs, nor what initializes the elements of an
+  // array that has none, nor the initializer of a `constexpr` variable. Each
+  // once for the site, also what defaults share, `int fg_Outer(int =
+  // fg_Inner() + fg_Inner())`.
+  // Nothing of a `consteval` function, which only constant evaluation runs.
+  if (FD->isConsteval())
+    return;
+  std::function<void(const Stmt *)> Visit = [&](const Stmt *S) {
+    if (!S || !MalterlibSizedCheckedDefaults.insert({FD, S}).second ||
+        isa<BlockExpr, CXXNoexceptExpr, UnaryExprOrTypeTraitExpr,
+            CXXUuidofExpr>(S))
+      return;
+    if (const auto *Generic = dyn_cast<GenericSelectionExpr>(S)) {
+      if (!Generic->isResultDependent())
+        Visit(Generic->getResultExpr());
+      return;
+    }
+    // Also only the operand `__builtin_choose_expr` chooses, and nothing of an
+    // immediate invocation, `consteval` or constant, which is evaluated where
+    // it is written and never runs.
+    if (const auto *Choose = dyn_cast<ChooseExpr>(S)) {
+      if (!Choose->isConditionDependent())
+        Visit(Choose->getChosenSubExpr());
+      return;
+    }
+    if (isa<ConstantExpr>(S))
+      return;
+    // Nor the initializer of a variable that constant evaluation initializes,
+    // `constexpr int n = consume(new A(produce()));`, also a `const int` one
+    // whose initializer is constant, which code generation emits as its
+    // value, and a static one that is constant initialized, which never runs
+    // either.
+    if (const auto *Decls = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : Decls->decls())
+        if (const auto *Var = dyn_cast<VarDecl>(D);
+            Var && !Var->isConstexpr() &&
+            !Var->isUsableInConstantExpressions(Context) &&
+            !(Var->hasGlobalStorage() && Var->hasConstantInitialization()))
+          Visit(Var->getInit());
+      return;
+    }
+    // Nor of a builtin that doesn't evaluate its operand, which only asks
+    // something of it, `__builtin_constant_p(new A(fg_Make()))`, or does
+    // nothing with it, `__noop(new A(fg_Make()))`, or only assumes it,
+    // `__builtin_assume(new A(fg_Make()) != nullptr)`.
+    if (const auto *Call = dyn_cast<CallExpr>(S)) {
+      switch (Call->getBuiltinCallee()) {
+      case Builtin::BI__builtin_constant_p:
+      case Builtin::BI__builtin_object_size:
+      case Builtin::BI__builtin_dynamic_object_size:
+      case Builtin::BI__noop:
+      case Builtin::BI__builtin_assume:
+      case Builtin::BI__assume:
+        return;
+      default:
+        break;
+      }
+    }
+    if (const auto *Lambda = dyn_cast<LambdaExpr>(S)) {
+      for (const Expr *Capture : Lambda->capture_inits())
+        Visit(Capture);
+      return;
+    }
+    // Nor one of the branch of an `if constexpr` that is discarded, also
+    // where it isn't in a template, nor of the branch of an `if consteval`
+    // that only constant evaluation runs, whose objects it destroys.
+    if (const auto *If = dyn_cast<IfStmt>(S); If && If->isConsteval()) {
+      Visit(If->isNegatedConsteval() ? If->getThen() : If->getElse());
+      return;
+    }
+    if (const auto *If = dyn_cast<IfStmt>(S); If && If->isConstexpr())
+      if (const std::optional<const Stmt *> Taken =
+              If->getNondiscardedCase(Context)) {
+        Visit(If->getInit());
+        Visit(If->getConditionVariableDeclStmt());
+        Visit(If->getCond());
+        Visit(*Taken);
+        return;
+      }
+    if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
+        Typeid && !Typeid->isPotentiallyEvaluated())
+      return;
+    if (const auto *New = dyn_cast<CXXNewExpr>(S)) {
+      // `new B[0]` evaluates neither `B()` nor its default arguments.
+      if (New->constructsNoElements(Context)) {
+        if (const std::optional<const Expr *> Count = New->getArraySize())
+          Visit(*Count);
+        for (const Expr *Argument : New->placement_arguments())
+          Visit(Argument);
+        return;
+      }
+      checkMalterlibSizedConstruction(*this, New->getAllocatedType(),
+                                      const_cast<Expr *>(New->getInitializer()),
+                                      New->getBeginLoc());
+    }
+    // Also in a default argument or member initializer it evaluates in turn,
+    // `void fg_Outer(int = (fg_Inner(), 0))`, which isn't a child of it, and
+    // in what initializes the elements past those an initializer list gives,
+    // `new CHolder[n]{}`, which isn't either.
+    if (const auto *List = dyn_cast<InitListExpr>(S))
+      Visit(List->getArrayFiller());
+    if (const auto *List = dyn_cast<CXXParenListInitExpr>(S))
+      Visit(List->getArrayFiller());
+    if (const auto *Argument = dyn_cast<CXXDefaultArgExpr>(S))
+      Visit(Argument->getExpr());
+    if (const auto *Initializer = dyn_cast<CXXDefaultInitExpr>(S))
+      Visit(Initializer->getExpr());
+    for (const Stmt *Child : S->children())
+      Visit(Child);
+  };
+  Visit(S);
+}
+
 ExprResult Sema::BuildCXXNew(SourceRange Range, bool UseGlobal,
                              SourceLocation PlacementLParen,
                              MultiExprArg PlacementArgs,

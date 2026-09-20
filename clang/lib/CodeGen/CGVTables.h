@@ -67,6 +67,10 @@ class CodeGenVTables {
                           unsigned vtableAddressPoint,
                           bool vtableHasLocalLinkage);
 
+  /// Computes the mangled name of the thunk \p TI for \p GD.
+  void getThunkName(GlobalDecl GD, const ThunkInfo &TI,
+                    SmallString<256> &Name);
+
   /// Add a 32-bit offset to a component relative to the vtable when using the
   /// relative vtables ABI. The array builder points to the start of the vtable.
   void addRelativeComponent(ConstantArrayBuilder &builder,
@@ -81,6 +85,27 @@ public:
   void createVTableInitializer(ConstantStructBuilder &builder,
                                const VTableLayout &layout, llvm::Constant *rtti,
                                bool vtableHasLocalLinkage);
+
+  /// Records the vtables of \p RD as definitions that must have been compiled
+  /// with -fmalterlib-sized-destructors, for a construction site or for the
+  /// marker of \p Owner, with \p Conditional only while what is emitted uses
+  /// them, unless each of \p Unless installs them, as
+  /// CodeGenModule::AddMalterlibSizedReference tells.
+  void addMalterlibSizedVTableReferences(
+      const CXXRecordDecl *RD, llvm::GlobalValue *Owner = nullptr,
+      bool Conditional = false,
+      ArrayRef<const CXXConstructorDecl *> Unless = {});
+
+  /// Records the deleting destructors and thunks in the vtables of \p RD as
+  /// definitions that must have been compiled with
+  /// -fmalterlib-sized-destructors for the marker of the vtable \p Owner, or
+  /// for a construction site, with \p Conditional only while what is emitted
+  /// uses them. With \p VFPtrOffset, only those of the Microsoft vftable at
+  /// that offset, which \p Owner is.
+  void addMalterlibSizedSlotReferences(
+      const CXXRecordDecl *RD, llvm::GlobalValue *Owner,
+      bool Conditional = false,
+      std::optional<CharUnits> VFPtrOffset = std::nullopt);
 
   CodeGenVTables(CodeGenModule &CGM);
 

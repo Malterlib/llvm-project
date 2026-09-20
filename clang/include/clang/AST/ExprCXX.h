@@ -2550,6 +2550,35 @@ public:
     return dyn_cast_or_null<CXXConstructExpr>(getInitializer());
   }
 
+  /// Returns the constructor call that initializes the object of a
+  /// new-expression with \p Initializer at the new-expression itself, looking
+  /// through parentheses, braces and temporaries, and through a copy or move
+  /// that is elided when \p ElideConstructors, or null when a value another
+  /// expression produces, such as a call's result, initializes it.
+  static const CXXConstructExpr *
+  getDirectConstruction(const Expr *Initializer, bool ElideConstructors);
+
+  /// Adds to \p Constructions the constructor calls that initialize the
+  /// objects of a new-expression with \p Initializer, each as
+  /// getDirectConstruction tells: the object, or each element of an array,
+  /// also of a braced or parenthesized list of them and of what fills the
+  /// rest, `new T[N]{T(1)}`, and of either result of a conditional, `B ? T(1)
+  /// : T(2)`, or with \p Context the one a constant condition chooses, which
+  /// is the only one code generation emits. With \p Unproven, also whether
+  /// each is only in a result of a condition that isn't constant, which the
+  /// optimizer can still leave out. Returns false when one is initialized by
+  /// a value another expression produces.
+  static bool getDirectConstructions(
+      const Expr *Initializer, bool ElideConstructors,
+      SmallVectorImpl<const CXXConstructExpr *> &Constructions,
+      const ASTContext *Context = nullptr,
+      SmallVectorImpl<bool> *Unproven = nullptr);
+
+  /// Whether this allocates an array that has no elements, `new T[0]` or `new
+  /// T[N][0]`, which constructs nothing, nor evaluates what would initialize
+  /// them.
+  bool constructsNoElements(const ASTContext &Context) const;
+
   /// Indicates whether the required alignment should be implicitly passed to
   /// the allocation function.
   bool passAlignment() const { return CXXNewExprBits.ShouldPassAlignment; }

@@ -938,7 +938,11 @@ Function *CodeExtractor::constructFunctionDeclaration(
   //           attribute can not be inherited.
   for (const auto &Attr : oldFunction->getAttributes().getFnAttrs()) {
     if (Attr.isStringAttribute()) {
-      if (Attr.getKindAsString() == "thunk")
+      // The marker of the original definition, and those of the aliases it
+      // lists, belong to it alone.
+      if (Attr.getKindAsString() == "thunk" ||
+          Attr.getKindAsString() == MalterlibSizedMarkerAttr ||
+          Attr.getKindAsString() == MalterlibSizedAliasesAttr)
         continue;
     } else
       switch (Attr.getKindAsEnum()) {

@@ -4018,6 +4018,13 @@ defm sized_deallocation : BoolFOption<"sized-deallocation",
   LangOpts<"SizedDeallocation">, Default<cpp14.KeyPath>,
   PosFlag<SetTrue, [], [], "Enable C++14 sized global deallocation functions">,
   NegFlag<SetFalse>, BothFlags<[], [ClangOption, CC1Option]>>;
+defm malterlib_sized_destructors : BoolFOption<"malterlib-sized-destructors",
+  LangOpts<"MalterlibSizedDestructors">, DefaultFalse,
+  PosFlag<SetTrue, [], [],
+          "Make deleting destructors return the size and address of the complete object, "
+          "enabling '__builtin_malterlib_destroy'">,
+  NegFlag<SetFalse>, BothFlags<[], [ClangOption, CLOption, CC1Option]>>,
+  ShouldParseIf<cplusplus.KeyPath>;
 defm aligned_allocation : BoolFOption<"aligned-allocation",
   LangOpts<"AlignedAllocation">, Default<cpp17.KeyPath>,
   PosFlag<SetTrue, [], [ClangOption], "Enable C++17 aligned allocation functions">,

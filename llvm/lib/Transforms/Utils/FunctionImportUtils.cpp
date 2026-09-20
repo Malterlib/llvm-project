@@ -143,6 +143,28 @@ std::string
 FunctionImportGlobalProcessing::getPromotedName(const GlobalValue *SGV) {
   assert(SGV->hasLocalLinkage());
 
+  // The local marker of -fmalterlib-sized-destructors of a definition, `X
+  // .mib_sized`, is named as the marker of the definition's promoted name,
+  // which is how the backend spells the references to it, in the module that
+  // defines it and in one that imports what refers to it alike.
+  if (SGV->getName().ends_with(MalterlibSizedMarkerSuffix)) {
+    const StringRef Definition =
+        SGV->getName().drop_back(MalterlibSizedMarkerSuffix.size());
+    if (UseSourceFilenameForPromotedLocals &&
+        !SGV->getParent()->getSourceFileName().empty()) {
+      SmallString<256> Suffix(SGV->getParent()->getSourceFileName());
+      std::replace_if(
+          std::begin(Suffix), std::end(Suffix),
+          [&](char ch) { return !isAlnum(ch); }, '_');
+      return ModuleSummaryIndex::getGlobalNameForLocal(Definition, Suffix) +
+             MalterlibSizedMarkerSuffix.str();
+    }
+    return ModuleSummaryIndex::getGlobalNameForLocal(
+               Definition, ImportIndex.getModuleHash(
+                               SGV->getParent()->getModuleIdentifier())) +
+           MalterlibSizedMarkerSuffix.str();
+  }
+
   // For locals that must be promoted to global scope, ensure that
   // the promoted name uniquely identifies the copy in the original module,
   // using the ID assigned during combined index creation.
@@ -321,6 +343,9 @@ void FunctionImportGlobalProcessing::processGlobalForThinLTO(GlobalValue &GV) {
     if (AlwaysRenamePromotedLocals || !Summary ||
         !Summary->noRenameOnPromotion())
       GV.setName(getPromotedName(&GV));
+    if (GV.hasName() && !GV.isDeclarationForLinker() &&
+        !StringRef(Name).ends_with(MalterlibSizedMarkerSuffix))
+      PromotedDefinitions.emplace_back(Name, GV.getName() != Name);
 
     GV.setLinkage(getLinkage(&GV, /* DoPromote */ true));
     assert(!GV.hasLocalLinkage());
@@ -371,6 +396,19 @@ void FunctionImportGlobalProcessing::processGlobalsForThinLTO() {
     processGlobalForThinLTO(SF);
   for (GlobalAlias &GA : M.aliases())
     processGlobalForThinLTO(GA);
+
+  // The local marker of -fmalterlib-sized-destructors of a definition that
+  // was promoted, which another module that imports a construction site
+  // refers to by the definition's name, is promoted with it, by that name.
+  for (const auto &[Name, Renamed] : PromotedDefinitions)
+    if (GlobalAlias *Marker =
+            M.getNamedAlias(Name + MalterlibSizedMarkerSuffix.str());
+        Marker && Marker->hasLocalLinkage()) {
+      if (Renamed)
+        Marker->setName(getPromotedName(Marker));
+      Marker->setLinkage(GlobalValue::ExternalLinkage);
+      Marker->setVisibility(GlobalValue::HiddenVisibility);
+    }
 
   // Replace any COMDATS that required renaming (because the COMDAT leader was
   // promoted and renamed).

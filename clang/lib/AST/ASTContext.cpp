@@ -8632,6 +8632,47 @@ void ASTContext::setCFConstantStringType(QualType T) {
   CFConstantStringTagDecl = TT->castAsRecordDecl();
 }
 
+QualType ASTContext::getMalterlibSizedDestroyResultType() const {
+  if (MalterlibSizedDestroyResultType)
+    return getCanonicalTagType(MalterlibSizedDestroyResultType);
+
+  RecordDecl *RD = buildImplicitRecord("__malterlib_destroy_result");
+  RD->startDefinition();
+
+  QualType FieldTypes[] = {
+      VoidPtrTy,
+      getSizeType(),
+  };
+
+  static const char *const FieldNames[] = {
+      "__memory",
+      "__size",
+  };
+
+  for (size_t i = 0; i != 2; ++i) {
+    FieldDecl *Field = FieldDecl::Create(
+        *this, RD, SourceLocation(), SourceLocation(),
+        &Idents.get(FieldNames[i]), FieldTypes[i], /*TInfo=*/nullptr,
+        /*BitWidth=*/nullptr, /*Mutable=*/false, ICIS_NoInit);
+    Field->setAccess(AS_public);
+    RD->addDecl(Field);
+  }
+
+  RD->completeDefinition();
+
+  MalterlibSizedDestroyResultType = RD;
+
+  return getCanonicalTagType(MalterlibSizedDestroyResultType);
+}
+
+bool ASTContext::isMalterlibSizedDestroyResultType(QualType T) const {
+  if (!MalterlibSizedDestroyResultType)
+    return false;
+  const auto *RD = T->getAsRecordDecl();
+  return RD && RD->getCanonicalDecl() ==
+                   MalterlibSizedDestroyResultType->getCanonicalDecl();
+}
+
 QualType ASTContext::getBlockDescriptorType() const {
   if (BlockDescriptorType)
     return getCanonicalTagType(BlockDescriptorType);

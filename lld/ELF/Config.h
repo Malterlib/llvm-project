@@ -654,6 +654,7 @@ struct Ctx : CommonLinkerContext {
   LinkerScript *script;
   std::unique_ptr<TargetInfo> target;
 
+
   // These variables are initialized by Writer and should not be used before
   // Writer is initialized.
   uint8_t *bufferStart = nullptr;

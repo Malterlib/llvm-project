@@ -86,6 +86,14 @@ bool isEligibleFunction(Function *F) {
       F->hasFnAttribute(llvm::Attribute::AlwaysInline))
     return false;
 
+  // A merged function becomes a thunk, which carries neither the marker of
+  // -fmalterlib-sized-destructors of the original nor the dependencies of its
+  // owners.
+  if (F->hasFnAttribute(MalterlibSizedMarkerAttr) ||
+      F->hasFnAttribute(MalterlibSizedAliasesAttr) ||
+      F->hasMetadata(MalterlibSizedDependenciesMD))
+    return false;
+
   if (F->hasAvailableExternallyLinkage())
     return false;
 

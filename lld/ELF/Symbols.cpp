@@ -16,6 +16,7 @@
 #include "Target.h"
 #include "Writer.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/Support/Compiler.h"
 #include <cstring>
 
@@ -428,6 +429,10 @@ void Symbol::resolve(Ctx &ctx, const Undefined &other) {
       type = other.type;
       return;
     }
+    // Neither does a marker of -fmalterlib-sized-destructors: it belongs to the
+    // copy of a definition the link chose for the definition's own sake.
+    if (getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      return;
 
     // Do extra check for --warn-backrefs.
     //
@@ -658,6 +663,10 @@ void Symbol::resolve(Ctx &ctx, const LazySymbol &other) {
     other.overwrite(*this);
     type = ty;
     binding = STB_WEAK;
+    return;
+  }
+  if (getName().ends_with(llvm::MalterlibSizedMarkerSuffix)) {
+    other.overwrite(*this);
     return;
   }
 

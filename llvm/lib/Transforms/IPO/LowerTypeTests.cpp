@@ -884,6 +884,10 @@ void LowerTypeTestsModule::buildBitSetsFromGlobalVariables(
         GlobalAlias::create(NewTy->getElementType(I * 2), 0, GV->getLinkage(),
                             "", CombinedGlobalElemPtr, &M);
     GAlias->setVisibility(GV->getVisibility());
+    transferMalterlibSizedMarkers(
+        *GV, *CombinedGlobal,
+        M.getDataLayout().getStructLayout(NewTy)->getElementOffset(I * 2),
+        GV->getName());
     GAlias->takeName(GV);
     GV->replaceAllUsesWith(GAlias);
     GV->eraseFromParent();

@@ -130,6 +130,39 @@ public:
 
   virtual bool hasMostDerivedReturn(GlobalDecl GD) const { return false; }
 
+  /// Whether \p GD is a deleting destructor that returns the address of the
+  /// complete object and its size. Every deleting destructor emitted with
+  /// -fmalterlib-sized-destructors does, so that __builtin_malterlib_destroy
+  /// can destroy an object and free it with the size of its dynamic type.
+  bool hasMalterlibSizedDestructor(GlobalDecl GD) const;
+
+  /// Whether a definition of \p GD gets the marker of
+  /// -fmalterlib-sized-destructors: a deleting destructor, whose contract the
+  /// flag changes, or a constructor of a class with one, which installs the
+  /// vtable of its own image.
+  bool needsMalterlibSizedMarker(GlobalDecl GD) const;
+
+  /// Whether the vtables of \p RD get the marker of
+  /// -fmalterlib-sized-destructors.
+  bool needsMalterlibSizedMarker(const CXXRecordDecl *RD) const;
+
+
+  /// Calls the deleting destructor of the dynamic type of the object at \p This
+  /// in its sized mode, which destroys the object without freeing it. Returns
+  /// the address of the complete object and its size.
+  virtual std::pair<llvm::Value *, llvm::Value *>
+  EmitMalterlibSizedDestroy(CodeGenFunction &CGF, Address This,
+                            QualType ObjectTy);
+
+  /// Loads one of the two values a sized deleting destructor returned: the
+  /// address of the complete object (0) or its size (1).
+  llvm::Value *loadMalterlibSizedDestroyField(CodeGenFunction &CGF,
+                                              RValue Result, unsigned Index);
+
+  /// Loads both values a sized deleting destructor returned.
+  std::pair<llvm::Value *, llvm::Value *>
+  loadMalterlibSizedDestroyResult(CodeGenFunction &CGF, RValue Result);
+
   virtual bool useSinitAndSterm() const { return false; }
 
   /// Returns true if the target allows calling a function through a pointer
@@ -145,6 +178,14 @@ public:
   /// If the C++ ABI requires the given type be returned in a particular way,
   /// this method sets RetAI and returns true.
   virtual bool classifyReturnType(CGFunctionInfo &FI) const = 0;
+
+  /// Classifies the result of a sized deleting destructor, if \p FI returns
+  /// one: it is returned in registers on every target.
+  bool classifyMalterlibSizedDestroyReturn(CGFunctionInfo &FI) const;
+
+  /// Keeps the destructor __builtin_malterlib_destroy calls a call, so that the
+  /// definition it reaches stays in the link for the check of the flag.
+  static void keepMalterlibSizedDestructorCall(llvm::CallBase *Call);
 
   /// Specify how one should pass an argument of a record type.
   enum RecordArgABI {

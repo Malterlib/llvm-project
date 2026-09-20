@@ -2764,6 +2764,14 @@ void llvm::InlineFunctionImpl(CallBase &CB, InlineFunctionInfo &IFI,
     }
   }
 
+  // The code of a construction site of -fmalterlib-sized-destructors uses what
+  // it depends on wherever it is emitted, also inlined in another function,
+  // which then is a site too, like a destructor that resets an object,
+  // `p->~A(); new (p) A;`, whose own store of a vtable pointer the construction
+  // can then rely on.
+  if (CalledFunc->hasFnAttribute(MalterlibSizedSiteAttr))
+    Caller->addFnAttr(MalterlibSizedSiteAttr);
+
   if (CalledFunc->hasPersonalityFn()) {
     Constant *CalledPersonality =
         CalledFunc->getPersonalityFn()->stripPointerCasts();

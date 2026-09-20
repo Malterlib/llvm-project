@@ -2122,6 +2122,13 @@ def Leaf : InheritableAttr {
   let SimpleHandler = 1;
 }
 
+def MalterlibSizedConstruction : InheritableAttr {
+  let Spellings = [CXX11<"malterlib", "sized_construction">];
+  let Subjects = SubjectList<[Function]>;
+  let Documentation = [MalterlibSizedConstructionDocs];
+  let SimpleHandler = 1;
+}
+
 def ExplicitInit : InheritableAttr {
   let Spellings = [Clang<"require_explicit_initialization">];
   let Subjects = SubjectList<[Field], ErrorDiag>;

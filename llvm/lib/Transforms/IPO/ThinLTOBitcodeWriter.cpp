@@ -67,6 +67,14 @@ void promoteInternals(Module &ExportM, Module &ImportM, StringRef ModuleId,
 
     std::string OldName = Name.str();
     std::string NewName = (Name + ModuleId).str();
+    // A local marker of -fmalterlib-sized-destructors, `X.mib_sized`, gets the
+    // name of the marker of its definition with the definition's new name,
+    // `X<ModuleId>.mib_sized`, which is how the backend spells references to
+    // it.
+    if (Name.ends_with(MalterlibSizedMarkerSuffix))
+      NewName = (Name.drop_back(MalterlibSizedMarkerSuffix.size()) + ModuleId +
+                 MalterlibSizedMarkerSuffix)
+                    .str();
 
     if (const auto *C = ExportGV.getComdat())
       if (C->getName() == Name)
@@ -82,6 +90,19 @@ void promoteInternals(Module &ExportM, Module &ImportM, StringRef ModuleId,
       ImportGV->setVisibility(GlobalValue::HiddenVisibility);
       ImportGV->reassignGUID();
     }
+
+    // And the local marker of the definition, also in the other module, where
+    // it can be declared, which the records that name the definition in
+    // either refer to by its name.
+    for (Module *M : {&ExportM, &ImportM})
+      if (GlobalValue *Marker =
+              M->getNamedValue(OldName + MalterlibSizedMarkerSuffix.str())) {
+        Marker->setName(NewName + MalterlibSizedMarkerSuffix.str());
+        if (Marker->hasLocalLinkage())
+          Marker->setLinkage(GlobalValue::ExternalLinkage);
+        Marker->setVisibility(GlobalValue::HiddenVisibility);
+        Marker->reassignGUID();
+      }
 
     if (isa<Function>(&ExportGV) && allowPromotionAlias(OldName)) {
       // Create a local alias with the original name to avoid breaking

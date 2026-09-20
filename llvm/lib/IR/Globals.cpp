@@ -20,6 +20,7 @@
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/MDBuilder.h"
+#include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -764,4 +765,100 @@ void GlobalIFunc::applyAlongResolverPath(
     function_ref<void(const GlobalValue &)> Op) const {
   DenseSet<const GlobalAlias *> Aliases;
   findBaseObject(getResolver(), Aliases, Op);
+}
+
+static Attribute getMalterlibSizedAttr(const GlobalObject &GO, StringRef Kind) {
+  if (const auto *F = dyn_cast<Function>(&GO))
+    return F->getFnAttribute(Kind);
+  if (const auto *V = dyn_cast<GlobalVariable>(&GO))
+    return V->getAttribute(Kind);
+  return Attribute();
+}
+
+void llvm::transferMalterlibSizedMarkers(const GlobalObject &From,
+                                         GlobalObject &To, uint64_t Offset,
+                                         StringRef Name) {
+  SmallVector<MDNode *, 2> Dependencies;
+  From.getMetadata(MalterlibSizedDependenciesMD, Dependencies);
+  for (MDNode *MD : Dependencies) {
+    SmallVector<Metadata *, 4> Operands(MD->operands());
+    uint64_t At =
+        mdconst::extract<ConstantInt>(Operands.front())->getZExtValue();
+    Operands.front() = ConstantAsMetadata::get(
+        ConstantInt::get(Type::getInt64Ty(To.getContext()), At + Offset));
+    To.addMetadata(MalterlibSizedDependenciesMD,
+                   *MDNode::get(To.getContext(), Operands));
+  }
+
+  SmallVector<std::string, 2> Entries;
+  if (getMalterlibSizedAttr(From, MalterlibSizedMarkerAttr).isValid())
+    Entries.push_back((Name + "=" + Twine(Offset)).str());
+  if (Attribute A = getMalterlibSizedAttr(From, MalterlibSizedAliasesAttr);
+      A.isStringAttribute()) {
+    SmallVector<StringRef, 2> Aliases;
+    A.getValueAsString().split(Aliases, ',', /*MaxSplit=*/-1,
+                               /*KeepEmpty=*/false);
+    for (StringRef Alias : Aliases) {
+      auto [AliasName, AliasOffset] = Alias.rsplit('=');
+      uint64_t Value = 0;
+      AliasOffset.getAsInteger(10, Value);
+      Entries.push_back((AliasName + "=" + Twine(Value + Offset)).str());
+    }
+  }
+  if (Entries.empty())
+    return;
+  std::string List;
+  if (Attribute A = getMalterlibSizedAttr(To, MalterlibSizedAliasesAttr);
+      A.isStringAttribute())
+    List = A.getValueAsString().str();
+  for (const std::string &Entry : Entries) {
+    if (!List.empty())
+      List += ',';
+    List += Entry;
+  }
+  if (auto *F = dyn_cast<Function>(&To))
+    F->addFnAttr(MalterlibSizedAliasesAttr, List);
+  else
+    cast<GlobalVariable>(To).addAttribute(MalterlibSizedAliasesAttr, List);
+}
+
+void llvm::keepMalterlibSizedMarker(GlobalObject &GO, StringRef Name) {
+  if (!getMalterlibSizedAttr(GO, MalterlibSizedMarkerAttr).isValid())
+    return;
+  std::string List;
+  if (Attribute A = getMalterlibSizedAttr(GO, MalterlibSizedAliasesAttr);
+      A.isStringAttribute())
+    List = (A.getValueAsString() + ",").str();
+  List += (Name + "=0").str();
+  if (auto *F = dyn_cast<Function>(&GO))
+    F->addFnAttr(MalterlibSizedAliasesAttr, List);
+  else
+    cast<GlobalVariable>(GO).addAttribute(MalterlibSizedAliasesAttr, List);
+}
+
+void llvm::renameMalterlibSizedMarker(GlobalValue &GV, StringRef OldName) {
+  // The old name decorated as the symbol of GV is.
+  if (GlobalValue *Marker = GV.getParent()->getNamedValue(
+          getMalterlibSizedMarkerIRName(&GV, OldName)))
+    Marker->setName(getMalterlibSizedMarkerIRName(&GV));
+  GlobalObject *GO = GV.getAliaseeObject();
+  if (!GO)
+    return;
+  Attribute A = getMalterlibSizedAttr(*GO, MalterlibSizedAliasesAttr);
+  if (!A.isStringAttribute())
+    return;
+  SmallVector<StringRef, 2> Aliases;
+  A.getValueAsString().split(Aliases, ',', /*MaxSplit=*/-1,
+                             /*KeepEmpty=*/false);
+  std::string List;
+  for (StringRef Alias : Aliases) {
+    auto [Name, Offset] = Alias.rsplit('=');
+    if (!List.empty())
+      List += ',';
+    List += ((Name == OldName ? GV.getName() : Name) + "=" + Offset).str();
+  }
+  if (auto *F = dyn_cast<Function>(GO))
+    F->addFnAttr(MalterlibSizedAliasesAttr, List);
+  else
+    cast<GlobalVariable>(GO)->addAttribute(MalterlibSizedAliasesAttr, List);
 }

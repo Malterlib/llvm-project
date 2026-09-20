@@ -1154,6 +1154,15 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
       CT = CT_Dependent;
     else if (isa<CXXPseudoDestructorExpr>(CE->getCallee()->IgnoreParens()))
       CT = CT_Cannot;
+    else if (CE->getBuiltinCallee() == Builtin::BI__builtin_malterlib_destroy)
+      // The builtin calls the virtual destructor of its first argument's
+      // class, and throws what that throws.
+      CT = canCalleeThrow(*this, /*E=*/nullptr,
+                          LookupDestructor(CE->getArg(0)
+                                               ->getType()
+                                               ->getPointeeType()
+                                               ->getAsCXXRecordDecl()),
+                          CE->getBeginLoc());
     else
       CT = canCalleeThrow(*this, CE, CE->getCalleeDecl());
     if (CT == CT_Can)

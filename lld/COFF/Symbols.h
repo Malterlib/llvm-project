@@ -350,6 +350,13 @@ public:
   // Alias pointer points to.
   Symbol *weakAlias = nullptr;
 
+  // Whether only records of -fmalterlib-sized-destructors refer to it, which
+  // name what a construction site or a proof depends on, also a definition a
+  // site imports from a DLL through `__imp_`: which loads no member of an
+  // archive that defines it but an import, and stays lazy for a reference
+  // that does.
+  bool recordOnly = false;
+
   // If this symbol is external weak, try to resolve it to a defined
   // symbol by searching the chain of fallback symbols. Returns the symbol if
   // successful, otherwise returns null.

@@ -53,6 +53,7 @@
 #include "llvm/ABI/TargetInfo.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/BinaryFormat/ELF.h"
@@ -61,6 +62,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Mangler.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ProfileSummary.h"
 #include "llvm/ProfileData/InstrProfReader.h"
@@ -1182,6 +1184,7 @@ void CodeGenModule::Release() {
   EmitCtorList(GlobalCtors, "llvm.global_ctors");
   EmitCtorList(GlobalDtors, "llvm.global_dtors");
   EmitGlobalAnnotations();
+  EmitMalterlibSizedReferences();
   EmitStaticExternCAliases();
   checkAliases();
   EmitDeferredUnusedCoverageMappings();
@@ -3038,8 +3041,35 @@ CodeGenModule::getMostBaseClasses(const CXXRecordDecl *RD) {
   return MostBases.takeVector();
 }
 
+/// Whether a declaration of \p FD says it isn't inlined,
+/// `__attribute__((noinline))` or `__attribute__((optnone))`, which every
+/// translation unit that has it agrees on, unlike `#pragma clang optimize off`
+/// around one of them, or `-O0`, which link-time optimization can replace with
+/// a definition of another one that is inlined.
+static bool declaresMalterlibSizedNoInline(const Decl *D) {
+  const auto *FD = dyn_cast_or_null<FunctionDecl>(D);
+  if (!FD)
+    return false;
+  const auto *NoInline = FD->getAttr<NoInlineAttr>();
+  const auto *OptimizeNone = FD->getAttr<OptimizeNoneAttr>();
+  return (NoInline && !NoInline->isImplicit()) ||
+         (OptimizeNone && !OptimizeNone->isImplicit());
+}
+
 void CodeGenModule::SetLLVMFunctionAttributesForDefinition(const Decl *D,
                                                            llvm::Function *F) {
+  if (LangOpts.MalterlibSizedDestructors && declaresMalterlibSizedNoInline(D))
+    MalterlibSizedDeclaredNoInline.insert(F->getName());
+  // A construction site of -fmalterlib-sized-destructors, which the backend
+  // keeps the references of wherever its code is emitted.
+  if (LangOpts.MalterlibSizedDestructors && D &&
+      D->hasAttr<MalterlibSizedConstructionAttr>())
+    F->addFnAttr(llvm::MalterlibSizedSiteAttr);
+  // And a destructor, whose installing of vtables, which the anchor of
+  // dependency records can keep, constructs nothing.
+  if (LangOpts.MalterlibSizedDestructors && isa_and_nonnull<CXXDestructorDecl>(D))
+    F->addFnAttr(llvm::MalterlibSizedDestructorAttr);
+
   llvm::AttrBuilder B(F->getContext());
 
   if ((!D || !D->hasAttr<NoUwtableAttr>()) && CodeGenOpts.UnwindTables)
@@ -3704,6 +3734,488 @@ void CodeGenModule::addUsedGlobal(llvm::GlobalValue *GV) {
   assert((isa<llvm::Function>(GV) || !GV->isDeclaration()) &&
          "Only globals with definition can force usage.");
   LLVMUsed.emplace_back(GV);
+}
+
+static void addMalterlibSizedAttr(llvm::GlobalObject *GO, llvm::StringRef Kind,
+                                  llvm::StringRef Value = llvm::StringRef()) {
+  if (auto *F = dyn_cast<llvm::Function>(GO))
+    F->addFnAttr(Kind, Value);
+  else
+    cast<llvm::GlobalVariable>(GO)->addAttribute(Kind, Value);
+}
+
+static llvm::StringRef getMalterlibSizedAttr(llvm::GlobalObject *GO,
+                                             llvm::StringRef Kind) {
+  llvm::Attribute A = isa<llvm::Function>(GO)
+                          ? cast<llvm::Function>(GO)->getFnAttribute(Kind)
+                          : cast<llvm::GlobalVariable>(GO)->getAttribute(Kind);
+  return A.isStringAttribute() ? A.getValueAsString() : llvm::StringRef();
+}
+
+/// The IR name of the marker of \p GV, which is how both its references and
+/// a local marker alias spell it.
+std::string
+CodeGenModule::getMalterlibSizedMarkerIRName(llvm::GlobalValue *GV) {
+  return llvm::getMalterlibSizedMarkerIRName(GV);
+}
+
+/// Gives a definition compiled with -fmalterlib-sized-destructors its marker,
+/// which the construction sites that depend on it reference. The marker of an
+/// external definition is a symbol the backend emits inside it, in its section
+/// or COMDAT, so that the linker keeps the marker of the copy of an inline
+/// definition it keeps, and link-time optimization drops the marker with a
+/// copy it does not keep. A local definition has no other copies, and its
+/// marker is an alias, which the IR keeps apart from other local definitions
+/// of the same name.
+void CodeGenModule::EmitMalterlibSizedMarker(llvm::GlobalValue *GV) {
+  if (!LangOpts.MalterlibSizedDestructors || GV->isDeclarationForLinker())
+    return;
+
+  if (GV->hasLocalLinkage()) {
+    llvm::Constant *Aliasee = GV;
+    if (auto *GA = dyn_cast<llvm::GlobalAlias>(GV))
+      Aliasee = GA->getAliasee();
+    auto *Marker = llvm::GlobalAlias::create(
+        GV->getValueType(), GV->getAddressSpace(),
+        llvm::GlobalValue::InternalLinkage, getMalterlibSizedMarkerIRName(GV),
+        Aliasee, &getModule());
+    Marker->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::None);
+    return;
+  }
+
+  // An alias, such as a complete constructor that is the base one, a vector
+  // deleting destructor that is the scalar one on the Microsoft ABI, or the
+  // vftable symbol inside its variable, gets its marker from the definition
+  // it names, at its offset into it.
+  if (auto *GA = dyn_cast<llvm::GlobalAlias>(GV)) {
+    auto *GO = dyn_cast_or_null<llvm::GlobalObject>(GA->getAliaseeObject());
+    if (!GO)
+      return;
+    llvm::APInt Offset(
+        getDataLayout().getIndexTypeSizeInBits(GA->getType()), 0);
+    GA->getAliasee()->stripAndAccumulateConstantOffsets(
+        getDataLayout(), Offset, /*AllowNonInbounds=*/true);
+    std::string List = getMalterlibSizedAttr(GO, llvm::MalterlibSizedAliasesAttr).str();
+    if (!List.empty())
+      List += ',';
+    List += (GA->getName() + "=" + llvm::Twine(Offset.getZExtValue())).str();
+    addMalterlibSizedAttr(GO, llvm::MalterlibSizedAliasesAttr, List);
+    return;
+  }
+
+  addMalterlibSizedAttr(cast<llvm::GlobalObject>(GV),
+                        llvm::MalterlibSizedMarkerAttr);
+}
+
+void CodeGenModule::AddMalterlibSizedReference(
+    llvm::GlobalValue *GV, llvm::GlobalValue *Owner, bool Conditional,
+    bool Slot, ArrayRef<const CXXConstructorDecl *> Unless) {
+  if (!LangOpts.MalterlibSizedDestructors)
+    return;
+  MalterlibSizedTarget Target{
+      GV->getName().str(), GV,
+      SmallVector<const CXXConstructorDecl *, 1>(Unless.begin(), Unless.end())};
+  if (Owner)
+    MalterlibSizedDependencies.emplace_back(
+        MalterlibSizedTarget{Owner->getName().str(), Owner}, Target);
+  else if (Conditional && Slot)
+    MalterlibSizedSlotReferences.push_back(Target);
+  else if (Conditional)
+    MalterlibSizedConditionalReferences.push_back(Target);
+  else
+    MalterlibSizedReferences.push_back(Target);
+}
+
+std::optional<bool> CodeGenModule::installsMalterlibSizedVTablesUninlined(
+    const CXXConstructorDecl *Ctor) {
+  // However long the chain is, `A(Tag<N>) : A(Tag<N - 1>{})`; a cycle, which
+  // Sema rejects, ends it.
+  llvm::SmallPtrSet<const CXXConstructorDecl *, 8> Followed;
+  while (Ctor && Followed.insert(Ctor->getCanonicalDecl()).second) {
+    if (declaresMalterlibSizedNoInline(Ctor) ||
+        (Ctor->hasAttr<DLLImportAttr>() && !Ctor->hasBody()))
+      return true;
+    const FunctionDecl *Definition = nullptr;
+    if (!Ctor->hasBody(Definition))
+      return Ctor->getTemplateSpecializationKind() == TSK_ImplicitInstantiation
+                 ? std::nullopt
+                 : std::optional<bool>(false);
+    const auto *Delegating = cast<CXXConstructorDecl>(Definition);
+    if (!Delegating->isDelegatingConstructor())
+      return false;
+    Ctor = Delegating->getTargetConstructor();
+  }
+  return false;
+}
+
+void CodeGenModule::EmitMalterlibSizedReferences() {
+  for (const CXXRecordDecl *RD : MalterlibSizedLocalSlotClasses)
+    getVTables().addMalterlibSizedSlotReferences(RD, /*Owner=*/nullptr,
+                                                 /*Conditional=*/true);
+  MalterlibSizedLocalSlotClasses.clear();
+  if (MalterlibSizedReferences.empty() &&
+      MalterlibSizedConditionalReferences.empty() &&
+      MalterlibSizedSlotReferences.empty() &&
+      MalterlibSizedDependencies.empty())
+    return;
+
+  // A declaration that became an alias, or a vtable a relative vtable renamed,
+  // keeps the name with another value; one code generation replaced keeps its
+  // value in the handle.
+  auto Resolve = [&](const MalterlibSizedTarget &Target) {
+    llvm::GlobalValue *GV = getModule().getNamedValue(Target.Name);
+    if (!GV && Target.Value)
+      GV = dyn_cast<llvm::GlobalValue>(Target.Value->stripPointerCasts());
+    assert(GV && "a definition a construction site depends on disappeared");
+    return GV;
+  };
+  // A demangler treats the marker's suffix as a clone suffix, so a diagnostic
+  // shows it as "D::~D() (.mib_sized)". The marker of an external definition
+  // is a symbol of the object file, which a reference names; one another
+  // image exports resolves to its import thunk.
+  auto Marker = [&](llvm::GlobalValue *GV) -> llvm::GlobalValue * {
+    std::string Name = getMalterlibSizedMarkerIRName(GV);
+    if (llvm::GlobalValue *Existing = getModule().getNamedValue(Name))
+      return Existing;
+    return new llvm::GlobalVariable(getModule(), Int8Ty, /*isConstant=*/true,
+                                    llvm::GlobalValue::ExternalLinkage,
+                                    /*Initializer=*/nullptr, Name);
+  };
+  // The references are ordinary data, in a section of their own so that the
+  // linker finds them before it drops anything. The linker reads it as nothing
+  // but references, so neither a sanitizer nor the alignment of an array that
+  // follows another in it may pad it.
+  auto Emit = [&](llvm::ArrayRef<llvm::Constant *> References,
+                  llvm::StringRef Name, llvm::StringRef MachOSection,
+                  llvm::StringRef COFFSection, llvm::StringRef ELFSection) {
+    if (References.empty())
+      return;
+    auto *ArrayTy = llvm::ArrayType::get(GlobalsInt8PtrTy, References.size());
+    auto *GV = new llvm::GlobalVariable(
+        getModule(), ArrayTy, /*isConstant=*/true,
+        llvm::GlobalValue::PrivateLinkage,
+        llvm::ConstantArray::get(ArrayTy, References), Name);
+    GV->setAlignment(getPointerAlign().getAsAlign());
+    if (getTriple().isOSBinFormatMachO())
+      GV->setSection(MachOSection);
+    else if (getTriple().isOSBinFormatCOFF())
+      GV->setSection(COFFSection);
+    else
+      GV->setSection(ELFSection);
+    getSanitizerMetadata()->disableSanitizerForGlobal(GV);
+    addCompilerUsedGlobal(GV);
+  };
+
+  // A site's references are pairs of a definition and its marker. Of a
+  // definition this module only has the body of to inline, an imported one,
+  // `__declspec(dllimport)`, or an instantiation another one has, `extern
+  // template`, which keeps no record of what it depends on, also those, which
+  // a site that inlined it binds in this image, like the local vftable an
+  // inline constructor of a dllimport class installs, `??_S`, of which
+  // another object of the image can keep a copy compiled without the flag.
+  // Such a definition itself only while the site still calls it, which the
+  // backend tells: the module lists it without keeping it, so a site that
+  // inlined it everywhere neither depends on another image's copy, which it
+  // doesn't use, nor refers to it.
+  llvm::SmallVector<llvm::Constant *, 16> References;
+  llvm::StringSet<> Seen;
+  auto Reference = [&](llvm::GlobalValue *GV) {
+    if (!GV || !Seen.insert(GV->getName()).second)
+      return;
+    References.push_back(GV);
+    References.push_back(Marker(GV));
+  };
+  // What each definition depends on, by the definition, which each site and
+  // owner looks up.
+  llvm::DenseMap<llvm::GlobalValue *, llvm::SmallVector<llvm::GlobalValue *, 2>>
+      DependenciesOf;
+  for (const auto &[OwnerTarget, Target] : MalterlibSizedDependencies)
+    if (llvm::GlobalValue *Owner = Resolve(OwnerTarget))
+      if (llvm::GlobalValue *GV = Resolve(Target))
+        DependenciesOf[Owner].push_back(GV);
+  // Also of what an alias names, like the complete object constructor that is
+  // the base one, `C1` of `C2`, whose dependencies are recorded with that.
+  auto DependenciesFor = [&](llvm::GlobalValue *GV) {
+    llvm::SmallVector<llvm::GlobalValue *, 2> Of = DependenciesOf.lookup(GV);
+    if (auto *GA = dyn_cast<llvm::GlobalAlias>(GV))
+      if (llvm::GlobalObject *Named = GA->getAliaseeObject();
+          Named && Named != GV)
+        llvm::append_range(Of, DependenciesOf.lookup(Named));
+    return Of;
+  };
+  // Also of what such a definition depends on that is one too, like the base
+  // object constructor a complete object constructor calls.
+  llvm::SmallPtrSet<llvm::GlobalValue *, 8> Inlinable;
+  llvm::SmallVector<llvm::GlobalValue *, 8> Inlined;
+  // Listed for the backend, which references it only while something emitted
+  // uses it.
+  // Also by its name, of one of a name of its own, which the backend finds
+  // where the optimizer removed a declaration nothing used yet, but code it
+  // imports with link-time optimization does.
+  // The marker alias of a local one is kept, which the optimizer would
+  // otherwise remove while the definition stays, like a constructor a site
+  // still calls in one result of a condition; the backend can't tell a
+  // definition that is the module's own from one link-time optimization
+  // brings in from a module compiled without the flag and makes local.
+  auto List = [&](llvm::GlobalValue *GV) {
+    if (!Inlinable.insert(GV).second)
+      return false;
+    if (GV->hasLocalLinkage())
+      if (auto *LocalMarker = dyn_cast_or_null<llvm::GlobalAlias>(
+              getModule().getNamedValue(getMalterlibSizedMarkerIRName(GV))))
+        addCompilerUsedGlobal(LocalMarker);
+    llvm::SmallVector<llvm::Metadata *, 2> Operands{
+        llvm::ValueAsMetadata::get(GV)};
+    if (!GV->hasLocalLinkage())
+      Operands.push_back(llvm::MDString::get(getLLVMContext(), GV->getName()));
+    getModule()
+        .getOrInsertNamedMetadata(llvm::MalterlibSizedInlinableMD)
+        ->addOperand(llvm::MDNode::get(getLLVMContext(), Operands));
+    return true;
+  };
+  // With \p OfInlined, what such a definition depends on, which a site uses
+  // only where it inlined that, like the local vftable an inline constructor
+  // of a dllimport class installs, `??_S`, which it then uses itself, and not
+  // where it still calls the imported one: listed like it.
+  // Not one the module only declares where link-time optimization can import
+  // its body, which another can then inline, whose own dependencies this
+  // module doesn't know, like a constructor it delegates to: that one is
+  // referenced as it is. Not one another image defines, `__declspec(
+  // dllimport)`, which it can't import.
+  const bool ImportsBodies =
+      getCodeGenOpts().PrepareForLTO || getCodeGenOpts().PrepareForThinLTO;
+  auto Importable = [&](const llvm::GlobalValue *GV) {
+    return ImportsBodies && isa<llvm::Function>(GV) && GV->isDeclaration() &&
+           !GV->hasDLLImportStorageClass();
+  };
+  // A site depends on a function that isn't inlined, `noinline` or
+  // `optnone`, also with link-time optimization, only by calling it, not on
+  // what its body depends on, like the local vftable of an imported
+  // `__attribute__((optnone)) A() {}`, which the one it calls installs itself.
+  // Only one its declaration says isn't inlined, whose definitions in every
+  // module agree on it.
+  auto NeverInlined = [&](const llvm::GlobalValue *GV) {
+    const auto *F = dyn_cast<llvm::Function>(GV);
+    return F && F->hasFnAttribute(llvm::Attribute::NoInline) &&
+           MalterlibSizedDeclaredNoInline.contains(F->getName());
+  };
+  std::function<void(llvm::GlobalValue *, bool)> Depend =
+      [&](llvm::GlobalValue *GV, bool OfInlined) {
+        if (!GV)
+          return;
+        if (!GV->hasAvailableExternallyLinkage()) {
+          // Also what that depends on in turn, which a site that inlined it
+          // too uses itself, like the constructor an inline one delegates
+          // to, `A(int) : A(0L) {}`, that it then calls.
+          if (OfInlined && !Importable(GV)) {
+            if (List(GV))
+              Inlined.push_back(GV);
+            return;
+          }
+          if (OfInlined) {
+            Reference(GV);
+            return;
+          }
+          Reference(GV);
+          // Also what an inline definition depends on that it imports, like
+          // the vtable an inline constructor of a dllimport class installs on
+          // MinGW, which the site that inlined it binds in this image,
+          // whichever copy of the constructor the link keeps: one that sees
+          // the class as its own installs its own vtable.
+          // A function any definition depends on that the module only has the
+          // body of to inline is one too, like the constructor a delegating
+          // constructor calls, `A() : A(0) {}`, that is dllimport or of an
+          // extern template, `extern template A<int>::A(int);`: the site
+          // depends on it only where it still calls it, and on what it
+          // installs where it inlined it.
+          // Also through a function it depends on that this module defines,
+          // which the site can inline too, like the constructor a delegating
+          // one calls, `A() : A(0)` of `A(int) : A(0L)`, which delegates to a
+          // dllimport `A(long)` in turn.
+          llvm::SmallPtrSet<llvm::GlobalValue *, 4> Through{GV};
+          llvm::SmallVector<llvm::GlobalValue *, 4> Pending{GV};
+          while (!Pending.empty()) {
+            llvm::GlobalValue *Of = Pending.pop_back_val();
+            for (llvm::GlobalValue *Imported : DependenciesFor(Of)) {
+              if (isa<llvm::Function>(Imported) &&
+                  Imported->hasAvailableExternallyLinkage())
+                Depend(Imported, /*OfInlined=*/false);
+              else if (Of->isDiscardableIfUnused() &&
+                       Imported->hasDLLImportStorageClass())
+                Reference(Imported);
+              else if (isa<llvm::Function>(Imported) &&
+                       !Imported->isDeclaration() && !NeverInlined(Imported) &&
+                       Through.insert(Imported).second)
+                Pending.push_back(Imported);
+            }
+          }
+          return;
+        }
+        if (List(GV))
+          Inlined.push_back(GV);
+      };
+  for (const MalterlibSizedTarget &Target : MalterlibSizedReferences)
+    Depend(Resolve(Target), /*OfInlined=*/false);
+  // One that a site reaches only in a result of a condition that isn't
+  // constant, `fg_Policy() ? T(1) : T(2L)`, which the optimizer can leave out,
+  // is listed like one the module only has the body of to inline, also what
+  // it depends on, which a site that inlined it uses itself: the backend
+  // references each only while what it emits uses it.
+  // One of a site whose delegation reached an instantiation that didn't have
+  // its body yet, which it now has, only when one of them can still install
+  // it here.
+  for (const MalterlibSizedTarget &Target :
+       MalterlibSizedConditionalReferences)
+    if (llvm::GlobalValue *GV = Resolve(Target);
+        GV && !Seen.contains(GV->getName()) &&
+        (Target.Unless.empty() ||
+         !llvm::all_of(Target.Unless, [&](const CXXConstructorDecl *Ctor) {
+           return installsMalterlibSizedVTablesUninlined(Ctor).value_or(false);
+         }))) {
+      if (Importable(GV))
+        Reference(GV);
+      else if (List(GV))
+        Inlined.push_back(GV);
+    }
+  // A deleting destructor in a slot of a vtable another module defines only
+  // while what is emitted calls it, also where link-time optimization can
+  // import its body: what installs the vtable is checked for it, and one
+  // another image defines, also hidden there, can't be imported nor checked.
+  for (const MalterlibSizedTarget &Target : MalterlibSizedSlotReferences)
+    if (llvm::GlobalValue *GV = Resolve(Target);
+        GV && !Seen.contains(GV->getName()) && List(GV))
+      Inlined.push_back(GV);
+  while (!Inlined.empty())
+    if (llvm::GlobalValue *Of = Inlined.pop_back_val(); !NeverInlined(Of))
+      for (llvm::GlobalValue *Dependency : DependenciesFor(Of))
+        Depend(Dependency, /*OfInlined=*/true);
+  Emit(References, "__mib_sized_ref", "__DATA_CONST,__mib_sized_ref",
+       ".rdata$mibszf", ".data.rel.ro.__mib_sized_ref");
+
+  // An owner's dependencies are metadata of the definition that holds it, at
+  // the owner's offset into it: the backend records them with the definition
+  // it emits, so that the linker checks them against the copy it keeps and an
+  // owner the optimizer removed has none. Each is a definition and its
+  // marker: the marker alias of a local definition, which the optimizer and
+  // the linking of modules may rename apart from it and which stays only
+  // while in use, or null for the symbol the backend derives from the
+  // definition's.
+  llvm::MapVector<std::pair<llvm::GlobalObject *, uint64_t>,
+                  llvm::SetVector<llvm::GlobalValue *>>
+      Dependencies;
+  // Those an owner depends on itself, not only through such a function.
+  llvm::DenseMap<std::pair<llvm::GlobalObject *, uint64_t>,
+                 llvm::SmallPtrSet<llvm::GlobalValue *, 4>>
+      OwnDependencies;
+  // A function the module only has the body of to inline, which another image
+  // defines, `extern template A<int>::A(int);` or a dllimport one: an owner
+  // that inlines it uses what it depends on itself, like the vtable it
+  // installs, which its own records then give, also where a pass removes it.
+  auto OnlyInlined = [](llvm::GlobalValue *GV) {
+    return isa<llvm::Function>(GV) && GV->hasAvailableExternallyLinkage();
+  };
+  for (const auto &[OwnerTarget, Target] : MalterlibSizedDependencies) {
+    llvm::GlobalValue *Owner = Resolve(OwnerTarget);
+    llvm::GlobalValue *GV = Resolve(Target);
+    auto *GO = Owner ? Owner->getAliaseeObject() : nullptr;
+    if (!GO || !GV || GO->isDeclaration())
+      continue;
+    llvm::APInt Offset(
+        getDataLayout().getIndexTypeSizeInBits(Owner->getType()), 0);
+    if (auto *GA = dyn_cast<llvm::GlobalAlias>(Owner))
+      GA->getAliasee()->stripAndAccumulateConstantOffsets(
+          getDataLayout(), Offset, /*AllowNonInbounds=*/true);
+    llvm::SetVector<llvm::GlobalValue *> &Set =
+        Dependencies[{GO, Offset.getZExtValue()}];
+    Set.insert(GV);
+    OwnDependencies[{GO, Offset.getZExtValue()}].insert(GV);
+    // Also what a function the owner can inline depends on, in turn, which
+    // it uses itself where it inlined that: one the module only has the body
+    // of to inline, and of a function owner also one the module defines, like
+    // the constructors a delegating one calls in turn, `A() : A(0)` of
+    // `A(int) : A(0L)`, of a dllimport `A(long)` or of what `A(long)` calls.
+    auto Inlinable = [&](llvm::GlobalValue *Of) {
+      return !NeverInlined(Of) &&
+             (OnlyInlined(Of) ||
+              (isa<llvm::Function>(GO) && isa<llvm::Function>(Of) &&
+               !Of->isDeclaration()));
+    };
+    llvm::SmallPtrSet<llvm::GlobalValue *, 4> Seen{GV};
+    llvm::SmallPtrSet<llvm::GlobalValue *, 4> Followed;
+    llvm::SmallVector<llvm::GlobalValue *, 4> Pending;
+    if (Inlinable(GV) && Followed.insert(GV).second)
+      Pending.push_back(GV);
+    while (!Pending.empty())
+      for (llvm::GlobalValue *Inner :
+           DependenciesFor(Pending.pop_back_val())) {
+        if (Seen.insert(Inner).second)
+          Set.insert(Inner);
+        if (Inlinable(Inner) && Followed.insert(Inner).second)
+          Pending.push_back(Inner);
+      }
+  }
+  llvm::SmallPtrSet<llvm::GlobalValue *, 16> KeptDependencies;
+  llvm::SmallVector<llvm::Constant *, 16> Kept;
+  for (auto &[Owner, GVs] : Dependencies) {
+    llvm::SmallVector<llvm::Metadata *, 4> Operands;
+    Operands.push_back(llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(Int64Ty, Owner.second)));
+    const llvm::SmallPtrSet<llvm::GlobalValue *, 4> &Own =
+        OwnDependencies[Owner];
+    for (llvm::GlobalValue *GV : GVs) {
+      // Not a function the module only has the body of to inline: the owner
+      // depends on it only while it calls it, and nothing calls it where a
+      // pass removes it, which keeps what it depends on as the owner's own.
+      // Keeping it would also keep its symbol undefined in the object
+      // link-time optimization makes, also where nothing calls it.
+      // Nor what only such a function depends on, like the vtable an imported
+      // constructor installs, which the owner uses only where it inlined it,
+      // and not where it still calls the one of the other image: one of a
+      // name of its own, which nothing local can be.
+      // But not a function the module only declares where link-time
+      // optimization can import its body, which another can inline into the
+      // owner, whose own dependencies this module doesn't know, like the
+      // vtable it installs: that one stays required, like for a site.
+      if (OnlyInlined(GV) ||
+          (!Own.contains(GV) && !GV->hasLocalLinkage() && !Importable(GV))) {
+        Operands.push_back(llvm::ConstantAsMetadata::get(GV));
+        Operands.push_back(
+            llvm::MDString::get(getLLVMContext(), llvm::MalterlibSizedMayGoMD));
+        continue;
+      }
+      // A definition stays, as it is, for the backend to name, whether this
+      // module has it or link-time optimization links it in from another: a
+      // pass that removes one would otherwise leave nothing, such as for the
+      // constructor another one forwards to. It is kept by a reference from
+      // a global that is never emitted, not by being in llvm.compiler.used,
+      // which would keep link-time optimization from hiding or internalizing
+      // it, like an inline vtable an image would then export.
+      if (KeptDependencies.insert(GV).second)
+        Kept.push_back(llvm::ConstantExpr::getPointerBitCastOrAddrSpaceCast(
+            GV, Int8PtrTy));
+      Operands.push_back(llvm::ConstantAsMetadata::get(GV));
+      auto *LocalMarker =
+          GV->hasLocalLinkage()
+              ? dyn_cast_or_null<llvm::GlobalAlias>(getModule().getNamedValue(
+                    getMalterlibSizedMarkerIRName(GV)))
+              : nullptr;
+      if (LocalMarker)
+        addCompilerUsedGlobal(LocalMarker);
+      Operands.push_back(LocalMarker ? llvm::ConstantAsMetadata::get(LocalMarker)
+                                     : nullptr);
+    }
+    Owner.first->addMetadata(llvm::MalterlibSizedDependenciesMD,
+                             *llvm::MDNode::get(getLLVMContext(), Operands));
+  }
+  if (!Kept.empty()) {
+    auto *Type = llvm::ArrayType::get(Int8PtrTy, Kept.size());
+    auto *Keep = new llvm::GlobalVariable(
+        getModule(), Type, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(Type, Kept), "__mib_sized_kept");
+    Keep->setSection("llvm.metadata");
+    addCompilerUsedGlobal(Keep);
+  }
 }
 
 void CodeGenModule::addCompilerUsedGlobal(llvm::GlobalValue *GV) {

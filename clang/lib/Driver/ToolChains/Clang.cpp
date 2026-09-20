@@ -7914,6 +7914,23 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
   Args.addLastArg(CmdArgs, options::OPT_fsized_deallocation,
                   options::OPT_fno_sized_deallocation);
 
+  // A sized deleting destructor returns a pointer and a size in the two
+  // registers every C ABI of these targets uses for a two-word return, which
+  // keeps it callable from code without the flag. A target that returns such a
+  // struct through a hidden pointer, or as multiple values, would change the
+  // destructor's signature, as would the ARM64EC thunks that carry a call
+  // between its two conventions.
+  if (Arg *A = Args.getLastArg(options::OPT_fmalterlib_sized_destructors,
+                               options::OPT_fno_malterlib_sized_destructors)) {
+    if (A->getOption().matches(options::OPT_fmalterlib_sized_destructors) &&
+        (!(Triple.isX86() || Triple.isAArch64() || Triple.isARM() ||
+           Triple.isThumb()) ||
+         Triple.isWindowsArm64EC()))
+      D.Diag(diag::err_drv_unsupported_opt_for_target)
+          << A->getSpelling() << Triple.getTriple();
+    A->render(Args, CmdArgs);
+  }
+
   // -faligned-allocation is on by default in C++17 onwards and otherwise off
   // by default.
   if (Arg *A = Args.getLastArg(options::OPT_faligned_allocation,

@@ -1041,6 +1041,15 @@ bool FunctionSpecializer::isCandidateFunction(Function *F) {
   if (F->hasFnAttribute(Attribute::NoDuplicate))
     return false;
 
+  // Nor a definition the construction sites of -fmalterlib-sized-destructors
+  // depend on: one with its marker, which their references name, or one they
+  // list, which they reference only while it is used. Copies in its place
+  // would leave the sites without a requirement of what the copies install.
+  if (F->hasFnAttribute(MalterlibSizedMarkerAttr) ||
+      (F->isUsedByMetadata() &&
+       F->getParent()->getNamedMetadata(MalterlibSizedInlinableMD)))
+    return false;
+
   if (F->hasOptSize())
     return false;
 

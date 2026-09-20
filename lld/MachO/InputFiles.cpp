@@ -61,7 +61,9 @@
 #include "lld/Common/Reproduce.h"
 #include "llvm/ADT/iterator.h"
 #include "llvm/BinaryFormat/MachO.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/Object/MachO.h"
 #include "llvm/Support/BinaryStreamReader.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -734,6 +736,18 @@ static macho::Symbol *createDefined(const NList &sym, StringRef name,
       isWeakDefCanBeHidden = false;
     else if (isWeakDefCanBeHidden)
       isPrivateExtern = true;
+    // A marker of -fmalterlib-sized-destructors belongs to the copy of its
+    // definition the link keeps. Bitcode has no markers, so the weak marker of
+    // a definition bitcode defined first is that of a copy the link does not
+    // keep, and link-time optimization defines the marker of the copy it keeps
+    // if that copy was compiled with the flag.
+    auto *objFile = dyn_cast<ObjFile>(isec->getFile());
+    if ((sym.n_desc & N_WEAK_DEF) && objFile && !objFile->builtFromBitcode &&
+        name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+      if (auto *def = dyn_cast_or_null<Defined>(symtab->find(
+              name.drop_back(llvm::MalterlibSizedMarkerSuffix.size())));
+          def && isa_and_nonnull<BitcodeFile>(def->getFile()))
+        return symtab->addUndefined(name, objFile, /*isWeakRef=*/false);
     return symtab->addDefined(
         name, isec->getFile(), isec, value, size, sym.n_desc & N_WEAK_DEF,
         isPrivateExtern, sym.n_desc & REFERENCED_DYNAMICALLY,
@@ -1756,7 +1770,10 @@ void DylibFile::loadReexport(StringRef path, DylibFile *umbrella,
       error(toString(this) + ": unable to locate re-export with install name " +
             path);
     }
+    reexport = reexport2;
   }
+  if (reexport && reexport != this && !llvm::is_contained(reexports, reexport))
+    reexports.push_back(reexport);
 }
 
 DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella,
@@ -1805,6 +1822,8 @@ DylibFile::DylibFile(MemoryBufferRef mb, DylibFile *umbrella,
   exportingFile = (canBeImplicitlyLinked && isImplicitlyLinked(installName))
                       ? this
                       : this->umbrella;
+  weakDefines = hdr->flags & MH_WEAK_DEFINES;
+  flatNamespace = !(hdr->flags & MH_TWOLEVEL);
 
   if (!canBeImplicitlyLinked) {
     for (auto *cmd : findCommands<sub_client_command>(hdr, LC_SUB_CLIENT)) {
@@ -1843,14 +1862,35 @@ void DylibFile::parseExportedSymbols(uint32_t offset, uint32_t size) {
 
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
   std::vector<TrieEntry> entries;
+  // The addresses of the markers of -fmalterlib-sized-destructors and of the
+  // definitions, to tell which markers are at their definition's.
+  DenseMap<CachedHashStringRef, uint64_t> addresses;
   // Find all the $ld$* symbols to process first.
-  parseTrie(toString(this), buf + offset, size,
-            [&](const Twine &name, uint64_t flags) {
-              StringRef savedName = saver().save(name);
-              if (handleLDSymbol(savedName))
-                return;
-              entries.push_back({savedName, flags});
-            });
+  parseTrie(
+      toString(this), buf + offset, size,
+      [&](const Twine &name, uint64_t flags) {
+        StringRef savedName = saver().save(name);
+        if (handleLDSymbol(savedName))
+          return;
+        entries.push_back({savedName, flags});
+      },
+      [&](const Twine &name, uint64_t ordinal, StringRef importName) {
+        reexportTargets[CachedHashStringRef(saver().save(name))] = {
+            ordinal, saver().save(importName)};
+      },
+      [&](const Twine &name, uint64_t address) {
+        addresses[CachedHashStringRef(saver().save(name))] = address;
+      });
+  // A marker is at its definition's address, which proves the copy the
+  // dylib exports, but a dylib linked by a linker that doesn't check them can
+  // export one of a copy it didn't keep, at another address, which proves
+  // nothing.
+  for (auto &[name, address] : addresses)
+    if (StringRef marker = name.val();
+        marker.consume_back(llvm::MalterlibSizedMarkerSuffix))
+      if (auto It = addresses.find(CachedHashStringRef(marker));
+          It != addresses.end() && It->second != address)
+        misplacedMarkers.insert(name);
 
   // Process the "normal" symbols.
   for (TrieEntry &entry : entries) {
@@ -1859,10 +1899,117 @@ void DylibFile::parseExportedSymbols(uint32_t offset, uint32_t size) {
 
     bool isWeakDef = entry.flags & EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION;
     bool isTlv = entry.flags & EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL;
+    if (entry.flags & EXPORT_SYMBOL_FLAGS_REEXPORT)
+      reexportedExports.insert(CachedHashStringRef(entry.name));
+    else if (isWeakDef)
+      weakDefExports.insert(CachedHashStringRef(entry.name));
 
     symbols.push_back(
         symtab->addDylib(entry.name, exportingFile, isWeakDef, isTlv));
   }
+}
+
+const DylibFile::Imports &DylibFile::getImports() const {
+  if (!parsedImports) {
+    parsedImports.emplace();
+    const auto *hdr =
+        reinterpret_cast<const mach_header *>(mb.getBufferStart());
+    if (mb.getBufferSize() >= sizeof(mach_header_64) &&
+        read32le(&hdr->magic) == MH_MAGIC_64) {
+      parseImports<LP64>();
+      parseBoundImports(/*is64=*/true);
+    } else if (mb.getBufferSize() >= sizeof(mach_header) &&
+               read32le(&hdr->magic) == MH_MAGIC) {
+      parseImports<ILP32>();
+      parseBoundImports(/*is64=*/false);
+    }
+  }
+  return *parsedImports;
+}
+
+uint32_t DylibFile::importOrdinal(StringRef name) const {
+  return getImports().ordinals.lookup(CachedHashStringRef(name));
+}
+
+bool DylibFile::importsByWeakLookup(StringRef name) const {
+  return getImports().weakLookups.contains(CachedHashStringRef(name));
+}
+
+template <class LP> void DylibFile::parseImports() const {
+  using NList = typename LP::nlist;
+  const auto *hdr =
+      reinterpret_cast<const typename LP::mach_header *>(mb.getBufferStart());
+  const bool twoLevel = hdr->flags & MH_TWOLEVEL;
+  const load_command *cmd = findCommand(hdr, LC_SYMTAB);
+  if (!cmd)
+    return;
+  const auto *c = reinterpret_cast<const symtab_command *>(cmd);
+  const uint64_t size = mb.getBufferSize();
+  if (c->symoff > size || c->nsyms > (size - c->symoff) / sizeof(NList) ||
+      c->stroff > size || c->strsize > size - c->stroff)
+    return;
+  const char *buf = mb.getBufferStart();
+  ArrayRef<NList> nList(reinterpret_cast<const NList *>(buf + c->symoff),
+                        c->nsyms);
+  const StringRef strtab(buf + c->stroff, c->strsize);
+  for (const NList &sym : nList) {
+    // An undefined external one, not a common one, whose value is its size.
+    if ((sym.n_type & N_TYPE) != N_UNDF || !(sym.n_type & N_EXT) ||
+        sym.n_value != 0 || sym.n_strx >= strtab.size())
+      continue;
+    const StringRef name = strtab.drop_front(sym.n_strx).split('\0').first;
+    if (sym.n_desc & N_WEAK_DEF)
+      parsedImports->weakLookups.insert(CachedHashStringRef(name));
+    const uint32_t ordinal = GET_LIBRARY_ORDINAL(sym.n_desc);
+    // Not this image itself, the executable, or a lookup by name.
+    if (!twoLevel || ordinal == SELF_LIBRARY_ORDINAL ||
+        ordinal >= EXECUTABLE_ORDINAL)
+      continue;
+    parsedImports->ordinals.try_emplace(CachedHashStringRef(name), ordinal);
+  }
+}
+
+void DylibFile::parseBoundImports(bool is64) const {
+  // Also those that its binds name, which strip keeps when it removes its
+  // symbol table: the imports of its chained fixups, or the binds of its dyld
+  // info, each with the ordinal it binds by, or the weak lookup it does.
+  Expected<std::unique_ptr<object::MachOObjectFile>> obj =
+      object::MachOObjectFile::create(mb, /*IsLittleEndian=*/true, is64);
+  if (!obj) {
+    consumeError(obj.takeError());
+    return;
+  }
+  const auto *hdr = reinterpret_cast<const mach_header *>(mb.getBufferStart());
+  const bool twoLevel = hdr->flags & MH_TWOLEVEL;
+  auto add = [&](StringRef name, int ordinal) {
+    if (ordinal == BIND_SPECIAL_DYLIB_WEAK_LOOKUP)
+      parsedImports->weakLookups.insert(CachedHashStringRef(name));
+    // Not this image itself, the executable, or a lookup by name.
+    else if (twoLevel && ordinal > 0)
+      parsedImports->ordinals.try_emplace(CachedHashStringRef(name), ordinal);
+  };
+  if (Expected<std::vector<object::ChainedFixupTarget>> targets =
+          (*obj)->getDyldChainedFixupTargets()) {
+    for (object::ChainedFixupTarget &t : *targets)
+      add(t.symbolName(), t.libOrdinal());
+  } else {
+    consumeError(targets.takeError());
+  }
+  auto addBinds = [&](auto table, bool weak) {
+    Error err = Error::success();
+    for (const object::MachOBindEntry &e : table(err)) {
+      // A weak bind coalesces a weak definition by name, and a strong one
+      // that overrides them.
+      if (!weak)
+        add(e.symbolName(), e.ordinal());
+      else if (!(e.flags() & BIND_SYMBOL_FLAGS_NON_WEAK_DEFINITION))
+        add(e.symbolName(), BIND_SPECIAL_DYLIB_WEAK_LOOKUP);
+    }
+    consumeError(std::move(err));
+  };
+  addBinds([&](Error &err) { return (*obj)->bindTable(err); }, false);
+  addBinds([&](Error &err) { return (*obj)->lazyBindTable(err); }, false);
+  addBinds([&](Error &err) { return (*obj)->weakBindTable(err); }, true);
 }
 
 void DylibFile::parseLoadCommands(MemoryBufferRef mb) {
@@ -1872,6 +2019,16 @@ void DylibFile::parseLoadCommands(MemoryBufferRef mb) {
   for (uint32_t i = 0, n = hdr->ncmds; i < n; ++i) {
     auto *cmd = reinterpret_cast<const load_command *>(p);
     p += cmd->cmdsize;
+
+    // Each dylib it loads, in order, which the ordinals of its export trie
+    // name, for the check of -fmalterlib-sized-destructors.
+    if (cmd->cmd == LC_LOAD_DYLIB || cmd->cmd == LC_LOAD_WEAK_DYLIB ||
+        cmd->cmd == LC_REEXPORT_DYLIB || cmd->cmd == LC_LOAD_UPWARD_DYLIB ||
+        cmd->cmd == LC_LAZY_LOAD_DYLIB) {
+      const auto *c = reinterpret_cast<const dylib_command *>(cmd);
+      loadedInstallNames.push_back(reinterpret_cast<const char *>(c) +
+                                   read32le(&c->dylib.name));
+    }
 
     if (!(hdr->flags & MH_NO_REEXPORTED_DYLIBS) &&
         cmd->cmd == LC_REEXPORT_DYLIB) {
@@ -1957,6 +2114,14 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
   this->umbrella = umbrella;
 
   installName = saver().save(interface.getInstallName());
+  flatNamespace = !interface.isTwoLevelNamespace();
+  // A stub has no header, so whether dyld looks in its dylib to coalesce weak
+  // definitions can't be told: also one that exports only strong ones is
+  // flagged with MH_WEAK_DEFINES when they take the place of weak ones of a
+  // dylib it links. It is taken as flagged, so that what it may bind to is
+  // checked.
+  weakDefines = true;
+  fromStub = true;
   compatibilityVersion = interface.getCompatibilityVersion().rawValue();
   currentVersion = interface.getCurrentVersion().rawValue();
   for (const auto &rpath : interface.rpaths())
@@ -1994,6 +2159,8 @@ DylibFile::DylibFile(const InterfaceFile &interface, DylibFile *umbrella,
     if (exportingFile->hiddenSymbols.contains(CachedHashStringRef(savedName)))
       return;
 
+    if (symbol.isWeakDefined())
+      weakDefExports.insert(CachedHashStringRef(savedName));
     symbols.push_back(symtab->addDylib(savedName, exportingFile,
                                        symbol.isWeakDefined(),
                                        symbol.isThreadLocalValue()));
