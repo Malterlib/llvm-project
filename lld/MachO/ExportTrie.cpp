@@ -298,8 +298,11 @@ namespace {
 class TrieParser {
 public:
   TrieParser(const std::string &fileName, const uint8_t *buf, size_t size,
-             const TrieEntryCallback &callback)
-      : fileName(fileName), start(buf), end(start + size), callback(callback) {}
+             const TrieEntryCallback &callback,
+             const TrieReexportCallback *reexportCallback = nullptr,
+             const TrieAddressCallback *addressCallback = nullptr)
+      : fileName(fileName), start(buf), end(start + size), callback(callback),
+        reexportCallback(reexportCallback), addressCallback(addressCallback) {}
 
   void parse(const uint8_t *buf, const Twine &cumulativeString,
              DenseSet<size_t> &visited);
@@ -313,6 +316,8 @@ public:
   const uint8_t *start;
   const uint8_t *end;
   const TrieEntryCallback &callback;
+  const TrieReexportCallback *reexportCallback;
+  const TrieAddressCallback *addressCallback;
 };
 
 } // namespace
@@ -333,6 +338,29 @@ void TrieParser::parse(const uint8_t *buf, const Twine &cumulativeString,
   if (terminalSize != 0) {
     flags = decodeULEB128(buf, &ulebSize);
     callback(cumulativeString, flags);
+    if (addressCallback &&
+        !(flags & (MachO::EXPORT_SYMBOL_FLAGS_REEXPORT |
+                   MachO::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER))) {
+      const uint8_t *info = buf + ulebSize;
+      const uint8_t *infoEnd = buf + terminalSize;
+      if (info < infoEnd && infoEnd <= end)
+        (*addressCallback)(cumulativeString,
+                           decodeULEB128(info, nullptr, infoEnd));
+    }
+    if (reexportCallback && (flags & MachO::EXPORT_SYMBOL_FLAGS_REEXPORT)) {
+      const uint8_t *info = buf + ulebSize;
+      const uint8_t *infoEnd = buf + terminalSize;
+      if (info < infoEnd && infoEnd <= end) {
+        unsigned ordinalSize;
+        uint64_t ordinal = decodeULEB128(info, &ordinalSize, infoEnd);
+        info += ordinalSize;
+        const char *name = reinterpret_cast<const char *>(info);
+        StringRef importName =
+            info < infoEnd ? StringRef(name, strnlen(name, infoEnd - info))
+                           : StringRef();
+        (*reexportCallback)(cumulativeString, ordinal, importName);
+      }
+    }
   }
   buf += terminalSize;
   uint8_t numEdges = *buf++;
@@ -356,4 +384,15 @@ void macho::parseTrie(const std::string &fileName, const uint8_t *buf,
     return;
 
   TrieParser(fileName, buf, size, callback).parse();
+}
+
+void macho::parseTrie(const std::string &fileName, const uint8_t *buf,
+                      size_t size, const TrieEntryCallback &callback,
+                      const TrieReexportCallback &reexportCallback,
+                      const TrieAddressCallback &addressCallback) {
+  if (size == 0)
+    return;
+
+  TrieParser(fileName, buf, size, callback, &reexportCallback, &addressCallback)
+      .parse();
 }

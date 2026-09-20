@@ -1374,7 +1374,9 @@ bool DevirtModule::trySingleImplDevirt(
 
     TheFn->setLinkage(GlobalValue::ExternalLinkage);
     TheFn->setVisibility(GlobalValue::HiddenVisibility);
+    std::string OldName = TheFn->getName().str();
     TheFn->setName(NewName);
+    renameMalterlibSizedMarker(*TheFn, OldName);
   }
   if (ValueInfo TheFnVI = ExportSummary->getValueInfo(TheFn->getGUID()))
     // Any needed promotion of 'TheFn' has already been done during
@@ -2066,6 +2068,8 @@ void DevirtModule::rebuildGlobal(VTableBits &B) {
                                ConstantInt::get(Int32Ty, 1)}),
       &M);
   Alias->setVisibility(B.GV->getVisibility());
+  transferMalterlibSizedMarkers(*B.GV, *NewGV, B.Before.Bytes.size(),
+                                B.GV->getName());
   Alias->takeName(B.GV);
 
   B.GV->replaceAllUsesWith(Alias);

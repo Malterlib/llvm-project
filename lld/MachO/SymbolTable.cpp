@@ -16,6 +16,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/Demangle/Demangle.h"
+#include "llvm/IR/GlobalValue.h"
 
 using namespace llvm;
 using namespace lld;
@@ -228,6 +229,13 @@ Defined *SymbolTable::aliasDefined(Defined *src, StringRef target,
                     src->weakDefCanBeHidden, src->cold);
 }
 
+// A marker of -fmalterlib-sized-destructors belongs to the copy of a
+// definition the link chose for the definition's own sake, so a reference to
+// it does not load an archive member.
+static bool isMalterlibSizedMarker(StringRef name) {
+  return name.ends_with(llvm::MalterlibSizedMarkerSuffix);
+}
+
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
                                   bool isWeakRef) {
   auto [s, wasInserted] = insert(name, file);
@@ -237,6 +245,8 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *file,
   if (wasInserted)
     replaceSymbol<Undefined>(s, name, file, refState,
                              /*wasBitcodeSymbol=*/false);
+  else if (isa<LazyArchive, LazyObject>(s) && isMalterlibSizedMarker(name))
+    return s;
   else if (auto *lazy = dyn_cast<LazyArchive>(s))
     lazy->fetchArchiveMember();
   else if (isa<LazyObject>(s))
@@ -306,6 +316,8 @@ Symbol *SymbolTable::addLazyArchive(StringRef name, ArchiveFile *file,
 
   if (wasInserted) {
     replaceSymbol<LazyArchive>(s, file, sym);
+  } else if (isMalterlibSizedMarker(name)) {
+    return s;
   } else if (isa<Undefined>(s)) {
     file->fetch(sym);
   } else if (auto *dysym = dyn_cast<DylibSymbol>(s)) {
@@ -324,6 +336,8 @@ Symbol *SymbolTable::addLazyObject(StringRef name, InputFile &file) {
 
   if (wasInserted) {
     replaceSymbol<LazyObject>(s, file, name);
+  } else if (isMalterlibSizedMarker(name)) {
+    return s;
   } else if (isa<Undefined>(s)) {
     extract(file, name);
   } else if (auto *dysym = dyn_cast<DylibSymbol>(s)) {

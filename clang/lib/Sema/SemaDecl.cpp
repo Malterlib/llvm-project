@@ -16727,6 +16727,17 @@ Decl *Sema::ActOnFinishFunctionBody(Decl *dcl, Stmt *Body, bool IsInstantiation,
       AnalysisWarnings.getPolicyInEffectAt(AnalysisLoc);
   sema::AnalysisBasedWarnings::Policy *ActivePolicy = nullptr;
 
+  // A construction site of -fmalterlib-sized-destructors, as complete, also
+  // the initializers of a constructor; not before a template is instantiated,
+  // whose arguments can choose a construction.
+  if (getLangOpts().MalterlibSizedDestructors && FD && Body &&
+      !FD->isDependentContext() &&
+      FD->hasAttr<MalterlibSizedConstructionAttr>()) {
+    if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(FD))
+      CheckMalterlibSizedConstructorInitializers(Constructor);
+    CheckMalterlibSizedConstructionsIn(FD, Body);
+  }
+
   // If we skip function body, we can't tell if a function is a coroutine.
   if (getLangOpts().Coroutines && FD && !FD->hasSkippedBody()) {
     if (FSI->isCoroutine())

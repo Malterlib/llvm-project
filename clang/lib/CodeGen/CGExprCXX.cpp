@@ -18,6 +18,7 @@
 #include "ConstantEmitter.h"
 #include "TargetInfo.h"
 #include "clang/Basic/CodeGenOptions.h"
+#include "clang/Basic/DiagnosticSema.h"
 #include "clang/CodeGen/CGFunctionInfo.h"
 #include "llvm/IR/Intrinsics.h"
 
@@ -1343,6 +1344,111 @@ static void EmitNewInitializer(CodeGenFunction &CGF, const CXXNewExpr *E,
                             AggValueSlot::DoesNotOverlap);
 }
 
+/// Records what a construction site of -fmalterlib-sized-destructors depends
+/// on having been compiled with the flag: the constructor the site calls,
+/// which depends on the vtables it installs, which depend on the deleting
+/// destructors and thunks in them. Each is checked in the image that defines
+/// it, so a library may hide what its exported constructor installs. Sema has
+/// rejected any other initializer.
+static void EmitMalterlibSizedConstructionReferences(CodeGenFunction &CGF,
+                                                     const CXXNewExpr *E) {
+  CodeGenModule &CGM = CGF.CGM;
+  // Also the elements of an array, `new T[N]`.
+  const QualType Allocated =
+      CGM.getContext().getBaseElementType(E->getAllocatedType());
+  const CXXRecordDecl *RD = Allocated->getAsCXXRecordDecl();
+  if (!RD)
+    return;
+
+  const CXXDestructorDecl *Dtor = RD->getDestructor();
+  if (!Dtor || !Dtor->isVirtual())
+    return;
+  // Not of an array that has no elements, `new T[0]` or `new T[N][0]`, which
+  // constructs nothing.
+  if (E->constructsNoElements(CGM.getContext()))
+    return;
+
+  // Sema checks a new-expression where it appears, which for a default
+  // argument or a default member initializer is not the site that evaluates
+  // it.
+  SmallVector<const CXXConstructExpr *, 2> Constructions;
+  SmallVector<bool, 2> Unproven;
+  if (!CXXNewExpr::getDirectConstructions(E->getInitializer(),
+                                          CGM.getLangOpts().ElideConstructors,
+                                          Constructions, &CGM.getContext(),
+                                          &Unproven)) {
+    CGM.getDiags().Report(E->getInitializer()->getExprLoc(),
+                          diag::err_malterlib_sized_construction_prvalue)
+        << Allocated;
+    return;
+  }
+  // An inheriting constructor emitted inline installs the vtables here.
+  // Of a result of a condition that isn't constant, which the optimizer can
+  // leave out, only while what is emitted uses it, and also the vtables of
+  // the class, which code it inlined it in, also from another module with
+  // link-time optimization, installs, whose dependencies this module doesn't
+  // know.
+  // One that installs them in a result of such a condition, `policy() ?
+  // D(Token{}) : D(1L)` with an inherited `D(Token)`, does so only while what
+  // is emitted uses it.
+  // Not those of a constructor that nothing here can inline, one of another
+  // image the module has no body of, `__declspec(dllimport) A();`, or one
+  // that isn't inlined, `__attribute__((noinline)) A();`, also with link-time
+  // optimization, which installs them itself, which its own proof covers, also
+  // anywhere in a chain of delegating ones. Where the delegation reaches an
+  // instantiation that doesn't have its body yet, `A() : A(Tag<1>{})`, the
+  // end of the module decides.
+  bool InstallsHere = false;
+  bool AnyConditional = false;
+  SmallVector<const CXXConstructorDecl *, 1> Undecided;
+  for (const auto [Construct, Conditional] :
+       llvm::zip_equal(Constructions, Unproven)) {
+    const CXXConstructorDecl *Constructor = Construct->getConstructor();
+    // An immediate one, `consteval A(int)`, which the code never calls, is
+    // emitted as the value constant evaluation made, which installs the
+    // vtables here.
+    if (Constructor->isConsteval()) {
+      InstallsHere |= !Conditional;
+      AnyConditional |= Conditional;
+      continue;
+    }
+    const bool Installs = !CGM.AddMalterlibSizedConstructorReference(
+        Constructor, Ctor_Complete, /*Owner=*/nullptr, Conditional);
+    InstallsHere |= Installs && !Conditional;
+    if (!Conditional)
+      continue;
+    const std::optional<bool> Uninlined =
+        CGM.installsMalterlibSizedVTablesUninlined(Constructor);
+    if (!Uninlined)
+      Undecided.push_back(Constructor);
+    AnyConditional |= Uninlined == false;
+  }
+  if (InstallsHere)
+    CGM.getVTables().addMalterlibSizedVTableReferences(RD);
+  else if (AnyConditional || !Undecided.empty())
+    CGM.getVTables().addMalterlibSizedVTableReferences(
+        RD, /*Owner=*/nullptr, /*Conditional=*/true,
+        AnyConditional ? ArrayRef<const CXXConstructorDecl *>() : Undecided);
+  // Also the deleting destructors that the vtables of a class another module
+  // defines hold, which link-time optimization can call directly,
+  // devirtualized, where nothing uses the vtables any more: each only while
+  // what is emitted uses it. So too those of the vtables of this module where
+  // the site doesn't install them, like where it calls the constructor of a
+  // DLL, as on the Microsoft ABI, whose vtables aren't external, where the
+  // builtin's call of one can be direct, of a class that is final or with
+  // whole-program devirtualization: the proof of the vtables the object has
+  // then doesn't cover it. Otherwise the call goes through those.
+  // Those of this module at its end, when the deleting destructors the
+  // vtables hold have been made, like an implicit one that Sema defines
+  // where the vtable is used.
+  if (CGM.getVTables().isVTableExternal(RD))
+    CGM.getVTables().addMalterlibSizedSlotReferences(RD, /*Owner=*/nullptr,
+                                                     /*Conditional=*/true);
+  else if (!InstallsHere && (RD->isEffectivelyFinal() ||
+                             CGM.getCodeGenOpts().WholeProgramVTables))
+    CGM.addMalterlibSizedLocalSlotReferences(RD);
+}
+
 /// Emit a call to an operator new or operator delete function, as implicitly
 /// created by new-expressions and delete-expressions.
 static RValue EmitNewDeleteCall(CodeGenFunction &CGF,
@@ -1781,6 +1887,13 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
                 E->getAllocatedTypeSourceInfo()->getTypeLoc().getBeginLoc(),
                 result, allocType, result.getAlignment(), SkippedChecks,
                 numElements);
+
+  // Of the function emitted, also a lambda's call operator, not the function
+  // it is in, which can be one without the attribute, or one with it whose
+  // lambda doesn't have it.
+  if (getLangOpts().MalterlibSizedDestructors && CurCodeDecl &&
+      CurCodeDecl->hasAttr<MalterlibSizedConstructionAttr>())
+    EmitMalterlibSizedConstructionReferences(*this, E);
 
   EmitNewInitializer(*this, E, allocType, elementTy, result, numElements,
                      allocSizeWithoutCookie);

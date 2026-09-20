@@ -22,11 +22,13 @@
 #include "clang/AST/DeclarationName.h"
 #include "clang/AST/DependenceFlags.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprConcepts.h"
 #include "clang/AST/LambdaCapture.h"
 #include "clang/AST/NestedNameSpecifier.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/AST/Type.h"
 #include "clang/AST/TypeLoc.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/OperatorKinds.h"
 #include "clang/Basic/SourceLocation.h"
@@ -315,6 +317,296 @@ CXXNewExpr *CXXNewExpr::Create(
       IsGlobalNew, OperatorNew, OperatorDelete, IAP, UsualArrayDeleteWantsSize,
       PlacementArgs, TypeIdParens, ArraySize, InitializationStyle, Initializer,
       Ty, AllocatedTypeInfo, Range, DirectInitRange);
+}
+
+/// The value of the last statement of \p Statement, which is its result.
+static const Expr *statementExpressionResult(const StmtExpr *Statement) {
+  const auto *Last =
+      dyn_cast_or_null<ValueStmt>(Statement->getSubStmt()->body_back());
+  return Last ? Last->getExprStmt() : nullptr;
+}
+
+const CXXConstructExpr *
+CXXNewExpr::getDirectConstruction(const Expr *Initializer,
+                                  bool ElideConstructors) {
+  while (Initializer) {
+    const Expr *Stripped = Initializer->IgnoreImplicit()->IgnoreParens();
+    if (Stripped != Initializer) {
+      Initializer = Stripped;
+      continue;
+    }
+    if (const auto *List = dyn_cast<InitListExpr>(Initializer);
+        List && List->getNumInits() == 1) {
+      Initializer = List->getInit(0);
+      continue;
+    }
+    // The result of a statement expression, `({ prepare(); T(1); })`, which
+    // code generation emits into the object.
+    if (const auto *Statement = dyn_cast<StmtExpr>(Initializer)) {
+      Initializer = statementExpressionResult(Statement);
+      continue;
+    }
+    // And what a compound literal is made of, `(T){1}`, which code generation
+    // also emits into the object.
+    if (const auto *Literal = dyn_cast<CompoundLiteralExpr>(Initializer);
+        Literal && Literal->isPRValue()) {
+      Initializer = Literal->getInitializer();
+      continue;
+    }
+    // T(x) and static_cast<T>(x) construct a T, or name one another
+    // expression produces.
+    if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Initializer);
+        Cast && (Cast->getCastKind() == CK_ConstructorConversion ||
+                 Cast->getCastKind() == CK_NoOp)) {
+      Initializer = Cast->getSubExpr();
+      continue;
+    }
+    const auto *Construct = dyn_cast<CXXConstructExpr>(Initializer);
+    if (Construct && ElideConstructors && Construct->isElidable()) {
+      Initializer = Construct->getArg(0);
+      continue;
+    }
+    return Construct;
+  }
+  return nullptr;
+}
+
+/// getDirectConstructions, with \p InCondition of what is only in a result of
+/// a condition that isn't constant.
+static bool directConstructions(
+    const Expr *Initializer, bool ElideConstructors,
+    SmallVectorImpl<const CXXConstructExpr *> &Constructions,
+    const ASTContext *Context, SmallVectorImpl<bool> *Unproven,
+    bool InCondition) {
+  if (!Initializer)
+    return true;
+  // Past what getDirectConstruction looks through, also to a conditional,
+  // `T{B ? T(1) : T(2)}`.
+  const Expr *Stripped = Initializer;
+  for (;;) {
+    const Expr *Inner = Stripped->IgnoreImplicit()->IgnoreParens();
+    if (const auto *List = dyn_cast<InitListExpr>(Inner);
+        List && !List->getType()->isArrayType() && List->getNumInits() == 1)
+      Inner = List->getInit(0);
+    else if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Inner);
+             Cast && (Cast->getCastKind() == CK_ConstructorConversion ||
+                      Cast->getCastKind() == CK_NoOp))
+      Inner = Cast->getSubExpr();
+    else if (const auto *Construct = dyn_cast<CXXConstructExpr>(Inner);
+             Construct && ElideConstructors && Construct->isElidable())
+      Inner = Construct->getArg(0);
+    else if (const auto *Statement = dyn_cast<StmtExpr>(Inner);
+             Statement && statementExpressionResult(Statement))
+      Inner = statementExpressionResult(Statement);
+    else if (const auto *Literal = dyn_cast<CompoundLiteralExpr>(Inner);
+             Literal && Literal->isPRValue())
+      Inner = Literal->getInitializer();
+    if (Inner == Stripped)
+      break;
+    Stripped = Inner;
+  }
+  ArrayRef<Expr *> Elements;
+  const Expr *Filler = nullptr;
+  if (const auto *List = dyn_cast<InitListExpr>(Stripped);
+      List && List->getType()->isArrayType()) {
+    Elements = List->inits();
+    Filler = List->getArrayFiller();
+  } else if (const auto *Parens = dyn_cast<CXXParenListInitExpr>(Stripped);
+             Parens && Parens->getType()->isArrayType()) {
+    Elements = Parens->getInitExprs();
+    Filler = Parens->getArrayFiller();
+  } else if (isa<ImplicitValueInitExpr, NoInitExpr>(Stripped)) {
+    return true;
+  } else if (const auto *Conditional = dyn_cast<ConditionalOperator>(Stripped);
+             Conditional && Conditional->isPRValue()) {
+    // Either result, which initializes the object directly, `B ? T(1) :
+    // T(2)`, but not one that throws, `B ? T(1) : throw 0`, which makes none.
+    auto Result = [&](const Expr *Branch, bool Unchosen) {
+      return isa<CXXThrowExpr>(Branch->IgnoreParens()) ||
+             directConstructions(Branch, ElideConstructors, Constructions,
+                                 Context, Unproven, InCondition || Unchosen);
+    };
+    // Only the one a constant condition chooses, `true ? T(1) : T(2L)`, of
+    // one that calls nothing, whose value is the same where the program runs:
+    // a call, also of a constexpr function, can give another there, like one
+    // of `__builtin_constant_p` of what the evaluation below can't tell,
+    // which the optimizer can fold either way. A constexpr variable, `c_bDirect ? T(1) :
+    // T(2L)`, has its value also there.
+    // Not in what isn't evaluated, `noexcept(T(1))` or `sizeof(f())`, nor in
+    // an operand that the one before it leaves out, `c_bDirect || f()`.
+    // Also `__builtin_is_constant_evaluated()`, also through a function that
+    // gives what it does, `std::is_constant_evaluated()`, which is false
+    // where the program runs and in the evaluation below, which isn't a
+    // constant one.
+    auto ConstantEvaluated = [](const Expr *E) {
+      for (int Depth = 0; Depth < 2; ++Depth) {
+        const auto *Call = dyn_cast<CallExpr>(E->IgnoreParenImpCasts());
+        if (!Call)
+          return false;
+        if (Call->getBuiltinCallee() == Builtin::BI__builtin_is_constant_evaluated)
+          return true;
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        const auto *Body =
+            Callee && Callee->isConstexpr() && Callee->getNumParams() == 0 &&
+                    Callee->getDefinition()
+                ? dyn_cast_or_null<CompoundStmt>(
+                      Callee->getDefinition()->getBody())
+                : nullptr;
+        const auto *Return =
+            Body && Body->size() == 1
+                ? dyn_cast<ReturnStmt>(Body->body_front())
+                : nullptr;
+        if (!Return || !Return->getRetValue())
+          return false;
+        E = Return->getRetValue();
+      }
+      return false;
+    };
+    // The value of a condition, or of an operand of it, that is constant,
+    // each evaluated once: of a logical operator, of its operands, `c_bFirst
+    // && c_bSecond`, which a long chain of them would otherwise evaluate
+    // again for each.
+    llvm::DenseMap<const Expr *, std::optional<bool>> Values;
+    std::function<std::optional<bool>(const Expr *)> Value =
+        [&](const Expr *E) -> std::optional<bool> {
+      E = E->IgnoreParens();
+      if (!Context || E->isValueDependent())
+        return std::nullopt;
+      if (auto It = Values.find(E); It != Values.end())
+        return It->second;
+      std::optional<bool> Found;
+      if (const auto *Logical = dyn_cast<BinaryOperator>(E);
+          Logical && Logical->isLogicalOp()) {
+        const bool Or = Logical->getOpcode() == BO_LOr;
+        if (const std::optional<bool> Left = Value(Logical->getLHS()))
+          Found = *Left == Or ? std::optional<bool>(Or)
+                              : Value(Logical->getRHS());
+      } else if (const auto *Not = dyn_cast<UnaryOperator>(E);
+                 Not && Not->getOpcode() == UO_LNot) {
+        if (const std::optional<bool> Inner = Value(Not->getSubExpr()))
+          Found = !*Inner;
+      } else if (const auto *Choice = dyn_cast<ConditionalOperator>(E);
+                 Choice && Value(Choice->getCond())) {
+        // Of the operand a condition that is constant chooses, `c_bUse ?
+        // fg_Policy() : true`.
+        Found = Value(*Value(Choice->getCond()) ? Choice->getTrueExpr()
+                                                : Choice->getFalseExpr());
+      } else if (bool Evaluated;
+                 E->EvaluateAsBooleanCondition(Evaluated, *Context)) {
+        Found = Evaluated;
+      }
+      Values[E] = Found;
+      return Found;
+    };
+    std::function<bool(const Stmt *)> Calls = [&](const Stmt *S) {
+      if (!S || isa<CXXNoexceptExpr, UnaryExprOrTypeTraitExpr, TypeTraitExpr,
+                    RequiresExpr, CXXUuidofExpr>(S))
+        return false;
+      if (const auto *TypeId = dyn_cast<CXXTypeidExpr>(S);
+          TypeId && !TypeId->isPotentiallyEvaluated())
+        return false;
+      if (const auto *Call = dyn_cast<CallExpr>(S);
+          Call && ConstantEvaluated(Call))
+        return false;
+      // Nor a builtin that only asks something of its operand, like
+      // `__builtin_constant_p(1)`, which code generation folds to the value
+      // the evaluation below gives, where it gives one.
+      if (const auto *Call = dyn_cast<CallExpr>(S))
+        switch (Call->getBuiltinCallee()) {
+        case Builtin::BI__builtin_constant_p:
+        case Builtin::BI__builtin_object_size:
+        case Builtin::BI__builtin_dynamic_object_size:
+        case Builtin::BI__noop:
+        case Builtin::BI__builtin_assume:
+        case Builtin::BI__assume:
+          return false;
+        default:
+          break;
+        }
+      // Nor what is evaluated where it is written, like an immediate
+      // invocation, `consteval bool fg_Direct()`, whose value the program has.
+      if (isa<ConstantExpr>(S))
+        return false;
+      // Each operand once: the right one only where the left one, which calls
+      // nothing, doesn't leave it out.
+      if (const auto *Logical = dyn_cast<BinaryOperator>(S);
+          Logical && Logical->isLogicalOp()) {
+        if (Calls(Logical->getLHS()))
+          return true;
+        if (const std::optional<bool> Left = Value(Logical->getLHS());
+            Left && *Left == (Logical->getOpcode() == BO_LOr))
+          return false;
+        return Calls(Logical->getRHS());
+      }
+      // Only the operand a condition that calls nothing and is constant
+      // chooses, `c_bUse ? fg_Policy() : true`.
+      if (const auto *Choice = dyn_cast<ConditionalOperator>(S)) {
+        if (Calls(Choice->getCond()))
+          return true;
+        if (const std::optional<bool> Chosen = Value(Choice->getCond()))
+          return Calls(*Chosen ? Choice->getTrueExpr()
+                               : Choice->getFalseExpr());
+        return Calls(Choice->getTrueExpr()) || Calls(Choice->getFalseExpr());
+      }
+      return isa<CallExpr, CXXConstructExpr, CXXNewExpr, LambdaExpr, BlockExpr,
+                 CXXThrowExpr>(S) ||
+             llvm::any_of(S->children(), Calls);
+    };
+    if (!Calls(Conditional->getCond()))
+      if (const std::optional<bool> Chosen = Value(Conditional->getCond()))
+        return Result(*Chosen ? Conditional->getTrueExpr()
+                              : Conditional->getFalseExpr(),
+                      false);
+    // Either, which the optimizer can still choose between, like through a
+    // constexpr function, `fg_Policy() ? T(1) : T(2L)`.
+    return Result(Conditional->getTrueExpr(), true) &&
+           Result(Conditional->getFalseExpr(), true);
+  } else if (const auto *Comma = dyn_cast<BinaryOperator>(Stripped);
+             Comma && Comma->getOpcode() == BO_Comma) {
+    // What the last of a comma is, `(f(), T(1))`.
+    return directConstructions(Comma->getRHS(), ElideConstructors,
+                               Constructions, Context, Unproven, InCondition);
+  } else {
+    const CXXConstructExpr *Construct =
+        CXXNewExpr::getDirectConstruction(Initializer, ElideConstructors);
+    if (!Construct)
+      return false;
+    Constructions.push_back(Construct);
+    if (Unproven)
+      Unproven->push_back(InCondition);
+    return true;
+  }
+  for (const Expr *Element : Elements)
+    if (!directConstructions(Element, ElideConstructors, Constructions,
+                             Context, Unproven, InCondition))
+      return false;
+  // The filler constructs only the elements past those, of which there can be
+  // none, `new A[n]{A(1)}`, and the optimizer can leave its loop out: like a
+  // result of a condition, only while what is emitted uses it.
+  return directConstructions(Filler, ElideConstructors, Constructions, Context,
+                             Unproven, /*InCondition=*/true);
+}
+
+bool CXXNewExpr::getDirectConstructions(
+    const Expr *Initializer, bool ElideConstructors,
+    SmallVectorImpl<const CXXConstructExpr *> &Constructions,
+    const ASTContext *Context, SmallVectorImpl<bool> *Unproven) {
+  return directConstructions(Initializer, ElideConstructors, Constructions,
+                             Context, Unproven, /*InCondition=*/false);
+}
+
+bool CXXNewExpr::constructsNoElements(const ASTContext &Context) const {
+  if (!isArray())
+    return false;
+  if (const std::optional<const Expr *> Count = getArraySize();
+      Count && *Count && !(*Count)->isValueDependent())
+    if (const std::optional<llvm::APSInt> Value =
+            (*Count)->getIntegerConstantExpr(Context);
+        Value && Value->isZero())
+      return true;
+  const ConstantArrayType *Inner =
+      Context.getAsConstantArrayType(getAllocatedType());
+  return Inner && Context.getConstantArrayElementCount(Inner) == 0;
 }
 
 CXXNewExpr *CXXNewExpr::CreateEmpty(const ASTContext &Ctx, bool IsArray,

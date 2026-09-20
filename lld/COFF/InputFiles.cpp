@@ -15,6 +15,7 @@
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "lld/Common/DWARF.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/BinaryFormat/COFF.h"
@@ -24,6 +25,7 @@
 #include "llvm/DebugInfo/CodeView/TypeDeserializer.h"
 #include "llvm/DebugInfo/PDB/Native/NativeSession.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFile.h"
+#include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/Binary.h"
@@ -558,15 +560,34 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
   SectionChunk *sc = sparseChunks[sym.getSectionNumber()];
   if (sym.isExternal()) {
     StringRef name = check(coffObj->getSymbolName(sym));
-    if (sc)
+    if (sc) {
+      // A marker of -fmalterlib-sized-destructors belongs to the copy of its
+      // definition the link keeps, also a larger copy of
+      // IMAGE_COMDAT_SELECT_LARGEST that took the place of one with a marker
+      // of its own, like a vftable with RTTI of one without.
+      if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+        if (auto *d = dyn_cast_or_null<DefinedRegular>(symtab.find(name));
+            d && symtab.replacedLargestComdats.contains(d->getChunk())) {
+          replaceSymbol<DefinedRegular>(d, this, name, /*IsCOMDAT*/ false,
+                                        /*IsExternal*/ true, sym.getGeneric(),
+                                        sc);
+          return d;
+        }
       return symtab.addRegular(this, name, sym.getGeneric(), sc,
                                sym.getValue());
+    }
     // For MinGW symbols named .weak.* that point to a discarded section,
     // don't create an Undefined symbol. If nothing ever refers to the symbol,
     // everything should be fine. If something actually refers to the symbol
     // (e.g. the undefined weak alias), linking will fail due to undefined
     // references at the end.
     if (symtab.ctx.config.mingw && name.starts_with(".weak."))
+      return nullptr;
+    // Likewise for the marker of -fmalterlib-sized-destructors in a copy of
+    // its definition the link did not keep: the copy it kept defines the
+    // marker if compiled with the flag, and a reference to the marker fails
+    // otherwise.
+    if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
       return nullptr;
     return symtab.addUndefined(name, this, false);
   }
@@ -597,11 +618,62 @@ void ObjFile::initializeSymbols() {
       coffObj->getNumberOfSections() + 1);
   COFFLinkerContext &ctx = symtab.ctx;
 
+  // The symbols only the records of -fmalterlib-sized-destructors refer to,
+  // which name what a construction site or a proof depends on: also a
+  // definition a site imports from a DLL through `__imp_`, which no other
+  // section of the object refers to, and which loads no member of an archive
+  // that defines it, as the object without the flag would load none.
+  llvm::BitVector recordOnly;
+  {
+    llvm::BitVector inRecords(numSymbols), elsewhere(numSymbols);
+    bool hasRecords = false;
+    for (uint32_t i = 1, n = coffObj->getNumberOfSections(); i <= n; ++i) {
+      const coff_section *sec = getSection(i);
+      Expected<StringRef> name = coffObj->getSectionName(sec);
+      if (!name) {
+        consumeError(name.takeError());
+        continue;
+      }
+      const bool record = *name == ".rdata$mibszf" || *name == ".rdata$mibszd";
+      hasRecords |= record;
+      for (const coff_relocation &rel : coffObj->getRelocations(sec))
+        if (rel.SymbolTableIndex < numSymbols)
+          (record ? inRecords : elsewhere).set(rel.SymbolTableIndex);
+    }
+    if (hasRecords) {
+      recordOnly = std::move(inRecords);
+      recordOnly.reset(elsewhere);
+      // What the records name that the rest of the object reaches only
+      // through its import, `__imp_X`, of a definition it sees as dllimport,
+      // like the vtable a constructor installs, which the records name `X`:
+      // the link can have a definition of X from an object that sees it as
+      // its own, which the code doesn't use. The import of its marker is
+      // loaded for them, as the reference to it is the records'.
+      DenseSet<StringRef> imported;
+      for (unsigned i : elsewhere.set_bits()) {
+        StringRef name =
+            check(coffObj->getSymbolName(check(coffObj->getSymbol(i))));
+        if (name.consume_front("__imp_"))
+          imported.insert(name);
+      }
+      for (unsigned i : recordOnly.set_bits()) {
+        StringRef name =
+            check(coffObj->getSymbolName(check(coffObj->getSymbol(i))));
+        name.consume_back(llvm::MalterlibSizedMarkerSuffix);
+        if (imported.contains(name) && importedInRecords.insert(name).second)
+          symtab.addUndefined(
+              saver().save("__imp_" + name + llvm::MalterlibSizedMarkerSuffix),
+              this, false, /*recordOnly=*/true);
+      }
+    }
+  }
+
   for (uint32_t i = 0; i < numSymbols; ++i) {
     COFFSymbolRef coffSym = check(coffObj->getSymbol(i));
     bool prevailingComdat;
     if (coffSym.isUndefined()) {
-      symbols[i] = createUndefined(coffSym, false);
+      symbols[i] = createUndefined(coffSym, false,
+                                   i < recordOnly.size() && recordOnly[i]);
     } else if (coffSym.isWeakExternal()) {
       auto aux = coffSym.getAux<coff_aux_weak_external>();
       bool overrideLazy = true;
@@ -669,18 +741,54 @@ void ObjFile::initializeSymbols() {
   for (auto &kv : weakAliases) {
     Symbol *sym = kv.first;
     const coff_aux_weak_external *aux = kv.second;
-    checkAndSetWeakAlias(symtab, this, sym, symbols[aux->TagIndex],
+    Symbol *target = symbols[aux->TagIndex];
+    // The marker of -fmalterlib-sized-destructors of a weak alias falls back
+    // on its definition's marker, which has no symbol in a copy of the
+    // definition the link did not keep, and stands for the copy it kept.
+    if (!target) {
+      if (Expected<COFFSymbolRef> targetSym =
+              coffObj->getSymbol(aux->TagIndex)) {
+        StringRef name = check(coffObj->getSymbolName(*targetSym));
+        if (targetSym->isExternal() &&
+            name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+          target = symtab.addUndefined(name, this, false);
+      } else {
+        consumeError(targetSym.takeError());
+      }
+    }
+    checkAndSetWeakAlias(symtab, this, sym, target,
                          aux->Characteristics ==
                              IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY);
+  }
+  // The marker of a weak definition whose copy in this object the link keeps
+  // falls back on this object's marker, also where an object before it gave it
+  // another fallback, which a weak alias defined twice keeps with -lldmingw:
+  // the copy link-time optimization compiles takes the place of a native
+  // object's weak copy, as the bitcode prevails, but the bitcode has no marker.
+  for (auto &kv : weakAliases) {
+    auto *marker = dyn_cast<Undefined>(kv.first);
+    Symbol *target = symbols[kv.second->TagIndex];
+    if (!marker || !target || marker->weakAlias == target ||
+        !marker->getName().ends_with(llvm::MalterlibSizedMarkerSuffix))
+      continue;
+    auto *def = dyn_cast_or_null<Undefined>(symtab.find(
+        marker->getName().drop_back(llvm::MalterlibSizedMarkerSuffix.size())));
+    if (Defined *kept = def ? def->getDefinedWeakAlias() : nullptr;
+        kept && kept->getFile() == this)
+      marker->setWeakAlias(target);
   }
 
   // Free the memory used by sparseChunks now that symbol loading is finished.
   decltype(sparseChunks)().swap(sparseChunks);
 }
 
-Symbol *ObjFile::createUndefined(COFFSymbolRef sym, bool overrideLazy) {
+Symbol *ObjFile::createUndefined(COFFSymbolRef sym, bool overrideLazy,
+                                 bool recordOnly) {
   StringRef name = check(coffObj->getSymbolName(sym));
-  Symbol *s = symtab.addUndefined(name, this, overrideLazy);
+  // A marker, which only records refer to, loads what loadsForMarker tells.
+  if (name.ends_with(llvm::MalterlibSizedMarkerSuffix))
+    recordOnly = false;
+  Symbol *s = symtab.addUndefined(name, this, overrideLazy, recordOnly);
 
   // Add an anti-dependency alias for undefined AMD64 symbols on the ARM64EC
   // target.
@@ -820,6 +928,7 @@ void ObjFile::handleComdatSelection(
       // or doing one pass that determines what the final largest comdat
       // is for all IMAGE_COMDAT_SELECT_LARGEST comdats and then reading
       // only the largest one.
+      symtab.replacedLargestComdats.insert(leaderChunk);
       replaceSymbol<DefinedRegular>(leader, this, name, /*IsCOMDAT*/ true,
                                     /*IsExternal*/ true, sym.getGeneric(),
                                     nullptr);

@@ -76,9 +76,11 @@ void markLive(COFFLinkerContext &ctx) {
       if (b)
         addSym(b);
 
-    // Mark associative sections if any.
+    // Mark associative sections if any, except the dependency records of
+    // -fmalterlib-sized-destructors, which the link consumed.
     for (SectionChunk &c : sc->children())
-      enqueue(&c);
+      if (!c.getSectionName().starts_with(".rdata$mibsz"))
+        enqueue(&c);
 
     // Mark EC entry thunks.
     if (Defined *entryThunk = sc->getEntryThunk())

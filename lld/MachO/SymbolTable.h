@@ -14,6 +14,7 @@
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/CachedHashString.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Object/Archive.h"
 
 namespace lld::macho {

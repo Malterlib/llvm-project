@@ -7792,6 +7792,25 @@ public:
                               ParmVarDecl *Param, Expr *Init = nullptr,
                               bool SkipImmediateInvocations = true);
 
+  /// Checks the new-expressions that \p S, the body or an initializer of the
+  /// construction site \p FD of -fmalterlib-sized-destructors, evaluates,
+  /// also in the defaults it uses, once it is complete: where one is built,
+  /// also in a default, it isn't known whether it is in an operand that isn't
+  /// evaluated, like that of `__builtin_constant_p`, nor whether a branch of
+  /// an `if constexpr` it is in is discarded.
+  void CheckMalterlibSizedConstructionsIn(const FunctionDecl *FD,
+                                          const Stmt *S);
+
+  /// Checks, as CheckMalterlibSizedConstructionsIn does, the initializers of
+  /// \p Constructor, a construction site, that a construction runs.
+  void CheckMalterlibSizedConstructorInitializers(
+      const CXXConstructorDecl *Constructor);
+
+  /// The expressions that CheckMalterlibSizedConstructionsIn has looked into
+  /// for each construction site, each once, also when defaults share them.
+  llvm::DenseSet<std::pair<const Decl *, const Stmt *>>
+      MalterlibSizedCheckedDefaults;
+
   /// BuildCXXDefaultArgExpr - Creates a CXXDefaultArgExpr, instantiating
   /// the default expr if needed.
   ExprResult BuildCXXDefaultArgExpr(SourceLocation CallLoc, FunctionDecl *FD,

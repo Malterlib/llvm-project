@@ -1277,6 +1277,7 @@ void DataFlowSanitizer::addGlobalNameSuffix(GlobalValue *GV) {
 
   std::string GVName = std::string(GV->getName()), Suffix = ".dfsan";
   GV->setName(GVName + Suffix);
+  renameMalterlibSizedMarker(*GV, GVName);
 
   // Try to change the name of the function in module inline asm.  We only do
   // this for specific asm directives, currently only ".symver", to try to avoid
