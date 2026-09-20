@@ -274,6 +274,11 @@ RValue CodeGenFunction::EmitCXXMemberOrOperatorMemberCallExpr(
         EmitCallArgs(*RtlArgs, MD->getType()->castAs<FunctionProtoType>(),
                      drop_begin(CE->arguments(), 1), CE->getDirectCallee(),
                      /*ParamsToSkip*/ 0, EvaluationOrder::ForceRightToLeft);
+        // The object expression is evaluated with the argument block already
+        // allocated.
+        if (isCoroutine() && RtlArgs->isUsingInAlloca())
+          checkCoroutineSuspendInInAllocaArgs(
+              llvm::make_range(CE->arg_begin(), CE->arg_begin() + 1));
       }
     }
   }
