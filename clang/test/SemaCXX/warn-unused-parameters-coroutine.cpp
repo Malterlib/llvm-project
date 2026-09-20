@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -fsyntax-only -Wunused-parameter -verify -std=c++20 -Wno-coroutines-unsupported-target %s
+// RUN: %clang_cc1 -fsyntax-only -Wunused-parameter -verify -std=c++20 %s
 
 #include "Inputs/std-coroutine.h"
 
