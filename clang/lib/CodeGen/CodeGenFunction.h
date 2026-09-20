@@ -5564,6 +5564,9 @@ public:
     PrototypeWrapper(const ObjCMethodDecl *MD) : P(MD) {}
   };
 
+  void checkCoroutineSuspendInInAllocaArgs(
+      llvm::iterator_range<CallExpr::const_arg_iterator> Args);
+
   void EmitCallArgs(CallArgList &Args, PrototypeWrapper Prototype,
                     llvm::iterator_range<CallExpr::const_arg_iterator> ArgRange,
                     AbstractCallee AC = AbstractCallee(),
