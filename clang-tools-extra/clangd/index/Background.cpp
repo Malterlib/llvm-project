@@ -198,7 +198,9 @@ BackgroundQueue::Task BackgroundIndex::changedFilesTask(
   });
 
   T.QueuePri = LoadShards;
-  T.ThreadPri = llvm::ThreadPriority::Default;
+  // Loading shards also reads every file they were built from to find stale
+  // ones, which for a large project takes long enough to compete with builds.
+  T.ThreadPri = IndexingPriority;
   return T;
 }
 
@@ -389,7 +391,7 @@ void BackgroundIndex::reindexChangedFiles(
       Queue.push(changedFilesTask(TUs));
   });
   T.QueuePri = LoadShards;
-  T.ThreadPri = llvm::ThreadPriority::Default;
+  T.ThreadPri = IndexingPriority;
   Queue.push(std::move(T));
 }
 

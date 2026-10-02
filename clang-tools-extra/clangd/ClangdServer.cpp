@@ -71,10 +71,12 @@ struct UpdateIndexCallbacks : public ParsingCallbacks {
   UpdateIndexCallbacks(FileIndex *FIndex,
                        ClangdServer::Callbacks *ServerCallbacks,
                        const ThreadsafeFS &TFS, AsyncTaskRunner *Tasks,
-                       bool CollectInactiveRegions)
+                       bool CollectInactiveRegions,
+                       llvm::ThreadPriority StdlibIndexPriority)
       : FIndex(FIndex), ServerCallbacks(ServerCallbacks), TFS(TFS),
         Stdlib{std::make_shared<StdLibSet>()}, Tasks(Tasks),
-        CollectInactiveRegions(CollectInactiveRegions) {}
+        CollectInactiveRegions(CollectInactiveRegions),
+        StdlibIndexPriority(StdlibIndexPriority) {}
 
   void onPreambleAST(
       PathRef Path, llvm::StringRef Version, CapturedASTCtx ASTCtx,
@@ -117,7 +119,13 @@ struct UpdateIndexCallbacks : public ParsingCallbacks {
                  Stdlib(Stdlib),
                  // We have some FS implementations that rely on information in
                  // the context.
-                 Ctx(Context::current().clone())]() mutable {
+                 Ctx(Context::current().clone()),
+                 Priority(StdlibIndexPriority),
+                 Async(Tasks != nullptr)]() mutable {
+      // Like the background index, this isn't needed to show the open files,
+      // so leave the CPU to e.g. builds. Each async task has its own thread.
+      if (Async && Priority != llvm::ThreadPriority::Default)
+        llvm::set_thread_priority(Priority);
       // Make sure we install the context into current thread.
       WithContext C(std::move(Ctx));
       clang::noteBottomOfStack();
@@ -172,6 +180,7 @@ private:
   std::shared_ptr<StdLibSet> Stdlib;
   AsyncTaskRunner *Tasks;
   bool CollectInactiveRegions;
+  llvm::ThreadPriority StdlibIndexPriority;
 };
 
 class DraftStoreFS : public ThreadsafeFS {
@@ -246,7 +255,8 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
                         std::make_unique<UpdateIndexCallbacks>(
                             DynamicIdx.get(), Callbacks, TFS,
                             IndexTasks ? &*IndexTasks : nullptr,
-                            PublishInactiveRegions));
+                            PublishInactiveRegions,
+                            Opts.BackgroundIndexPriority));
   // Adds an index to the stack, at higher priority than existing indexes.
   auto AddIndex = [&](SymbolIndex *Idx) {
     if (this->Index != nullptr) {
