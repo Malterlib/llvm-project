@@ -42,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -647,6 +648,196 @@ TEST_F(TUSchedulerTests, EvictedAST) {
 // We send "empty" changes to TUScheduler when we think some external event
 // *might* have invalidated current state (e.g. a header was edited).
 // Verify that this doesn't evict our cache entries.
+
+// Records the diagnostics published for each file.
+class RecordDiags : public ParsingCallbacks {
+public:
+  void onMainAST(PathRef File, ParsedAST &AST, PublishFn Publish) override {
+    record(File, AST.getDiagnostics(), Publish);
+  }
+  void onFailedAST(PathRef File, llvm::StringRef Version,
+                   std::vector<Diag> Diags, PublishFn Publish) override {
+    record(File, Diags, Publish);
+  }
+  std::vector<std::vector<std::string>> published(PathRef File) {
+    std::lock_guard<std::mutex> Lock(Mu);
+    return Published[File];
+  }
+
+private:
+  void record(PathRef File, llvm::ArrayRef<Diag> Diags, PublishFn Publish) {
+    Publish([&] {
+      std::vector<std::string> Messages;
+      for (const Diag &D : Diags)
+        Messages.push_back(D.Message);
+      std::lock_guard<std::mutex> Lock(Mu);
+      Published[File].push_back(std::move(Messages));
+    });
+  }
+  std::mutex Mu;
+  llvm::StringMap<std::vector<std::vector<std::string>>> Published;
+};
+
+static std::vector<std::string> liveFiles(const TUScheduler &S) {
+  std::vector<std::string> Result;
+  for (const auto &File : S.fileStats())
+    Result.push_back(File.first().str());
+  return Result;
+}
+
+// Open files that aren't used for a while are closed, clearing their
+// diagnostics, and reopened when they're used again.
+TEST_F(TUSchedulerTests, ClosesIdleFiles) {
+  auto Opts = optsForTest();
+  Opts.RetentionPolicy.CloseIdleFilesAfter = std::chrono::milliseconds(100);
+  Opts.HasUnsavedChanges = [](PathRef, llvm::StringRef) { return false; };
+  auto Callbacks = std::make_unique<RecordDiags>();
+  RecordDiags &Diags = *Callbacks;
+  TUScheduler S(CDB, Opts, std::move(Callbacks));
+  auto Foo = testPath("foo.cpp"), Bar = testPath("bar.cpp");
+
+  S.update(Foo, getInputs(Foo, "int x = undeclared;"), WantDiagnostics::Yes);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // Files are closed when another one is used.
+  S.update(Bar, getInputs(Bar, ""), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(liveFiles(S), ElementsAre(Bar));
+
+  std::string Contents;
+  S.runWithAST("Use", Foo, [&](llvm::Expected<InputsAndAST> AST) {
+    ASSERT_TRUE(bool(AST)) << AST.takeError();
+    Contents = AST->Inputs.Contents;
+  });
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_EQ(Contents, "int x = undeclared;");
+  EXPECT_THAT(Diags.published(Foo),
+              ElementsAre(ElementsAre("use of undeclared identifier "
+                                      "'undeclared'"),
+                          IsEmpty(),
+                          ElementsAre("use of undeclared identifier "
+                                      "'undeclared'")));
+}
+
+// Updates without changes, e.g. to reparse open files after one was saved,
+// leave files closed for being idle closed, and the most recently used files
+// are kept even when they're idle.
+TEST_F(TUSchedulerTests, KeepsIdleFilesClosed) {
+  auto Opts = optsForTest();
+  Opts.RetentionPolicy.CloseIdleFilesAfter = std::chrono::milliseconds(100);
+  Opts.RetentionPolicy.MinLiveFiles = 1;
+  Opts.HasUnsavedChanges = [](PathRef, llvm::StringRef) { return false; };
+  CDB.ExtraClangFlags.push_back("-DFROM_CDB");
+  TUScheduler S(CDB, Opts);
+  auto Foo = testPath("foo.cpp"), Bar = testPath("bar.cpp");
+
+  S.update(Foo, getInputs(Foo, ""), WantDiagnostics::No);
+  S.update(Bar, getInputs(Bar, ""), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // Like before reparsing open files for changes on disk, which doesn't use
+  // them.
+  S.closeIdleFilesNow();
+  S.reparseAllFiles();
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_TRUE(S.isClosed(Foo));
+  EXPECT_FALSE(S.isClosed(Bar));
+
+  S.update(Foo, getInputs(Foo, ""), WantDiagnostics::Auto);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_TRUE(S.isClosed(Foo));
+
+  // Requests on reopened files use their command before it's resolved again.
+  tooling::CompileCommand Command;
+  S.runWithPreamble("Use", Foo, TUScheduler::StaleOrAbsent,
+                    [&](llvm::Expected<InputsAndPreamble> IP) {
+                      ASSERT_TRUE(bool(IP)) << IP.takeError();
+                      Command = IP->Command;
+                    });
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(S.isClosed(Foo));
+  EXPECT_THAT(Command.CommandLine, Contains("-DFROM_CDB"));
+
+  // Bar is now idle and no longer the most recently used file.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  S.closeIdleFilesNow();
+  S.reparseAllFiles();
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_TRUE(S.isClosed(Bar));
+  // Updates that explicitly ask for diagnostics reopen files.
+  S.update(Bar, getInputs(Bar, ""), WantDiagnostics::Yes);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(S.isClosed(Bar));
+}
+
+// Files that include open files with unsaved changes are kept, as parsing them
+// can use those changes, e.g. with --use-dirty-headers.
+TEST_F(TUSchedulerTests, KeepsFilesDependingOnUnsavedFiles) {
+  auto Foo = testPath("foo.cpp"), Bar = testPath("bar.cpp"),
+       Header = testPath("header.h");
+  auto Opts = optsForTest();
+  Opts.RetentionPolicy.CloseIdleFilesAfter = std::chrono::milliseconds(100);
+  Opts.HasUnsavedChanges = [&](PathRef File, llvm::StringRef) {
+    return File == Header;
+  };
+  TUScheduler S(CDB, Opts);
+  FS.Files[Header] = "int x;";
+
+  S.update(Header, getInputs(Header, "int x;"), WantDiagnostics::No);
+  // Included outside the preamble.
+  S.update(Foo, getInputs(Foo, "int y;\n#include \"header.h\""),
+           WantDiagnostics::Yes);
+  S.update(Bar, getInputs(Bar, ""), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  S.closeIdleFilesNow();
+  S.reparseAllFiles();
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(S.isClosed(Header));
+  EXPECT_FALSE(S.isClosed(Foo));
+  EXPECT_TRUE(S.isClosed(Bar));
+}
+
+// Beyond the limit of open files, the least recently used ones without unsaved
+// changes are closed.
+TEST_F(TUSchedulerTests, LimitsLiveFiles) {
+  auto Foo = testPath("foo.cpp"), Bar = testPath("bar.cpp"),
+       Baz = testPath("baz.cpp");
+  auto Opts = optsForTest();
+  Opts.RetentionPolicy.MaxLiveFiles = 2;
+  Opts.HasUnsavedChanges = [&](PathRef File, llvm::StringRef) {
+    return File == Foo;
+  };
+  TUScheduler S(CDB, Opts);
+
+  for (const auto &File : {Foo, Bar, Baz}) {
+    S.update(File, getInputs(File, ""), WantDiagnostics::No);
+    ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  }
+  EXPECT_THAT(liveFiles(S), UnorderedElementsAre(Foo, Baz));
+
+  S.runWithAST("Use", Bar, [&](llvm::Expected<InputsAndAST> AST) {
+    ASSERT_TRUE(bool(AST)) << AST.takeError();
+  });
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(liveFiles(S), UnorderedElementsAre(Foo, Bar));
+}
+
+// Files opened at once are closed beyond the limit once they're parsed.
+TEST_F(TUSchedulerTests, LimitsLiveFilesOpenedAtOnce) {
+  auto Opts = optsForTest();
+  Opts.RetentionPolicy.MaxLiveFiles = 1;
+  Opts.HasUnsavedChanges = [](PathRef, llvm::StringRef) { return false; };
+  TUScheduler S(CDB, Opts);
+  std::vector<std::string> Files;
+  for (const char *Name : {"foo.cpp", "bar.cpp", "baz.cpp"}) {
+    Files.push_back(testPath(Name));
+    S.update(Files.back(), getInputs(Files.back(), ""), WantDiagnostics::Yes);
+  }
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(liveFiles(S), ElementsAre(Files.back()));
+}
+
 TEST_F(TUSchedulerTests, NoopChangesDontThrashCache) {
   auto Opts = optsForTest();
   Opts.RetentionPolicy.MaxRetainedASTs = 1;

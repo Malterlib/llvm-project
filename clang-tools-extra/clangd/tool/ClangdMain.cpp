@@ -407,6 +407,34 @@ opt<PCHStorageFlag> PCHStorage{
     init(PCHStorageFlag::Disk),
 };
 
+opt<unsigned> CloseIdleFilesAfter{
+    "close-idle-files-after",
+    cat(Misc),
+    desc("Free the preamble and worker of open files that weren't edited or "
+         "used for this many minutes, and clear their diagnostics, until "
+         "they're used again. Files with unsaved changes are kept. 0 disables "
+         "it"),
+    init(30),
+};
+
+opt<unsigned> MaxLiveFiles{
+    "max-live-files",
+    cat(Misc),
+    desc("Maximum number of open files to keep parsed, freeing the least "
+         "recently used ones beyond it like idle ones "
+         "(see --close-idle-files-after), but at least --min-live-files are "
+         "kept. 0 means no limit"),
+    init(20),
+};
+
+opt<unsigned> MinLiveFiles{
+    "min-live-files",
+    cat(Misc),
+    desc("Number of most recently used open files that are never freed by "
+         "--close-idle-files-after or --max-live-files"),
+    init(3),
+};
+
 opt<bool> Sync{
     "sync",
     cat(Misc),
@@ -982,6 +1010,10 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
     Opts.StorePreamblesInMemory = false;
     break;
   }
+  Opts.RetentionPolicy.CloseIdleFilesAfter =
+      std::chrono::minutes(CloseIdleFilesAfter);
+  Opts.RetentionPolicy.MaxLiveFiles = MaxLiveFiles;
+  Opts.RetentionPolicy.MinLiveFiles = MinLiveFiles;
   if (!ResourceDir.empty())
     Opts.ResourceDir = ResourceDir;
   Opts.StrongWorkspaceMode = StrongWorkspaceMode;

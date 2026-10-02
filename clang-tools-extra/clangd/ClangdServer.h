@@ -257,7 +257,8 @@ public:
   void reparseOpenFilesIfNeeded(
       llvm::function_ref<bool(llvm::StringRef File)> Filter,
       bool RebuildASTs = false,
-      std::shared_ptr<const llvm::StringSet<>> ChangedFiles = {});
+      std::shared_ptr<const llvm::StringSet<>> ChangedFiles = {},
+      bool CloseIdleFiles = true);
 
   /// Run code completion for \p File at \p Pos.
   ///
@@ -485,6 +486,10 @@ public:
   void profile(MemoryTree &MT) const;
 
 private:
+  /// Whether \p File is open and parsed, so that its symbols in the dynamic
+  /// index are kept up to date, unlike those of files closed for being idle.
+  bool isParsed(PathRef File) const;
+
   FeatureModuleSet *FeatureModules;
   const GlobalCompilationDatabase &CDB;
   const ThreadsafeFS &getHeaderFS() const {
@@ -506,6 +511,9 @@ private:
   // Guards background-index and compilation database callbacks that can
   // schedule reparses.
   mutable std::mutex BackgroundIndexReparseMu;
+  // Serializes closing idle files explicitly, e.g. with deciding which closed
+  // files' symbols to drop from the dynamic index and reparsing the others.
+  std::mutex ClosingIdleFilesMu;
   // If present, the new "auto-index" maintained in background threads.
   std::unique_ptr<BackgroundIndex> BackgroundIdx;
   // Storage for merged views of the various indexes.
