@@ -263,9 +263,14 @@ Clang-Tidy Checks
    :doc:`llvmlibc-restrict-system-libc-headers <llvmlibc/restrict-system-libc-headers>`, "Yes"
    :doc:`malterlib-conceptual-prefix <malterlib/conceptual-prefix>`,
    :doc:`malterlib-function-naming <malterlib/function-naming>`,
+   :doc:`malterlib-header-declarations-only <malterlib/header-declarations-only>`,
    :doc:`malterlib-macro-naming <malterlib/macro-naming>`,
+   :doc:`malterlib-no-zero-bit-scan <malterlib/no-zero-bit-scan>`,
    :doc:`malterlib-parameter-naming <malterlib/parameter-naming>`,
+   :doc:`malterlib-parameter-ownership <malterlib/parameter-ownership>`,
+   :doc:`malterlib-struct-not-class <malterlib/struct-not-class>`, "Yes"
    :doc:`malterlib-type-naming <malterlib/type-naming>`,
+   :doc:`malterlib-unused-parameter-cast <malterlib/unused-parameter-cast>`, "Yes"
    :doc:`malterlib-variable-naming <malterlib/variable-naming>`,
    :doc:`misc-anonymous-namespace-in-header <misc/anonymous-namespace-in-header>`,
    :doc:`misc-confusable-identifiers <misc/confusable-identifiers>`,

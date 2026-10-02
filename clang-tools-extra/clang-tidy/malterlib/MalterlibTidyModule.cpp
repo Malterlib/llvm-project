@@ -10,9 +10,14 @@
 #include "../ClangTidyModule.h"
 #include "ConceptualPrefixCheck.h"
 #include "FunctionNamingCheck.h"
+#include "HeaderDeclarationsOnlyCheck.h"
 #include "MacroNamingCheck.h"
+#include "NoZeroBitScanCheck.h"
 #include "ParameterNamingCheck.h"
+#include "ParameterOwnershipCheck.h"
+#include "StructNotClassCheck.h"
 #include "TypeNamingCheck.h"
+#include "UnusedParameterCastCheck.h"
 #include "VariableNamingCheck.h"
 
 namespace clang::tidy {
@@ -27,10 +32,20 @@ public:
         "malterlib-conceptual-prefix");
     CheckFactories.registerCheck<FunctionNamingCheck>(
         "malterlib-function-naming");
+    CheckFactories.registerCheck<HeaderDeclarationsOnlyCheck>(
+        "malterlib-header-declarations-only");
     CheckFactories.registerCheck<MacroNamingCheck>("malterlib-macro-naming");
+    CheckFactories.registerCheck<NoZeroBitScanCheck>(
+        "malterlib-no-zero-bit-scan");
     CheckFactories.registerCheck<ParameterNamingCheck>(
         "malterlib-parameter-naming");
+    CheckFactories.registerCheck<ParameterOwnershipCheck>(
+        "malterlib-parameter-ownership");
+    CheckFactories.registerCheck<StructNotClassCheck>(
+        "malterlib-struct-not-class");
     CheckFactories.registerCheck<TypeNamingCheck>("malterlib-type-naming");
+    CheckFactories.registerCheck<UnusedParameterCastCheck>(
+        "malterlib-unused-parameter-cast");
     CheckFactories.registerCheck<VariableNamingCheck>(
         "malterlib-variable-naming");
   }
