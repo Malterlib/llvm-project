@@ -62,6 +62,14 @@
 using namespace clang;
 using namespace llvm::opt;
 
+#ifdef CLANG_MALTERLIB_PLUGIN
+// This anchor is used to force the linker to link the plugin that runs the
+// Malterlib clang-tidy checks, which registers itself when it is linked.
+extern volatile int MalterlibPluginAnchorSource;
+[[maybe_unused]] static int MalterlibPluginAnchorDestination =
+    MalterlibPluginAnchorSource;
+#endif
+
 //===----------------------------------------------------------------------===//
 // Main driver
 //===----------------------------------------------------------------------===//

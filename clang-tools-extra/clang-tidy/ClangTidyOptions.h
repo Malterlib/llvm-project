@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+namespace clang {
+class FileManager;
+} // namespace clang
+
 namespace clang::tidy {
 
 /// Contains a list of line ranges in a single file.
@@ -44,7 +48,32 @@ struct ClangTidyGlobalOptions {
   /// Output warnings from certain line ranges of certain files only.
   /// If empty, no warnings will be filtered.
   std::vector<FileFilter> LineFilter;
+
+  /// Match the header filters against the absolute name of a header without
+  /// `.` and `..` components, made absolute against the working directory of
+  /// the compile, instead of the name it was included with. The Malterlib
+  /// checks plugin sets it, so the filters work for headers included through
+  /// relative and `..` paths.
+  bool NormalizeHeaderNames = false;
+
+  /// Forward the fixes of diagnostics forwarded to another diagnostics
+  /// engine. The Malterlib checks plugin doesn't: it checks only part of a
+  /// translation unit, so a fix that spans several declarations, like the
+  /// tags of a class, can be incomplete. clang-tidy fixes see all of it.
+  bool ForwardFixes = true;
+
+  /// Decides which headers are reported instead of the header filters, from
+  /// the absolute name of a header without `.` and `..` components, and where
+  /// it is past symbolic links, or an empty name when that isn't known. The
+  /// Malterlib checks plugin sets it from the rules of the repositories the
+  /// files are in.
+  std::function<bool(StringRef NormalizedName, StringRef RealName)>
+      IsHeaderReported;
 };
+
+/// The absolute name of \p Name without `.` and `..` components, with forward
+/// slashes, made absolute against the working directory of \p Files.
+std::string normalizeHeaderName(StringRef Name, const FileManager &Files);
 
 /// Contains options for clang-tidy. These options may be read from
 /// configuration files, and may be different for different translation units.
@@ -123,12 +152,21 @@ struct ClangTidyOptions {
     /// Priority stores relative precedence of the value loaded from config
     /// files to disambiguate local vs global value from different levels.
     unsigned Priority = 0;
+    /// The values of the same option that this one took the place of when
+    /// configurations were merged, with their priorities, for options whose
+    /// values edit the ones before, like the lists of the Malterlib checks.
+    std::vector<std::pair<std::string, unsigned>> Replaced;
   };
   using StringPair = std::pair<std::string, std::string>;
   using OptionMap = llvm::StringMap<ClangTidyValue>;
 
   /// Key-value mapping used to store check-specific options.
   OptionMap CheckOptions;
+
+  /// Sets the check option \p Key to \p Value, which takes the place of the
+  /// value it has: that value and those it replaced go into the values \p
+  /// Value replaced, before those of its own.
+  void replaceCheckOption(StringRef Key, ClangTidyValue Value);
 
   struct CustomCheckDiag {
     std::string BindName;
@@ -343,9 +381,21 @@ std::error_code parseLineFilter(StringRef LineFilter,
                                 ClangTidyGlobalOptions &Options);
 
 /// Parses configuration from JSON and returns \c ClangTidyOptions or an
-/// error.
+/// error. The options that are paths, like `malterlib.OptionsFile`, are made
+/// absolute relative to the directory of the configuration file that \p
+/// Config is read from, its buffer identifier.
 llvm::ErrorOr<ClangTidyOptions>
 parseConfiguration(llvm::MemoryBufferRef Config);
+
+/// Whether the option \p Name is a path, which a configuration file gives
+/// relative to its directory, like `malterlib.OptionsFile`.
+bool isPathOption(StringRef Name);
+
+/// The name of the buffer of a configuration given on the command line,
+/// `--config`, which has no file, so its paths are relative to the current
+/// directory.
+inline constexpr llvm::StringLiteral CommandLineConfigName =
+    "<command-line-config>";
 
 using DiagCallback = llvm::function_ref<void(const llvm::SMDiagnostic &)>;
 

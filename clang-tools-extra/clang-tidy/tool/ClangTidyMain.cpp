@@ -18,6 +18,7 @@
 #include "../ClangTidy.h"
 #include "../ClangTidyForceLinker.h" // IWYU pragma: keep
 #include "../GlobList.h"
+#include "../malterlib/MalterlibOptions.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/CommandLine.h"
@@ -470,7 +471,7 @@ createOptionsProvider(llvm::IntrusiveRefCntPtr<vfs::FileSystem> FS) {
   }
 
   if (Config.getNumOccurrences() > 0)
-    return LoadConfig(Config, "<command-line-config>");
+    return LoadConfig(Config, CommandLineConfigName);
 
   return std::make_unique<FileOptionsProvider>(
       std::move(GlobalOptions), std::move(DefaultOptions),
@@ -687,9 +688,23 @@ int clangTidyMain(int argc, const char **argv) {
   }
 
   if (DumpConfig) {
+    std::vector<ClangTidyError> ConfigErrors;
     EffectiveOptions.CheckOptions =
         getCheckOptions(EffectiveOptions, AllowEnablingAnalyzerAlphaCheckers,
-                        ExperimentalCustomChecks);
+                        ExperimentalCustomChecks, &ConfigErrors, BaseFS);
+    // What the checks report of the configuration, which fails the dump when
+    // it is an error, like an options file a check can't read, rather than
+    // giving the options a check has without it.
+    bool AnyError = false;
+    for (const ClangTidyError &Error : ConfigErrors) {
+      const bool IsError = Error.DiagLevel == ClangTidyError::Error;
+      AnyError |= IsError;
+      llvm::errs() << (IsError ? "error: " : "warning: ")
+                   << Error.Message.Message << " [" << Error.DiagnosticName
+                   << "]\n";
+    }
+    if (AnyError)
+      return 1;
     ClangTidyOptions OptionsToDump =
         ClangTidyOptions::getDefaults().merge(EffectiveOptions, 0);
     filterCheckOptions(OptionsToDump, EnabledChecks);
@@ -703,6 +718,16 @@ int clangTidyMain(int argc, const char **argv) {
     const ChecksAndOptions Valid = getAllChecksAndOptions(
         AllowEnablingAnalyzerAlphaCheckers, ExperimentalCustomChecks);
     bool AnyInvalid = false;
+    // Each options file once, also one that a configuration and one it
+    // inherits both name, also by other paths, `options.yaml` and
+    // `child/../options.yaml`: by where it is, past `..` and symbolic links.
+    llvm::StringSet<> VerifiedOptionsFiles;
+    auto FirstVerification = [&](StringRef Path) {
+      SmallString<256> Real;
+      if (BaseFS->getRealPath(Path, Real))
+        Real = Path;
+      return VerifiedOptionsFiles.insert(Real).second;
+    };
     for (const auto &[Opts, Source] : RawOptions) {
       if (Opts.Checks)
         AnyInvalid |= verifyChecks(Valid.Checks, *Opts.Checks, Source);
@@ -711,6 +736,41 @@ int clangTidyMain(int argc, const char **argv) {
             verifyFileExtensions(*Opts.HeaderFileExtensions,
                                  *Opts.ImplementationFileExtensions, Source);
       AnyInvalid |= verifyOptions(Valid.Options, Opts.CheckOptions, Source);
+      // And those of the Malterlib options file it names, which are options
+      // of the checks too.
+      if (auto It = Opts.CheckOptions.find(malterlib::OptionsFileOption);
+          It != Opts.CheckOptions.end() && !It->second.Value.empty() &&
+          FirstVerification(It->second.Value)) {
+        std::string Error;
+        std::shared_ptr<const malterlib::COptionsFile> File =
+            malterlib::loadOptionsFile(It->second.Value, Error, BaseFS.get());
+        if (!File) {
+          AnyInvalid = true;
+          llvm::WithColor::error(llvm::errs(), Source)
+              << Error << VerifyConfigWarningEnd;
+          continue;
+        }
+        ClangTidyOptions::OptionMap FileOptions;
+        for (const auto &Option : *File)
+          FileOptions[Option.getKey()] =
+              ClangTidyOptions::ClangTidyValue(Option.getValue());
+        AnyInvalid |=
+            verifyOptions(Valid.Options, FileOptions, It->second.Value);
+      }
+    }
+    // The Malterlib checks need the options file, which the configuration of
+    // the file, made of all of these, must name, as they report otherwise.
+    if (llvm::any_of(EnabledChecks,
+                     [](const std::string &Check) {
+                       return StringRef(Check).starts_with("malterlib-");
+                     }) &&
+        EffectiveOptions.CheckOptions.lookup(malterlib::OptionsFileOption)
+            .Value.empty()) {
+      AnyInvalid = true;
+      llvm::WithColor::error(llvm::errs(), FilePath)
+          << "the Malterlib checks need the option '"
+          << malterlib::OptionsFileOption << "', the Malterlib options file"
+          << VerifyConfigWarningEnd;
     }
     if (AnyInvalid)
       return 1;

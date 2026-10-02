@@ -1,0 +1,345 @@
+# Options of the Malterlib clang-tidy checks (malterlib-*), for every root
+# that uses Malterlib. The .clang-tidy of each module names this file:
+#
+#   CheckOptions:
+#     malterlib.OptionsFile: ../Core/ClangTidyOptions.yaml
+#
+# and the .clang-tidy at the root of a project made with Malterlib names it as
+# Malterlib/Core/ClangTidyOptions.yaml, relative to the directory of that
+# .clang-tidy.
+#
+# Each option is a list of names, written as a sequence or joined by ';'. It
+# edits what the checks know of the language and the standard library, like
+# `std::move` and `begin`: a name is added, `-Name` removes one and `-*` all
+# before it. The CheckOptions of a .clang-tidy edit the result the same way. A
+# plain name, like MoveFunctions, applies to every check; one of a check,
+# malterlib-no-zero-bit-scan.Functions, to that check only.
+
+# The functions that move what they are given, by unqualified name.
+MoveFunctions:
+  - fg_Move
+# The functions that forward what they are given.
+ForwardFunctions:
+  - fg_Forward
+# The functions that set a value and give the one it had.
+ExchangeFunctions:
+  - fg_Exchange
+# The functions that swap two values.
+SwapFunctions:
+  - fg_Swap
+# The functions that give a copy of what they are given.
+CopyFunctions:
+  - fg_TempCopy
+
+# The functions and types that keep a closure alive while they run it, or that
+# only run it on an actor: what the closure of a lambda coroutine that uses its
+# captures after a suspension may be given to. Calls of operator /, like
+# `g_Dispatch / Lambda`, and of operator >, which continues a future with it,
+# always are.
+SafeCallees:
+  - fg_CallSafe
+  - fg_Dispatch
+  - fg_DirectDispatch
+  - fg_ConcurrentDispatch
+  - f_Invoke
+  - f_Bind
+  - f_BindByValue
+  - f_Dispatch
+  - f_DispatchWithReturn
+  - fg_AsyncDestroy
+  - fg_AsyncDestroyByValue
+  - fg_AsyncDestroyGeneric
+  - fg_AsyncDestroyLogError
+  - TCActor
+  - TCWeakActor
+  - f_RegisterCommand
+  - fg_RegisterTimer
+  - fg_RegisterExactTimer
+  - fg_OneshotTimer
+  - fg_OneshotTimerAbortable
+  - TCDistributedActor
+  - CTestCategoryScope
+  - fg_CallSafeDispatched
+  - fg_CallSafeDispatchedOn
+  - fg_ActorFunctor
+  - TCActorFunctor
+  - fg_ActorFunctorWeak
+  - TCActorFunctorWeak
+# The classes whose member functions, also operators, run a closure they are
+# given to completion before they return, like the test category of
+# `DMibTestCategory("Name") % [&] () -> TCFuture<void> { ... }`.
+BlockingCallees:
+  - CTestCategoryScope
+# The classes whose operator / dispatches a closure to another actor, which
+# malterlib-actor-dispatch-this reports a capture of `this` in.
+OtherActorDispatchers:
+  - CDispatchHelperWithActor
+  - CDispatchHelperWithWeakActor
+  - CConcurrentDispatchHelper
+  - TCActor
+  - TCWeakActor
+  - CActorSubscriptionHelperWithActor
+  - CBlockingActorSubscriptionHelper
+  - COnScopeExitActorHelperWithActor
+  - TCActorFunctorHelperWithProperties
+  - TCActorFunctorWeakHelperWithProperties
+
+# The types that refer to data without owning it. A leading `*` matches the
+# end of a name, a trailing one its start, and a template with its first
+# argument, TCStr<CStrTraitsPtr_*>, its specializations with such an argument.
+ViewTypes:
+  - '*StrPtr'
+  - 'TCStr<CStrTraitsPtr_*>'
+  - '*StrSpan'
+  - CIoSpan
+
+# The member functions that remove entries of a collection.
+RemovingMethods:
+  - 'f_Remove*'
+  - 'f_TryRemove*'
+  - 'f_Consume*'
+  - 'f_Clear*'
+  - f_Extract
+  - f_ExtractAll
+  - f_ExtractNode
+  - f_FindEqualAndRemove
+  - 'f_ExpectAndRemoveFront*'
+  - 'f_Unique*'
+  - 'f_Pop*'
+  - 'f_Swap*'
+  - 'f_Delete*'
+  - 'f_Erase*'
+  - 'f_SetLen*'
+  - f_Resize
+  - 'f_Take*'
+  - 'f_Replace*'
+# The member functions that give an iterator, which can remove the entry it is
+# at.
+IteratorMethods:
+  - 'f_GetIterator*'
+# The functions that make a key that no other entry of a collection has.
+FreshKeyFunctions:
+  - fg_RandomID
+# The containers whose entries stay where they are when other entries are
+# added or removed.
+NodeStableContainers:
+  - TCMap
+  - TCSet
+  - TCMapWithPool
+  - TCSetWithPool
+  - TCLinkedList
+
+# The smart pointers, function objects and iterators, which the conceptual
+# prefixes p, f and i are for.
+SmartPointerTypes:
+  - TCSharedPointer
+  - TCUniquePointer
+  - TCWeakPointer
+  - TCAutoClearPtr
+  - TCAutoClearPtrDebug
+  - TCPointer
+  - TCBitStorePointer
+  - TCDebugPointer
+# What `CExceptionPointer` is an alias of, also where a call through
+# `TCFunction` gives it without the alias.
+  - std::exception_ptr
+# Any other class named as a pointer, or an alias named so, like
+# `CExceptionPointer` of `std::exception_ptr`, that has `operator->`, a unary
+# `operator*` or a conversion to `bool`.
+  - '*Pointer'
+# The aliases of smart pointers that are handles, named for what they give
+# rather than as pointers, which take no concept prefix: every other alias of a
+# smart pointer is a pointer.
+SmartPointerHandleTypes:
+  - CActorSubscription
+  - COnScopeExitShared
+  - COnScopeExitSharedWithException
+FunctionObjectTypes:
+  - TCFunction
+  - TCFunctionMovable
+  - TCFunctionMutable
+  - TCFunctionNoAlloc
+  - TCFunctionSmall
+  - TCFunctionFastCall
+  - TCFunctionNSCP
+  - TCActorFunctor
+  - TCActorFunctorWeak
+  - TCActorFunctorWithID
+  - '*Functor*'
+IteratorTypes:
+  - '*Iterator*'
+  - '*Cursor*'
+# Templates that wrap a value whose concept is the wrapper's: `TCAtomic<bool>`
+# is a boolean, `TCAtomic<int *>` a pointer and `TCAtomic<umint>` an integer,
+# which a `b` (a set of flags) or an `i` (an index) can name.
+ValueWrapperTypes:
+  - std::atomic
+  - TCAtomic
+  - TCAutoClear
+  - TCAutoClearInt
+# Classes that are a boolean or a set of flags, which the `b` prefix can name
+# without requiring it.
+FlagTypes:
+  - CAtomicFlag
+# The result of a type trait, which follows `std::integral_constant::value`.
+malterlib-conceptual-prefix.IgnoredNames:
+  - mc_Value
+
+# The built-in types of Malterlib, as it defines them, like uint32, fp64 and
+# zint96, which the naming checks take as types of the language.
+BuiltinTypes:
+  - aint
+  - ch16
+  - ch32
+  - ch8
+  - fp1024
+  - fp128
+  - fp16
+  - fp2048
+  - fp256
+  - fp32
+  - fp4096
+  - fp512
+  - fp64
+  - fp8
+  - fp80
+  - int1024
+  - int128
+  - int16
+  - int160
+  - int16384
+  - int192
+  - int2048
+  - int256
+  - int32
+  - int320
+  - int384
+  - int4096
+  - int512
+  - int64
+  - int8
+  - int80
+  - int8192
+  - int96
+  - pfp32
+  - pfp64
+  - pfp80
+  - smint
+  - uaint
+  - ufp1024
+  - ufp128
+  - ufp16
+  - ufp2048
+  - ufp256
+  - ufp32
+  - ufp4096
+  - ufp512
+  - ufp64
+  - ufp8
+  - ufp80
+  - uint1024
+  - uint128
+  - uint16
+  - uint160
+  - uint16384
+  - uint192
+  - uint2048
+  - uint256
+  - uint32
+  - uint320
+  - uint384
+  - uint4096
+  - uint512
+  - uint64
+  - uint8
+  - uint80
+  - uint8192
+  - uint96
+  - umint
+  - zamint
+  - zbool
+  - zch16
+  - zch32
+  - zch8
+  - zfp1024
+  - zfp128
+  - zfp16
+  - zfp2048
+  - zfp256
+  - zfp32
+  - zfp4096
+  - zfp512
+  - zfp64
+  - zfp8
+  - zfp80
+  - zint1024
+  - zint128
+  - zint16
+  - zint160
+  - zint16384
+  - zint192
+  - zint2048
+  - zint256
+  - zint32
+  - zint320
+  - zint384
+  - zint4096
+  - zint512
+  - zint64
+  - zint8
+  - zint80
+  - zint8192
+  - zint96
+  - zmint
+  - zsmint
+  - zuamint
+  - zufp1024
+  - zufp128
+  - zufp16
+  - zufp2048
+  - zufp256
+  - zufp32
+  - zufp4096
+  - zufp512
+  - zufp64
+  - zufp8
+  - zufp80
+  - zuint1024
+  - zuint128
+  - zuint16
+  - zuint160
+  - zuint16384
+  - zuint192
+  - zuint2048
+  - zuint256
+  - zuint32
+  - zuint320
+  - zuint384
+  - zuint4096
+  - zuint512
+  - zuint64
+  - zuint8
+  - zuint80
+  - zuint8192
+  - zuint96
+  - uch16
+  - uch32
+  - uch8
+  - zuch16
+  - zuch32
+  - zuch8
+
+# The bit scans that require an argument that isn't zero, and the macros that
+# check, or let the analyzer assume, that a value is.
+malterlib-no-zero-bit-scan.Functions:
+  - fg_GetHighestBitSetNoZero
+  - fg_GetLowestBitSetNoZero
+  - fg_MostSignificantBitNoZero
+  - fg_LeastSignificantBitNoZero
+malterlib-no-zero-bit-scan.CheckMacros:
+  - DMibCheck
+  - DMibFastCheck
+  - DMibSafeCheck
+  - DMibRequire
+malterlib-no-zero-bit-scan.AssumeMacros:
+  - DMibAnalyzerAssume

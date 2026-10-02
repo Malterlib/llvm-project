@@ -86,6 +86,10 @@ config.substitutions.append(("%clang_tidy_headers", clang_tidy_headers))
 if config.has_plugins and config.llvm_plugin_ext:
     config.available_features.add("plugins")
 
+# The plugin that runs the Malterlib checks in clang
+if config.has_malterlib_plugin:
+    config.available_features.add("malterlib-plugin")
+
 # It is not realistically possible to account for all options that could
 # possibly be present in system and user configuration files, so disable
 # default configs for the test runs.

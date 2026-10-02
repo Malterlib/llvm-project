@@ -33,6 +33,10 @@ std::vector<std::unique_ptr<ClangTidyCheck>>
 ClangTidyCheckFactories::createChecksForLanguage(
     ClangTidyContext *Context) const {
   std::vector<std::unique_ptr<ClangTidyCheck>> Checks;
+  // Those of another language version too until all are made, so checks that
+  // share what they report of their configuration while any of them exists
+  // report it once.
+  std::vector<std::unique_ptr<ClangTidyCheck>> Unsupported;
   const LangOptions &LO = Context->getLangOpts();
   for (const auto &[CheckName, Factory] : Factories) {
     if (!Context->isCheckEnabled(CheckName))
@@ -40,6 +44,8 @@ ClangTidyCheckFactories::createChecksForLanguage(
     std::unique_ptr<ClangTidyCheck> Check = Factory(CheckName, Context);
     if (Check->isLanguageVersionSupported(LO))
       Checks.push_back(std::move(Check));
+    else
+      Unsupported.push_back(std::move(Check));
   }
   return Checks;
 }

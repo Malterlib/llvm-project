@@ -14,6 +14,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -309,12 +310,24 @@ ClangTidyOptions &ClangTidyOptions::mergeWith(const ClangTidyOptions &Other,
   // FIXME: how to handle duplicate names check?
   mergeVectors(CustomChecks, Other.CustomChecks);
   for (const auto &KeyValue : Other.CheckOptions) {
-    CheckOptions.insert_or_assign(
-        KeyValue.getKey(),
-        ClangTidyValue(KeyValue.getValue().Value,
-                       KeyValue.getValue().Priority + Order));
+    ClangTidyValue Value(KeyValue.getValue().Value,
+                         KeyValue.getValue().Priority + Order);
+    for (const auto &[Replaced, Priority] : KeyValue.getValue().Replaced)
+      Value.Replaced.emplace_back(Replaced, Priority + Order);
+    replaceCheckOption(KeyValue.getKey(), std::move(Value));
   }
   return *this;
+}
+
+void ClangTidyOptions::replaceCheckOption(StringRef Key, ClangTidyValue Value) {
+  if (auto It = CheckOptions.find(Key); It != CheckOptions.end()) {
+    std::vector<std::pair<std::string, unsigned>> Replaced =
+        std::move(It->second.Replaced);
+    Replaced.emplace_back(std::move(It->second.Value), It->second.Priority);
+    llvm::append_range(Replaced, std::move(Value.Replaced));
+    Value.Replaced = std::move(Replaced);
+  }
+  CheckOptions.insert_or_assign(Key, std::move(Value));
 }
 
 ClangTidyOptions ClangTidyOptions::merge(const ClangTidyOptions &Other,
@@ -539,6 +552,40 @@ std::error_code parseLineFilter(StringRef LineFilter,
   return {};
 }
 
+/// The options whose values are paths, which a configuration file gives
+/// relative to the directory it is in.
+static constexpr llvm::StringLiteral PathOptions[] = {"malterlib.OptionsFile"};
+
+bool isPathOption(StringRef Name) {
+  return llvm::is_contained(PathOptions, Name);
+}
+
+/// Makes the relative paths of \p Options absolute, relative to the directory
+/// of the configuration file \p Config is read from, or to the current
+/// directory for one given on the command line, which has no file. Like
+/// `malterlib.OptionsFile: ../Core/ClangTidyOptions.yaml` in a module's
+/// `.clang-tidy`, which refers to the same file from wherever a source is.
+static void resolvePathOptions(ClangTidyOptions &Options,
+                               llvm::MemoryBufferRef Config) {
+  for (StringRef Name : PathOptions) {
+    auto It = Options.CheckOptions.find(Name);
+    if (It == Options.CheckOptions.end() || It->second.Value.empty() ||
+        llvm::sys::path::is_absolute(It->second.Value))
+      continue;
+    const StringRef Identifier = Config.getBufferIdentifier();
+    SmallString<256> Path;
+    // Of a file, also one whose name starts with `<`, `<module>/tidy.yaml`.
+    if (!Identifier.empty() && Identifier != CommandLineConfigName)
+      Path = llvm::sys::path::parent_path(Identifier);
+    llvm::sys::path::append(Path, It->second.Value);
+    llvm::sys::fs::make_absolute(Path);
+    // Not `..`, which after a symbolic link is in another directory than the
+    // one before it.
+    llvm::sys::path::remove_dots(Path);
+    It->second.Value = std::string(Path);
+  }
+}
+
 llvm::ErrorOr<ClangTidyOptions>
 parseConfiguration(llvm::MemoryBufferRef Config) {
   llvm::yaml::Input Input(Config);
@@ -546,6 +593,7 @@ parseConfiguration(llvm::MemoryBufferRef Config) {
   Input >> Options;
   if (Input.error())
     return Input.error();
+  resolvePathOptions(Options, Config);
   return Options;
 }
 
@@ -562,6 +610,7 @@ parseConfigurationWithDiags(llvm::MemoryBufferRef Config,
   Input >> Options;
   if (Input.error())
     return Input.error();
+  resolvePathOptions(Options, Config);
   return Options;
 }
 

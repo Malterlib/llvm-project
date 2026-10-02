@@ -221,6 +221,14 @@ bool ClangTidyContext::shouldSuppressDiagnostic(
                                       AllowIO, EnableNoLintBlocks);
 }
 
+llvm::vfs::FileSystem *ClangTidyContext::getFileSystem() const {
+  if (!DiagEngine || !DiagEngine->hasSourceManager())
+    return FileSystem.get();
+  return &DiagEngine->getSourceManager()
+              .getFileManager()
+              .getVirtualFileSystem();
+}
+
 void ClangTidyContext::setSourceManager(SourceManager *SourceMgr) {
   DiagEngine->setSourceManager(SourceMgr);
 }
@@ -245,15 +253,19 @@ void ClangTidyContext::setCurrentFile(StringRef File) {
   WarningAsErrorFilter = std::make_unique<CachedGlobList>(
       StringRef(getOptions().WarningsAsErrors.value_or("")));
   static const std::vector<std::string> EmptyFileExtensions;
+  // Before there is a diagnostics engine, like for the file a context is made
+  // with, they are reported for the file that is checked.
   if (!parseFileExtensions(getOptions().HeaderFileExtensions
                                ? *getOptions().HeaderFileExtensions
                                : EmptyFileExtensions,
-                           HeaderFileExtensions))
+                           HeaderFileExtensions) &&
+      DiagEngine)
     this->configurationDiag("Invalid header file extensions");
   if (!parseFileExtensions(getOptions().ImplementationFileExtensions
                                ? *getOptions().ImplementationFileExtensions
                                : EmptyFileExtensions,
-                           ImplementationFileExtensions))
+                           ImplementationFileExtensions) &&
+      DiagEngine)
     this->configurationDiag("Invalid implementation file extensions");
 }
 
@@ -381,6 +393,8 @@ void ClangTidyDiagnosticConsumer::BeginSourceFile(const LangOptions &LangOpts,
 
 void ClangTidyDiagnosticConsumer::EndSourceFile() {
   assert(InSourceFile);
+  if (ExternalDiagEngine)
+    flushForwardedDiagnostics();
   InSourceFile = false;
 
   DiagnosticConsumer::EndSourceFile();
@@ -414,6 +428,8 @@ void ClangTidyDiagnosticConsumer::HandleDiagnostic(
     assert(!Errors.empty() &&
            "A diagnostic note can only be appended to a message.");
   } else {
+    if (ExternalDiagEngine)
+      flushForwardedDiagnostics();
     finalizeLastError();
     std::string CheckName = Context.getCheckName(Info.getID());
     if (CheckName.empty()) {
@@ -501,76 +517,77 @@ bool ClangTidyDiagnosticConsumer::passesLineFilter(StringRef FileName,
 }
 
 void ClangTidyDiagnosticConsumer::forwardDiagnostic(const Diagnostic &Info) {
-  // Acquire a diagnostic ID also in the external diagnostics engine.
-  auto DiagLevelAndFormatString =
+  auto [Level, Format] =
       Context.getDiagLevelAndFormatString(Info.getID(), Info.getLocation());
-  const unsigned ExternalID =
-      ExternalDiagEngine->getDiagnosticIDs()->getCustomDiagID(
-          DiagLevelAndFormatString.first, DiagLevelAndFormatString.second);
+  if (Level == DiagnosticIDs::Ignored)
+    return;
+  // A warning that WarningsAsErrors makes an error is an error in the external
+  // engine too.
+  if (Level == DiagnosticIDs::Warning && !Errors.empty() &&
+      Errors.back().IsWarningAsError)
+    Level = DiagnosticIDs::Error;
+  // A forwarded diagnostic can't be retracted, so keep the diagnostic and its
+  // notes until the filters can tell whether they are reported: a note in the
+  // main file can make a diagnostic in a header relate to user code.
+  ForwardedDiagnostics.emplace_back(
+      static_cast<DiagnosticsEngine::Level>(Level), Info);
+}
 
-  // Forward the details.
-  auto Builder = ExternalDiagEngine->Report(Info.getLocation(), ExternalID);
-  for (const FixItHint &Hint : Info.getFixItHints())
-    Builder << Hint;
-  for (auto Range : Info.getRanges())
-    Builder << Range;
-  for (unsigned Index = 0; Index < Info.getNumArgs(); ++Index) {
-    const DiagnosticsEngine::ArgumentKind Kind = Info.getArgKind(Index);
-    switch (Kind) {
-    case DiagnosticsEngine::ak_std_string:
-      Builder << Info.getArgStdStr(Index);
-      break;
-    case DiagnosticsEngine::ak_c_string:
-      Builder << Info.getArgCStr(Index);
-      break;
-    case DiagnosticsEngine::ak_sint:
-      Builder << Info.getArgSInt(Index);
-      break;
-    case DiagnosticsEngine::ak_uint:
-      Builder << Info.getArgUInt(Index);
-      break;
-    case DiagnosticsEngine::ak_tokenkind:
-      Builder << static_cast<tok::TokenKind>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_identifierinfo:
-      Builder << Info.getArgIdentifier(Index);
-      break;
-    case DiagnosticsEngine::ak_qual:
-      Builder << Qualifiers::fromOpaqueValue(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_qualtype:
-      Builder << QualType::getFromOpaquePtr(
-          reinterpret_cast<void *>(Info.getRawArg(Index)));
-      break;
-    case DiagnosticsEngine::ak_declarationname:
-      Builder << DeclarationName::getFromOpaqueInteger(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_nameddecl:
-      Builder << reinterpret_cast<const NamedDecl *>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_nestednamespec:
-      Builder << NestedNameSpecifier::getFromVoidPointer(
-          reinterpret_cast<void *>(Info.getRawArg(Index)));
-      break;
-    case DiagnosticsEngine::ak_declcontext:
-      Builder << reinterpret_cast<DeclContext *>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_qualtype_pair:
-      assert(false); // This one is not passed around.
-      break;
-    case DiagnosticsEngine::ak_attr:
-      Builder << reinterpret_cast<Attr *>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_attr_info:
-      Builder << reinterpret_cast<AttributeCommonInfo *>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_addrspace:
-      Builder << static_cast<LangAS>(Info.getRawArg(Index));
-      break;
-    case DiagnosticsEngine::ak_expr:
-      Builder << reinterpret_cast<const Expr *>(Info.getRawArg(Index));
+void ClangTidyDiagnosticConsumer::flushForwardedDiagnostics() {
+  if (ForwardedDiagnostics.empty())
+    return;
+  // Like finalizeLastError(), which never ignores configuration diagnostics.
+  bool Forward =
+      !Errors.empty() &&
+      (Errors.back().DiagnosticName == "clang-tidy-config" ||
+       (LastErrorRelatesToUserCode && LastErrorPassesLineFilter &&
+        (Context.isCheckEnabled(Errors.back().DiagnosticName) ||
+         Errors.back().DiagLevel == ClangTidyError::Error)));
+  // A diagnostic at the same place with the same message was forwarded
+  // already, like one in a macro that several expansions report, also of an
+  // argument a macro expands more than once, which is at the same place where
+  // it is written and where the macro is used.
+  if (Forward) {
+    const StoredDiagnostic &Main = ForwardedDiagnostics.front();
+    const FullSourceLoc Loc = Main.getLocation();
+    const std::string Place =
+        Loc.isValid() && Loc.isMacroID()
+            ? std::to_string(Loc.getExpansionLoc().getRawEncoding()) + "/" +
+                  std::to_string(Loc.getSpellingLoc().getRawEncoding())
+            : std::to_string(Loc.getRawEncoding());
+    Forward =
+        ForwardedKeys.insert(Place + ":" + Main.getMessage().str()).second;
+  }
+  if (Forward) {
+    for (const StoredDiagnostic &Stored : ForwardedDiagnostics) {
+      // An error is fatal with -Wfatal-errors, like the compiler's own.
+      DiagnosticIDs::Level Level =
+          static_cast<DiagnosticIDs::Level>(Stored.getLevel());
+      if (Level == DiagnosticIDs::Error &&
+          ExternalDiagEngine->getErrorsAsFatal())
+        Level = DiagnosticIDs::Fatal;
+      const unsigned ExternalID =
+          ExternalDiagEngine->getDiagnosticIDs()->getCustomDiagID(Level, "%0");
+      auto Builder =
+          ExternalDiagEngine->Report(Stored.getLocation(), ExternalID);
+      Builder << Stored.getMessage();
+      for (const CharSourceRange &Range : Stored.getRanges())
+        Builder << Range;
+      if (Context.getGlobalOptions().ForwardFixes) {
+        for (const FixItHint &Hint : Stored.getFixIts())
+          Builder << Hint;
+      }
     }
   }
+  ForwardedDiagnostics.clear();
+}
+
+std::string clang::tidy::normalizeHeaderName(StringRef Name,
+                                             const FileManager &Files) {
+  SmallString<256> Path(Name);
+  Files.makeAbsolutePath(Path);
+  llvm::sys::path::remove_dots(Path, /*remove_dot_dot=*/true);
+  return llvm::sys::path::convert_to_slash(Path);
 }
 
 void ClangTidyDiagnosticConsumer::checkFilters(SourceLocation Location,
@@ -610,10 +627,34 @@ void ClangTidyDiagnosticConsumer::checkFilters(SourceLocation Location,
   }
 
   const StringRef FileName(File->getName());
+  std::string NormalizedName;
+  if (Context.getGlobalOptions().NormalizeHeaderNames)
+    NormalizedName = normalizeHeaderName(FileName, Sources.getFileManager());
+  const StringRef FilteredName =
+      Context.getGlobalOptions().NormalizeHeaderNames ? StringRef(NormalizedName)
+                                                      : FileName;
+  const auto &IsHeaderReported = Context.getGlobalOptions().IsHeaderReported;
+  // With normalized names, a header is also told by where it is, past
+  // symbolic links, like the plugin tells which headers it checks: the rules
+  // of the plugin tell that themselves, and the header filters match either
+  // name, and either name that an exclude matches leaves it out.
+  auto ReportedHeader = [&] {
+    // With forward slashes like the normalized name, also on Windows.
+    std::string Real;
+    if (Context.getGlobalOptions().NormalizeHeaderNames)
+      Real = llvm::sys::path::convert_to_slash(
+          Sources.getFileManager().getCanonicalName(*File));
+    if (IsHeaderReported)
+      return IsHeaderReported(FilteredName, Real);
+    const bool Linked = !Real.empty() && Real != FilteredName;
+    return (getHeaderFilter()->match(FilteredName) ||
+            (Linked && getHeaderFilter()->match(Real))) &&
+           !getExcludeHeaderFilter()->match(FilteredName) &&
+           !(Linked && getExcludeHeaderFilter()->match(Real));
+  };
   LastErrorRelatesToUserCode = LastErrorRelatesToUserCode ||
                                Sources.isInMainFile(Location) ||
-                               (getHeaderFilter()->match(FileName) &&
-                                !getExcludeHeaderFilter()->match(FileName));
+                               ReportedHeader();
 
   const unsigned LineNumber = Sources.getExpansionLineNumber(Location);
   LastErrorPassesLineFilter =

@@ -257,10 +257,19 @@ TidyProvider provideClangdConfig() {
     if (!CurTidyConfig.Checks.empty())
       mergeCheckList(Opts.Checks, CurTidyConfig.Checks);
 
-    for (const auto &CheckOption : CurTidyConfig.CheckOptions)
-      Opts.CheckOptions.insert_or_assign(CheckOption.getKey(),
-                                         tidy::ClangTidyOptions::ClangTidyValue(
-                                             CheckOption.getValue(), 10000U));
+    // Each after the options of the .clang-tidy files, in the order of the
+    // fragments that set them, also those that later fragments took the place
+    // of, which edit them in turn.
+    for (const auto &CheckOption : CurTidyConfig.CheckOptions) {
+      tidy::ClangTidyOptions::ClangTidyValue Value(
+          CheckOption.getValue(),
+          10000U +
+              CurTidyConfig.CheckOptionFragments.lookup(CheckOption.getKey()));
+      for (const auto &[Replaced, Fragment] :
+           CurTidyConfig.ReplacedCheckOptions.lookup(CheckOption.getKey()))
+        Value.Replaced.emplace_back(Replaced, 10000U + Fragment);
+      Opts.replaceCheckOption(CheckOption.getKey(), std::move(Value));
+    }
   };
 }
 

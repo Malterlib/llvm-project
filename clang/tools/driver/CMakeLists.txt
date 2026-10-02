@@ -67,6 +67,35 @@ clang_target_link_libraries(clang
   clangSerialization
   )
 
+# Link the plugin that runs the Malterlib clang-tidy checks in the compile
+# (-fplugin-arg-malterlib-checks=...). It is linked into clang, instead of
+# loaded with -fplugin, so it works on every platform and always matches the
+# compiler.
+set(CLANG_ENABLE_MALTERLIB_PLUGIN_DEFAULT OFF)
+if("clang-tools-extra" IN_LIST LLVM_ENABLE_PROJECTS)
+  set(CLANG_ENABLE_MALTERLIB_PLUGIN_DEFAULT ON)
+endif()
+option(CLANG_ENABLE_MALTERLIB_PLUGIN
+  "Link the Malterlib clang-tidy checks into clang as a plugin."
+  ${CLANG_ENABLE_MALTERLIB_PLUGIN_DEFAULT})
+if(CLANG_ENABLE_MALTERLIB_PLUGIN)
+  # In the multicall driver build clang is linked into llvm-driver and its
+  # sources are compiled in obj.clang.
+  set(malterlib_plugin_target clang)
+  get_property(LLVM_DRIVER_TOOLS GLOBAL PROPERTY LLVM_DRIVER_TOOLS)
+  if(LLVM_TOOL_LLVM_DRIVER_BUILD AND clang IN_LIST LLVM_DRIVER_TOOLS)
+    set(malterlib_plugin_target llvm-driver)
+  endif()
+  target_link_libraries(${malterlib_plugin_target} PRIVATE
+    clangTidyMalterlibPlugin)
+  if(TARGET obj.clang)
+    target_compile_definitions(obj.clang PRIVATE CLANG_MALTERLIB_PLUGIN=1)
+  endif()
+  if(NOT malterlib_plugin_target STREQUAL "llvm-driver")
+    target_compile_definitions(clang PRIVATE CLANG_MALTERLIB_PLUGIN=1)
+  endif()
+endif()
+
 if(WIN32 AND NOT CYGWIN)
   # Prevent versioning if the buildhost is targeting for Win32.
 else()
