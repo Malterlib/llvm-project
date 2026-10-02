@@ -1,0 +1,50 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "../ClangTidy.h"
+#include "../ClangTidyModule.h"
+#include "ConceptualPrefixCheck.h"
+#include "FunctionNamingCheck.h"
+#include "MacroNamingCheck.h"
+#include "ParameterNamingCheck.h"
+#include "TypeNamingCheck.h"
+#include "VariableNamingCheck.h"
+
+namespace clang::tidy {
+namespace malterlib {
+namespace {
+
+/// This module is for checks of the Malterlib coding standard.
+class MalterlibModule : public ClangTidyModule {
+public:
+  void addCheckFactories(ClangTidyCheckFactories &CheckFactories) override {
+    CheckFactories.registerCheck<ConceptualPrefixCheck>(
+        "malterlib-conceptual-prefix");
+    CheckFactories.registerCheck<FunctionNamingCheck>(
+        "malterlib-function-naming");
+    CheckFactories.registerCheck<MacroNamingCheck>("malterlib-macro-naming");
+    CheckFactories.registerCheck<ParameterNamingCheck>(
+        "malterlib-parameter-naming");
+    CheckFactories.registerCheck<TypeNamingCheck>("malterlib-type-naming");
+    CheckFactories.registerCheck<VariableNamingCheck>(
+        "malterlib-variable-naming");
+  }
+};
+
+} // namespace
+
+// Register the MalterlibTidyModule using this statically initialized variable.
+static ClangTidyModuleRegistry::Add<MalterlibModule>
+    X("malterlib-module", "Adds checks of the Malterlib coding standard.");
+} // namespace malterlib
+
+// This anchor is used to force the linker to link in the generated object file
+// and thus register the MalterlibModule.
+volatile int MalterlibModuleAnchorSource = 0; // NOLINT(misc-use-internal-linkage)
+
+} // namespace clang::tidy

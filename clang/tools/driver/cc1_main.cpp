@@ -62,6 +62,15 @@
 using namespace clang;
 using namespace llvm::opt;
 
+#ifdef CLANG_MALTERLIB_PLUGIN
+// This anchor is used to force the linker to link the plugin that runs the
+// Malterlib clang-tidy checks, which registers itself when it is linked.
+extern volatile int MalterlibPluginAnchorSource;
+[[maybe_unused]] static int MalterlibPluginAnchorDestination =
+    MalterlibPluginAnchorSource;
+void addMalterlibPluginModuleFileExtensions(clang::FrontendOptions &Options);
+#endif
+
 //===----------------------------------------------------------------------===//
 // Main driver
 //===----------------------------------------------------------------------===//
@@ -247,6 +256,9 @@ int cc1_main(ArrayRef<const char *> Argv, const char *Argv0, void *MainAddr) {
   bool Success =
       CompilerInvocation::CreateFromArgs(*Invocation, Argv, Diags, Argv0);
 
+#ifdef CLANG_MALTERLIB_PLUGIN
+  addMalterlibPluginModuleFileExtensions(Invocation->getFrontendOpts());
+#endif
   auto Clang = std::make_unique<CompilerInstance>(std::move(Invocation),
                                                   std::move(PCHOps));
 

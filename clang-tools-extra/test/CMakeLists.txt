@@ -11,6 +11,7 @@ llvm_canonicalize_cmake_booleans(
   CLANG_TIDY_ENABLE_STATIC_ANALYZER
   CLANG_TIDY_ENABLE_QUERY_BASED_CUSTOM_CHECKS
   CLANG_PLUGIN_SUPPORT
+  CLANG_ENABLE_MALTERLIB_PLUGIN
   LLVM_INSTALL_TOOLCHAIN_ONLY
   )
 
@@ -50,8 +51,10 @@ set(CLANG_TOOLS_TEST_DEPS
 )
 
 # Add lit test dependencies.
+# llvm-config tells lit whether LLVM is built with assertions, the asserts
+# feature of tests that can't run under them.
 set(LLVM_UTILS_DEPS
-  FileCheck count not split-file
+  FileCheck count not split-file llvm-config
 )
 foreach(dep ${LLVM_UTILS_DEPS})
   if(TARGET ${dep})
