@@ -596,6 +596,11 @@ public:
     return wait(Lock, ReqCV, Timeout, [&] { return !NextReq && !CurrentReq; });
   }
 
+  bool isIdle() const {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    return !NextReq && !CurrentReq;
+  }
+
 private:
   /// Holds inputs required for building a preamble. CI is guaranteed to be
   /// non-null.
@@ -681,6 +686,34 @@ public:
              llvm::unique_function<void(llvm::Expected<InputsAndAST>)> Action,
              TUScheduler::ASTActionInvalidation);
   bool blockUntilIdle(Deadline Timeout) const;
+  /// Whether there are no pending or running requests, and none are being
+  /// scheduled (see pin()).
+  bool isIdle() const;
+  /// Keeps the worker from being closed for being idle while a request is
+  /// scheduled outside TUScheduler's lock, until unpin().
+  void pin() { ++Pins; }
+  void unpin() { --Pins; }
+  /// The inputs of the latest update.
+  ParseInputs latestInputs();
+  /// The headers the latest AST included, also outside the preamble.
+  std::vector<std::string> includedHeaders() const {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    return IncludedHeaders;
+  }
+  void recordIncludedHeaders(const ParsedAST &AST) {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    IncludedHeaders = AST.getIncludeStructure().allHeaders().vec();
+    ++ParseGeneration;
+  }
+  /// Changes when the file is parsed, e.g. with different dependencies.
+  unsigned parseGeneration() const { return ParseGeneration; }
+  /// The including file the file is parsed in the context of, if any.
+  std::optional<std::string> proxyFile() const {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (!FileInputs.ProxyCompileCommand)
+      return std::nullopt;
+    return FileInputs.ProxyCompileCommand->Filename;
+  }
 
   std::shared_ptr<const PreambleData> getPossiblyStalePreamble(
       std::shared_ptr<const ASTSignals> *ASTSignals = nullptr) const;
@@ -695,6 +728,9 @@ public:
 
   /// Returns compile command from the current file inputs.
   tooling::CompileCommand getCurrentCompileCommand() const;
+  /// Sets the compile command until the first update resolves it, e.g. to the
+  /// one the file had when it was closed for being idle.
+  void setCompileCommand(tooling::CompileCommand Command);
 
   /// Wait for the first build of preamble to finish. Preamble itself can be
   /// accessed via getPossiblyStalePreamble(). Note that this function will
@@ -779,8 +815,12 @@ private:
   Semaphore &Barrier;
   /// Whether the 'onMainAST' callback ran for the current FileInputs.
   bool RanASTCallback = false;
+  /// Requests being scheduled outside TUScheduler's lock.
+  std::atomic<unsigned> Pins = {0};
+  std::atomic<unsigned> ParseGeneration = {0};
   /// Guards members used by both TUScheduler and the worker thread.
   mutable std::mutex Mutex;
+  std::vector<std::string> IncludedHeaders; /* GUARDED_BY(Mutex) */
   /// File inputs, currently being used by the worker.
   /// Writes and reads from unknown threads are locked. Reads from the worker
   /// thread are not locked, as it's the only writer.
@@ -1201,6 +1241,8 @@ void ASTWorker::runWithAST(
         ++ASTBuildCount;
       }
       AST = NewAST ? std::make_unique<ParsedAST>(std::move(*NewAST)) : nullptr;
+      if (*AST)
+        recordIncludedHeaders(**AST);
     }
     // Make sure we put the AST back into the LRU cache.
     llvm::scope_exit _([&AST, this]() { IdleASTs.put(this, std::move(*AST)); });
@@ -1325,6 +1367,7 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
     // finishes.
     if (!LatestPreamble || Preamble != *LatestPreamble) {
       ++PreambleBuildCount;
+      ++ParseGeneration;
       // Cached AST is no longer valid.
       IdleASTs.take(this);
       RanASTCallback = false;
@@ -1457,6 +1500,7 @@ void ASTWorker::generateDiagnostics(
       Publish();
   };
   if (*AST) {
+    recordIncludedHeaders(**AST);
     trace::Span Span("Running main AST callback");
     Callbacks.onMainAST(FileName, **AST, RunPublish);
     updateASTSignals(**AST);
@@ -1493,6 +1537,11 @@ void ASTWorker::waitForFirstPreamble() const {
 tooling::CompileCommand ASTWorker::getCurrentCompileCommand() const {
   std::unique_lock<std::mutex> Lock(Mutex);
   return FileInputs.CompileCommand;
+}
+
+void ASTWorker::setCompileCommand(tooling::CompileCommand Command) {
+  std::unique_lock<std::mutex> Lock(Mutex);
+  FileInputs.CompileCommand = std::move(Command);
 }
 
 TUScheduler::FileStats ASTWorker::stats() const {
@@ -1784,6 +1833,23 @@ bool ASTWorker::blockUntilIdle(Deadline Timeout) const {
   return WaitUntilASTWorkerIsIdle();
 }
 
+bool ASTWorker::isIdle() const {
+  if (Pins)
+    return false;
+  // Requests are handed between this thread and the preamble thread while
+  // either is busy, with the lock held: the preamble thread to queue the AST
+  // build, and this thread to start or finish requests, such as one updating
+  // the preamble. Holding it keeps requests from moving between the checks.
+  std::lock_guard<std::mutex> Lock(Mutex);
+  return PreambleRequests.empty() && Requests.empty() && !CurrentRequest &&
+         PreamblePeer.isIdle();
+}
+
+ParseInputs ASTWorker::latestInputs() {
+  std::lock_guard<std::mutex> Lock(LatestInputsMu);
+  return LatestInputs;
+}
+
 // Render a TUAction to a user-facing string representation.
 // TUAction represents clangd-internal states, we don't intend to expose them
 // to users (say C++ programmers) directly to avoid confusion, we use terms that
@@ -1836,7 +1902,17 @@ FileStatus TUStatus::render(PathRef File) const {
 struct TUScheduler::FileData {
   /// Latest inputs, passed to TUScheduler::update().
   std::string Contents;
+  /// Empty while the file is closed for being idle.
   ASTWorkerHandle Worker;
+  /// The inputs to reopen the file with while it's closed for being idle.
+  std::optional<ParseInputs> ClosedInputs;
+  /// The compile command the file had when it was closed, which requests can
+  /// use before the reopened file's first update resolves it again.
+  tooling::CompileCommand ClosedCommand;
+  /// When the file was last updated or used.
+  std::chrono::steady_clock::time_point LastUsed;
+
+  bool isClosed() const { return ClosedInputs.has_value(); }
 };
 
 TUScheduler::TUScheduler(const GlobalCompilationDatabase &CDB,
@@ -1873,7 +1949,9 @@ TUScheduler::~TUScheduler() {
   {
     std::lock_guard<std::mutex> Lock(FilesMu);
     Files.clear();
+    ShuttingDown = true;
   }
+  ClosingIdleFilesCV.notify_all();
 
   // Wait for all in-flight tasks to finish.
   if (PreambleTasks)
@@ -1893,7 +1971,8 @@ bool TUScheduler::blockUntilIdle(Deadline D) const {
       std::lock_guard<std::mutex> Lock(FilesMu);
       Workers.reserve(Files.size());
       for (auto &File : Files)
-        Workers.push_back(File.getValue()->Worker.lock());
+        if (!File.getValue()->isClosed())
+          Workers.push_back(File.getValue()->Worker.lock());
     }
     for (auto &Worker : Workers)
       if (!Worker->blockUntilIdle(D))
@@ -1921,22 +2000,289 @@ bool TUScheduler::update(PathRef File, ParseInputs Inputs,
           WorkerThreads ? &*WorkerThreads : nullptr, Barrier, Opts, *Callbacks);
       Worker = NewWorker.lockMutable();
       FD = std::unique_ptr<FileData>(
-          new FileData{Inputs.Contents, std::move(NewWorker)});
+          new FileData{Inputs.Contents, std::move(NewWorker),
+                       /*ClosedInputs=*/std::nullopt, /*ClosedCommand=*/{},
+                       /*LastUsed=*/{}});
       ContentChanged = true;
     } else {
-      Worker = FD->Worker.lockMutable();
       if (FD->Contents != Inputs.Contents) {
         ContentChanged = true;
         FD->Contents = Inputs.Contents;
+      } else if (FD->isClosed() && WantDiags != WantDiagnostics::Yes &&
+                 !Inputs.ForceRebuild) {
+        // Updates that don't change the contents, e.g. to reparse open files
+        // after one was saved, are handled when the file is reopened.
+        FD->ClosedInputs = std::move(Inputs);
+        return false;
       }
+      // The update supersedes the inputs the file was closed with.
+      reopenClosedFileLocked(File, *FD, /*UpdateWithClosedInputs=*/false);
+      Worker = FD->Worker.lockMutable();
     }
+    // Updates that don't change the contents don't make the file used, unless
+    // they explicitly ask for diagnostics or a rebuild.
+    if (ContentChanged || WantDiags == WantDiagnostics::Yes ||
+        Inputs.ForceRebuild)
+      FD->LastUsed = std::chrono::steady_clock::now();
     // There might be synthetic update requests, don't change the LastActiveFile
     // in such cases.
     if (ContentChanged)
       LastActiveFile = File.str();
+    Worker->pin();
   }
   Worker->update(std::move(Inputs), WantDiags, ContentChanged);
+  Worker->unpin();
+  scheduleClosingIdleFiles();
   return NewFile;
+}
+
+void TUScheduler::reopenClosedFileLocked(PathRef File, FileData &FD,
+                                         bool UpdateWithClosedInputs) {
+  if (!FD.isClosed())
+    return;
+  log("Reopening {0}, which was closed to free its resources", File);
+  FD.Worker = ASTWorker::create(File, CDB, *IdleASTs, *HeaderIncluders,
+                                WorkerThreads ? &*WorkerThreads : nullptr,
+                                Barrier, Opts, *Callbacks);
+  FD.Worker->setCompileCommand(std::move(FD.ClosedCommand));
+  ParseInputs Inputs = std::move(*FD.ClosedInputs);
+  FD.ClosedInputs.reset();
+  // Update the worker before releasing the lock, so that requests scheduled
+  // by other threads see it parsed. Closing idle files needs worker threads,
+  // so this doesn't parse the file on this thread.
+  if (UpdateWithClosedInputs)
+    FD.Worker->update(std::move(Inputs), WantDiagnostics::Auto,
+                      /*ContentChanged=*/true);
+}
+
+bool TUScheduler::closesIdleFiles() const {
+  const ASTRetentionPolicy &Policy = Opts.RetentionPolicy;
+  // Reopening files on demand relies on workers not running synchronously.
+  return PreambleTasks && WorkerThreads && Opts.HasUnsavedChanges &&
+         (Policy.CloseIdleFilesAfter !=
+              std::chrono::steady_clock::duration::zero() ||
+          Policy.MaxLiveFiles);
+}
+
+void TUScheduler::closeIdleFilesNow() {
+  if (closesIdleFiles() && closeIdleFiles(/*IgnoreSuspension=*/true))
+    scheduleClosingIdleFiles();
+}
+
+void TUScheduler::suspendClosingIdleFiles() {
+  // Closing files holds the lock, so none are closed once this returns.
+  std::lock_guard<std::mutex> Lock(FilesMu);
+  ++ClosingIdleFilesSuspended;
+}
+
+void TUScheduler::resumeClosingIdleFiles() {
+  std::lock_guard<std::mutex> Lock(FilesMu);
+  assert(ClosingIdleFilesSuspended);
+  --ClosingIdleFilesSuspended;
+}
+
+void TUScheduler::scheduleClosingIdleFiles() {
+  if (!closesIdleFiles())
+    return;
+  // Coalesce the checks requested while one is pending or running, e.g. by
+  // bursts of requests. Checking for unsaved changes reads the files. Set
+  // before checking, so that a running task that is about to finish sees it.
+  CloseIdleFilesAgain = true;
+  if (ClosingIdleFiles.exchange(true))
+    return;
+  PreambleTasks->runAsync("CloseIdleFiles", [this, Ctx = Context::current()
+                                                          .clone()]() mutable {
+    WithContext WC(std::move(Ctx));
+    while (CloseIdleFilesAgain.exchange(false)) {
+      // Files to close can be busy, e.g. parsing many files opened at once.
+      // Nothing else may check again once they're done, so retry until then.
+      while (closeIdleFiles(/*IgnoreSuspension=*/false)) {
+        std::unique_lock<std::mutex> Lock(FilesMu);
+        if (ClosingIdleFilesCV.wait_for(Lock, std::chrono::seconds(1),
+                                        [&] { return ShuttingDown; }))
+          break;
+      }
+      std::lock_guard<std::mutex> Lock(FilesMu);
+      if (ShuttingDown)
+        break;
+    }
+    ClosingIdleFiles = false;
+    // Checks requested since the last one, before this task was done.
+    if (CloseIdleFilesAgain)
+      scheduleClosingIdleFiles();
+  });
+}
+
+bool TUScheduler::closeIdleFiles(bool IgnoreSuspension) {
+  const ASTRetentionPolicy &Policy = Opts.RetentionPolicy;
+  auto Now = std::chrono::steady_clock::now();
+  struct Candidate {
+    std::string File;
+    std::string Contents;
+    std::chrono::steady_clock::time_point LastUsed;
+    bool Idle;
+    // Open files that parsing the file depends on, with their contents: the
+    // headers it includes, or the file it's parsed in the context of. Files
+    // open in the editor can be parsed with their unsaved changes, which then
+    // only the file's own parse reflects.
+    std::vector<std::pair<std::string, std::string>> OpenDependencies;
+    // Of the parse the dependencies are from.
+    unsigned ParseGeneration = 0;
+  };
+  std::vector<Candidate> Candidates;
+  size_t OverLimit = 0;
+  bool Busy = false;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    struct LiveFile {
+      std::chrono::steady_clock::time_point LastUsed;
+      llvm::StringRef File;
+      FileData *FD;
+    };
+    std::vector<LiveFile> Live;
+    for (auto &PathAndFile : Files)
+      if (!PathAndFile.second->isClosed())
+        Live.push_back({PathAndFile.second->LastUsed, PathAndFile.first(),
+                        PathAndFile.second.get()});
+    // Least recently used first.
+    llvm::sort(Live, [](const LiveFile &L, const LiveFile &R) {
+      return L.LastUsed < R.LastUsed;
+    });
+    if (Policy.MaxLiveFiles && Live.size() > Policy.MaxLiveFiles)
+      OverLimit = Live.size() - Policy.MaxLiveFiles;
+    // The most recently used files are kept, and beyond the limit, more
+    // recently used files can replace ones that can't be closed, but not the
+    // most recently used one.
+    size_t Closable =
+        Live.size() - std::min<size_t>(Live.size(),
+                                       std::max(Policy.MinLiveFiles, 1u));
+    size_t IdleClosable =
+        Live.size() - std::min<size_t>(Live.size(), Policy.MinLiveFiles);
+    llvm::StringMap<llvm::StringRef> FilesByFoldedPath;
+    for (const auto &PathAndFile : Files)
+      FilesByFoldedPath[maybeCaseFoldPath(PathAndFile.first())] =
+          PathAndFile.first();
+    for (size_t I = 0; I < Live.size(); ++I) {
+      const LiveFile &L = Live[I];
+      bool Idle = I < IdleClosable &&
+                  Policy.CloseIdleFilesAfter !=
+                      std::chrono::steady_clock::duration::zero() &&
+                  Now - L.LastUsed >= Policy.CloseIdleFilesAfter;
+      if (!Idle && (!OverLimit || I >= Closable))
+        continue;
+      if (!L.FD->Worker->isIdle()) {
+        Busy = true;
+        continue;
+      }
+      Candidate C{L.File.str(), L.FD->Contents, L.LastUsed, Idle, {}, 0};
+      llvm::StringSet<> Seen;
+      auto AddDependency = [&](llvm::StringRef Dependency) {
+        // Paths can be spelled in other case than the open file's.
+        auto It = FilesByFoldedPath.find(maybeCaseFoldPath(Dependency));
+        if (It == FilesByFoldedPath.end() || !Seen.insert(It->second).second)
+          return;
+        FileData &Open = *Files.find(It->second)->second;
+        if (&Open != L.FD)
+          C.OpenDependencies.emplace_back(It->second.str(), Open.Contents);
+      };
+      C.ParseGeneration = L.FD->Worker->parseGeneration();
+      if (auto Preamble = L.FD->Worker->getPossiblyStalePreamble()) {
+        for (const std::string &Header : Preamble->Includes.allHeaders())
+          AddDependency(Header);
+        if (!Preamble->ProxyFile.empty())
+          AddDependency(Preamble->ProxyFile);
+      }
+      for (const std::string &Header : L.FD->Worker->includedHeaders())
+        AddDependency(Header);
+      if (auto Proxy = L.FD->Worker->proxyFile())
+        AddDependency(*Proxy);
+      Candidates.push_back(std::move(C));
+    }
+  }
+  if (Candidates.empty())
+    return Busy;
+
+  // Outside the lock, as it reads the files.
+  std::vector<const Candidate *> ToClose;
+  for (const Candidate &C : Candidates) {
+    if (!C.Idle && !OverLimit)
+      continue;
+    WithContext WithProvidedContext(Opts.ContextProvider(C.File));
+    if (Opts.HasUnsavedChanges(C.File, C.Contents) ||
+        llvm::any_of(C.OpenDependencies, [&](const auto &Dependency) {
+          return Opts.HasUnsavedChanges(Dependency.first, Dependency.second);
+        }))
+      continue;
+    ToClose.push_back(&C);
+    if (OverLimit)
+      --OverLimit;
+  }
+
+  std::lock_guard<std::mutex> Lock(FilesMu);
+  if (ClosingIdleFilesSuspended && !IgnoreSuspension)
+    return true;
+  for (const Candidate *C : ToClose) {
+    auto It = Files.find(C->File);
+    if (It == Files.end())
+      continue;
+    FileData &FD = *It->second;
+    // Skip files used or changed since they were picked.
+    if (FD.isClosed() || FD.LastUsed != C->LastUsed ||
+        FD.Contents != C->Contents)
+      continue;
+    // Files it depends on that changed since may now have unsaved changes, and
+    // parsing it again may have found other dependencies.
+    if (FD.Worker->parseGeneration() != C->ParseGeneration ||
+        llvm::any_of(C->OpenDependencies, [&](const auto &Dependency) {
+          auto It = Files.find(Dependency.first);
+          return It != Files.end() && It->second->Contents != Dependency.second;
+        })) {
+      Busy = true;
+      continue;
+    }
+    // Other files can have been closed or removed since, which can make this
+    // one of the most recently used files that must be kept.
+    size_t LiveCount = 0, MoreRecent = 0;
+    for (const auto &PathAndFile : Files) {
+      if (PathAndFile.second->isClosed())
+        continue;
+      ++LiveCount;
+      if (PathAndFile.second->LastUsed > FD.LastUsed)
+        ++MoreRecent;
+    }
+    bool CanCloseIdle = C->Idle && MoreRecent >= Policy.MinLiveFiles;
+    bool CanCloseOverLimit =
+        Policy.MaxLiveFiles && LiveCount > Policy.MaxLiveFiles &&
+        MoreRecent >= std::max(Policy.MinLiveFiles, 1u);
+    if (!CanCloseIdle && !CanCloseOverLimit)
+      continue;
+    if (!FD.Worker->isIdle()) {
+      Busy = true;
+      continue;
+    }
+    log("Closing {0}, which {1}", C->File,
+        C->Idle ? "was idle" : "is beyond the limit of open files");
+    ParseInputs Inputs = FD.Worker->latestInputs();
+    std::string Version = Inputs.Version;
+    FD.ClosedInputs = std::move(Inputs);
+    FD.ClosedCommand = FD.Worker->getCurrentCompileCommand();
+    {
+      // Stops the worker, so that it no longer publishes diagnostics.
+      ASTWorkerHandle Worker = std::move(FD.Worker);
+    }
+    // Clear the diagnostics while holding the lock, so that they can't replace
+    // those of the file if it's reopened meanwhile.
+    WithContext WithProvidedContext(Opts.ContextProvider(C->File));
+    Callbacks->onFailedAST(C->File, Version, {},
+                           [](llvm::function_ref<void()> Publish) { Publish(); });
+  }
+  return Busy;
+}
+
+bool TUScheduler::isClosed(PathRef File) const {
+  std::lock_guard<std::mutex> Lock(FilesMu);
+  auto It = Files.find(File);
+  return It != Files.end() && It->second->isClosed();
 }
 
 void TUScheduler::remove(PathRef File) {
@@ -2003,7 +2349,11 @@ void TUScheduler::runWithAST(
     auto It = Files.find(File);
     if (It != Files.end()) {
       LastActiveFile = File.str();
+      reopenClosedFileLocked(File, *It->second,
+                             /*UpdateWithClosedInputs=*/true);
+      It->second->LastUsed = std::chrono::steady_clock::now();
       Worker = It->second->Worker.lockMutable();
+      Worker->pin();
     }
   }
   if (!Worker) {
@@ -2013,6 +2363,8 @@ void TUScheduler::runWithAST(
   }
 
   Worker->runWithAST(Name, std::move(Action), Invalidation);
+  Worker->unpin();
+  scheduleClosingIdleFiles();
 }
 
 void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
@@ -2025,10 +2377,17 @@ void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
     auto It = Files.find(File);
     if (It != Files.end()) {
       LastActiveFile = File.str();
+      reopenClosedFileLocked(File, *It->second,
+                             /*UpdateWithClosedInputs=*/true);
+      It->second->LastUsed = std::chrono::steady_clock::now();
       Contents = It->second->Contents;
       Worker = It->second->Worker.lockMutable();
+      // Until the action ran, as closing the file would stop it waiting for
+      // the preamble.
+      Worker->pin();
     }
   }
+  scheduleClosingIdleFiles();
   if (!Worker) {
     Action(llvm::make_error<LSPError>(
         "trying to get preamble for non-added document",
@@ -2045,6 +2404,7 @@ void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
     WithContext WithProvidedContext(Opts.ContextProvider(File));
     Action(InputsAndPreamble{Contents, Worker->getCurrentCompileCommand(),
                              Preamble.get(), Signals.get()});
+    Worker->unpin();
     return;
   }
 
@@ -2076,6 +2436,7 @@ void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
     SPAN_ATTACH(Tracer, "file", File);
     WithContext WithProvidedContext(Opts.ContextProvider(File));
     Action(InputsAndPreamble{Contents, Command, Preamble.get(), Signals.get()});
+    Worker->unpin();
   };
 
   PreambleTasks->runAsync("task:" + llvm::sys::path::filename(File),
@@ -2093,7 +2454,10 @@ void TUScheduler::reparseFilesWithNewContext(
 
     Workers.reserve(FilesToReparse.size());
     for (const auto &PathAndFile : Files) {
-      if (!FilesToReparseKeys.contains(maybeCaseFoldPath(PathAndFile.first())))
+      // Files closed for being idle are parsed in their new context when
+      // they're reopened.
+      if (PathAndFile.second->isClosed() ||
+          !FilesToReparseKeys.contains(maybeCaseFoldPath(PathAndFile.first())))
         continue;
       Workers.push_back(PathAndFile.second->Worker.lockMutable());
     }
@@ -2108,7 +2472,9 @@ void TUScheduler::reparseAllFiles() {
     std::lock_guard<std::mutex> Lock(FilesMu);
     Workers.reserve(Files.size());
     for (const auto &PathAndFile : Files)
-      Workers.push_back(PathAndFile.second->Worker.lockMutable());
+      // Files closed for being idle are reparsed when they're reopened.
+      if (!PathAndFile.second->isClosed())
+        Workers.push_back(PathAndFile.second->Worker.lockMutable());
   }
   for (const auto &Worker : Workers)
     Worker->reparse(WantDiagnostics::Auto);
@@ -2121,8 +2487,9 @@ llvm::StringMap<TUScheduler::FileStats> TUScheduler::fileStats() const {
     std::lock_guard<std::mutex> Lock(FilesMu);
     Workers.reserve(Files.size());
     for (const auto &PathAndFile : Files)
-      Workers.emplace_back(PathAndFile.first().str(),
-                           PathAndFile.second->Worker.lock());
+      if (!PathAndFile.second->isClosed())
+        Workers.emplace_back(PathAndFile.first().str(),
+                             PathAndFile.second->Worker.lock());
   }
   for (const auto &PathAndWorker : Workers)
     Result.try_emplace(PathAndWorker.first, PathAndWorker.second->stats());
@@ -2136,8 +2503,9 @@ std::vector<Path> TUScheduler::getFilesWithCachedAST() const {
     std::lock_guard<std::mutex> Lock(FilesMu);
     Workers.reserve(Files.size());
     for (const auto &PathAndFile : Files)
-      Workers.emplace_back(PathAndFile.first().str(),
-                           PathAndFile.second->Worker.lock());
+      if (!PathAndFile.second->isClosed())
+        Workers.emplace_back(PathAndFile.first().str(),
+                             PathAndFile.second->Worker.lock());
   }
   for (const auto &PathAndWorker : Workers) {
     if (!PathAndWorker.second->isASTCached())

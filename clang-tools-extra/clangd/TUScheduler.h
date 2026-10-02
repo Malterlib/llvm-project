@@ -23,6 +23,7 @@
 #include "llvm/ADT/StringRef.h"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -67,6 +68,17 @@ struct ASTRetentionPolicy {
   /// Maximum number of ASTs to be retained in memory when there are no pending
   /// requests for them.
   unsigned MaxRetainedASTs = 3;
+  /// Open files that weren't updated or used for this long are closed: their
+  /// preamble and worker are freed and their diagnostics cleared, until they're
+  /// updated or used again. Zero disables it.
+  std::chrono::steady_clock::duration CloseIdleFilesAfter =
+      std::chrono::steady_clock::duration::zero();
+  /// Maximum number of open files that aren't closed like idle ones, closing
+  /// the least recently used ones beyond it. Zero means no limit.
+  unsigned MaxLiveFiles = 0;
+  /// Number of most recently used open files that are never closed, e.g. so
+  /// that changes on disk don't close the file being read.
+  unsigned MinLiveFiles = 0;
 };
 
 /// Clangd may wait after an update to see if another one comes along.
@@ -243,6 +255,12 @@ public:
     /// Returns an indexed translation unit that includes the specified file.
     /// This is used as a fallback header context when no open TU includes it.
     std::function<std::string(PathRef)> IndexedHeaderIncluder;
+
+    /// Whether the open file with \p Contents has changes that aren't saved.
+    /// Only those changes keep its symbols in the index, so such files aren't
+    /// closed like idle ones (see ASTRetentionPolicy). If unset, none are.
+    std::function<bool(PathRef File, llvm::StringRef Contents)>
+        HasUnsavedChanges;
   };
 
   TUScheduler(const GlobalCompilationDatabase &CDB, const Options &Opts,
@@ -275,6 +293,21 @@ public:
   /// permits it (i.e. WantDiagnostics is downgraded to Auto).
   /// Returns true if the file was not previously tracked.
   bool update(PathRef File, ParseInputs Inputs, WantDiagnostics WD);
+
+  /// Whether \p File is open but closed for being idle (see
+  /// ASTRetentionPolicy), so that it isn't parsed until it's used again.
+  bool isClosed(PathRef File) const;
+
+  /// Closes files according to Opts.RetentionPolicy, e.g. before reparsing
+  /// open files for changes on disk, which don't make them used. Reads files
+  /// to check them for unsaved changes. Ignores suspendClosingIdleFiles().
+  void closeIdleFilesNow();
+
+  /// Keeps files from being closed for being idle in the background until
+  /// resumeClosingIdleFiles(), e.g. while handling changes on disk relies on
+  /// which files are closed.
+  void suspendClosingIdleFiles();
+  void resumeClosingIdleFiles();
 
   /// Remove \p File from the list of tracked files and schedule removal of its
   /// resources. Pending diagnostics for closed files may not be delivered, even
@@ -389,6 +422,27 @@ private:
   // Incremented after a preamble build scheduled reparses of other files, so
   // that blockUntilIdle() can notice workers given work after it waited.
   std::atomic<unsigned> ContextReparses = {0};
+  // Whether a task closing idle files is scheduled or running.
+  std::atomic<bool> ClosingIdleFiles = {false};
+  // Whether that task should check again.
+  std::atomic<bool> CloseIdleFilesAgain = {false};
+  // See suspendClosingIdleFiles().
+  unsigned ClosingIdleFilesSuspended = 0; /* GUARDED_BY(FilesMu) */
+  // Interrupts waiting to close files that were busy when shutting down.
+  std::condition_variable ClosingIdleFilesCV;
+  bool ShuttingDown = false; /* GUARDED_BY(FilesMu) */
+
+  /// Recreates the worker of a file closed for being idle, updating it with
+  /// the inputs it was closed with if \p UpdateWithClosedInputs.
+  void reopenClosedFileLocked(PathRef File, FileData &FD,
+                              bool UpdateWithClosedInputs);
+  /// Whether Opts enable closing idle files.
+  bool closesIdleFiles() const;
+  /// Schedules closing open files according to Opts.RetentionPolicy.
+  void scheduleClosingIdleFiles();
+  /// Returns whether files that should be closed were busy, or closing them
+  /// was suspended, unless \p IgnoreSuspension.
+  bool closeIdleFiles(bool IgnoreSuspension);
   std::unique_ptr<ASTCache> IdleASTs;
   std::unique_ptr<HeaderIncluderCache> HeaderIncluders;
   // std::nullopt when running tasks synchronously and non-std::nullopt when
