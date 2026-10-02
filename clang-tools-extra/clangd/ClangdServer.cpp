@@ -66,6 +66,22 @@ namespace {
 static constexpr trace::Metric TweakAvailable(
     "tweak_available", trace::Metric::Counter, "tweak_id");
 
+// Keeps other threads from closing files for being idle, e.g. while deciding
+// which closed files' symbols to drop from the dynamic index before reparsing
+// the others: in the background, and explicitly, which \p Mu serializes.
+class ClosingIdleFilesSuspension {
+public:
+  ClosingIdleFilesSuspension(TUScheduler &Scheduler, std::mutex &Mu)
+      : Lock(Mu), Scheduler(Scheduler) {
+    Scheduler.suspendClosingIdleFiles();
+  }
+  ~ClosingIdleFilesSuspension() { Scheduler.resumeClosingIdleFiles(); }
+
+private:
+  std::lock_guard<std::mutex> Lock;
+  TUScheduler &Scheduler;
+};
+
 // Update the FileIndex with new ASTs and plumb the diagnostics responses.
 struct UpdateIndexCallbacks : public ParsingCallbacks {
   UpdateIndexCallbacks(FileIndex *FIndex,
@@ -251,6 +267,12 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
     return BackgroundIdx ? BackgroundIdx->indexedTUForHeader(Header)
                          : std::string();
   };
+  SchedulerOpts.HasUnsavedChanges = [&TFS = this->TFS](
+                                        PathRef File, llvm::StringRef Contents) {
+    // TFS doesn't include the contents of open files, unlike getHeaderFS().
+    auto Buffer = TFS.view(std::nullopt)->getBufferForFile(File);
+    return !Buffer || (*Buffer)->getBuffer() != Contents;
+  };
   WorkScheduler.emplace(CDB, SchedulerOpts,
                         std::make_unique<UpdateIndexCallbacks>(
                             DynamicIdx.get(), Callbacks, TFS,
@@ -301,30 +323,38 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
   // their diagnostics use the new commands instead of waiting for an edit.
   CommandsChanged = CDB.watch([this, Sync(Opts.AsyncThreadsCount == 0)](
                                   const std::vector<std::string> &Files) {
-    // Closed files keep their symbols in the dynamic index, which takes
-    // precedence over the background index that reindexes them with the new
-    // commands.
+    // The server may be shutting down, see ~ClangdServer().
+    std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
+    if (!WorkScheduler)
+      return;
+    // Closed files, also open ones closed for being idle, keep their symbols
+    // in the dynamic index, which takes precedence over the background index
+    // that reindexes them with the new commands.
     // This runs off the main thread, so a file opened concurrently may lose
     // its first symbols until it's parsed again, e.g. on its next edit.
     // Symbols of headers from the preambles of closed files stay: the dynamic
     // index doesn't track which file they came from, and dropping all of them
     // would also drop those of open files' headers until their preambles are
     // rebuilt. They're replaced when a file including them is parsed again.
-    if (DynamicIdx && BackgroundIdx) {
-      std::vector<std::string> Closed;
-      for (const std::string &File : Files)
-        if (!DraftMgr.getDraft(File) && BackgroundIdx->isIndexed(File))
-          Closed.push_back(File);
-      DynamicIdx->removeFiles(Closed);
-      DynamicIdx->rebuildAfterRemovals();
+    // Close idle files first, which aren't reparsed, and keep others open
+    // until they're reparsed.
+    {
+      ClosingIdleFilesSuspension Suspension(*WorkScheduler, ClosingIdleFilesMu);
+      WorkScheduler->closeIdleFilesNow();
+      if (DynamicIdx && BackgroundIdx) {
+        std::vector<std::string> Closed;
+        for (const std::string &File : Files)
+          if (!isParsed(File) && BackgroundIdx->isIndexed(File))
+            Closed.push_back(File);
+        DynamicIdx->removeFiles(Closed);
+      }
+      // Synchronous workers run updates on the calling thread, which must be
+      // the main thread. Watchers may be notified from other threads.
+      if (!Sync)
+        WorkScheduler->reparseAllFiles();
     }
-    // Synchronous workers run updates on the calling thread, which must be the
-    // main thread. Watchers may be notified from other threads.
-    if (Sync)
-      return;
-    std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
-    if (WorkScheduler)
-      WorkScheduler->reparseAllFiles();
+    if (DynamicIdx)
+      DynamicIdx->rebuildAfterRemovals();
   });
 
   if (Opts.FeatureModules) {
@@ -386,7 +416,13 @@ void ClangdServer::addDocument(
 
 void ClangdServer::reparseOpenFilesIfNeeded(
     llvm::function_ref<bool(llvm::StringRef File)> Filter, bool RebuildASTs,
-    std::shared_ptr<const llvm::StringSet<>> ChangedFiles) {
+    std::shared_ptr<const llvm::StringSet<>> ChangedFiles, bool CloseIdleFiles) {
+  // Files closed for being idle aren't reparsed until they're used again.
+  std::optional<ClosingIdleFilesSuspension> Suspension;
+  if (CloseIdleFiles) {
+    Suspension.emplace(*WorkScheduler, ClosingIdleFilesMu);
+    WorkScheduler->closeIdleFilesNow();
+  }
   // Reparse only opened files that were modified.
   for (const Path &FilePath : DraftMgr.getActiveFiles())
     if (Filter(FilePath))
@@ -394,6 +430,11 @@ void ClangdServer::reparseOpenFilesIfNeeded(
         addDocument(FilePath, *Draft->Contents, Draft->Version,
                     WantDiagnostics::Auto, /*ForceRebuild=*/false, RebuildASTs,
                     ChangedFiles);
+}
+
+bool ClangdServer::isParsed(PathRef File) const {
+  return DraftMgr.getDraft(File) &&
+         !(WorkScheduler && WorkScheduler->isClosed(File));
 }
 
 std::shared_ptr<const std::string> ClangdServer::getDraft(PathRef File) const {
@@ -1034,7 +1075,8 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
     noteCachedFilesChanged();
     if (SourceFiles.empty() && CDBFiles.empty()) {
       reparseOpenFilesIfNeeded([](llvm::StringRef) { return true; },
-                               /*RebuildASTs=*/true);
+                               /*RebuildASTs=*/true, /*ChangedFiles=*/{},
+                               /*CloseIdleFiles=*/false);
       return;
     }
   }
@@ -1055,8 +1097,13 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
          Reindex(ReindexAfterReload ? SourceFiles
                                     : std::vector<std::string>())]() mutable {
           CDB.checkForChanges(CDBFiles);
-          // The scheduler waits for its tasks when destroyed.
-          Scheduler->reparseAllFiles();
+          {
+            // The scheduler waits for its tasks when destroyed.
+            ClosingIdleFilesSuspension Suspension(*Scheduler,
+                                                  ClosingIdleFilesMu);
+            Scheduler->closeIdleFilesNow();
+            Scheduler->reparseAllFiles();
+          }
           if (!Reindex.empty())
             BackgroundIdx->reindexChangedFiles(std::move(Reindex));
         });
@@ -1069,26 +1116,35 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
   auto Changed = std::make_shared<llvm::StringSet<>>();
   for (const std::string &File : SourceFiles)
     Changed->insert(File);
+  // Close idle files first, which aren't reparsed, and keep others open until
+  // they're reparsed.
+  ClosingIdleFilesSuspension Suspension(*WorkScheduler, ClosingIdleFilesMu);
+  WorkScheduler->closeIdleFilesNow();
   if (BackgroundIdx) {
-    // Files that were open keep their symbols in the dynamic index, which takes
-    // precedence over the background index. Drop them for files that changed
-    // since, so the background index's new results become visible. Headers of
-    // open files are added back when their preambles are rebuilt. Only files
-    // in the background index are dropped: e.g. with compile_flags.txt or
-    // background indexing disabled for them, the dynamic index is all there
-    // is. Files that are being reindexed for the first time are kept.
+    // Files that were open, or are closed for being idle, keep their symbols
+    // in the dynamic index, which takes precedence over the background index.
+    // Drop them for files that changed since, so the background index's new
+    // results become visible, before reparsing open files, which can add new
+    // symbols of changed headers. Headers of open files are added back when
+    // their preambles are rebuilt. Only files in the background index are
+    // dropped: e.g. with compile_flags.txt or background indexing disabled for
+    // them, the dynamic index is all there is. Files that are being reindexed
+    // for the first time are kept.
     if (DynamicIdx) {
       std::vector<std::string> Closed;
       for (const std::string &File : SourceFiles)
-        if (!DraftMgr.getDraft(File) && BackgroundIdx->isIndexed(File))
+        if (!isParsed(File) && BackgroundIdx->isIndexed(File))
           Closed.push_back(File);
       // Remove now, so this can't undo later updates, e.g. from reopening one
       // of the files. Rebuilding the dynamic index can be slow.
       DynamicIdx->removeFiles(Closed);
       // Closed files that include changed headers can be stale too. The
-      // background index covers all closed files, so drop them.
+      // background index covers all closed files, so drop them. It's outdated
+      // for files saved without a file event, e.g. if the client watches only
+      // some files. Files closed for being idle are treated like files closed
+      // in the editor then, whose symbols are dropped too.
       DynamicIdx->removeMainFiles([&](llvm::StringRef Path) {
-        return !DraftMgr.getDraft(Path) && BackgroundIdx->isIndexed(Path);
+        return !isParsed(Path) && BackgroundIdx->isIndexed(Path);
       });
       WorkScheduler->run("Rebuild dynamic index", /*Path=*/"",
                          [this] { DynamicIdx->rebuildAfterRemovals(); });
@@ -1103,7 +1159,8 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
   // particular, for headers parsed in the context of an including file, that's
   // everything the header itself includes.
   reparseOpenFilesIfNeeded([](llvm::StringRef) { return true; },
-                           /*RebuildASTs=*/true, std::move(Changed));
+                           /*RebuildASTs=*/true, std::move(Changed),
+                           /*CloseIdleFiles=*/false);
 }
 
 void ClangdServer::workspaceSymbols(
