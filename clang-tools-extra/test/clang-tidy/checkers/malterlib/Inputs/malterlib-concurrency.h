@@ -346,6 +346,7 @@ namespace NMib::NConcurrency
 		}
 
 		void f_Clear();
+		void f_Assign(TCActor const &_Other);
 		CDispatchHelperWithActor f_Dispatch() const;
 
 		template <typename t_FFunction>

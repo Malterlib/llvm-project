@@ -130,9 +130,33 @@ struct CVocabulary {
   /// The member functions that remove entries of a collection,
   /// RemovingMethods.
   CNameList RemovingMethods;
+  /// The classes whose elements are held in them, fixed in number, like
+  /// those of a built-in array, FixedArrayTypes.
+  CNameList FixedArrayTypes;
+  /// The owners, each `Type=kind`, OwnerTypes: what keeps what it owns alive
+  /// is a property of its type and the operation, never of how the type is
+  /// written. Of `shared`, a copy and a move keep it, counting references;
+  /// `weak` refers to what a shared one owns without keeping it; of
+  /// `unique`, a move; of `buffer`, the data held in a buffer on the heap,
+  /// a move gives the buffer to the one moved to, at the same address, and a
+  /// copy, also one made of anything else, copies it; of `sharedbuffer`, a
+  /// buffer whose copies share it, counting references, and copy it before
+  /// they change it, a copy and a move keep it, and one made of anything
+  /// else copies it.
+  CNameList OwnerTypes;
+  /// The types of OwnerTypes of each kind, by the kind.
+  CNameList SharedOwnerTypes;
+  CNameList WeakOwnerTypes;
+  CNameList UniqueOwnerTypes;
+  CNameList BufferOwnerTypes;
+  CNameList SharedBufferOwnerTypes;
   /// The types that are named like a language's built-in types, which the
   /// naming checks take as such, BuiltinTypes.
   CNameList BuiltinTypes;
+  /// The function objects that keep a callable and call it where they are
+  /// called, on that thread, before the call returns,
+  /// SynchronousFunctionTypes.
+  CNameList SynchronousFunctionTypes;
 };
 
 /// The vocabulary of the configuration of the checks that run on this thread,

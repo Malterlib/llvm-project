@@ -223,11 +223,32 @@ constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral> BuiltInLists[] = {
     {"RemovingMethods",
      "erase;clear;pop_back;pop_front;swap;extract;resize;erase_after;remove;"
      "remove_if;unique;assign;splice;splice_after"},
+    {"FixedArrayTypes", "std::array"},
+    {"OwnerTypes", "std::shared_ptr=shared;std::weak_ptr=weak;"
+                   "std::unique_ptr=unique;std::vector=buffer"},
     {"BuiltinTypes", "bool;void;char;char8_t;char16_t;char32_t;wchar_t;short;"
                      "int;long;float;double;signed;unsigned"},
+    {"SynchronousFunctionTypes",
+     "std::function;std::move_only_function;std::copyable_function;"
+     "std::function_ref"},
 };
 
 } // namespace
+
+/// The types of \p Owners, `Type=kind` each, of the kind \p Kind, joined by
+/// `;`.
+static std::string ownersOfKind(const CNameList &Owners, StringRef Kind) {
+  std::string Types;
+  for (StringRef Entry : Owners.names()) {
+    const auto [Type, Of] = Entry.rsplit('=');
+    if (Of.trim() != Kind)
+      continue;
+    if (!Types.empty())
+      Types += ';';
+    Types += Type.trim();
+  }
+  return Types;
+}
 
 StringRef CVocabulary::builtIn(StringRef Name) {
   for (const auto &[List, Names] : BuiltInLists)
@@ -251,7 +272,16 @@ CVocabulary::CVocabulary(
       BlockingCallees(Resolve("BlockingCallees", builtIn("BlockingCallees"))),
       ViewTypes(Resolve("ViewTypes", builtIn("ViewTypes"))),
       RemovingMethods(Resolve("RemovingMethods", builtIn("RemovingMethods"))),
-      BuiltinTypes(Resolve("BuiltinTypes", builtIn("BuiltinTypes"))) {}
+      FixedArrayTypes(Resolve("FixedArrayTypes", builtIn("FixedArrayTypes"))),
+      OwnerTypes(Resolve("OwnerTypes", builtIn("OwnerTypes"))),
+      SharedOwnerTypes(ownersOfKind(OwnerTypes, "shared")),
+      WeakOwnerTypes(ownersOfKind(OwnerTypes, "weak")),
+      UniqueOwnerTypes(ownersOfKind(OwnerTypes, "unique")),
+      BufferOwnerTypes(ownersOfKind(OwnerTypes, "buffer")),
+      SharedBufferOwnerTypes(ownersOfKind(OwnerTypes, "sharedbuffer")),
+      BuiltinTypes(Resolve("BuiltinTypes", builtIn("BuiltinTypes"))),
+      SynchronousFunctionTypes(Resolve("SynchronousFunctionTypes",
+                                       builtIn("SynchronousFunctionTypes"))) {}
 
 void CVocabulary::forEachList(
     llvm::function_ref<void(StringRef Name, const CNameList &List)> Each)
@@ -265,7 +295,10 @@ void CVocabulary::forEachList(
   Each("BlockingCallees", BlockingCallees);
   Each("ViewTypes", ViewTypes);
   Each("RemovingMethods", RemovingMethods);
+  Each("FixedArrayTypes", FixedArrayTypes);
+  Each("OwnerTypes", OwnerTypes);
   Each("BuiltinTypes", BuiltinTypes);
+  Each("SynchronousFunctionTypes", SynchronousFunctionTypes);
 }
 
 const CVocabulary &vocabulary() {

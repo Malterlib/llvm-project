@@ -47,6 +47,11 @@
 // CHECK-NO-WARNINGS-NOT: warning:
 // CHECK-UNSET: error: the Malterlib checks need the option 'malterlib.OptionsFile', the Malterlib options file, like 'malterlib.OptionsFile: Malterlib/Core/ClangTidyOptions.yaml' in the CheckOptions of the .clang-tidy file at the root, relative to the directory of that file [clang-tidy-config]
 
+// Once, also when the checks are of another language version, which aren't
+// run, each made and dropped.
+// RUN: not clang-tidy --checks='-*,malterlib-async-destroy,malterlib-coawait-precedence,malterlib-coroutine-unsafe-this' --config='{}' %t/root/Module/main.cpp -- -std=c++17 2>&1 | FileCheck --check-prefix=CHECK-UNSET-ONCE %s
+// CHECK-UNSET-ONCE: 1 error generated.
+// CHECK-UNSET-ONCE: error: the Malterlib checks need the option 'malterlib.OptionsFile'
 // Nor when it can't be read, or isn't a mapping of names to lists.
 // RUN: not clang-tidy --checks='-*,malterlib-function-naming' --config="{CheckOptions: {malterlib.OptionsFile: '%t/missing.yaml'}}" %t/root/Module/main.cpp -- 2>&1 | FileCheck --check-prefix=CHECK-MISSING %s
 // CHECK-MISSING: error: can't read the Malterlib options file '{{.*}}missing.yaml': {{.*}} [clang-tidy-config]
@@ -90,6 +95,34 @@
 // RUN: printf 'LowerCaseFreeFunctions: clear\nLowerCaseFreeFunctions: swap\n' > %t/twice.yaml
 // RUN: not clang-tidy --checks='-*,malterlib-function-naming' --config="{CheckOptions: {malterlib.OptionsFile: '%t/twice.yaml'}}" %t/root/Module/main.cpp -- 2>&1 | FileCheck --check-prefix=CHECK-TWICE %s
 // CHECK-TWICE: error: the option 'LowerCaseFreeFunctions' is given twice in '{{.*}}twice.yaml' [clang-tidy-config]
+
+// The option of a check of a shared list takes the edits of the file and then
+// of the configuration, each of all checks and then of the check: one of all
+// checks of the configuration comes after one of the check of the file.
+// RUN: printf "malterlib-coroutine-lambda-call.SafeCallees: '-f_RegisterCommand'\n" > %t/order.yaml
+// RUN: clang-tidy --checks='-*,malterlib-coroutine-lambda-call' --config="{CheckOptions: {malterlib.OptionsFile: '%t/order.yaml', SafeCallees: f_RegisterCommand}}" %S/Inputs/options-file-safe-callee.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-ORDER --allow-empty %s
+// CHECK-ORDER-NOT: warning:
+// RUN: clang-tidy --checks='-*,malterlib-coroutine-lambda-call' --config="{CheckOptions: {malterlib.OptionsFile: '%t/order.yaml'}}" %S/Inputs/options-file-safe-callee.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-REMOVED %s
+// CHECK-REMOVED: options-file-safe-callee.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: {{.*}}[malterlib-coroutine-lambda-call]
+
+// A boolean option is what clang-tidy reads as one, `False` and `0` too, and a
+// value that isn't one, or a number that isn't, is reported.
+// RUN: printf '#include "malterlib-concurrency.h"\nTCFuture<int> fg_Suspend();\nTCFuture<int> fg_Test(int *_pValue)\n{\n\tco_await fg_Suspend();\n\tco_return *_pValue;\n}\n' > %t/pointer.cpp
+// RUN: clang-tidy --checks='-*,malterlib-coroutine-reference-parameter' --config="{CheckOptions: {malterlib.OptionsFile: '%t/root/Core/ClangTidyOptions.yaml', malterlib-coroutine-reference-parameter.CheckPointers: False}}" %t/pointer.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-NOPOINTERS --allow-empty %s
+// RUN: clang-tidy --checks='-*,malterlib-coroutine-reference-parameter' --config="{CheckOptions: {malterlib.OptionsFile: '%t/root/Core/ClangTidyOptions.yaml', CheckPointers: 0}}" %t/pointer.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-NOPOINTERS --allow-empty %s
+// CHECK-NOPOINTERS-NOT: _pValue
+// RUN: clang-tidy --checks='-*,malterlib-coroutine-reference-parameter,malterlib-function-naming' --config="{CheckOptions: {malterlib.OptionsFile: '%t/root/Core/ClangTidyOptions.yaml', malterlib-coroutine-reference-parameter.CheckPointers: Maybe, MinimumNameLength: x}}" %t/pointer.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-BADVALUE %s
+// CHECK-BADVALUE-DAG: warning: invalid configuration value 'Maybe' for option 'malterlib-coroutine-reference-parameter.CheckPointers'; expected a bool [clang-tidy-config]
+// CHECK-BADVALUE-DAG: warning: invalid configuration value 'x' for option 'MinimumNameLength'; expected an integer [clang-tidy-config]
+// CHECK-BADVALUE-DAG: pointer.cpp:3:28: warning: TCFuture coroutine 'fg_Test' uses '_pValue' after a suspension
+
+// A configuration that inherits another's comes after it, also a plain option
+// after one with the name of the check.
+// RUN: mkdir -p %t/priority/child
+// RUN: printf "Checks: '-*,malterlib-coroutine-reference-parameter'\nCheckOptions:\n  malterlib.OptionsFile: %/t/root/Core/ClangTidyOptions.yaml\n  malterlib-coroutine-reference-parameter.CheckPointers: true\n" > %t/priority/.clang-tidy
+// RUN: printf "InheritParentConfig: true\nCheckOptions:\n  CheckPointers: false\n" > %t/priority/child/.clang-tidy
+// RUN: cp %t/pointer.cpp %t/priority/child/pointer.cpp
+// RUN: clang-tidy %t/priority/child/pointer.cpp -- -std=c++20 -I %S/Inputs 2>&1 | FileCheck --check-prefix=CHECK-NOPOINTERS --allow-empty %s
 
 // Its list edits come after the other's, which they don't take the place of.
 // RUN: mkdir -p %t/edits/child
