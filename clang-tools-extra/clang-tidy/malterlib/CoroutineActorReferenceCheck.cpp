@@ -1,0 +1,12346 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "CoroutineActorReferenceCheck.h"
+#include "CheckedAccess.h"
+#include "ActorAnnotations.h"
+#include "CoroutineUtils.h"
+#include "NamingUtils.h"
+#include "OncePerTypeVisitor.h"
+#include "RunsToCompletion.h"
+#include "Summaries.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/ASTLambda.h"
+#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/StmtCXX.h"
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/Analysis/CFG.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include <deque>
+#include <functional>
+#include <memory>
+
+using namespace clang::ast_matchers;
+
+namespace clang::tidy::malterlib {
+
+/// The assignments that \p Statement, an `if` or `switch`, always runs: of
+/// its initializer, `if (pValue = mp_Items.f_FindEqual(0); !pValue)`, not a
+/// declaration, and of its condition, `if (!(pValue = mp_Items.f_FindEqual(
+/// 0)))`, also tested or compared, which runs before either branch.
+static llvm::SmallVector<const BinaryOperator *, 2>
+alwaysRunAssignments(const Stmt *Statement) {
+  llvm::SmallVector<const BinaryOperator *, 2> Assignments;
+  const Stmt *Init = nullptr;
+  const Expr *Condition = nullptr;
+  if (const auto *If = dyn_cast<IfStmt>(Statement)) {
+    Init = If->getInit();
+    Condition = If->getConditionVariable() ? nullptr : If->getCond();
+  } else if (const auto *Switch = dyn_cast<SwitchStmt>(Statement)) {
+    Init = Switch->getInit();
+    Condition = Switch->getConditionVariable() ? nullptr : Switch->getCond();
+  }
+  if (const auto *Assign = dyn_cast_or_null<BinaryOperator>(
+          isa_and_nonnull<Expr>(Init) ? cast<Expr>(Init)->IgnoreImplicit()
+                                      : nullptr);
+      Assign && Assign->getOpcode() == BO_Assign)
+    Assignments.push_back(Assign);
+  for (int Depth = 0; Condition && Depth < 8; ++Depth) {
+    Condition = Condition->IgnoreParenImpCasts();
+    if (const auto *Assign = dyn_cast<BinaryOperator>(Condition);
+        Assign && Assign->getOpcode() == BO_Assign) {
+      Assignments.push_back(Assign);
+      break;
+    }
+    if (const auto *Not = dyn_cast<UnaryOperator>(Condition);
+        Not && Not->getOpcode() == UO_LNot)
+      Condition = Not->getSubExpr();
+    else if (const auto *Compare = dyn_cast<BinaryOperator>(Condition);
+             Compare && Compare->isEqualityOp())
+      Condition = Compare->getLHS();
+    else
+      break;
+  }
+  return Assignments;
+}
+
+/// Whether \p Member is named for telling that what holds it was removed,
+/// like `m_pDestroyed` or `m_pDeleted`.
+static bool isRemovalFlagName(const ValueDecl *Member) {
+  if (!Member || !Member->getIdentifier())
+    return false;
+  const StringRef Name = identifierTextOf(Member);
+  return Name.contains("Destroyed") || Name.contains("Deleted") ||
+         Name.contains("Removed");
+}
+
+/// Whether \p Type points or refers to the object of an actor, also a
+/// reference to such a pointer, `CApp *const &`.
+static bool refersToActorClass(QualType Type) {
+  if (Type->isReferenceType() && Type.getNonReferenceType()->isPointerType())
+    Type = Type.getNonReferenceType();
+  return (Type->isPointerType() || Type->isReferenceType()) &&
+         isActorClass(Type->getPointeeType()->getAsCXXRecordDecl());
+}
+
+/// Whether \p Type is a handle that refers to what it was made from, like
+/// the `TCMapResult` that `m_Items(Key)` returns, which holds a reference to
+/// the entry.
+static bool isReferenceHandle(QualType Type) {
+  if (Type->isPointerType() || Type->isReferenceType())
+    return false;
+  // Also one it inherits, each base once, which a hierarchy of virtual bases
+  // shares.
+  llvm::SmallVector<const CXXRecordDecl *, 8> Work{Type->getAsCXXRecordDecl()};
+  llvm::SmallPtrSet<const CXXRecordDecl *, 16> Visited;
+  while (!Work.empty()) {
+    const CXXRecordDecl *Record = Work.pop_back_val();
+    if (!Record || !Record->hasDefinition())
+      continue;
+    Record = Record->getDefinition();
+    if (!Visited.insert(Record).second)
+      continue;
+    // Not one of the class it is in, `TCMap &mp_Map` of `TCMap::CKeys`, a
+    // view of that, which `mp_Items.f_Keys()` gives of the collection itself,
+    // not of an entry.
+    auto OfEnclosing = [&](const FieldDecl *Field) {
+      const CXXRecordDecl *Referred =
+          Field->getType().getNonReferenceType()->getAsCXXRecordDecl();
+      for (const DeclContext *Context = Record->getDeclContext();
+           Referred && Context; Context = Context->getParent())
+        if (const auto *Enclosing = dyn_cast<CXXRecordDecl>(Context);
+            Enclosing &&
+            Enclosing->getCanonicalDecl() == Referred->getCanonicalDecl())
+          return true;
+      return false;
+    };
+    if (llvm::any_of(Record->fields(), [&](const FieldDecl *Field) {
+          return Field->getType()->isReferenceType() && !OfEnclosing(Field);
+        }))
+      return true;
+    for (const CXXBaseSpecifier &Base : Record->bases())
+      Work.push_back(Base.getType()->getAsCXXRecordDecl());
+  }
+  return false;
+}
+
+/// The flag that \p Binary compares to be set, like `*pDeleted` of
+/// `*pDeleted == true` or `*pDeleted != false`, also with the numbers a flag
+/// can be, `*pDeleted != 0` or `*pDeleted == 1`.
+static const Expr *comparedToBeSet(const BinaryOperator *Binary) {
+  if (Binary->getOpcode() != BO_EQ && Binary->getOpcode() != BO_NE)
+    return nullptr;
+  const bool Set = Binary->getOpcode() == BO_EQ;
+  // The value of a side that is `true`, `false`, `1` or `0`.
+  auto Constant = [](const Expr *Side) -> std::optional<bool> {
+    Side = Side->IgnoreParenImpCasts();
+    if (const auto *Bool = dyn_cast<CXXBoolLiteralExpr>(Side))
+      return Bool->getValue();
+    if (const auto *Number = dyn_cast<IntegerLiteral>(Side);
+        Number && Number->getValue().ule(1))
+      return !Number->getValue().isZero();
+    return std::nullopt;
+  };
+  if (const std::optional<bool> Value = Constant(Binary->getRHS());
+      Value && *Value == Set)
+    return Binary->getLHS();
+  if (const std::optional<bool> Value = Constant(Binary->getLHS());
+      Value && *Value == Set)
+    return Binary->getRHS();
+  return nullptr;
+}
+
+/// Whether \p Type is an optional, `TCOptional` or `std::optional`, whose
+/// value can be cleared, `mp_Value.f_Clear()`, unlike what an owning pointer
+/// points to.
+static bool isOptionalHolder(QualType Type) {
+  const StringRef Holder = recordName(Type.getNonReferenceType());
+  return Holder == "TCOptional" || Holder == "optional";
+}
+
+/// Whether \p Values, what a function gives back, are only members of the
+/// object \p Object points to, or of its own object when null, `m_Value`,
+/// `&_pThis->m_Fixed` or `m_Inner.m_Value`, which live with it: not one a
+/// pointer or reference member refers to.
+static bool givesOnlyMembers(llvm::ArrayRef<const Expr *> Values,
+                             const ValueDecl *Object) {
+  return llvm::all_of(Values, [&](const Expr *Value) {
+    const Expr *Part = Value->IgnoreParenImpCasts();
+    if (const auto *Address = dyn_cast<UnaryOperator>(Part);
+        Address && Address->getOpcode() == UO_AddrOf)
+      Part = Address->getSubExpr()->IgnoreParenImpCasts();
+    bool Member = false;
+    // Also an element of an array member, `return m_Axis[_iAxis];`, which
+    // lives with it.
+    auto PastElements = [&] {
+      while (const auto *Element = dyn_cast<ArraySubscriptExpr>(Part)) {
+        const Expr *Array = Element->getBase()->IgnoreParenImpCasts();
+        if (!Array->getType()->isConstantArrayType())
+          break;
+        Part = Array;
+      }
+    };
+    PastElements();
+    // Also what an owning pointer member points to, `*_pThis->mp_pInternal`,
+    // which lives with the object, as its lookups tell.
+    if (const auto *Owned = dyn_cast<CXXOperatorCallExpr>(Part);
+        Owned && Owned->getNumArgs() == 1 &&
+        (Owned->getOperator() == OO_Star || Owned->getOperator() == OO_Arrow) &&
+        isa<MemberExpr>(Owned->getArg(0)->IgnoreParenImpCasts()) &&
+        Owned->getArg(0)->getType()->isRecordType() &&
+        !isOptionalHolder(Owned->getArg(0)->getType()))
+      Part = Owned->getArg(0)->IgnoreParenImpCasts();
+    while (const auto *Access = dyn_cast<MemberExpr>(Part)) {
+      if (!isa<FieldDecl>(Access->getMemberDecl()) ||
+          Access->getMemberDecl()->getType()->isReferenceType() ||
+          Access->getMemberDecl()->getType()->isPointerType())
+        return false;
+      Member = true;
+      Part = Access->getBase()->IgnoreParenImpCasts();
+      if (Access->isArrow())
+        break;
+      PastElements();
+    }
+    if (!Object)
+      return Member && isa<CXXThisExpr>(Part);
+    const auto *Ref = dyn_cast<DeclRefExpr>(Part);
+    return Member && Ref && Ref->getDecl() == Object;
+  });
+}
+
+/// Whether \p Type can hold a lookup: a pointer, a reference, a handle or an
+/// iterator.
+static bool canHoldLookup(QualType Type) {
+  return Type->isPointerType() || Type->isReferenceType() ||
+         isReferenceHandle(Type) || isIteratorType(Type);
+}
+
+/// The member functions whose calls on a member of the object look up again:
+/// `operator[]`; the options file adds a library's, like Malterlib's
+/// `f_FindEqual`.
+static constexpr llvm::StringLiteral BuiltInCallbackLookupFunctions =
+    "operator[]";
+
+CoroutineActorReferenceCheck::CoroutineActorReferenceCheck(
+    StringRef Name, ClangTidyContext *Context)
+    : MalterlibCheck(Name, Context),
+      FreshKeyFunctions(listOption("FreshKeyFunctions", "")),
+      NodeStableContainers(
+          listOption("NodeStableContainers", BuiltInNodeStableContainers)),
+      CallbackLookupFunctions(listOption("CallbackLookupFunctions",
+                                         BuiltInCallbackLookupFunctions)) {
+  splitOptionList(FreshKeyFunctions, FreshKeyFunctionList);
+  splitOptionList(NodeStableContainers, NodeStableContainerList);
+  splitOptionList(CallbackLookupFunctions, CallbackLookupFunctionList);
+}
+
+void CoroutineActorReferenceCheck::storeCheckOptions(
+    ClangTidyOptions::OptionMap &Opts) {
+  Options.store(Opts, "FreshKeyFunctions", FreshKeyFunctions);
+  Options.store(Opts, "NodeStableContainers", NodeStableContainers);
+  Options.store(Opts, "CallbackLookupFunctions", CallbackLookupFunctions);
+}
+
+llvm::SmallVector<const Expr *, 4>
+CoroutineActorReferenceCheck::valuesOf(const VarDecl *Local) {
+  llvm::SmallVector<const Expr *, 4> Values;
+  if (Local->getInit())
+    Values.push_back(Local->getInit());
+  const auto *Function =
+      dyn_cast_or_null<FunctionDecl>(Local->getParentFunctionOrMethod());
+  if (!Function)
+    return Values;
+  auto [It, Inserted] = Assignments.try_emplace(Function);
+  if (Inserted) {
+    auto &Assigned = It->second;
+    TCRecursive<void(const Stmt *)> Find = [&](const Stmt *S) {
+      if (!S)
+        return;
+      if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+          Assign && Assign->isAssignmentOp())
+        if (const auto *Target =
+                dyn_cast<DeclRefExpr>(Assign->getLHS()->IgnoreParenImpCasts()))
+          if (const auto *Variable = dyn_cast<VarDecl>(Target->getDecl()))
+            Assigned[Variable].push_back(Assign->getRHS());
+      for (const Stmt *Child : keptChildren(S))
+        Find(Child);
+    };
+    Find(Function->getBody());
+  }
+  if (auto Found = It->second.find(Local); Found != It->second.end())
+    llvm::append_range(Values, Found->second);
+  return Values;
+}
+
+/// Whether \p Ref, of a local pointer, only names its storage, without
+/// reading what it points to: its address, `&pEntry`, or a reference bound
+/// to it, `int *&pAlias = pEntry`, whose uses are followed by themselves. Not
+/// the address of what a reference refers to, `&Entry` of `CEntry &Entry`,
+/// which is of the data.
+static bool namesOnlyStorage(const DeclRefExpr *Ref, ASTContext &Context) {
+  DynTypedNode Node = DynTypedNode::create(*Ref);
+  for (int Depth = 0; Depth < 8; ++Depth) {
+    const auto Parents = instantiatedParents(Node, Context);
+    if (Parents.empty())
+      return false;
+    if (Parents[0].get<ParenExpr>()) {
+      Node = Parents[0];
+      continue;
+    }
+    if (const auto *Address = Parents[0].get<UnaryOperator>())
+      return Address->getOpcode() == UO_AddrOf &&
+             !Ref->getDecl()->getType()->isReferenceType();
+    if (const auto *Alias = Parents[0].get<VarDecl>())
+      return Alias->getType()->isReferenceType();
+    return false;
+  }
+  return false;
+}
+
+/// Which of the operands of one expression suspend (suspendsIn), each walked
+/// once: each operand asks about the others, which walking them again for
+/// each would make quadratic in their number.
+class CSuspendingOperands {
+public:
+  CSuspendingOperands(llvm::ArrayRef<const Expr *> Operands,
+                      const ASTContext &Context) {
+    Suspends.reserve(Operands.size());
+    for (unsigned iOperand = 0; iOperand < Operands.size(); ++iOperand) {
+      Suspends.push_back(Operands[iOperand] &&
+                         suspendsIn(Operands[iOperand], Context));
+      if (Suspends.back())
+        Suspending.push_back(iOperand);
+    }
+  }
+  bool any() const { return !Suspending.empty(); }
+  bool suspends(unsigned Index) const { return Suspends[Index]; }
+  bool laterSuspends(unsigned Index) const {
+    return !Suspending.empty() && Suspending.back() > Index;
+  }
+  /// Whether one from \p First on other than \p Index suspends.
+  bool otherSuspends(unsigned Index, unsigned First = 0) const {
+    const unsigned *From = llvm::lower_bound(Suspending, First);
+    const size_t nFrom = Suspending.end() - From;
+    return nFrom > (Index >= First && Suspends[Index] ? 1u : 0u);
+  }
+
+private:
+  llvm::SmallVector<bool, 8> Suspends;
+  // The indices of those that suspend, in order.
+  llvm::SmallVector<unsigned, 2> Suspending;
+};
+
+/// What \p S, a call whose arguments suspend, uses after they did, though it
+/// is evaluated before: the object of a member function or an operator, and
+/// the arguments given by reference or pointer, `fg_Read(Entry, co_await
+/// fg_Suspend())`. The left side of an assignment, also an overloaded one, is
+/// evaluated after its right side, `mp_Items[0] = co_await fg_Suspend()`.
+/// The pointer a subscript indexes is evaluated before its index when written
+/// first, `(&mp_Items[0])[(co_await fg_Suspend(), 0)]`, and after it when
+/// written last, `(co_await fg_Suspend(), 0)[&mp_Items[0]]`.
+static llvm::SmallVector<const Expr *, 2>
+earlyCallOperands(const Stmt *S, const ASTContext &Context) {
+  llvm::SmallVector<const Expr *, 2> Operands;
+  if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(S)) {
+    if (Subscript->getLHS() == Subscript->getBase() &&
+        suspendsIn(Subscript->getRHS(), Context) &&
+        !suspendsIn(Subscript->getLHS(), Context) &&
+        Subscript->getBase()->getType()->isPointerType())
+      Operands.push_back(Subscript->getBase());
+    return Operands;
+  }
+  // A constructor uses what it is given by reference after the arguments
+  // after it, `CCopy{Entry, co_await fg_Suspend()}`. Braced ones are
+  // evaluated in order, so what follows the last that suspends is looked up
+  // after, `CCopy{co_await fg_Suspend(), Entry}`.
+  if (const auto *Construct = dyn_cast<CXXConstructExpr>(S)) {
+    const CSuspendingOperands Suspending(
+        llvm::ArrayRef<const Expr *>(Construct->getArgs(),
+                                     Construct->getNumArgs()),
+        Context);
+    unsigned nEarly = 0;
+    for (unsigned iArgument = 0; iArgument < Construct->getNumArgs();
+         ++iArgument)
+      if (Suspending.suspends(iArgument))
+        nEarly = Construct->isListInitialization() ? iArgument
+                                                   : Construct->getNumArgs();
+    // Also one that suspends itself, `CCopy{mp_Items[co_await fg_Key()],
+    // co_await fg_Suspend()}`, which looks up after its own suspension but
+    // before those of the arguments after it, or, unordered, of the others.
+    for (unsigned iArgument = 0; iArgument < nEarly; ++iArgument) {
+      const std::optional<QualType> Type =
+          argumentParameterType(Construct, iArgument);
+      const bool OthersSuspend = Construct->isListInitialization()
+                                     ? Suspending.laterSuspends(iArgument)
+                                     : Suspending.otherSuspends(iArgument);
+      if (Type && ((*Type)->isReferenceType() || (*Type)->isPointerType()) &&
+          (!Suspending.suspends(iArgument) || OthersSuspend))
+        Operands.push_back(Construct->getArg(iArgument));
+    }
+    return Operands;
+  }
+  // So does an aggregate, of what binds a reference or pointer member before
+  // what follows suspends, `CView{mp_Items[0], co_await fg_Work()}`,
+  // evaluated in order.
+  // Also in parentheses, `CView(mp_Items[0], co_await fg_Work())`, and one that
+  // suspends itself before what it binds, before one after it suspends again.
+  if (isa<InitListExpr, CXXParenListInitExpr>(S)) {
+    llvm::ArrayRef<const Expr *> Inits;
+    if (const auto *List = dyn_cast<InitListExpr>(S)) {
+      if (!List->isSemanticForm() && List->getSemanticForm())
+        List = List->getSemanticForm();
+      Inits =
+          llvm::ArrayRef<const Expr *>(List->getInits(), List->getNumInits());
+    } else
+      Inits = cast<CXXParenListInitExpr>(S)->getUserSpecifiedInitExprs();
+    std::optional<CSuspendingOperands> Suspending;
+    for (unsigned iInit = 0; iInit < Inits.size(); ++iInit) {
+      const Expr *Init = Inits[iInit];
+      if (!Init || !(Init->getType()->isPointerType() || Init->isGLValue()))
+        continue;
+      if (!Suspending)
+        Suspending.emplace(Inits, Context);
+      if (Suspending->laterSuspends(iInit))
+        Operands.push_back(Init);
+    }
+    return Operands;
+  }
+  const auto *Call = dyn_cast<CallExpr>(S);
+  if (!Call)
+    return Operands;
+  const CSuspendingOperands Suspending(
+      llvm::ArrayRef<const Expr *>(Call->getArgs(), Call->getNumArgs()),
+      Context);
+  if (!Suspending.any())
+    return Operands;
+  if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Call);
+      Operator && Operator->isAssignmentOp() && Operator->getNumArgs() == 2) {
+    // The parameter of the value, also after an explicit object,
+    // `operator=(this CValue &_Self, int const &_Value)`.
+    const std::optional<QualType> Type = argumentParameterType(Operator, 1);
+    if (!suspendsIn(Operator->getArg(1), Context) && Type &&
+        ((*Type)->isReferenceType() || (*Type)->isPointerType()))
+      Operands.push_back(Operator->getArg(1));
+    return Operands;
+  }
+  if (const CMemberCall Member = memberCallOf(Call);
+      Member && Member->getImplicitObjectArgument())
+    Operands.push_back(Member->getImplicitObjectArgument());
+  const FunctionDecl *Callee = Call->getDirectCallee();
+  const unsigned Offset = argumentShift(Call, Callee);
+  if (Offset == 1)
+    Operands.push_back(Call->getArg(0));
+  // Also through a pointer to a function, `fUse(Entry, co_await ...)`.
+  for (unsigned iArgument = Offset; iArgument < Call->getNumArgs();
+       ++iArgument) {
+    const std::optional<QualType> Type = argumentParameterType(Call, iArgument);
+    if (!Type || !((*Type)->isReferenceType() || (*Type)->isPointerType()))
+      continue;
+    const Expr *Argument = Call->getArg(iArgument);
+    // Also a pointer moved by an offset that suspends, `pEntry + (co_await
+    // fg_Suspend(), 0)`, which is read before.
+    for (int Depth = 0; Depth < 16 && suspendsIn(Argument, Context); ++Depth) {
+      Argument = Argument->IgnoreParenImpCasts();
+      if (const auto *Offset = dyn_cast<BinaryOperator>(Argument);
+          Offset && Offset->isAdditiveOp() &&
+          Offset->getType()->isPointerType())
+        Argument = Offset->getLHS()->getType()->isPointerType()
+                       ? Offset->getLHS()
+                       : Offset->getRHS();
+      else if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Argument))
+        Argument = Cast->getSubExpr();
+      else
+        break;
+    }
+    // Not, of an operator whose left is evaluated before its right, `<<`,
+    // `>>`, `->*` or `[]`, one after all that suspend, `(co_await
+    // fg_Stream()) << CView{&t_Value}`, which is evaluated after them.
+    if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Call);
+        Operator &&
+        (Operator->getOperator() == OO_LessLess ||
+         Operator->getOperator() == OO_GreaterGreater ||
+         Operator->getOperator() == OO_ArrowStar ||
+         Operator->getOperator() == OO_Subscript) &&
+        !Suspending.laterSuspends(iArgument) && !suspendsIn(Argument, Context))
+      continue;
+    // Also one that suspends itself, `fg_Use(mp_Items[co_await fg_Key()],
+    // co_await fg_Suspend())`, when another suspends too, which can run after
+    // it looks up.
+    if (!suspendsIn(Argument, Context) ||
+        Suspending.otherSuspends(iArgument, Offset))
+      Operands.push_back(Argument);
+  }
+  return Operands;
+}
+
+/// The collection that \p Object designates, when it is a field declared
+/// with `DMibActorEntries`, also through local references and pointers to it,
+/// through up to 64 of them and addresses and dereferences, and both values of
+/// up to 4 nested conditionals, \p Branches, which each look at two.
+static const FieldDecl *annotatedCollection(const Expr *Object,
+                                            const Expr *&Owner, int Depth = 0,
+                                            int Branches = 0) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return annotatedCollection(Object, Owner, Depth, Branches); });
+  if (!Object || Depth > 64 || Branches > 4)
+    return nullptr;
+  const Expr *E = skipWrappers(Object)->IgnoreParenImpCasts();
+  if (const auto *Member = dyn_cast<MemberExpr>(E)) {
+    const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+    Owner = Member->getBase()->IgnoreParenImpCasts();
+    return Field && annotatedPhases(Field, AnnotationActorEntries) ? Field
+                                                                   : nullptr;
+  }
+  if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+      Unary && (Unary->getOpcode() == UO_Deref ||
+                Unary->getOpcode() == UO_AddrOf))
+    return annotatedCollection(Unary->getSubExpr(), Owner, Depth + 1, Branches);
+  // A conditional, `(bChoose ? mp_Items : mp_Other)`, when both values are
+  // collections that lose entries in the same phases of the same object, what
+  // a comma gives, `(void(0), mp_Items)`, and a cast to a reference to it.
+  if (const auto *Conditional = dyn_cast<AbstractConditionalOperator>(E)) {
+    // Of one whose condition is constant, the one it chooses (keptArms).
+    if (const llvm::SmallVector<const Expr *, 2> Arms = keptArms(Conditional);
+        Arms.size() == 1)
+      return annotatedCollection(Arms.front(), Owner, Depth + 1, Branches);
+    const Expr *TrueOwner = nullptr;
+    const Expr *FalseOwner = nullptr;
+    const FieldDecl *TrueField = annotatedCollection(
+        Conditional->getTrueExpr(), TrueOwner, Depth + 1, Branches + 1);
+    const FieldDecl *FalseField = annotatedCollection(
+        Conditional->getFalseExpr(), FalseOwner, Depth + 1, Branches + 1);
+    if (!TrueField || !FalseField ||
+        annotatedPhases(TrueField, AnnotationActorEntries) !=
+            annotatedPhases(FalseField, AnnotationActorEntries))
+      return nullptr;
+    auto Designated = [](const Expr *Of) -> const void * {
+      Of = Of ? Of->IgnoreParenImpCasts() : nullptr;
+      if (isa_and_nonnull<CXXThisExpr>(Of))
+        return Of->getType().getTypePtr();
+      if (const auto *Ref = dyn_cast_or_null<DeclRefExpr>(Of))
+        return Ref->getDecl();
+      return nullptr;
+    };
+    const void *Object = Designated(TrueOwner);
+    if (!Object || Object != Designated(FalseOwner))
+      return nullptr;
+    Owner = TrueOwner;
+    return TrueField;
+  }
+  if (const auto *Comma = dyn_cast<BinaryOperator>(E);
+      Comma && Comma->getOpcode() == BO_Comma)
+    return annotatedCollection(Comma->getRHS(), Owner, Depth + 1, Branches);
+  if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
+      Cast && Cast->isGLValue())
+    return annotatedCollection(Cast->getSubExpr(), Owner, Depth + 1, Branches);
+  if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+    const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
+    if (!Variable || !Variable->hasLocalStorage() || isa<ParmVarDecl>(Variable))
+      return nullptr;
+    if (Variable->getInit() &&
+        (Variable->getType()->isReferenceType() ||
+         (Variable->getType()->isPointerType() &&
+          !isChangedVariable(Variable))))
+      return annotatedCollection(Variable->getInit(), Owner, Depth + 1,
+                                 Branches);
+    // A pointer changed, what it was last assigned on every path, like
+    // `pItems = pSaved`.
+    if (Variable->getType()->isPointerType())
+      if (const Expr *Value = assignedValueAt(Variable, Ref))
+        return annotatedCollection(Value, Owner, Depth + 1, Branches);
+  }
+  return nullptr;
+}
+
+/// The annotated collection that the lookup \p Init finds an entry of, and
+/// the key it finds it by. A member of the entry, like `&pEntry->m_Value`,
+/// lives as long as the entry.
+static const FieldDecl *lookupCollection(const Expr *Init, const Expr *&Key,
+                                         const Expr *&Owner, int Depth = 0) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return lookupCollection(Init, Key, Owner, Depth); });
+  if (!Init || Depth > 8)
+    return nullptr;
+  // The value of a pointer member of an entry, `int *pValue =
+  // mp_Items[Key].m_pValue`, points to an object of its own, which can be
+  // replaced while the entry stays.
+  for (const Expr *Read = Init;;) {
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(Read))
+      Read = Cleanups->getSubExpr();
+    else if (const auto *Paren = dyn_cast<ParenExpr>(Read))
+      Read = Paren->getSubExpr();
+    else if (const auto *Cast = dyn_cast<ImplicitCastExpr>(Read)) {
+      if (Cast->getCastKind() == CK_LValueToRValue) {
+        // Also through a local reference to the member, `auto &pMember =
+        // mp_Items[Key].m_pValue; int *pValue = pMember`, a chain of them
+        // each looked at once.
+        const Expr *Read = Cast->getSubExpr()->IgnoreParens();
+        for (int Level = 0; Level < 32; ++Level) {
+          const auto *Ref = dyn_cast<DeclRefExpr>(Read);
+          const auto *Alias = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+          if (!Alias || !Alias->getType()->isReferenceType() ||
+              !Alias->hasLocalStorage() || isa<ParmVarDecl>(Alias) ||
+              !Alias->getInit())
+            break;
+          Read = Alias->getInit()->IgnoreParenImpCasts();
+        }
+        // Also through a cast to a reference to it, `static_cast<int *&>(
+        // mp_Items[Key].m_pValue)`, and a pointer to the member, `mp_Items[
+        // Key].*pmValue`.
+        while (const auto *Cast = dyn_cast<ExplicitCastExpr>(Read)) {
+          if (!Cast->isGLValue())
+            break;
+          Read = Cast->getSubExpr()->IgnoreParenImpCasts();
+        }
+        const auto *Member = dyn_cast<MemberExpr>(Read);
+        if (Member && isa<FieldDecl>(Member->getMemberDecl()) &&
+            Member->getType()->isPointerType())
+          return nullptr;
+        if (const auto *Through = dyn_cast<BinaryOperator>(Read);
+            Through && Through->isPtrMemOp() &&
+            Through->getType()->isPointerType())
+          return nullptr;
+        break;
+      }
+      Read = Cast->getSubExpr();
+    } else
+      break;
+  }
+  const Expr *E = skipWrappers(Init)->IgnoreParenImpCasts();
+  // The last of a comma, `(void(0), mp_Items[1])`, and either value of a
+  // conditional, of the same collection of the same object, `bFirst ?
+  // mp_Items[1] : mp_Items[2]`, which have no one key.
+  if (const auto *Comma = dyn_cast<BinaryOperator>(E);
+      Comma && Comma->getOpcode() == BO_Comma)
+    return lookupCollection(Comma->getRHS(), Key, Owner, Depth + 1);
+  if (const auto *Conditional = dyn_cast<ConditionalOperator>(E)) {
+    if (const llvm::SmallVector<const Expr *, 2> Arms = keptArms(Conditional);
+        Arms.size() == 1)
+      return lookupCollection(Arms.front(), Key, Owner, Depth + 1);
+    const Expr *TrueKey = nullptr;
+    const Expr *TrueOwner = nullptr;
+    const FieldDecl *True = lookupCollection(Conditional->getTrueExpr(),
+                                             TrueKey, TrueOwner, Depth + 1);
+    const FieldDecl *False = lookupCollection(Conditional->getFalseExpr(), Key,
+                                              Owner, Depth + 1);
+    // Also of two collections of the object of the same type that lose entries
+    // in the same phases, `bFirst ? mp_First[1] : mp_Second[1]`, which the
+    // same guards keep.
+    auto Alike = [&] {
+      if (True == False)
+        return true;
+      const std::optional<unsigned> TruePhases =
+          annotatedPhases(True, AnnotationActorEntries);
+      const std::optional<unsigned> FalsePhases =
+          annotatedPhases(False, AnnotationActorEntries);
+      return TruePhases && TruePhases == FalsePhases &&
+             True->getASTContext().hasSameType(True->getType(),
+                                               False->getType());
+    };
+    if (!True || !False || !Alike() ||
+        isOwnActorObject(TrueOwner) != isOwnActorObject(Owner) ||
+        !isOwnActorObject(Owner))
+      return nullptr;
+    Key = nullptr;
+    return True;
+  }
+  // What a member of an entry points to, like `*Entry.m_pValue`, is an object
+  // of its own, which the member can be pointed elsewhere from while the
+  // entry stays, also through a local made from it, `auto &pValue =
+  // Entry.m_pValue`.
+  auto IsMemberOfEntry = [](const Expr *Pointer) {
+    for (int Level = 0; Level < 4; ++Level) {
+      const Expr *E = skipWrappers(Pointer)->IgnoreParenImpCasts();
+      while (const auto *Cast = dyn_cast<ExplicitCastExpr>(E)) {
+        if (!Cast->isGLValue())
+          break;
+        E = Cast->getSubExpr()->IgnoreParenImpCasts();
+      }
+      if (const auto *Member = dyn_cast<MemberExpr>(E))
+        return isa<FieldDecl>(Member->getMemberDecl());
+      if (const auto *Through = dyn_cast<BinaryOperator>(E);
+          Through && Through->isPtrMemOp())
+        return true;
+      const auto *Ref = dyn_cast<DeclRefExpr>(E);
+      const auto *Variable = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+      if (!Variable || !Variable->getInit() || isa<ParmVarDecl>(Variable) ||
+          !(Variable->hasLocalStorage() || Variable->isInitCapture()) ||
+          !(Variable->getType()->isReferenceType() ||
+            !isChangedVariable(Variable)))
+        return false;
+      Pointer = Variable->getInit();
+    }
+    return false;
+  };
+  if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+      Unary && (Unary->getOpcode() == UO_AddrOf ||
+                Unary->getOpcode() == UO_Deref)) {
+    if (Unary->getOpcode() == UO_Deref && IsMemberOfEntry(Unary->getSubExpr()))
+      return nullptr;
+    return lookupCollection(Unary->getSubExpr(), Key, Owner, Depth + 1);
+  }
+  if (const auto *Member = dyn_cast<MemberExpr>(E);
+      Member && isa<FieldDecl>(Member->getMemberDecl())) {
+    if (Member->isArrow() && IsMemberOfEntry(Member->getBase()))
+      return nullptr;
+    return lookupCollection(Member->getBase(), Key, Owner, Depth + 1);
+  }
+  // Also through a cast to a reference, `static_cast<int &>(mp_Items[1].m_Value)`,
+  // and a pointer to a member, `mp_Items[1].*pmValue`.
+  if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E); Cast && Cast->isGLValue())
+    return lookupCollection(Cast->getSubExpr(), Key, Owner, Depth + 1);
+  if (const auto *Pointer = dyn_cast<BinaryOperator>(E);
+      Pointer && Pointer->isPtrMemOp() && !Pointer->getType()->isFunctionType() &&
+      !Pointer->getType()->isSpecificBuiltinType(BuiltinType::BoundMember))
+    return Pointer->getOpcode() == BO_PtrMemI &&
+                   IsMemberOfEntry(Pointer->getLHS())
+               ? nullptr
+               : lookupCollection(Pointer->getLHS(), Key, Owner, Depth + 1);
+  // An element of an array in the entry, `mp_Items[1].m_Values[0]`, and the
+  // entry offset, `&mp_Items[1] + 0`, are in the entry.
+  if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E);
+      Subscript &&
+      Subscript->getBase()->IgnoreParenImpCasts()->getType()->isArrayType())
+    return lookupCollection(Subscript->getBase(), Key, Owner, Depth + 1);
+  if (const auto *Offset = dyn_cast<BinaryOperator>(E);
+      Offset && Offset->isAdditiveOp() && Offset->getType()->isPointerType())
+    return lookupCollection(Offset->getLHS()->getType()->isPointerType()
+                                ? Offset->getLHS()
+                                : Offset->getRHS(),
+                            Key, Owner, Depth + 1);
+  // A handle made from a single lookup, like `CHandle Handle{*pEntry}`, or a
+  // copy of one.
+  if (const auto *List = dyn_cast<InitListExpr>(E);
+      List && isReferenceHandle(List->getType()))
+    return List->getNumInits() == 1
+               ? lookupCollection(List->getInit(0), Key, Owner, Depth + 1)
+               : nullptr;
+  // Also with parentheses, `CHandle Handle(*pEntry)` of an aggregate.
+  if (const auto *List = dyn_cast<CXXParenListInitExpr>(E);
+      List && isReferenceHandle(List->getType()))
+    return List->getInitExprs().size() == 1
+               ? lookupCollection(List->getInitExprs()[0], Key, Owner,
+                                  Depth + 1)
+               : nullptr;
+  if (const auto *Construct = dyn_cast<CXXConstructExpr>(E);
+      Construct && Construct->getNumArgs() == 1 &&
+      isReferenceHandle(Construct->getType()) &&
+      Construct->getConstructor()->isCopyOrMoveConstructor())
+    return lookupCollection(Construct->getArg(0), Key, Owner, Depth + 1);
+  // A handle made with more arguments, of which one is bound to a reference
+  // or pointer, like `CHandle Handle(Entry, Tag)`.
+  if (const auto *Construct = dyn_cast<CXXConstructExpr>(E);
+      Construct && isReferenceHandle(Construct->getType())) {
+    const CXXConstructorDecl *Constructor = Construct->getConstructor();
+    const Expr *Borrowed = nullptr;
+    for (unsigned iArgument = 0; iArgument < Construct->getNumArgs() &&
+                                 iArgument < Constructor->getNumParams();
+         ++iArgument) {
+      const QualType Type = Constructor->getParamDecl(iArgument)->getType();
+      if (!Type->isReferenceType() && !Type->isPointerType())
+        continue;
+      if (Borrowed)
+        return nullptr;
+      Borrowed = Construct->getArg(iArgument);
+    }
+    return Borrowed ? lookupCollection(Borrowed, Key, Owner, Depth + 1)
+                    : nullptr;
+  }
+  if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E)) {
+    if ((Call->getOperator() == OO_Subscript ||
+         Call->getOperator() == OO_Call) &&
+        Call->getNumArgs() >= 1) {
+      // Not a value it gives, like `int operator[](int) const`.
+      if (!Call->isGLValue() && !canHoldLookup(Call->getType()))
+        return nullptr;
+      Key = Call->getNumArgs() >= 2 ? Call->getArg(1) : nullptr;
+      return annotatedCollection(Call->getArg(0), Owner);
+    }
+    if ((Call->getOperator() == OO_Star || Call->getOperator() == OO_Arrow) &&
+        Call->getNumArgs() == 1)
+      return IsMemberOfEntry(Call->getArg(0))
+                 ? nullptr
+                 : lookupCollection(Call->getArg(0), Key, Owner, Depth + 1);
+    return nullptr;
+  }
+  // A free `begin(Container)`, like a loop over it uses.
+  if (const auto *Call = dyn_cast<CallExpr>(E);
+      Call && !isMemberOrOperatorCall(Call) &&
+      Call->getNumArgs() == 1 &&
+      (calleeName(Call) == "begin" || calleeName(Call) == "end")) {
+    Key = nullptr;
+    return annotatedCollection(Call->getArg(0), Owner);
+  }
+  if (const CMemberCall Call = memberCallOf(E)) {
+    const Expr *Object = Call->getImplicitObjectArgument();
+    if (isReferenceHandle(Object->IgnoreParenImpCasts()->getType()))
+      return lookupCollection(Object, Key, Owner, Depth + 1);
+    Key = Call->getNumArgs() >= 1 ? Call->getArg(0) : nullptr;
+    if (const FieldDecl *Collection = annotatedCollection(Object, Owner))
+      return Collection;
+    // What a getter of an entry gives of it, `mp_Items[1].f_GetName()` of
+    // `return m_Name;`, which is in the entry, like `mp_Items[1].m_Name`.
+    const CXXMethodDecl *Method = Call->getMethodDecl();
+    const FunctionDecl *Definition =
+        Method && !callsOverride(Call) ? Method->getDefinition() : nullptr;
+    if (Definition && Definition->getBody() && Object &&
+        (Call->isGLValue() || Call->getType()->isPointerType())) {
+      const llvm::SmallVector<const Expr *, 4> Values =
+          returnedValues(Definition);
+      if (!Values.empty() && givesOnlyMembers(Values, explicitObjectOf(Definition)))
+        return lookupCollection(Object, Key, Owner, Depth + 1);
+    }
+    return nullptr;
+  }
+  if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+    const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
+    if (Variable && Variable->getInit() && !isa<ParmVarDecl>(Variable) &&
+        (Variable->hasLocalStorage() || Variable->isInitCapture()) &&
+        (Variable->getType()->isReferenceType() ||
+         !isChangedVariable(Variable)))
+      return lookupCollection(Variable->getInit(), Key, Owner, Depth + 1);
+  }
+  return nullptr;
+}
+
+/// Whether the cleanup \p Lambda runs after the uses of the entry that
+/// \p Variable refers to: an `fg_AsyncDestroy` cleanup whose guard isn't
+/// awaited early, or a `g_OnScopeExit`, held in a local of a scope around
+/// \p Variable, which runs it when the scope ends.
+static bool isDeferredCleanup(const LambdaExpr *Lambda, const VarDecl *Variable,
+                              ASTContext &Context) {
+  DynTypedNode Up = DynTypedNode::create(*Lambda);
+  const Expr *Cleanup = nullptr;
+  for (int Depth = 0; Depth < 8 && !Cleanup; ++Depth) {
+    const auto Parents = instantiatedParents(Up, Context);
+    if (Parents.empty())
+      return false;
+    // A scope exit, `g_OnScopeExit / [...]`, also called explicitly,
+    // `g_OnScopeExit.operator/([...])`, or `fg_OnScopeExit([...])`.
+    if (const auto *Made = Parents[0].get<Expr>();
+        Made && scopeExitOperand(Made) == Lambda) {
+      Cleanup = Made;
+      break;
+    }
+    if (const auto *Divide = Parents[0].get<CXXOperatorCallExpr>();
+        Divide && Divide->getOperator() == OO_Slash)
+      return false;
+    if (const auto *Call = Parents[0].get<CallExpr>()) {
+      if (Call->getNumArgs() < 1 || asLambda(Call->getArg(0)) != Lambda)
+        return false;
+      const StringRef Name = calleeName(Call);
+      // Run when the coroutine ends, unless awaited before.
+      if (llvm::is_contained(llvm::ArrayRef<StringRef>(AsyncDestroyFunctions),
+                             Name)) {
+        bool AwaitedEarly = false;
+        if (!isCleanupJoined(Call, Context, &AwaitedEarly) || AwaitedEarly)
+          return false;
+        Cleanup = Call;
+        break;
+      }
+      if (!Name.starts_with("fg_OnScopeExit"))
+        return false;
+      Cleanup = Call;
+      break;
+    }
+    if (!Parents[0].get<Expr>())
+      return false;
+    Up = Parents[0];
+  }
+  if (!Cleanup)
+    return false;
+  // Held in a local, which runs it when its scope ends; a temporary runs it
+  // at the end of its full-expression.
+  const VarDecl *Holder = nullptr;
+  for (DynTypedNode Node = DynTypedNode::create(*Cleanup); !Holder;) {
+    const auto Parents = instantiatedParents(Node, Context);
+    if (Parents.empty())
+      return false;
+    Node = Parents[0];
+    if (const auto *Local = Node.get<VarDecl>()) {
+      Holder = Local;
+      break;
+    }
+    if (!Node.get<ImplicitCastExpr>() && !Node.get<CXXBindTemporaryExpr>() &&
+        !Node.get<MaterializeTemporaryExpr>() && !Node.get<ExprWithCleanups>() &&
+        !Node.get<CXXConstructExpr>() && !Node.get<ParenExpr>() &&
+        !Node.get<CoawaitExpr>() && !Node.get<OpaqueValueExpr>())
+      return false;
+  }
+  // Also a reference that extends it, `auto const &Cleanup = co_await
+  // fg_AsyncDestroy(...)`, which lives as long as it.
+  if (!Holder->hasLocalStorage() ||
+      (Holder->getType()->isReferenceType() && !extendedTemporary(Holder)))
+    return false;
+  // Used, like `Cleanup()`, which runs it right away, or moved elsewhere.
+  // Clearing it, `Cleanup.f_Clear()`, drops the cleanup, which then doesn't
+  // remove anything.
+  if (const auto *Function =
+          dyn_cast_or_null<FunctionDecl>(Holder->getParentFunctionOrMethod());
+      Function && Function->getBody()) {
+    for (const auto &Nodes : matchEach<DeclRefExpr>(
+             declRefExpr(to(varDecl(equalsNode(Holder)))).bind("use"),
+             *Function->getBody(), Context)) {
+      const auto *Use = Nodes.getNodeAs<DeclRefExpr>("use");
+      const auto Parents = instantiatedParents(*Use, Context);
+      const auto *Member =
+          Parents.empty() ? nullptr : Parents[0].get<MemberExpr>();
+      if (Member && Member->getMemberDecl()->getIdentifier() &&
+          identifierTextOf(Member->getMemberDecl()) == "f_Clear")
+        continue;
+      return false;
+    }
+  }
+  // The holder's scope is around the entry's variable.
+  for (DynTypedNode Node = DynTypedNode::create(*Holder);;) {
+    const auto Parents = instantiatedParents(Node, Context);
+    if (Parents.empty())
+      return false;
+    Node = Parents[0];
+    if (const auto *Compound = Node.get<CompoundStmt>()) {
+      const SourceManager &SM = Context.getSourceManager();
+      return !SM.isBeforeInTranslationUnit(Variable->getLocation(),
+                                           Compound->getBeginLoc()) &&
+             !SM.isBeforeInTranslationUnit(Compound->getEndLoc(),
+                                           Variable->getLocation());
+    }
+  }
+}
+
+/// The variable a lambda captures by \p Init, its capture initializer, also
+/// through the copy of an iterator, `[iEntry]`, which its constructor makes,
+/// and which refers where it does, and of another class with borrowed parts,
+/// a view or a holder, `[View]`, whose borrowed parts lead where its do,
+/// unlike the copy of a shared pointer, which owns what it points to.
+static const DeclRefExpr *capturedVariableRef(const Expr *Init) {
+  if (!Init)
+    return nullptr;
+  Init = Init->IgnoreImplicit()->IgnoreParenImpCasts();
+  if (const auto *Copy = dyn_cast<CXXConstructExpr>(Init);
+      Copy && Copy->getNumArgs() == 1 &&
+      Copy->getConstructor()->isCopyOrMoveConstructor() &&
+      (isIteratorType(Copy->getType()) ||
+       (hasBorrowedParts(Copy->getType(),
+                         Copy->getConstructor()->getASTContext()) &&
+        !isSharedPointerType(Copy->getType(),
+                             Copy->getConstructor()->getASTContext()))))
+    Init = Copy->getArg(0)->IgnoreParenImpCasts();
+  return dyn_cast<DeclRefExpr>(Init);
+}
+
+/// Whether \p Type, also of what a pointer or reference to it is, has a
+/// member of a union in it by value, also in a base or a member it holds by
+/// value, which a change of it can end the life of.
+static bool holdsUnion(QualType Type) {
+  if (Type.isNull())
+    return false;
+  Type = Type.getNonReferenceType();
+  if (Type->isPointerType())
+    Type = Type->getPointeeType();
+  llvm::SmallVector<const CXXRecordDecl *, 4> Work{Type->getAsCXXRecordDecl()};
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Seen;
+  while (!Work.empty()) {
+    const CXXRecordDecl *Record = Work.pop_back_val();
+    if (!Record || !Record->hasDefinition())
+      continue;
+    Record = Record->getDefinition();
+    if (!Seen.insert(Record).second)
+      continue;
+    if (Record->isUnion())
+      return true;
+    for (const FieldDecl *Field : Record->fields()) {
+      QualType FieldType = Field->getType();
+      while (const ArrayType *Array = FieldType->getAsArrayTypeUnsafe())
+        FieldType = Array->getElementType();
+      if (!FieldType->isReferenceType() && !FieldType->isPointerType())
+        Work.push_back(FieldType->getAsCXXRecordDecl());
+    }
+    for (const CXXBaseSpecifier &Base : Record->bases())
+      Work.push_back(Base.getType()->getAsCXXRecordDecl());
+  }
+  return false;
+}
+
+
+namespace {
+/// What a change of an object can end the life of, as heldContents tells.
+struct CHeldContents {
+  /// A collection (isCollectionType).
+  bool bCollection = false;
+  /// What an owning pointer owns (ownedPointee).
+  bool bOwned = false;
+  /// A member of a union held by value, which assigning another ends.
+  bool bUnion = false;
+  bool any() const { return bCollection || bOwned || bUnion; }
+};
+} // namespace
+
+/// What \p Type, also of what a pointer or reference to it is, holds that a
+/// change of it can end: a collection, being one, holding one by value, a
+/// member of it, also of a base, or of a member it holds by value, or owning
+/// one through an owning pointer it holds (ownedPointee), also at any depth;
+/// what an owning pointer it holds that way owns, whatever that is; and a
+/// union it holds by value, not one in what it owns, which is stored by
+/// itself. One traversal with one set of what it has seen, which ends at
+/// recursive types, `struct CNode { TCUniquePointer<CNode> m_pNext; }`, and
+/// a budget, past which it can hold anything.
+static CHeldContents heldContents(QualType Type) {
+  CHeldContents Held;
+  if (Type.isNull())
+    return Held;
+  Type = Type.getNonReferenceType();
+  if (Type->isPointerType())
+    Type = Type->getPointeeType();
+  // Each type with whether it is reached through an owning pointer.
+  llvm::SmallVector<std::pair<QualType, bool>, 8> Work{{Type, false}};
+  llvm::DenseSet<std::pair<const CXXRecordDecl *, int>> Seen;
+  for (unsigned Steps = 0; !Work.empty(); ++Steps) {
+    if (Steps >= 512)
+      return {true, true, true};
+    auto [Current, Owned] = Work.pop_back_val();
+    while (const ArrayType *Array = Current->getAsArrayTypeUnsafe())
+      Current = Array->getElementType();
+    if (Current.isNull() || Current->isDependentType() ||
+        Current->isReferenceType() || Current->isPointerType())
+      continue;
+    const CXXRecordDecl *Record = Current->getAsCXXRecordDecl();
+    if (!Record || !Record->hasDefinition())
+      continue;
+    Record = Record->getDefinition();
+    if (!Seen.insert({Record, Owned ? 1 : 0}).second)
+      continue;
+    if (Record->isUnion() && !Owned)
+      Held.bUnion = true;
+    if (isCollectionType(Current))
+      Held.bCollection = true;
+    if (const QualType Pointee = ownedPointee(Current); !Pointee.isNull()) {
+      Held.bOwned = true;
+      Work.push_back({Pointee, true});
+    }
+    if (Held.bCollection && Held.bOwned && Held.bUnion)
+      return Held;
+    for (const FieldDecl *Field : Record->fields())
+      Work.push_back({Field->getType(), Owned});
+    for (const CXXBaseSpecifier &Base : Record->bases())
+      Work.push_back({Base.getType(), Owned});
+  }
+  return Held;
+}
+
+/// Whether a change of \p Type can change a collection (heldContents).
+static bool changesCollection(QualType Type) {
+  return heldContents(Type).bCollection;
+}
+
+/// Whether what is bound to \p Type can be kept and changed through later: a
+/// pointer or a reference to what isn't const, also a reference to a pointer
+/// whose pointer or pointee isn't const, `CItems *const &` or `CItems const
+/// *&`; not a copy. One that isn't known, null, can.
+static bool keepsChangeable(QualType Type) {
+  if (Type.isNull())
+    return true;
+  // A reference to a pointer, also to const, `CItems const *&`, whose
+  // pointer can be pointed elsewhere and what it pointed to deleted, unless
+  // the pointer itself is const and so is what it points to.
+  if (Type->isReferenceType()) {
+    const QualType Referent = Type.getNonReferenceType();
+    if (Referent->isPointerType())
+      return !Referent.isConstQualified() ||
+             !pointsToConst(Referent);
+    return !Referent.isConstQualified();
+  }
+  return Type->isPointerType() && !pointsToConst(Type);
+}
+
+/// Whether \p Type, also of what a reference to it is, is of \p Class.
+static bool declaresSameClass(QualType Type, const CXXRecordDecl *Class) {
+  const CXXRecordDecl *Record =
+      Type.getNonReferenceType()->getAsCXXRecordDecl();
+  return Record && Class &&
+         Record->getCanonicalDecl() == Class->getCanonicalDecl();
+}
+
+/// Whether what \p Call gives is a value all its own, which keeps nothing of
+/// what it is called on or given: one that can't refer back to what it is
+/// made from, a number or a value without pointers, `pEntry->f_GetLen()`
+/// (canReferBack); one independent of what it is made from, an owning copy
+/// (isIndependentType); or what
+/// the body that runs gives (calledDefinition) when what each of its returns
+/// is relative to its object and to each of its parameters is unrelated
+/// (objectRelation), which follows local aliases, views and copies, `return
+/// CPrinted{};`, not `auto &Items = _Items; return CView{&Items};`. Not a
+/// guard or a view that keeps what it is called on.
+static bool givesOwnValue(const CallExpr *Call) {
+  const FunctionDecl *Callee = Call->getDirectCallee();
+  if (!Callee || !Call->isPRValue() || Call->getType()->isPointerType())
+    return false;
+  ASTContext &Context = Callee->getASTContext();
+  const QualType Type = Call->getType();
+  if (!canReferBack(Type, Context) || isIndependentType(Type, Context))
+    return true;
+  const FunctionDecl *Definition = calledDefinition(Call);
+  if (!Definition)
+    return false;
+  const llvm::SmallVector<const Expr *, 4> Values = returnedValues(Definition);
+  auto IsGiven = [&](const Expr *E) {
+    if (isa<CXXThisExpr>(E))
+      return true;
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    const auto *Parameter =
+        Ref ? dyn_cast<ParmVarDecl>(Ref->getDecl()) : nullptr;
+    return Parameter && Parameter->getDeclContext() == Definition;
+  };
+  return !Values.empty() && llvm::all_of(Values, [&](const Expr *Value) {
+    return objectRelation(Value, IsGiven, &Context).Kind ==
+           EObjectRelation::Unrelated;
+  });
+}
+
+/// What an object made by \p Init keeps that it can change when it goes:
+/// each value its whole initialization binds to a pointer or a reference to
+/// what isn't const (keepsChangeable), as a parameter of a constructor, a
+/// factory or a member operator, `CClearOnExit Cleanup(_Items)`, or as a
+/// member of an aggregate, `CClearOnExit Cleanup{_Items}`, also through its
+/// bases, members held by value, array elements and fillers, in braces or in
+/// parentheses, `CClearOnExit Cleanup(_Items)` of an aggregate, also of a
+/// temporary, also one whose life a reference extends, and the object of a
+/// member function that makes it, `_Items.f_MakeGuard()`.
+/// Not a copy, `CItems Copy(_Items)`, whose destruction ends only the copy,
+/// nor what a lambda in it captures, whose body is told where it runs, like
+/// a scope exit. Each node once.
+static llvm::SmallVector<const Expr *, 4> keptByMade(const Expr *Init) {
+  llvm::SmallVector<const Expr *, 4> Kept;
+  llvm::SmallPtrSet<const Stmt *, 32> Seen;
+  TCRecursive<void(const Expr *)> Walk;
+  // \p Value bound to what has \p Type.
+  auto Bound = [&](const Expr *Value, QualType Type) {
+    if (!Value)
+      return;
+    if (keepsChangeable(Type))
+      Kept.push_back(Value);
+    Walk(Value);
+  };
+  // The arguments of \p Call given to \p Callee, from its parameter \p
+  // Shift on, the first argument of a member operator being its object.
+  auto Arguments = [&](llvm::ArrayRef<const Expr *> Given,
+                       const FunctionDecl *Callee, unsigned Shift) {
+    for (unsigned iArgument = 0; iArgument < Given.size(); ++iArgument) {
+      if (iArgument < Shift) {
+        Bound(Given[iArgument], QualType());
+        continue;
+      }
+      const unsigned iParameter = iArgument - Shift;
+      Bound(Given[iArgument], Callee && iParameter < Callee->getNumParams()
+                                  ? Callee->getParamDecl(iParameter)->getType()
+                                  : QualType());
+    }
+  };
+  // The values of an aggregate, each bound to what it initializes
+  // (aggregateParts), but a base, which is made of them.
+  auto Aggregate = [&](const Expr *List) {
+    for (const CAggregatePart &Part : aggregateParts(List))
+      if (Part.Base || Part.Type.isNull())
+        Walk(Part.Init);
+      else
+        Bound(Part.Init, Part.Type);
+  };
+  Walk = [&](const Expr *E) {
+    // Not what isn't evaluated, `CGuard{sizeof(&_Items)}`
+    // (hasUnevaluatedOperands).
+    if (!E || !Seen.insert(E).second || hasUnevaluatedOperands(E))
+      return;
+    // Nor what an object that is bound, or whose address is, is reached
+    // through, `CRestore{mp_Items[0].m_Value}` or `&mp_Items[0]`, which only
+    // finds it: the object itself is what is kept (Bound).
+    const Expr *Bare = E->IgnoreImplicit()->IgnoreParens();
+    if (const auto *Address = dyn_cast<UnaryOperator>(Bare);
+        Address && Address->getOpcode() == UO_AddrOf)
+      return;
+    if (Bare->isGLValue())
+      return;
+    switch (E->getStmtClass()) {
+    case Stmt::CXXConstructExprClass:
+    case Stmt::CXXTemporaryObjectExprClass: {
+      const auto *Construct = cast<CXXConstructExpr>(E);
+      // A copy keeps what its source's borrowed parts lead to, also by a
+      // copy constructor given it as const, `CView Copy = View`
+      // (hasBorrowedParts), not its own storage: nothing of one independent
+      // of its source, also by one given it not as const, `TCVector(TCVector
+      // &)` (isIndependentType).
+      if (const CXXConstructorDecl *Constructor = Construct->getConstructor();
+          Constructor && Construct->getNumArgs() >= 1 &&
+          (Constructor->isCopyOrMoveConstructor() ||
+           declaresSameClass(Construct->getArg(0)->getType(),
+                             Constructor->getParent()))) {
+        if (isIndependentType(Construct->getType(),
+                              Constructor->getASTContext()))
+          return;
+        Kept.push_back(Construct->getArg(0));
+        Walk(Construct->getArg(0));
+        return;
+      }
+      Arguments(llvm::ArrayRef<const Expr *>(Construct->getArgs(),
+                                             Construct->getNumArgs()),
+                Construct->getConstructor(), 0);
+      return;
+    }
+    case Stmt::InitListExprClass:
+    case Stmt::CXXParenListInitExprClass:
+      Aggregate(E);
+      return;
+    case Stmt::CallExprClass:
+    case Stmt::CXXMemberCallExprClass:
+    case Stmt::CXXOperatorCallExprClass:
+    case Stmt::UserDefinedLiteralClass:
+    case Stmt::CUDAKernelCallExprClass: {
+      const auto *Call = cast<CallExpr>(E);
+      const FunctionDecl *Callee = Call->getDirectCallee();
+      const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Callee);
+      // Nothing of a result all its own (givesOwnValue).
+      if (givesOwnValue(Call))
+        return;
+      // The object of a member function that makes it, which it can keep.
+      if (const CMemberCall Member = memberCallOf(Call))
+        Bound(Member->getImplicitObjectArgument(), QualType());
+      const unsigned Shift = argumentShift(Call, Method);
+      Arguments(
+          llvm::ArrayRef<const Expr *>(Call->getArgs(), Call->getNumArgs()),
+          Callee, Shift);
+      return;
+    }
+    // Not a lambda, whose body is told where it can run, a scope exit
+    // where it goes.
+    case Stmt::LambdaExprClass:
+      return;
+    case Stmt::CXXDefaultArgExprClass:
+      Walk(cast<CXXDefaultArgExpr>(E)->getExpr());
+      return;
+    case Stmt::CXXDefaultInitExprClass:
+      Walk(cast<CXXDefaultInitExpr>(E)->getExpr());
+      return;
+    case Stmt::OpaqueValueExprClass:
+      Walk(cast<OpaqueValueExpr>(E)->getSourceExpr());
+      return;
+    default:
+      // Through what keeps it the same, a temporary, also one whose life a
+      // reference extends, cleanups, casts, parentheses, a conditional or a
+      // comma, and anything else, by its parts that run (evaluatedChildren).
+      for (const Stmt *Child : evaluatedChildren(E))
+        if (const auto *Part = dyn_cast_or_null<Expr>(Child))
+          Walk(Part);
+      return;
+    }
+  };
+  Walk(Init);
+  return Kept;
+}
+
+/// The members of what \p Parameter refers or points to that \p Body names
+/// through it, `_pThis->mp_Other`, when that is all it does with it, none
+/// when it also gives it on or uses it otherwise, `fg_Clear(_pThis)`.
+static std::optional<llvm::SmallVector<const FieldDecl *, 4>>
+fieldsNamedThrough(const Stmt *Body, const ParmVarDecl *Parameter) {
+  llvm::SmallVector<const FieldDecl *, 4> Fields;
+  llvm::SmallPtrSet<const Stmt *, 16> Through;
+  unsigned Uses = 0;
+  llvm::SmallVector<const Stmt *, 32> Pending{Body};
+  llvm::SmallPtrSet<const Stmt *, 32> Seen;
+  while (!Pending.empty()) {
+    const Stmt *S = Pending.pop_back_val();
+    if (!S || !Seen.insert(S).second)
+      continue;
+    if (const auto *Member = dyn_cast<MemberExpr>(S))
+      if (const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl()))
+        if (const auto *Ref =
+                dyn_cast<DeclRefExpr>(Member->getBase()->IgnoreParenImpCasts());
+            Ref && Ref->getDecl() == Parameter) {
+          if (!llvm::is_contained(Fields, Field))
+            Fields.push_back(Field);
+          Through.insert(Ref);
+        }
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(S);
+        Ref && Ref->getDecl() == Parameter)
+      ++Uses;
+    llvm::append_range(Pending, keptChildren(S));
+  }
+  if (Uses != Through.size())
+    return std::nullopt;
+  return Fields;
+}
+
+/// The explicit object parameter of \p Function, `this CView &_Self`, which
+/// is its receiver; none for one whose receiver is `this`.
+static const ParmVarDecl *receiverOf(const FunctionDecl *Function) {
+  const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Function);
+  return Method && Method->isExplicitObjectMemberFunction() &&
+                 Method->getNumParams() > 0
+             ? Method->getParamDecl(0)
+             : nullptr;
+}
+
+/// Whether \p E is the receiver of \p Function (receiverOf): `this`, or its
+/// explicit object parameter, also dereferenced, `*this`.
+static bool isReceiver(const Expr *E, const FunctionDecl *Function) {
+  E = E->IgnoreParenImpCasts();
+  if (const auto *Deref = dyn_cast<UnaryOperator>(E);
+      Deref && Deref->getOpcode() == UO_Deref)
+    E = Deref->getSubExpr()->IgnoreParenImpCasts();
+  if (const ParmVarDecl *Receiver = receiverOf(Function)) {
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    return Ref && Ref->getDecl() == Receiver;
+  }
+  return isa<CXXThisExpr>(E);
+}
+
+static bool destructionReachesBorrowedPart(
+    const CXXRecordDecl *Record, ASTContext &Context, int Depth,
+    llvm::function_ref<bool(llvm::ArrayRef<const FieldDecl *>)> Unrelated =
+        nullptr,
+    llvm::ArrayRef<const FieldDecl *> Prefix = {});
+
+/// Whether \p Method, called on a copy at its own level, can reach what a
+/// borrowed part of its object leads to: an accessor that gives one,
+/// `CValue &f_Peer() { return m_Peer; }`, or a member function that reads
+/// through one, a borrowed member (isBorrowedField) or a shared owner of its
+/// receiver (receiverOf), also through a member function of it that can, or
+/// a member held by value that has borrowed parts, or its receiver given
+/// anywhere else, of a class that has them; any whose body can't be seen, or
+/// that an override can run instead of, or past \p Depth, can. Only what is
+/// evaluated, not `sizeof(m_pPeer)`. Its body is gone through from the top,
+/// for the parents of an implicit `this` aren't kept.
+/// Not through a borrowed member of the receiver itself that \p Unrelated
+/// tells leads elsewhere, of the holder it is called on
+/// (borrowedFieldUnrelated).
+static bool methodReachesBorrowedPart(
+    const CXXMethodDecl *Method, ASTContext &Context, int Depth,
+    bool GivenBack = false,
+    llvm::function_ref<bool(const FieldDecl *)> Unrelated = nullptr) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return methodReachesBorrowedPart(Method, Context, Depth, GivenBack, Unrelated); });
+  // Not one that no override can run instead of, final itself or of a final
+  // class.
+  if (!Method || Depth > 4 ||
+      (Method->isVirtual() && !Method->hasAttr<FinalAttr>() &&
+       !Method->getParent()->hasAttr<FinalAttr>()))
+    return true;
+  // Not of a lambda, whose object is the closure, nor a trivial one, which
+  // only copies or does nothing.
+  if (Method->getParent()->isLambda() || Method->isTrivial())
+    return false;
+  const FunctionDecl *Definition = Method->getDefinition();
+  if (!Definition || !Definition->getBody())
+    return true;
+  const QualType Object = Method->getFunctionObjectParameterType();
+  // The uses of the receiver that are followed, a member access or an
+  // operator of it; any other is the receiver given anywhere else.
+  llvm::SmallPtrSet<const Expr *, 8> Followed;
+  bool Reaches = false;
+  llvm::SmallVector<const Expr *, 8> Receivers;
+  // Of a member of the receiver, also of a member of it held by value,
+  // `m_View.m_Count`, the receiver it is reached from, or null.
+  // Not through a member that is borrowed itself, `m_Data.m_Value` of
+  // `CData &m_Data`, whose members are what it borrows.
+  auto ReceiverOf = [&](const MemberExpr *Member) -> const Expr * {
+    for (int Step = 0; Member && Step < 16; ++Step) {
+      if (isReceiver(Member->getBase(), Definition))
+        return Member->getBase()->IgnoreParenImpCasts();
+      const auto *Inner =
+          dyn_cast<MemberExpr>(Member->getBase()->IgnoreParenImpCasts());
+      const auto *Field =
+          Inner ? dyn_cast<FieldDecl>(Inner->getMemberDecl()) : nullptr;
+      if (!Field || isBorrowedField(Field) ||
+          isSharedPointerType(Field->getType(), Context) ||
+          (Inner->isArrow() && !isReceiver(Inner->getBase(), Definition)))
+        return nullptr;
+      Member = Inner;
+    }
+    return nullptr;
+  };
+  // A borrowed member of the receiver, also of a member of it held by value,
+  // as it is or what is in what it points to, `m_pData` or
+  // `&m_pData->m_Value`, whose value is only read.
+  // Of an address, anything on the way through one, which isn't read; else
+  // the member itself, `m_pData`, not a value read through it,
+  // `m_Data.m_Value`.
+  auto BorrowedRead = [&](const Expr *E) {
+    E = E->IgnoreParenImpCasts();
+    bool Address = false;
+    if (const auto *AddressOf = dyn_cast<UnaryOperator>(E);
+        AddressOf && AddressOf->getOpcode() == UO_AddrOf) {
+      E = AddressOf->getSubExpr()->IgnoreParenImpCasts();
+      Address = true;
+    }
+    bool Borrowed = false;
+    for (int Step = 0; Step < 16; ++Step) {
+      const auto *Member = dyn_cast<MemberExpr>(E);
+      if (!Member)
+        return false;
+      const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+      if (!Field || (Step == 0 && !Address && !isBorrowedField(Field)))
+        return false;
+      Borrowed = Borrowed || isBorrowedField(Field);
+      if (isReceiver(Member->getBase(), Definition))
+        return Borrowed;
+      // Not through what a pointer points to, `m_pData->m_pNext`, which
+      // reads it.
+      if (Member->isArrow())
+        return false;
+      E = Member->getBase()->IgnoreParenImpCasts();
+    }
+    return false;
+  };
+  TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+    if (!S || Reaches)
+      return;
+    // Not deleting what a borrowed member owns, `delete m_pView`, whose
+    // destruction reaches nothing borrowed (destructionReachesBorrowedPart):
+    // what is deleted is apart from what it borrows.
+    if (const auto *Delete = dyn_cast<CXXDeleteExpr>(S);
+        Delete && BorrowedRead(Delete->getArgument())) {
+      const QualType Deleted = Delete->getDestroyedType();
+      if (!destructionReachesBorrowedPart(
+              Context.getBaseElementType(Deleted)->getAsCXXRecordDecl(),
+              Context, Depth + 1))
+        return;
+    }
+    // Not what can't run, after a return, `if constexpr (!t_bEnabled)
+    // return; *m_pValue = 0;` (canRunIn).
+    if ((isa<Expr>(S) || isa<ReturnStmt>(S)) &&
+        !canRunIn(S, Definition->getBody(), Definition,
+                  Definition->getASTContext()))
+      return;
+    // Not a test of a borrowed pointer, `if (m_pData)` or `m_pData !=
+    // nullptr`, which doesn't use what it points to.
+    if (const auto *Test = dyn_cast<ImplicitCastExpr>(S);
+        Test && Test->getCastKind() == CK_PointerToBoolean &&
+        BorrowedRead(Test->getSubExpr()))
+      return;
+    // Each of its operands so, or null.
+    auto TestedOperand = [&](const Expr *Operand) {
+      return BorrowedRead(Operand) ||
+             nullPointerConstantOf(Operand->IgnoreParenImpCasts(), Context,
+                                   Expr::NPC_ValueDependentIsNotNull);
+    };
+    if (const auto *Compare = dyn_cast<BinaryOperator>(S);
+        Compare && Compare->isEqualityOp() &&
+        Compare->getLHS()->getType()->isPointerType() &&
+        TestedOperand(Compare->getLHS()) && TestedOperand(Compare->getRHS()))
+      return;
+    // With \p GivenBack, not what it gives back of a borrowed member,
+    // `return m_pData;`, which what it is given to is followed by.
+    if (const auto *Return = dyn_cast<ReturnStmt>(S);
+        GivenBack && Return && Return->getRetValue() &&
+        BorrowedRead(Return->getRetValue()))
+      return;
+    // Not giving back the receiver, `return *this;`, which the caller has.
+    if (const auto *Return = dyn_cast<ReturnStmt>(S);
+        Return && Return->getRetValue() &&
+        isReceiver(Return->getRetValue(), Definition)) {
+      const Expr *Receiver = Return->getRetValue()->IgnoreParenImpCasts();
+      if (const auto *Deref = dyn_cast<UnaryOperator>(Receiver);
+          Deref && Deref->getOpcode() == UO_Deref)
+        Receiver = Deref->getSubExpr()->IgnoreParenImpCasts();
+      Followed.insert(Receiver);
+      Receivers.push_back(Receiver);
+      return;
+    }
+    // Not overwriting a pointer member, `m_pData = nullptr`, also of a
+    // member held by value, `m_View.m_pData = nullptr`, which doesn't use
+    // what it pointed to, unlike assigning through a reference member.
+    if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+        Assign && Assign->getOpcode() == BO_Assign)
+      if (const auto *Target =
+              dyn_cast<MemberExpr>(Assign->getLHS()->IgnoreParens()))
+        if (const Expr *Receiver = ReceiverOf(Target))
+          if (const auto *Field = dyn_cast<FieldDecl>(Target->getMemberDecl());
+              Field && (Field->getType()->isPointerType() ||
+                        Field->getType()->isMemberPointerType())) {
+            Followed.insert(Receiver);
+            Visit(Assign->getRHS());
+            return;
+          }
+    // What a member held by value is used for, by the member of it that is
+    // used, `m_View.m_Count`, not all it has.
+    if (const auto *Member = dyn_cast<MemberExpr>(S);
+        Member && !isReceiver(Member->getBase(), Definition))
+      if (const Expr *Receiver = ReceiverOf(Member)) {
+        Followed.insert(Receiver);
+        if (const auto *Called =
+                dyn_cast<CXXMethodDecl>(Member->getMemberDecl()))
+          Reaches = methodReachesBorrowedPart(Called, Context, Depth + 1);
+        else if (const auto *Field =
+                     dyn_cast<FieldDecl>(Member->getMemberDecl()))
+          Reaches = isBorrowedField(Field) ||
+                    isSharedPointerType(Field->getType(), Context) ||
+                    hasBorrowedParts(Field->getType(), Context);
+        return;
+      }
+    if (const auto *Member = dyn_cast<MemberExpr>(S);
+        Member && isReceiver(Member->getBase(), Definition)) {
+      Followed.insert(Member->getBase()->IgnoreParenImpCasts());
+      if (const auto *Called =
+              dyn_cast<CXXMethodDecl>(Member->getMemberDecl())) {
+        Reaches = methodReachesBorrowedPart(Called, Context, Depth + 1,
+                                            /*GivenBack=*/false, Unrelated);
+      } else if (const auto *Field =
+                     dyn_cast<FieldDecl>(Member->getMemberDecl())) {
+        Reaches = !(Unrelated && isBorrowedField(Field) &&
+                    (Field->getType()->isPointerType() ||
+                     Field->getType()->isReferenceType()) &&
+                    Unrelated(Field)) &&
+                  (isBorrowedField(Field) ||
+                   isSharedPointerType(Field->getType(), Context) ||
+                   hasBorrowedParts(Field->getType(), Context));
+      }
+    } else if (const CMemberCall Call = memberCallOf(S, /*Operators=*/true);
+               Call && (Call->isOperator() || Call->isExplicitObject()) &&
+               isReceiver(Call.call()->getArg(0), Definition)) {
+      // A member function of the receiver whose object is its first
+      // argument, an operator or one with an explicit object, like one named
+      // on it above.
+      Followed.insert(Call.call()->getArg(0)->IgnoreParenImpCasts());
+      const CXXMethodDecl *Called = Call->getMethodDecl();
+      Reaches =
+          !Called || methodReachesBorrowedPart(Called, Context, Depth + 1);
+    }
+    if (const auto *E = dyn_cast<Expr>(S);
+        E && (isa<CXXThisExpr>(E) || isa<DeclRefExpr>(E)) &&
+        isReceiver(E, Definition))
+      Receivers.push_back(E);
+    for (const Stmt *Child : evaluatedChildren(S, Context))
+      Visit(Child);
+  };
+  Visit(Definition->getBody());
+  if (Reaches)
+    return true;
+  // Given anywhere else: what has borrowed parts can be used through them.
+  for (const Expr *Receiver : Receivers) {
+    bool Used = Followed.contains(Receiver);
+    for (const Expr *Of : Followed)
+      if (const auto *Deref = dyn_cast<UnaryOperator>(Of);
+          Deref && Deref->getSubExpr()->IgnoreParenImpCasts() == Receiver)
+        Used = true;
+    if (!Used && hasBorrowedParts(Object, Context))
+      return true;
+  }
+  return false;
+}
+
+/// Whether \p Variable is a reference that extends the life of a temporary,
+/// `auto &&Guard = CGuard{...}`, which is destroyed with it.
+/// With \p Type, the type of the temporary, also of a class derived from the
+/// one the reference is to, `CBase const &Guard = CGuard{...}`.
+static bool extendsTemporary(const VarDecl *Variable,
+                             QualType *Type = nullptr) {
+  const Expr *Init = Variable->getInit();
+  for (int Depth = 0; Init && Depth < 8; ++Depth) {
+    Init = Init->IgnoreParens();
+    if (const auto *Materialize = dyn_cast<MaterializeTemporaryExpr>(Init)) {
+      if (Type)
+        *Type = Materialize->getSubExpr()->getType();
+      return true;
+    }
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(Init))
+      Init = Cleanups->getSubExpr();
+    else if (const auto *Cast = dyn_cast<ImplicitCastExpr>(Init);
+             Cast && (Cast->getCastKind() == CK_NoOp ||
+                      Cast->getCastKind() == CK_DerivedToBase ||
+                      Cast->getCastKind() == CK_UncheckedDerivedToBase))
+      Init = Cast->getSubExpr();
+    else
+      return false;
+  }
+  return false;
+}
+
+/// Whether destroying an object of \p Record can reach what a borrowed part
+/// of it leads to: its destructor (methodReachesBorrowedPart), also one that
+/// can't be seen, and then the destructors of its members held by value and
+/// its bases; nothing of one whose destruction is trivial.
+/// Not through a borrowed member that \p Unrelated tells leads elsewhere, by
+/// its path from the holder, \p Prefix, also of the members and bases it
+/// destroys (borrowedFieldUnrelated).
+static bool destructionReachesBorrowedPart(
+    const CXXRecordDecl *Record, ASTContext &Context, int Depth,
+    llvm::function_ref<bool(llvm::ArrayRef<const FieldDecl *>)> Unrelated,
+    llvm::ArrayRef<const FieldDecl *> Prefix) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return destructionReachesBorrowedPart(Record, Context, Depth, Unrelated, Prefix); });
+  if (!Record || !Record->hasDefinition())
+    return false;
+  Record = Record->getDefinition();
+  if (Record->hasTrivialDestructor())
+    return false;
+  if (Depth > 4)
+    return true;
+  const CXXDestructorDecl *Destructor = Record->getDestructor();
+  if (!Destructor)
+    return true;
+  const FunctionDecl *Definition = Destructor->getDefinition();
+  // One written can do anything its body does; an implicit one only
+  // destroys the members and bases.
+  auto UnrelatedField = [&](const FieldDecl *Field) {
+    llvm::SmallVector<const FieldDecl *, 4> Path(Prefix.begin(), Prefix.end());
+    Path.push_back(Field);
+    return Unrelated(Path);
+  };
+  if (Destructor->isUserProvided() &&
+      (!Definition || !Definition->getBody() ||
+       methodReachesBorrowedPart(
+           Destructor, Context, Depth, /*GivenBack=*/false,
+           Unrelated
+               ? llvm::function_ref<bool(const FieldDecl *)>(UnrelatedField)
+               : nullptr)))
+    return true;
+  for (const FieldDecl *Field : Record->fields()) {
+    QualType Type = Field->getType();
+    const bool Array = Type->isArrayType();
+    while (const ArrayType *Elements = Type->getAsArrayTypeUnsafe())
+      Type = Elements->getElementType();
+    llvm::SmallVector<const FieldDecl *, 4> Path(Prefix.begin(), Prefix.end());
+    Path.push_back(Field);
+    if (destructionReachesBorrowedPart(Type->getAsCXXRecordDecl(), Context,
+                                       Depth + 1, Array ? nullptr : Unrelated,
+                                       Path))
+      return true;
+  }
+  for (const CXXBaseSpecifier &Base : Record->bases())
+    if (destructionReachesBorrowedPart(Base.getType()->getAsCXXRecordDecl(),
+                                       Context, Depth + 1, Unrelated, Prefix))
+      return true;
+  return false;
+}
+
+/// Whether \p Member, a borrowed member of a holder, \p Field, or a local
+/// reference to it, uses what it leads to where it is.
+static bool borrowedFieldUsed(const Expr *Member, const FieldDecl *Field,
+                              ASTContext &Context) {
+  if (!Member)
+    return true;
+  // Not the slot itself, its address or a reference bound to it, `auto
+  // **ppValue = &View.m_pValue` or `auto &rpValue = View.m_pValue`, which use
+  // the holder's own storage until what it holds is read through them.
+  {
+    const auto Parents = Context.getParents(*Member);
+    if (!Parents.empty()) {
+      if (const auto *Address = Parents[0].get<UnaryOperator>();
+          Address && Address->getOpcode() == UO_AddrOf)
+        return false;
+      if (const auto *Bound = Parents[0].get<VarDecl>();
+          Bound && Bound->getType()->isReferenceType())
+        return false;
+    }
+  }
+  // Not overwriting it, `Holder.m_pValue = nullptr`, which doesn't use
+  // what it pointed to, unlike assigning through a reference member,
+  // nor testing it, `if (Holder.m_pValue)` or `Holder.m_pValue !=
+  // nullptr`.
+  const auto Above = Context.getParents(*Member);
+  const auto *Assign = Above.empty() ? nullptr : Above[0].get<BinaryOperator>();
+  // Nothing done to what it leads to (storageUsesOf): compared, `View.m_pValue
+  // == &g_Value`, whose other operand is told by itself, or tested.
+  if (storageUsesOf(Member, Field->getType()->isPointerType() ? 1 : 0, Context)
+          .none())
+    return false;
+  return Field->getType()->isReferenceType() ||
+         !(Assign && Assign->getOpcode() == BO_Assign &&
+           Assign->getLHS()->IgnoreParens() == Member);
+}
+
+/// Whether \p Ref, a use of a copy at its own level (isCopyAtOwnLevel),
+/// reaches what a borrowed part of it leads to (isBorrowedField), the
+/// source's, not only its own storage, `Entry.m_Value`: through a borrowed
+/// member, also of a member it holds by value, `*Entry.m_pPeer` or
+/// `Entry.m_Items.f_Clear()` of `CItems &m_Items`, or a shared owner,
+/// through a member function or an operator that can
+/// (methodReachesBorrowedPart), `Entry.f_Peer()`, or given anywhere else,
+/// `fg_Read(Entry)`, unless what is given has no borrowed parts. Not the uses
+/// of a shared owner itself, `[rpChildren] { rpChildren->f_FindEqual(0); }`,
+/// whose copy keeps what it points to alive.
+/// Not through a borrowed member of it that \p Unrelated tells leads
+/// elsewhere, by its path from it, also of a member held by value, and in a
+/// member function of either (methodReachesBorrowedPart).
+static bool throughBorrowedPart(
+    const DeclRefExpr *Ref, ASTContext &Context,
+    llvm::function_ref<bool(llvm::ArrayRef<const FieldDecl *>)> Unrelated =
+        nullptr) {
+  DynTypedNode Node = DynTypedNode::create(*Ref);
+  const Expr *Current = Ref;
+  // The members held by value it is reached through.
+  llvm::SmallVector<const FieldDecl *, 4> Prefix;
+  auto UnrelatedField = [&](const FieldDecl *Field) {
+    llvm::SmallVector<const FieldDecl *, 4> Path(Prefix.begin(), Prefix.end());
+    Path.push_back(Field);
+    return Unrelated(Path);
+  };
+  for (int Step = 0; Step < 16; ++Step) {
+    const auto Parents = Context.getParents(Node);
+    if (Parents.empty())
+      return false;
+    const DynTypedNode &Parent = Parents[0];
+    // Also what a pointer to it points to, `(*pView).m_pValue` of `auto
+    // *pView = &View`.
+    if (Parent.get<ParenExpr>() || Parent.get<ImplicitCastExpr>() ||
+        (Parent.get<UnaryOperator>() &&
+         Parent.get<UnaryOperator>()->getOpcode() == UO_Deref &&
+         Current->getType()->isPointerType())) {
+      Node = Parent;
+      Current = Parent.get<Expr>();
+      continue;
+    }
+    // A member function called on it, implicit or explicit object alike
+    // (receiverCallOf).
+    if (const CMemberCall Call = receiverCallOf(
+            Parent, Current, const_cast<ASTContext &>(Context))) {
+      const CXXMethodDecl *Method = Call->getMethodDecl();
+      if (!Method ||
+          methodReachesBorrowedPart(
+              Method, Context, 0, /*GivenBack=*/false,
+              Unrelated ? llvm::function_ref<bool(const FieldDecl *)>(
+                              UnrelatedField)
+                        : nullptr))
+        return true;
+      // What gives its object back, `View.f_Self().f_Read()`, is followed
+      // as it.
+      if (!Call->isGLValue() || !givesItsObject(Method) ||
+          callsOverride(Call))
+        return false;
+      Node = DynTypedNode::create(*static_cast<const Stmt *>(Call.call()));
+      Current = Call.call();
+      continue;
+    }
+    if (const auto *Member = Parent.get<MemberExpr>();
+        Member && Member->getBase()->IgnoreParenImpCasts() ==
+                      Current->IgnoreParenImpCasts()) {
+      if (const auto *Method =
+              dyn_cast<CXXMethodDecl>(Member->getMemberDecl())) {
+        if (methodReachesBorrowedPart(
+                Method, Context, 0, /*GivenBack=*/false,
+                Unrelated ? llvm::function_ref<bool(const FieldDecl *)>(
+                                UnrelatedField)
+                          : nullptr))
+          return true;
+        // What gives its object back, `View.f_Self().f_Read()`, is followed
+        // as it.
+        const auto Calls = Context.getParents(*Member);
+        const auto *Call =
+            Calls.empty() ? nullptr : memberCallOf(Calls[0].get<CallExpr>());
+        if (!Call || !Call->isGLValue() || !givesItsObject(Method) ||
+            callsOverride(Call))
+          return false;
+        Node = Calls[0];
+        Current = Call;
+        continue;
+      }
+      const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+      if (!Field)
+        return false;
+      if (isBorrowedField(Field) ||
+          isSharedPointerType(Field->getType(), Context)) {
+        // Not one \p Unrelated tells of, which leads elsewhere or is given
+        // anew.
+        if (Unrelated && UnrelatedField(Field))
+          return false;
+        return borrowedFieldUsed(Member, Field, Context);
+      }
+      // A member held by value, its own, of which only what is borrowed
+      // leads elsewhere.
+      if (!hasBorrowedParts(Field->getType(), Context))
+        return false;
+      Node = Parent;
+      Current = Member;
+      Prefix.push_back(Field);
+      continue;
+    }
+    const QualType Type = Current->getType();
+    if (isSharedPointerType(Type, Context))
+      return false;
+    // An operator of it, `Copy[0]`.
+    if (const auto *Operator = Parent.get<CXXOperatorCallExpr>();
+        Operator && Operator->getNumArgs() >= 1 &&
+        Operator->getArg(0)->IgnoreParenImpCasts() ==
+            Current->IgnoreParenImpCasts())
+      if (const auto *Method =
+              dyn_cast_or_null<CXXMethodDecl>(Operator->getDirectCallee()))
+        return methodReachesBorrowedPart(Method, Context, 0);
+    // Given anywhere else, or its address taken: what has borrowed parts
+    // can be used through them.
+    return hasBorrowedParts(Type, Context);
+  }
+  return true;
+}
+
+/// Whether \p Lambda uses its copy of \p Captured through a borrowed part of
+/// it (throughBorrowedPart).
+static bool usesThroughBorrowedPart(const LambdaExpr *Lambda,
+                                    const ValueDecl *Captured,
+                                    ASTContext &Context) {
+  llvm::SmallVector<const Stmt *, 32> Pending{Lambda->getBody()};
+  llvm::SmallPtrSet<const Stmt *, 32> Seen;
+  while (!Pending.empty()) {
+    const Stmt *S = Pending.pop_back_val();
+    if (!S || !Seen.insert(S).second)
+      continue;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(S);
+        Ref && Ref->getDecl() == Captured && throughBorrowedPart(Ref, Context))
+      return true;
+    llvm::append_range(Pending, keptChildren(S));
+  }
+  return false;
+}
+
+/// Whether \p E is in the storage of a local, not a reference, itself or a
+/// member or an element of it held by value, `View.m_pItems` or `Batch[0]`,
+/// which is none of what it can refer to. Also through a local reference to
+/// one, `Alias.m_pItems` of `auto &Alias = View`, or an unchanged local
+/// pointer to one, `pView->m_pItems` (addressedExpr).
+static bool isLocalStorage(const Expr *E) {
+  for (int Steps = 0; E && Steps < 16; ++Steps) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+      const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+      if (Local && Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+          Local->getType()->isReferenceType() && Local->getInit() &&
+          !Local->isInitCapture()) {
+        E = Local->getInit();
+        continue;
+      }
+      return Local && Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+             !Local->getType()->isReferenceType();
+    }
+    if (const auto *Member = dyn_cast<MemberExpr>(E);
+        Member && Member->isArrow() &&
+        !Member->getMemberDecl()->getType()->isReferenceType())
+      if (const Expr *Pointed = addressedExpr(Member->getBase())) {
+        E = Pointed;
+        continue;
+      }
+    if (const auto *Member = dyn_cast<MemberExpr>(E);
+        Member && !Member->isArrow() &&
+        !Member->getMemberDecl()->getType()->isReferenceType())
+      E = Member->getBase();
+    else if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E);
+             Subscript && Subscript->getBase()
+                              ->IgnoreParenImpCasts()
+                              ->getType()
+                              ->isArrayType())
+      E = Subscript->getBase();
+    else
+      return false;
+  }
+  return false;
+}
+
+/// Whether \p Object is part of another object, which isn't allocated by
+/// itself and so can't be ended by itself: a member, also through a local
+/// reference to one, also what an accessor of it whose body can be seen gives
+/// of it, a member, `f_Children()`, or itself, `operator*` returning
+/// `*this`, of a part. Of `this` or a parameter of what is analysed, \p
+/// IsObject, what its caller tells, \p ObjectIsPart: what it is called on or
+/// given there, `void f_Tidy() { f_Remove(); }` called as
+/// `mp_Items[0].f_Tidy()` can end the entry.
+static bool
+isPartOfObject(const Expr *Object,
+               llvm::function_ref<bool(const Expr *)> IsObject = nullptr,
+               bool ObjectIsPart = false) {
+  for (int Steps = 0; Object && Steps < 16; ++Steps) {
+    Object = Object->IgnoreParenImpCasts();
+    if (IsObject && IsObject(Object))
+      return ObjectIsPart;
+    if (isa<CXXThisExpr>(Object))
+      return false;
+    // Of a pointer, what it points to: what it is the address of,
+    // `(&mp_Items)->f_Remove()`, also through an unchanged local pointer
+    // made with one, `auto *pChildren = &(*this)[0].m_Children`
+    // (addressedExpr), or what an accessor gives, as below; not what a
+    // pointer member or another pointer points to, which can be allocated by
+    // itself, `mp_Items[0].m_pHeap->f_Remove()`.
+    if (Object->getType()->isPointerType() && !isa<CallExpr>(Object)) {
+      Object = addressedExpr(Object);
+      continue;
+    }
+    // The same object cast, `static_cast<CChildren &>(m_Child)`, and an
+    // element of an array it holds, `m_Children[0]`, not of what a pointer
+    // points to.
+    if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Object);
+        Cast && Cast->isGLValue()) {
+      Object = Cast->getSubExpr();
+      continue;
+    }
+    if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(Object)) {
+      const Expr *Array = Subscript->getBase()->IgnoreParenImpCasts();
+      if (!Array->getType()->isArrayType())
+        return false;
+      Object = Array;
+      continue;
+    }
+    if (const auto *Member = dyn_cast<MemberExpr>(Object))
+      return isa<FieldDecl>(Member->getMemberDecl()) &&
+             !Member->getMemberDecl()->getType()->isReferenceType();
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(Object)) {
+      const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+      if (!Local)
+        return false;
+      if (isa<ParmVarDecl>(Local))
+        return false;
+      if (!Local->getType()->isReferenceType() || !Local->getInit())
+        return false;
+      Object = Local->getInit();
+      continue;
+    }
+    if (const auto *Call = dyn_cast<CallExpr>(Object)) {
+      // Of the body that runs (calledDefinition).
+      const auto *Method =
+          calledDefinition(Call)
+              ? dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee())
+              : nullptr;
+      const std::optional<CObjectRelation> Gives =
+          Method ? returnedRelation(Method, &Method->getASTContext())
+                 : std::nullopt;
+      if (!Gives || Gives->bThroughPointer)
+        return false;
+      if (Gives->Kind == EObjectRelation::Subobject)
+        return true;
+      if (Gives->Kind != EObjectRelation::SameObject)
+        return false;
+      if (const CMemberCall Member = memberCallOf(Call))
+        Object = Member->getImplicitObjectArgument();
+      else if (Call->getNumArgs() >= 1)
+        Object = Call->getArg(0);
+      else
+        return false;
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+/// How much deeper than an object a change of it changes when that is
+/// anything, what can't be told.
+static constexpr int c_Everything = -(1 << 20);
+
+/// Whether \p S, also what it has in it, names \p Decl. Each node once,
+/// also of nested awaits (childrenOnce).
+static bool namesDecl(const Stmt *S, const ValueDecl *Decl) {
+  llvm::SmallVector<const Stmt *, 32> Pending{S};
+  llvm::SmallPtrSet<const Stmt *, 32> Seen;
+  while (!Pending.empty()) {
+    const Stmt *Current = Pending.pop_back_val();
+    if (!Current || !Seen.insert(Current).second)
+      continue;
+    if (isReferenceTo(Current, Decl))
+      return true;
+    llvm::append_range(Pending, keptChildren(Current));
+  }
+  return false;
+}
+
+/// What is given to \p Object, a local, after it is made, in \p Body, which
+/// it can keep like what it is made from (keptByMade): what is assigned to it
+/// or a member of it, `Guard.m_pItems = &_Items`, `Guard = CGuard{_Items}`,
+/// and what a call it is given to, also as its object or by its address, is
+/// given besides, `Guard.f_Set(_Items)` or `fg_Fill(&Guard, _Items)`, each
+/// argument by what it is bound to, whatever the call gives. Of the local
+/// also through local aliases, `auto &Alias = Guard` or `auto *pGuard =
+/// &Guard`, as objectRelation tells what an expression is relative to it.
+/// What what \p IsObject tells is given after it is made in \p Body, also
+/// a part of it, the values given to its parts or to it as a whole, and what
+/// calls it or a part of it is given to are given with it by what can keep
+/// them, a reference or a pointer that isn't to const (keepsChangeable), or
+/// with \p KeepConst, also to const, as the guards are; one whose body can be
+/// seen and never names its parameter keeps nothing of it.
+namespace {
+/// Of the AST a thread analyzes, the lambdas of each body that are never
+/// called (uncalledLambdas).
+struct CUncalledFacts {
+  llvm::DenseMap<const Stmt *, llvm::SmallPtrSet<const LambdaExpr *, 4>>
+      Lambdas;
+};
+} // namespace
+
+/// The lambdas in \p Body that are never called: one discarded where it is
+/// made, `[&] { ... };`, or one a local is made with that is never named,
+/// `auto fNever = [&] { ... };`, once for each body.
+static const llvm::SmallPtrSet<const LambdaExpr *, 4> &
+uncalledLambdas(const Stmt *Body, ASTContext &Context) {
+  auto [It, Inserted] =
+      astCache<CUncalledFacts>(Context).Lambdas.try_emplace(Body);
+  if (!Inserted)
+    return It->second;
+  llvm::SmallPtrSet<const LambdaExpr *, 4> Uncalled;
+  // The locals named, other than where they are declared.
+  llvm::SmallPtrSet<const ValueDecl *, 32> Named;
+  llvm::SmallVector<const VarDecl *, 8> LambdaLocals;
+  llvm::SmallVector<const Stmt *, 64> Work{Body};
+  while (!Work.empty()) {
+    const Stmt *S = Work.pop_back_val();
+    if (!S)
+      continue;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(S))
+      Named.insert(Ref->getDecl());
+    if (const auto *Block = dyn_cast<CompoundStmt>(S))
+      for (const Stmt *Statement : Block->body())
+        if (const auto *Discarded = dyn_cast_or_null<Expr>(Statement))
+          if (const auto *Lambda =
+                  dyn_cast<LambdaExpr>(Discarded->IgnoreImplicit()))
+            Uncalled.insert(Lambda);
+    if (const auto *Declaration = dyn_cast<DeclStmt>(S))
+      for (const Decl *Declared : Declaration->decls())
+        if (const auto *Local = dyn_cast<VarDecl>(Declared);
+            Local && Local->getInit() &&
+            isa<LambdaExpr>(Local->getInit()->IgnoreImplicit()))
+          LambdaLocals.push_back(Local);
+    for (const Stmt *Child : keptChildren(S))
+      Work.push_back(Child);
+  }
+  for (const VarDecl *Local : LambdaLocals)
+    if (!Named.contains(Local))
+      Uncalled.insert(cast<LambdaExpr>(Local->getInit()->IgnoreImplicit()));
+  auto &Lambdas = astCache<CUncalledFacts>(Context).Lambdas;
+  return Lambdas[Body] = std::move(Uncalled);
+}
+
+static llvm::SmallVector<const Expr *, 4>
+keptLaterOf(llvm::function_ref<bool(const Expr *)> IsObject, const Stmt *Body,
+            ASTContext &Context, bool KeepConst,
+            llvm::function_ref<bool(const Expr *)> MayName = nullptr) {
+  llvm::SmallVector<const Expr *, 4> Kept;
+  // Only what \p MayName lets through can name it, which is told first.
+  auto Names = [&](const Expr *E) {
+    if (MayName && !MayName(E))
+      return false;
+    const CObjectRelation Of = objectRelation(E, IsObject, &Context);
+    return (Of.Kind == EObjectRelation::SameObject ||
+            Of.Kind == EObjectRelation::Subobject) &&
+           !Of.bThroughPointer && !isCopyStorage(Of);
+  };
+  // Only what runs: not what isn't evaluated, `sizeof(Guard.m_pItems =
+  // &_Items)` (hasUnevaluatedOperands), nor a branch never taken or
+  // discarded, `if constexpr (false)` (evaluatedChildren).
+  // Nor the body of a lambda that is never called: one discarded where it
+  // is made, `[&] { ... };`, or one a local is made with that is never
+  // named, `auto fNever = [&] { Guard.m_pItems = &mp_Items; };`, which are
+  // found once for each body.
+  const llvm::SmallPtrSet<const LambdaExpr *, 4> &Uncalled =
+      uncalledLambdas(Body, Context);
+  llvm::SmallVector<const Stmt *, 32> Pending{Body};
+  llvm::SmallPtrSet<const Stmt *, 32> Seen;
+  while (!Pending.empty()) {
+    const Stmt *S = Pending.pop_back_val();
+    if (!S || !Seen.insert(S).second || hasUnevaluatedOperands(S))
+      continue;
+    if (const auto *Lambda = dyn_cast<LambdaExpr>(S);
+        Lambda && Uncalled.contains(Lambda))
+      continue;
+    // Nor after a return (canRunIn).
+    if (isa<BinaryOperator, CallExpr>(S) &&
+        !canRunIn(S, Body, nullptr, Context))
+      continue;
+    if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+        Assign && Assign->isAssignmentOp() && Names(Assign->getLHS())) {
+      Kept.push_back(Assign->getRHS());
+      llvm::append_range(Kept, keptByMade(Assign->getRHS()));
+    } else if (const auto *Assign = dyn_cast<CXXOperatorCallExpr>(S);
+               Assign && Assign->isAssignmentOp() &&
+               Assign->getNumArgs() == 2 &&
+               isa_and_nonnull<CXXMethodDecl>(Assign->getDirectCallee()) &&
+               (cast<CXXMethodDecl>(Assign->getDirectCallee())
+                    ->isCopyAssignmentOperator() ||
+                cast<CXXMethodDecl>(Assign->getDirectCallee())
+                    ->isMoveAssignmentOperator()) &&
+               !cast<CXXMethodDecl>(Assign->getDirectCallee())
+                    ->isUserProvided()) {
+      // A copy or a move assignment that isn't written copies from what is
+      // assigned to what it is assigned to only, `View = Other`: what it is
+      // assigned keeps that, as a copy made of it would, and what is
+      // assigned keeps nothing of it.
+      if (Names(Assign->getArg(0)) && !Names(Assign->getArg(1))) {
+        Kept.push_back(Assign->getArg(1));
+        llvm::append_range(Kept, keptByMade(Assign->getArg(1)));
+      }
+    } else if (const auto *Call = dyn_cast<CallExpr>(S)) {
+      bool Given = false;
+      if (const CMemberCall Member = memberCallOf(Call))
+        Given = Names(Member->getImplicitObjectArgument());
+      for (const Expr *Argument : Call->arguments())
+        Given = Given || Names(Argument);
+      // Not of a call of a lambda, whose closure keeps none of what it is
+      // given: what its body gives what it captures is followed through its
+      // parameters, below.
+      if (Given && !calledLambda(Call)) {
+        // Not what is given to a parameter of one whose body can be seen,
+        // and that no override can run instead of (callsOverride), that the
+        // body never names, `void f_Apply(CItems &_Items) {}`.
+        llvm::SmallPtrSet<const Stmt *, 16> Unkept;
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        const FunctionDecl *Definition =
+            Callee && !isa<CXXOperatorCallExpr>(Call) && !callsOverride(Call)
+                ? Callee->getDefinition()
+                : nullptr;
+        if (const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Definition);
+            Method && Method->isExplicitObjectMemberFunction())
+          Definition = nullptr;
+        if (Definition && Definition->getBody())
+          for (unsigned iArgument = 0; iArgument < Call->getNumArgs() &&
+                                       iArgument < Definition->getNumParams();
+               ++iArgument)
+            if (!namesDecl(Definition->getBody(),
+                           Definition->getParamDecl(iArgument))) {
+              llvm::SmallVector<const Stmt *, 16> Inside{
+                  Call->getArg(iArgument)};
+              while (!Inside.empty())
+                if (const Stmt *Part = Inside.pop_back_val();
+                    Part && Unkept.insert(Part).second)
+                  llvm::append_range(Inside, Part->children());
+            }
+        // Each argument, and the object, by what it is bound to, whatever
+        // the call gives, `fg_Set(Guard.m_pItems, _Items)`.
+        const auto *Method =
+            dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
+        const unsigned Shift = argumentShift(Call, Method);
+        auto Keep = [&](const Expr *Value, QualType Bound) {
+          if (!Value || Names(Value) || Unkept.contains(Value))
+            return;
+          if (keepsChangeable(Bound) ||
+              (KeepConst && !Bound.isNull() &&
+               (Bound->isReferenceType() || Bound->isPointerType())))
+            Kept.push_back(Value);
+          for (const Expr *Made : keptByMade(Value))
+            if (!Names(Made) && !Unkept.contains(Made))
+              Kept.push_back(Made);
+        };
+        if (const CMemberCall Member = memberCallOf(Call))
+          Keep(Member->getImplicitObjectArgument(), QualType());
+        for (unsigned iArgument = 0; iArgument < Call->getNumArgs();
+             ++iArgument)
+          Keep(Call->getArg(iArgument),
+               iArgument < Shift ? QualType()
+               : Callee && iArgument - Shift < Callee->getNumParams()
+                   ? Callee->getParamDecl(iArgument - Shift)->getType()
+                   : QualType());
+      }
+    }
+    for (const Stmt *Child : evaluatedChildren(S, Context))
+      Pending.push_back(Child);
+  }
+  // What a lambda in it is given and gives it, `auto fSet = [&](int *_pValue)
+  // { View.m_pValue = _pValue; }`, is what the calls of it in it give it,
+  // `fSet(&mp_Value)`.
+  llvm::SmallVector<const Expr *, 4> Given;
+  llvm::SmallPtrSet<const Stmt *, 32> Visited;
+  for (const Expr *Value : Kept) {
+    const auto *Ref = dyn_cast<DeclRefExpr>(Value->IgnoreParenImpCasts());
+    const auto *Parameter =
+        Ref ? dyn_cast<ParmVarDecl>(Ref->getDecl()) : nullptr;
+    const auto *Operator =
+        Parameter ? dyn_cast<CXXMethodDecl>(Parameter->getDeclContext())
+                  : nullptr;
+    if (!Operator || !Operator->getParent()->isLambda())
+      continue;
+    // Only the calls that run, as above.
+    llvm::SmallVector<const Stmt *, 32> Work{Body};
+    Visited.clear();
+    while (!Work.empty()) {
+      const Stmt *S = Work.pop_back_val();
+      if (!S || !Visited.insert(S).second || hasUnevaluatedOperands(S))
+        continue;
+      if (const auto *Lambda = dyn_cast<LambdaExpr>(S);
+          Lambda && Uncalled.contains(Lambda))
+        continue;
+      if (const auto *Call = dyn_cast<CallExpr>(S))
+        if (const LambdaExpr *Lambda = calledLambda(Call);
+            Lambda && Lambda->getLambdaClass() == Operator->getParent() &&
+            canRunIn(Call, Body, nullptr, Context)) {
+          // Not shifted again for an explicit object parameter
+          // (argumentOf).
+          if (const Expr *Argument = argumentOf(
+                  Call, Operator, Parameter->getFunctionScopeIndex()))
+            Given.push_back(Argument);
+        }
+      for (const Stmt *Child : evaluatedChildren(S, Context))
+        Work.push_back(Child);
+    }
+  }
+  llvm::append_range(Kept, Given);
+  return Kept;
+}
+
+/// What is given to the local \p Object after it is made in \p Body, also
+/// to a part of it it holds by value, or its address, also through aliases
+/// (keptLaterOf).
+static llvm::SmallVector<const Expr *, 4>
+keptLater(const VarDecl *Object, const Stmt *Body, bool KeepConst = false) {
+  // What can name it names it or a local made with it, an alias, `auto
+  // &Alias = Guard` or `auto *pGuard = &Guard`, also of those, which is
+  // told by the names in it before what they relate to.
+  llvm::SmallPtrSet<const ValueDecl *, 8> Names{Object};
+  llvm::SmallVector<const VarDecl *, 16> Locals;
+  llvm::SmallVector<const Stmt *, 64> Work{Body};
+  while (!Work.empty()) {
+    const Stmt *S = Work.pop_back_val();
+    if (!S)
+      continue;
+    if (const auto *Declaration = dyn_cast<DeclStmt>(S))
+      for (const Decl *Declared : Declaration->decls())
+        if (const auto *Local = dyn_cast<VarDecl>(Declared);
+            Local && Local->getInit())
+          Locals.push_back(Local);
+    for (const Stmt *Child : keptChildren(S))
+      Work.push_back(Child);
+  }
+  auto Mentions = [&](const Stmt *S) {
+    llvm::SmallVector<const Stmt *, 16> Pending{S};
+    while (!Pending.empty()) {
+      const Stmt *Current = Pending.pop_back_val();
+      if (!Current)
+        continue;
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(Current);
+          Ref && Names.contains(Ref->getDecl()))
+        return true;
+      for (const Stmt *Child : keptChildren(Current))
+        Pending.push_back(Child);
+    }
+    return false;
+  };
+  for (bool Added = true; Added;) {
+    Added = false;
+    for (const VarDecl *Local : Locals)
+      if (!Names.contains(Local) && Mentions(Local->getInit())) {
+        Names.insert(Local);
+        Added = true;
+      }
+  }
+  return keptLaterOf(
+      [&](const Expr *E) {
+        const auto *Ref = dyn_cast<DeclRefExpr>(E);
+        return Ref && Ref->getDecl() == Object;
+      },
+      Body, Object->getASTContext(), KeepConst,
+      [&](const Expr *E) { return Mentions(E); });
+}
+
+/// Whether destroying an object of \p Type that \p Made makes, a local,
+/// \p Local, in \p Body, or a temporary, ends nothing it is made from: a copy
+/// of a shared owner (OwnerTypes), whose source owns what it points to
+/// still, `auto pKeep = pEntry->m_pData`, unless the local is given another
+/// later (keptLater). One moved from its source owns it instead of that, and
+/// what holds a copy can change what it points to when it is destroyed, which
+/// its destructor tells.
+static bool destroysOnlySharedCopy(QualType Type, const Expr *Made,
+                                   const VarDecl *Local, const Stmt *Body) {
+  const auto *Construct =
+      Made ? dyn_cast<CXXConstructExpr>(Made->IgnoreImplicit()) : nullptr;
+  return Construct && Construct->getConstructor() &&
+         Construct->getConstructor()->isCopyConstructor() &&
+         isSharedPointerType(Type,
+                             Construct->getConstructor()->getASTContext()) &&
+         (!Local || keptLater(Local, Body).empty());
+}
+
+/// Whether what an object keeps, \p Kept, related to the object as \p
+/// Related, is only entries or what is in them, not a collection, also by a
+/// pointer or a reference, `CRestore Restore{mp_Items[0].m_Value}`, whose
+/// plain data its destructor can restore without changing a collection.
+static bool keepsOnlyEntries(llvm::ArrayRef<const Expr *> Kept,
+                             llvm::ArrayRef<CObjectRelation> Related) {
+  return !Related.empty() &&
+         llvm::all_of(Related,
+                      [](const CObjectRelation &Of) {
+                        return Of.Kind == EObjectRelation::Entry;
+                      }) &&
+         llvm::none_of(Kept, [](const Expr *Value) {
+           return isCollectionType(Value->getType());
+         });
+}
+
+/// Whether a function that can't be seen, given an argument for a parameter
+/// of \p Type, can end it: a pointer, which it can delete or deallocate,
+/// `free(void *)`, also by a reference to it, `int *&`, or a reference to a
+/// class, also through what it is given, `delete &_Entry`. Not a reference
+/// to a number.
+static bool mayEnd(QualType Type) {
+  if (Type.isNull())
+    return false;
+  if (Type->isPointerType())
+    return true;
+  return Type->isReferenceType() &&
+         (Type.getNonReferenceType()->isRecordType() ||
+          Type.getNonReferenceType()->isPointerType());
+}
+
+/// Whether \p E names a reference parameter, `int *&_pSlot`, which refers to
+/// what it is given, also through a local reference bound to one and casts
+/// to references.
+static bool aliasesGiven(const Expr *E) {
+  for (int Depth = 0; E && Depth < 8; ++Depth) {
+    E = E->IgnoreParenImpCasts();
+    if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
+        Cast && Cast->isGLValue()) {
+      E = Cast->getSubExpr();
+      continue;
+    }
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    const auto *Variable = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!Variable || !Variable->getType()->isReferenceType())
+      return false;
+    if (isa<ParmVarDecl>(Variable))
+      return true;
+    E = Variable->getInit();
+  }
+  return false;
+}
+
+/// The local pointer that \p E is the address of, `&pItems`, also through
+/// `std::addressof` or a local made with it, `CItems **ppItems = &pItems`.
+/// Null otherwise.
+static const Expr *addressedLocalPointer(const Expr *E) {
+  const Expr *Addressed = addressedExpr(E);
+  const auto *Ref =
+      Addressed ? dyn_cast<DeclRefExpr>(Addressed->IgnoreParens()) : nullptr;
+  const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+  return Local && Local->hasLocalStorage() && Local->getType()->isPointerType()
+             ? Ref
+             : nullptr;
+}
+
+/// The object that \p S, a call of a member function that consumes it,
+/// moves from: one qualified `&&`, `f_GetIteratorDestructive() &&`, also a
+/// member operator, or one whose explicit object parameter is an rvalue
+/// reference, `f_Drain(this CItems &&)`. Null otherwise.
+static const Expr *consumedObject(const Stmt *S) {
+  const auto *Call = dyn_cast<CallExpr>(S);
+  // Also through a pointer to such a member function, `(Items.*fDrain)()`,
+  // by the qualifier of its type.
+  if (const CMemberCall Member = memberCallOf(Call);
+      Member && !Member->getDirectCallee())
+    if (const auto *Pointer =
+            dyn_cast<BinaryOperator>(Member->getCallee()->IgnoreParens());
+        Pointer && Pointer->isPtrMemOp()) {
+      const auto *Type =
+          Pointer->getRHS()->getType()->getAs<MemberPointerType>();
+      const auto *Function =
+          Type ? Type->getPointeeType()->getAs<FunctionProtoType>() : nullptr;
+      return Function && Function->getRefQualifier() == RQ_RValue
+                 ? Pointer->getLHS()
+                 : nullptr;
+    }
+  const auto *Method =
+      Call ? dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee()) : nullptr;
+  if (!Method || Method->isStatic())
+    return nullptr;
+  if (Method->isExplicitObjectMemberFunction())
+    return Call->getNumArgs() >= 1 &&
+                   Method->getParamDecl(0)->getType()->isRValueReferenceType()
+               ? Call->getArg(0)
+               : nullptr;
+  if (Method->getRefQualifier() != RQ_RValue)
+    return nullptr;
+  if (const CMemberCall Member = memberCallOf(Call))
+    return Member->getImplicitObjectArgument();
+  if (isa<CXXOperatorCallExpr>(Call) && Call->getNumArgs() >= 1)
+    return Call->getArg(0);
+  return nullptr;
+}
+
+/// The member function that \p Pointer, a pointer to a member function,
+/// can be seen to point to: `&CItems::f_Clear`, also through a local made
+/// with it that isn't changed, or a const one, also through a cast that
+/// picks one of overloads, `static_cast<void (CItems::*)()>(&CItems::f_Touch)`.
+/// Null otherwise.
+static const CXXMethodDecl *pointedMemberFunction(const Expr *Pointer) {
+  for (int Depth = 0; Pointer && Depth < 8; ++Depth) {
+    Pointer = Pointer->IgnoreParenImpCasts();
+    while (const auto *Cast = dyn_cast<ExplicitCastExpr>(Pointer)) {
+      if (!isa<CXXStaticCastExpr>(Cast) && Cast->getCastKind() != CK_NoOp)
+        break;
+      Pointer = Cast->getSubExpr()->IgnoreParenImpCasts();
+    }
+    if (const auto *Address = dyn_cast<UnaryOperator>(Pointer);
+        Address && Address->getOpcode() == UO_AddrOf)
+      Pointer = Address->getSubExpr()->IgnoreParenImpCasts();
+    const auto *Ref = dyn_cast<DeclRefExpr>(Pointer);
+    if (!Ref)
+      return nullptr;
+    if (const auto *Method = dyn_cast<CXXMethodDecl>(Ref->getDecl()))
+      return Method;
+    // Not one that a lambda can point elsewhere, also its copy in a mutable
+    // one, `[fCall]() mutable { fCall = &CItems::f_Clear; ... }`.
+    const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
+    if (!Variable || !Variable->getInit() || isa<ParmVarDecl>(Variable) ||
+        !(Variable->getType().isConstQualified() ||
+          (Variable->hasLocalStorage() && !isChangedVariable(Variable) &&
+           isUnchangedAt(Ref))))
+      return nullptr;
+    Pointer = Variable->getInit();
+  }
+  return nullptr;
+}
+
+/// Whether \p Function, which added the entry that \p Variable refers to,
+/// removes it from \p Field itself before a later use, also through an alias
+/// of the collection, like `auto &Items = mp_Items; Items.f_Remove(Key)`.
+/// The names of the member functions that remove entries of a collection,
+/// like `f_Remove` and `f_Clear`, of the vocabulary.
+static llvm::ArrayRef<StringRef> removingMethods() {
+  return vocabulary().RemovingMethods.names();
+}
+
+static bool removesOwnEntry(const VarDecl *Variable, const Expr *Key,
+                            const FieldDecl *Field, const FunctionDecl *Function,
+                            llvm::ArrayRef<StringRef> FreshKeyFunctions,
+                            ASTContext &Context) {
+  // A key made fresh by this call, like `auto ID = fg_RandomID(mp_Items)`,
+  // which no other key is.
+  // Also through an unchanged copy of it, `auto Copy = ID`.
+  TCRecursive<const VarDecl *(const Expr *, int)> FreshKey =
+      [&](const Expr *E, int Depth) -> const VarDecl * {
+    const auto *Ref =
+        E ? dyn_cast<DeclRefExpr>(skipWrappers(E)->IgnoreParenImpCasts())
+          : nullptr;
+    const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!Local || !Local->hasLocalStorage() || !Local->getInit() ||
+        isChangedVariable(Local) || Depth > 4)
+      return nullptr;
+    const Expr *Init = skipWrappers(Local->getInit())->IgnoreParenImpCasts();
+    if (isa<DeclRefExpr>(Init))
+      return FreshKey(Init, Depth + 1);
+    const auto *Call = dyn_cast<CallExpr>(Init);
+    return Call && matchesNamePattern(calleeName(Call), FreshKeyFunctions)
+               ? Local
+               : nullptr;
+  };
+  const VarDecl *EntryKey = FreshKey(Key, 0);
+  const llvm::ArrayRef<StringRef> RemovingMethodList = removingMethods();
+  const SourceManager &SM = Context.getSourceManager();
+  for (const auto &Nodes :
+       matchEach<CallExpr>(callExpr(isMemberCallExpr()).bind("removal"),
+                           *Function->getBody(), Context)) {
+    const CMemberCall Removal = memberCallOf(Nodes.getNodeAs<CallExpr>("removal"));
+    const CXXMethodDecl *Method = Removal->getMethodDecl();
+    const Expr *Owner = nullptr;
+    if (!Method || !Method->getIdentifier() ||
+        !matchesNamePattern(identifierTextOf(Method), RemovingMethodList) ||
+        annotatedCollection(Removal->getImplicitObjectArgument(), Owner) !=
+            Field)
+      continue;
+    // Not of another object that has the collection, like a copy of the
+    // state, `auto Copy = mp_State; Copy.m_Items.f_Remove(Key)`.
+    if (!isOwnActorObject(Owner))
+      continue;
+    // Not one that doesn't run, `if constexpr (false) mp_Items.f_Remove(Key)`,
+    // `if (false) mp_Items.f_Remove(Key)`, or in `sizeof`.
+    if (isInUnevaluatedOperand(DynTypedNode::create(*Removal), Context) ||
+        isInDiscardedBranch(DynTypedNode::create(*Removal), Context) ||
+        isInNeverTakenBranch(DynTypedNode::create(*Removal), Context))
+      continue;
+    // Removing the entry of another fresh key leaves this one.
+    if (const VarDecl *RemovedKey =
+            Removal->getNumArgs() >= 1 ? FreshKey(Removal->getArg(0), 0)
+                                       : nullptr;
+        EntryKey && RemovedKey && RemovedKey != EntryKey)
+      continue;
+    // In a cleanup that runs after the uses.
+    const LambdaExpr *Lambda = nullptr;
+    for (DynTypedNode Node = DynTypedNode::create(*Removal); !Lambda;) {
+      const auto Parents = instantiatedParents(Node, Context);
+      if (Parents.empty() || Parents[0].get<FunctionDecl>())
+        break;
+      Node = Parents[0];
+      Lambda = Node.get<LambdaExpr>();
+    }
+    if (Lambda && isDeferredCleanup(Lambda, Variable, Context))
+      continue;
+    // A removal after the last use doesn't matter, unless a loop, or a jump
+    // back, runs the use again after it: not a loop the reference is declared
+    // in, which binds it again each time, `for (...) { auto &Value =
+    // mp_Items[Key]; ... mp_Items.f_Remove(Key); }`.
+    bool UsedAfter = !matchEach<Stmt>(stmt(anyOf(gotoStmt(), labelStmt())),
+                                      *Function->getBody(), Context)
+                          .empty();
+    for (DynTypedNode Up = DynTypedNode::create(*Removal);;) {
+      const auto UpParents = instantiatedParents(Up, Context);
+      if (UpParents.empty() || UpParents[0].get<FunctionDecl>() ||
+          UpParents[0].get<LambdaExpr>())
+        break;
+      Up = UpParents[0];
+      const Stmt *Body = nullptr;
+      if (const auto *For = Up.get<ForStmt>())
+        Body = For->getBody();
+      else if (const auto *While = Up.get<WhileStmt>())
+        Body = While->getBody();
+      else if (const auto *Do = Up.get<DoStmt>())
+        Body = Do->getBody();
+      else if (const auto *Range = Up.get<CXXForRangeStmt>())
+        Body = Range->getBody();
+      if (!Body)
+        continue;
+      if (Body->getSourceRange().fullyContains(Variable->getSourceRange()))
+        continue;
+      UsedAfter = true;
+      break;
+    }
+    // A removal before the lookup, without a loop or a jump back, is of an
+    // entry that the lookup makes again, unless a lambda made before runs it
+    // later.
+    if (!UsedAfter && !Lambda &&
+        SM.isBeforeInTranslationUnit(Removal->getEndLoc(),
+                                     Variable->getBeginLoc()))
+      continue;
+    // After it in the source, or in the same full expression, which can
+    // evaluate it after, like the left side of an assignment, `Entry =
+    // (mp_Items.f_Remove(Key), 0)`, after the right.
+    const Expr *RemovalFull = fullExpressionOf(Removal, Context);
+    for (const auto &RefNodes : matchEach<DeclRefExpr>(
+             declRefExpr(to(varDecl(equalsNode(Variable)))).bind("use"),
+             *Function->getBody(), Context)) {
+      const auto *Use = RefNodes.getNodeAs<DeclRefExpr>("use");
+      if (SM.isBeforeInTranslationUnit(Removal->getEndLoc(),
+                                       Use->getBeginLoc()) ||
+          fullExpressionOf(Use, Context) == RemovalFull)
+        UsedAfter = true;
+    }
+    if (UsedAfter)
+      return true;
+  }
+  return false;
+}
+
+/// Whether \p Variable, a local, is changed only by assignments of the
+/// function it is in, `pEntry = nullptr`, which the flow of the function
+/// follows, not through its address, a reference to it, a lambda or a step,
+/// `++pEntry`: each use reads it or is assigned.
+static bool changedOnlyByAssignments(const VarDecl *Variable) {
+  const auto *Function =
+      dyn_cast_or_null<FunctionDecl>(Variable->getParentFunctionOrMethod());
+  if (!Function || !Function->getBody() || !Variable->hasLocalStorage() ||
+      Variable->getType()->isReferenceType())
+    return false;
+  auto RefersTo = [&](const Expr *E) {
+    const auto *Ref = dyn_cast<DeclRefExpr>(E->IgnoreParens());
+    return Ref && Ref->getDecl() == Variable ? Ref : nullptr;
+  };
+  unsigned nUses = 0;
+  unsigned nReadOrAssigned = 0;
+  TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+    if (!S)
+      return;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(S);
+        Ref && Ref->getDecl() == Variable)
+      ++nUses;
+    if (const auto *Load = dyn_cast<ImplicitCastExpr>(S);
+        Load && Load->getCastKind() == CK_LValueToRValue &&
+        RefersTo(Load->getSubExpr()))
+      ++nReadOrAssigned;
+    if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+        Assign && Assign->getOpcode() == BO_Assign)
+      if (const DeclRefExpr *Ref = RefersTo(Assign->getLHS());
+          Ref && !Ref->refersToEnclosingVariableOrCapture())
+        ++nReadOrAssigned;
+    for (const Stmt *Child : keptChildren(S))
+      Visit(Child);
+  };
+  Visit(Function->getBody());
+  return nUses == nReadOrAssigned;
+}
+
+std::optional<unsigned> CoroutineActorReferenceCheck::requiredPhases(
+    const VarDecl *Variable, bool RangeIterator, const FunctionDecl *Coroutine, ASTContext &Context,
+    const FieldDecl **FieldOut) const {
+  // A reference can't be bound to something else, also when its address is
+  // taken, but an iterator it refers to can be moved on, like `++iEntry`. A
+  // pointer assigned in the function, `pEntry = nullptr`, needs the guards
+  // while it holds what it was made from, which the flow tells.
+  const CXXRecordDecl *Referred =
+      Variable->getType().getNonReferenceType()->getAsCXXRecordDecl();
+  const bool MovableIterator =
+      Referred && Referred->hasDefinition() &&
+      llvm::any_of(Referred->methods(), [](const CXXMethodDecl *Method) {
+        return Method->getOverloadedOperator() == OO_PlusPlus ||
+               Method->getOverloadedOperator() == OO_MinusMinus ||
+               (Method->getIdentifier() && (identifierTextOf(Method) == "f_Next" ||
+                                            identifierTextOf(Method) == "f_Prev"));
+      });
+  if (!Variable->getInit() ||
+      (!RangeIterator &&
+       (!Variable->getType()->isReferenceType() || MovableIterator) &&
+       isChangedVariable(Variable) &&
+       (MovableIterator || !changedOnlyByAssignments(Variable))))
+    return std::nullopt;
+  const Expr *Key = nullptr;
+  const Expr *Owner = nullptr;
+  const FieldDecl *Field = lookupCollection(Variable->getInit(), Key, Owner);
+  if (!Field)
+    return std::nullopt;
+  // Only the own actor's phases are guarded, and only its destruction ends
+  // the coroutine: another actor can be destroyed while it is suspended.
+  if (!isOwnActorObject(Owner))
+    return std::nullopt;
+  if (FieldOut)
+    *FieldOut = Field;
+  const unsigned Phases =
+      annotatedPhases(Field, AnnotationActorEntries).value_or(0);
+  // Other calls can add entries, which must leave this one where it is.
+  if (!matchesTypeName(Field->getType(), NodeStableContainerList, Context))
+    return std::nullopt;
+  if (Phases & ActorPhase_Owner) {
+    // Other calls remove the entries they added, which a loop can be at.
+    if (RangeIterator)
+      return std::nullopt;
+    // The coroutine that made the key: a lambda that got the key from the
+    // call that added the entry doesn't own it, since that call can remove it
+    // while the lambda is suspended.
+    const auto *Function =
+        dyn_cast_or_null<FunctionDecl>(Variable->getParentFunctionOrMethod());
+    if (!Function || !Function->getBody() || Function != Coroutine ||
+        !isOwnEntryKey(Key, Field, Function, FreshKeyFunctionList, Context,
+                       Owner))
+      return std::nullopt;
+    if (removesOwnEntry(Variable, Key, Field, Function, FreshKeyFunctionList,
+                        Context))
+      return std::nullopt;
+  }
+  return Phases & ~ActorPhase_Owner;
+}
+
+void CoroutineActorReferenceCheck::registerMatchers(MatchFinder *Finder) {
+  Finder->addMatcher(cxxMethodDecl(isDefinition()).bind("method"), this);
+  Finder->addMatcher(
+      functionDecl(isDefinition()).bind("function"),
+      this);
+  Finder->addMatcher(lambdaExpr().bind("lambda"), this);
+}
+
+void CoroutineActorReferenceCheck::check(
+    const MatchFinder::MatchResult &Result) {
+  // Nothing in a translation unit with an error that stops it from compiling
+  // (hasUncompilableErrors): no flow is built there, and what the errors leave
+  // can't be relied on.
+  if (hasUncompilableErrors(*Result.Context))
+    return;
+  if (Repeated.repeated(Result))
+    return;
+  // What a template is instantiated as, not the template, whose types and
+  // calls its instantiations tell.
+  auto ForEachChecked = [&](const FunctionDecl *Function, auto &&Check) {
+    for (const FunctionDecl *Body :
+         Instantiations.bodiesOf(Function, *Result.Context)) {
+      std::optional<InstantiationScope> Scope;
+      if (Body != Function)
+        Scope.emplace(*this, Body);
+      Check(Body);
+    }
+  };
+  auto GetsActor = [](const FunctionDecl *Candidate) {
+    return llvm::any_of(Candidate->parameters(),
+                        [](const ParmVarDecl *Parameter) {
+                          return refersToActorClass(Parameter->getType());
+                        });
+  };
+  if (const auto *Method = Result.Nodes.getNodeAs<CXXMethodDecl>("method")) {
+    ForEachChecked(Method, [&](const FunctionDecl *Function) {
+      const auto *Instance = dyn_cast<CXXMethodDecl>(Function);
+      if (Instance && !Instance->isStatic() &&
+          !isLambdaCallOperator(Instance) &&
+          isActorClass(Instance->getParent()) && isCoroutine(Instance))
+        checkFunction(Instance, nullptr, *Result.Context);
+    });
+    return;
+  }
+  // A free or static function that gets the object of an actor through a
+  // parameter, like `CInternal *_pThis`, looks up its data like `this`.
+  if (const auto *Function = Result.Nodes.getNodeAs<FunctionDecl>("function")) {
+    ForEachChecked(Function, [&](const FunctionDecl *Instance) {
+      const auto *Method = dyn_cast<CXXMethodDecl>(Instance);
+      if ((!Method || Method->isStatic() ||
+           (!isLambdaCallOperator(Method) &&
+            !isActorClass(Method->getParent()))) &&
+          isCoroutine(Instance) && GetsActor(Instance))
+        checkFunction(Instance, nullptr, *Result.Context);
+    });
+    return;
+  }
+  const auto *Matched = Result.Nodes.getNodeAs<LambdaExpr>("lambda");
+  // In an actor, or getting the object of an actor through a parameter or a
+  // capture.
+  ForEachChecked(Matched->getCallOperator(), [&](const FunctionDecl *Operator) {
+    const LambdaExpr *Lambda = Operator == Matched->getCallOperator()
+                                   ? Matched
+                                   : Instantiations.lambdaOf(Operator,
+                                                             *Result.Context);
+    if (!Lambda || !isCoroutine(Operator))
+      return;
+    // Through all nodes: a matcher of the parent map's traversal skips the
+    // callee of a member call, like `_pActor` of
+    // `_pActor->mp_Items.f_FindEqual(_Key)`.
+    // Also through the locals it is made from, like `q` of `auto *q = p`,
+    // each once, on a stack of its own, as long as a chain of them is.
+    llvm::SmallPtrSet<const VarDecl *, 8> Followed;
+    llvm::SmallVector<const Stmt *, 16> Work;
+    // What a local is made from: its initializer, and what is assigned to it,
+    // `p = &pActor->mp_Items[1]` after `int *p = nullptr`.
+    auto FollowLocal = [&](const VarDecl *Local) {
+      if (Local && Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+          Followed.insert(Local).second)
+        llvm::append_range(Work, valuesOf(Local));
+    };
+    auto RefersToWork = [&] {
+      while (!Work.empty()) {
+        const Stmt *S = Work.pop_back_val();
+        if (!S)
+          continue;
+        if (const auto *Ref = dyn_cast<DeclRefExpr>(S)) {
+          if (refersToActorClass(Ref->getDecl()->getType())) {
+            Work.clear();
+            return true;
+          }
+          FollowLocal(dyn_cast<VarDecl>(Ref->getDecl()));
+        }
+        llvm::append_range(Work, keptChildren(S));
+      }
+      return false;
+    };
+    auto LocalRefersToActor = [&](const VarDecl *Local) {
+      FollowLocal(Local);
+      return RefersToWork();
+    };
+    auto RefersToActor = [&](const Stmt *S) {
+      Work.push_back(S);
+      return RefersToWork();
+    };
+    // Also a local made from an actor that it captures, like `[pEntry]` of
+    // `auto *pEntry = pActor->mp_Items.f_FindEqual(Key)`.
+    const bool CapturesActor =
+        llvm::any_of(Lambda->captures(), [&](const LambdaCapture &Capture) {
+          if (!Capture.capturesVariable())
+            return false;
+          return refersToActorClass(Capture.getCapturedVar()->getType()) ||
+                 LocalRefersToActor(
+                     dyn_cast<VarDecl>(Capture.getCapturedVar()));
+        }) ||
+        llvm::any_of(captureInitsOf(Lambda), [&](const Expr *Init) {
+          return Init && RefersToActor(Init);
+        });
+    if (isActorClass(enclosingThisClass(Lambda)) || GetsActor(Operator) ||
+        CapturesActor)
+      checkFunction(Operator, Lambda, *Result.Context);
+  });
+}
+
+namespace {
+
+/// The variable that \p Decl refers to: itself, or what a reference init
+/// capture like `[&pCurrent = pValue]` is bound to.
+const ValueDecl *resolveReferenceCapture(const ValueDecl *Decl) {
+  // Each is bound to one declared before it, so a chain of them ends.
+  for (int Depth = 0; Depth < 64; ++Depth) {
+    const auto *Variable = dyn_cast<VarDecl>(Decl);
+    // A reference init capture, or a local reference to a pointer, like
+    // `CValue *&pAlias = pValue`, also to an iterator or a reference handle,
+    // `auto &iAlias = iEntry`, whose state is that of what it refers to.
+    const QualType Referred =
+        Variable ? Variable->getType().getNonReferenceType() : QualType();
+    if (!Variable || !Variable->getType()->isReferenceType() ||
+        !Variable->getInit() ||
+        !(Variable->isInitCapture() ||
+          (Variable->hasLocalStorage() &&
+           (Referred->isPointerType() || isIteratorType(Referred) ||
+            isReferenceHandle(Referred)))))
+      return Decl;
+    // Also through a helper that gives back what it is given by reference,
+    // `auto &pAlias = fg_Pointer(pValue)` of `CValue *&fg_Pointer(CValue
+    // *&_pValue) { return _pValue; }`.
+    const Expr *Init = Variable->getInit()->IgnoreParenImpCasts();
+    if (const auto *Call = dyn_cast<CallExpr>(Init); Call && Call->isLValue())
+      if (const llvm::SmallVector<const Expr *, 2> Returned =
+              returnedArguments(Call);
+          Returned.size() == 1)
+        Init = Returned.front()->IgnoreParenImpCasts();
+    const auto *Ref = dyn_cast<DeclRefExpr>(Init);
+    if (!Ref)
+      return Decl;
+    // Not a `thread_local` pointer, whose slot is of the thread that runs
+    // it: the reference is, `int *&rp = t_pValue`, of the thread it was
+    // bound on.
+    if (const auto *Target = dyn_cast<VarDecl>(Ref->getDecl());
+        Target && Target->getTLSKind() != VarDecl::TLS_None)
+      return Decl;
+    Decl = Ref->getDecl();
+  }
+  return Decl;
+}
+
+/// Whether \p Decl is a reference that resolveReferenceCapture doesn't take
+/// to a variable it is bound to, of what it refers to itself, like a slot of
+/// a `thread_local` pointer, `auto &Slot = t_pData`, also through others
+/// bound to it, `auto &Alias = Slot`.
+bool isUnresolvedReference(const ValueDecl *Decl) {
+  if (!Decl->getType()->isReferenceType())
+    return false;
+  const ValueDecl *Resolved = resolveReferenceCapture(Decl);
+  return Resolved->getType()->isReferenceType() &&
+         resolveReferenceCapture(Resolved) == Resolved;
+}
+
+/// Collects what the analysis needs from a coroutine body: the pointers and
+/// references into the data of the actor that it looks up, the variables that
+/// `fg_OnResume` re-validates, and the left sides of assignments.
+class BodyCollector : public OncePerTypeVisitor<BodyCollector> {
+public:
+  /// The parameters that point or refer to the objects of actors, whose data
+  /// is looked up like that of `this`.
+  llvm::SmallPtrSet<const ValueDecl *, 4> ActorObjects;
+
+  /// Whether `this` is the object of an actor, also with actor objects.
+  bool ThisIsActor = false;
+
+  /// The context of what is collected, which tells the value of constant
+  /// conditions.
+  const ASTContext *Context = nullptr;
+  /// The containers whose entries stay where they are when others are added.
+  llvm::ArrayRef<StringRef> NodeStableContainers;
+  /// The member functions whose calls on a member of the object look up
+  /// again, which an fg_OnResume callback's local made by one is.
+  llvm::ArrayRef<StringRef> CallbackLookupFunctions;
+
+  /// Whether \p E is the object of the actor: `this`, unless it isn't an
+  /// actor while there are actor object parameters, like a
+  /// `CAllowUnsafeThis` given an actor, whose own data the actor's calls
+  /// don't change, or an actor object parameter.
+  bool isActorObject(const Expr *E) const {
+    if (isa<CXXThisExpr>(E))
+      return ActorObjects.empty() || ThisIsActor;
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    return Ref && ActorObjects.contains(Ref->getDecl());
+  }
+
+  /// What \p E is relative to the object of the actor (objectRelation), once
+  /// for each expression of the body: a function of the expression, the
+  /// objects of actors (isActorObject) and the context alone, worked out
+  /// again when the objects change.
+  CObjectRelation relationToActor(const Expr *E) const {
+    if (RelationsActors != ActorObjects.size() ||
+        RelationsThisIsActor != ThisIsActor) {
+      Relations.clear();
+      RelationsActors = ActorObjects.size();
+      RelationsThisIsActor = ThisIsActor;
+    }
+    if (const auto It = Relations.find(E); It != Relations.end())
+      return It->second;
+    const CObjectRelation Of = objectRelation(
+        E, [&](const Expr *Of) { return isActorObject(Of); },
+        const_cast<ASTContext *>(Context));
+    Relations.try_emplace(E, Of);
+    return Of;
+  }
+  /// What relationToActor told of each expression, with the objects of
+  /// actors it was told for, which are only added to.
+  mutable llvm::DenseMap<const Expr *, CObjectRelation> Relations;
+  mutable size_t RelationsActors = 0;
+  mutable bool RelationsThisIsActor = false;
+
+  /// The right-hand sides of the assignments `Local = ...` of \p Variable in
+  /// \p Function, in the order a walk of its body meets them (keptChildren,
+  /// not into lambdas), each assignment once: the body is walked once for
+  /// every local of it.
+  llvm::ArrayRef<const Expr *>
+  assignmentsOf(const FunctionDecl *Function, const ValueDecl *Variable) const {
+    std::unique_ptr<CAssignments> &Of = Assignments[Function];
+    if (!Of) {
+      Of = std::make_unique<CAssignments>();
+      TCRecursive<void(const Stmt *)> Walk = [&](const Stmt *S) {
+        if (!S || isa<LambdaExpr>(S))
+          return;
+        if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+            Assign && Assign->getOpcode() == BO_Assign) {
+          llvm::SmallPtrSet<const ValueDecl *, 2> Assigned;
+          for (const DeclRefExpr *Target : assignedVariables(Assign->getLHS()))
+            if (Assigned.insert(Target->getDecl()).second)
+              (*Of)[Target->getDecl()].push_back(Assign->getRHS());
+        }
+        for (const Stmt *Child : keptChildren(S))
+          Walk(Child);
+      };
+      Walk(Function->getBody());
+    }
+    const auto It = Of->find(Variable);
+    return It == Of->end() ? llvm::ArrayRef<const Expr *>()
+                           : llvm::ArrayRef<const Expr *>(It->second);
+  }
+  using CAssignments =
+      llvm::DenseMap<const ValueDecl *, llvm::SmallVector<const Expr *, 2>>;
+  /// What assignmentsOf found of each function.
+  mutable llvm::DenseMap<const FunctionDecl *, std::unique_ptr<CAssignments>>
+      Assignments;
+
+  /// Whether \p Value is reached through a pointer held in what it is of
+  /// (isStoredPointer): a read of it, `m_pValue`, also cast or converted,
+  /// `static_cast<CValue *>(m_pVoid)`, or what that points to, `*m_pValue`,
+  /// `m_pValue->m_Sub` or `&m_pValue[1]`, or what a reference member refers
+  /// to, `m_rValue`; or what isn't of it at all, a global, `g_Value`; also
+  /// either of a conditional, and what another accessor of it whose body can
+  /// be seen gives so, `return f_Pointer();`. Not the pointer itself, `int *&
+  /// f_Slot() { return m_pValue; }`, which is of its own storage.
+  static bool throughStoredPointer(const Expr *Value, int Depth) {
+    if (!Value || Depth > 16)
+      return false;
+    Value = Value->IgnoreParens();
+    if (const auto *Conditional = dyn_cast<ConditionalOperator>(Value))
+      return llvm::all_of(keptArms(Conditional), [&](const Expr *Arm) {
+        return throughStoredPointer(Arm, Depth + 1);
+      });
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(Value)) {
+      const auto *Global = dyn_cast<VarDecl>(Ref->getDecl());
+      return Global && !Global->hasLocalStorage() &&
+             Global->getTLSKind() == VarDecl::TLS_None;
+    }
+    // What a helper gives back of what it is given, `*fg_Get(m_pData)` of
+    // `T *fg_Get(T *_pData) { return _pData; }` (returnedArgumentChoices).
+    if (const auto *Call = dyn_cast<CallExpr>(Value);
+        Call && !isMemberOrOperatorCall(Call))
+      if (const llvm::SmallVector<const Expr *, 2> Given =
+              returnedArgumentChoices(Call);
+          !Given.empty())
+        return llvm::all_of(Given, [&](const Expr *Each) {
+          return throughStoredPointer(Each, Depth + 1);
+        });
+    if (const CMemberCall Call = memberCallOf(Value);
+        Call &&
+        isa<CXXThisExpr>(
+            Call->getImplicitObjectArgument()->IgnoreParenImpCasts()) &&
+        !callsOverride(Call))
+      if (const FunctionDecl *Definition =
+              Call->getDirectCallee() ? Call->getDirectCallee()->getDefinition()
+                                      : nullptr) {
+        const llvm::SmallVector<const Expr *, 4> Values =
+            returnedValues(Definition);
+        return !Values.empty() && llvm::all_of(Values, [&](const Expr *Each) {
+          return throughStoredPointer(Each, Depth + 1);
+        });
+      }
+    if (const auto *Cast = dyn_cast<CastExpr>(Value)) {
+      if (Cast->getCastKind() != CK_LValueToRValue)
+        return throughStoredPointer(Cast->getSubExpr(), Depth + 1);
+      // Also a local made of it that isn't changed, `auto *pValue =
+      // m_pValue; return pValue;`, or a reference to it, `auto &rpValue =
+      // m_pValue; return rpValue;`.
+      const auto *Ref =
+          dyn_cast<DeclRefExpr>(Cast->getSubExpr()->IgnoreParenImpCasts());
+      if (const auto *Alias = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+          Alias && Alias->hasLocalStorage() && !isa<ParmVarDecl>(Alias) &&
+          Alias->getType()->isReferenceType() && Alias->getInit() &&
+          Cast->getType()->isPointerType())
+        return isStoredPointer(Alias->getInit());
+      if (const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+          Local && Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+          Local->getType()->isPointerType() && Local->getInit() &&
+          !isChangedVariable(Local))
+        return throughStoredPointer(Local->getInit(), Depth + 1);
+      // Not a pointer of a local holder of the function's own, `CView
+      // View{&t_Value}; return View.m_pValue;`, which is what it is made
+      // with (isLocalStorage).
+      if (isLocalStorage(Cast->getSubExpr()))
+        return false;
+      return Cast->getType()->isPointerType() &&
+             isStoredPointer(Cast->getSubExpr());
+    }
+    if (const auto *Unary = dyn_cast<UnaryOperator>(Value);
+        Unary &&
+        (Unary->getOpcode() == UO_Deref || Unary->getOpcode() == UO_AddrOf))
+      return throughStoredPointer(Unary->getSubExpr(), Depth + 1);
+    if (const auto *Member = dyn_cast<MemberExpr>(Value)) {
+      if (const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+          Field && Field->getType()->isReferenceType())
+        return true;
+      return throughStoredPointer(Member->getBase(), Depth + 1);
+    }
+    if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(Value);
+        Subscript && Subscript->getBase()->getType()->isPointerType())
+      return throughStoredPointer(Subscript->getBase(), Depth + 1);
+    if (const auto *Step = dyn_cast<BinaryOperator>(Value);
+        Step && Step->isAdditiveOp() && Step->getType()->isPointerType())
+      return throughStoredPointer(Step->getLHS()->getType()->isPointerType()
+                                      ? Step->getLHS()
+                                      : Step->getRHS(),
+                                  Depth + 1);
+    return false;
+  }
+
+  bool isRootedForLookup(const Expr *E) const {
+    const CObjectRelation Of = relationToActor(E);
+    return Of.Kind != EObjectRelation::Unrelated && !isCopyStorage(Of);
+  }
+
+  bool isRooted(const Expr *E) const {
+    // Not a copy's own, nor what a copy of a shared owner keeps alive,
+    // `*pDeleted` of `TCSharedPointer<bool> pDeleted = pEntry->m_pDeleted`,
+    // though what is looked up in that is (bKeptAlive).
+    const CObjectRelation Of = relationToActor(E);
+    return Of.Kind != EObjectRelation::Unrelated && !isCopyStorage(Of) &&
+           !Of.bKeptAlive;
+  }
+
+  /// The member of the object of the actor that \p E, a lookup or what a
+  /// removal is called on, goes through first, like `mp_Items` of
+  /// `mp_Items.f_FindEqual(1)` or `&mp_Items[1].m_Value`, also through a
+  /// local alias, or null when that can't be told.
+  const FieldDecl *outermostField(const Expr *E) const {
+    const CObjectRelation Of = relationToActor(E);
+    return Of.Outermost ? dyn_cast<FieldDecl>(Of.Outermost->getMemberDecl())
+                        : nullptr;
+  }
+
+  llvm::SmallVector<const VarDecl *, 8> Lookups;
+  /// The variables of Lookups, to tell which are.
+  llvm::DenseSet<const VarDecl *> LookupSet;
+
+  /// Adds \p Variable to the lookups, when it isn't one yet.
+  bool addLookup(const VarDecl *Variable) {
+    if (!LookupSet.insert(Variable).second)
+      return false;
+    Lookups.push_back(Variable);
+    return true;
+  }
+
+  /// Makes the variables that are made or assigned from lookups found since
+  /// they were visited lookups too, like `pFirst = pSecond` before `pSecond =
+  /// mp_Items.f_FindEqual(1)` in a loop: each value that names a lookup is
+  /// looked at again, not the whole body.
+  void propagateLookups() {
+    llvm::DenseMap<const ValueDecl *, llvm::SmallVector<unsigned, 2>>
+        ByVariable;
+    for (unsigned iSite = 0; iSite < PendingSites.size(); ++iSite) {
+      llvm::SmallVector<const Stmt *, 8> Work{PendingSites[iSite].second};
+      while (!Work.empty()) {
+        const Stmt *S = Work.pop_back_val();
+        if (!S)
+          continue;
+        if (const auto *Ref = dyn_cast<DeclRefExpr>(S))
+          ByVariable[Ref->getDecl()].push_back(iSite);
+        for (const Stmt *Child : keptChildren(S))
+          Work.push_back(Child);
+      }
+    }
+    llvm::SmallVector<const VarDecl *, 8> Work(Lookups.begin(), Lookups.end());
+    while (!Work.empty()) {
+      const VarDecl *Found = Work.pop_back_val();
+      auto It = ByVariable.find(Found);
+      if (It == ByVariable.end())
+        continue;
+      for (const unsigned iSite : It->second) {
+        const auto &[Target, Value] = PendingSites[iSite];
+        if (!LookupSet.contains(Target) && isLookupIntoActor(Value) &&
+            addLookup(Target))
+          Work.push_back(Target);
+      }
+    }
+    PendingSites.clear();
+  }
+
+  /// The variables made or assigned from what isn't a lookup when they were
+  /// visited, and what from.
+  llvm::SmallVector<std::pair<const VarDecl *, const Expr *>, 8> PendingSites;
+
+  /// The variables that hold `fg_OnResume` registrations, and the variables
+  /// they re-validate while they live, in the order they are found, which
+  /// numbers the holders.
+  llvm::MapVector<const VarDecl *, llvm::SmallVector<const ValueDecl *, 4>>
+      Revalidations;
+  /// Of those, the ones each re-validates only by comparing them with a
+  /// fresh lookup and leaving with an error when they differ, which leaves
+  /// them as they are, so a copy read before the suspension is valid too.
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<const ValueDecl *, 4>>
+      ComparedRevalidations;
+  /// The phases that a holder guards, like `f_CheckDestroyedOnResume()` or an
+  /// `fg_OnResume` callback that tests the flags of the phases.
+  llvm::DenseMap<const VarDecl *, unsigned> HolderPhases;
+  /// The phases the callback of each registration starts, like `if
+  /// (m_bStopNow) f_StopApp();`, which the guards registered before it don't
+  /// see: the callbacks run in the order they were registered.
+  llvm::DenseMap<const VarDecl *, unsigned> HolderStarted;
+
+  /// The pointers assigned, with what they are assigned.
+  llvm::DenseMap<const DeclRefExpr *, const Expr *> AssignedRefs;
+  /// The pointers read to assign what they point to, `ppEntry` of `*ppEntry =
+  /// ...`, and the references to pointers assigned, with the variables
+  /// assigned, what they are assigned, and whether it may be another, like
+  /// for a reference bound to either of a conditional, `int *&pAlias =
+  /// bChoose ? pFirst : pSecond`.
+  struct CAssignedThrough {
+    const ValueDecl *Assigned;
+    const Expr *Value;
+    bool Maybe;
+  };
+  llvm::DenseMap<const DeclRefExpr *, llvm::SmallVector<CAssignedThrough, 1>>
+      AssignedThrough;
+  /// Those of them that may not be assigned, either of a conditional.
+  llvm::DenseSet<const DeclRefExpr *> MaybeAssignedRefs;
+
+  bool TraverseLambdaExpr(LambdaExpr *Lambda) {
+    // Lambdas are separate functions, which check their own uses. Capturing
+    // a pointer doesn't use what it points to, but copying a stale one into a
+    // coroutine, which is checked as if it were fresh, does.
+    const bool Coroutine = isCoroutine(Lambda->getCallOperator());
+    const auto CaptureInits = captureInitsOf(Lambda);
+    auto Init = CaptureInits.begin();
+    for (const LambdaCapture &Capture : Lambda->captures()) {
+      const Expr *CaptureInit = *Init++;
+      if (const DeclRefExpr *Ref = capturedVariableRef(CaptureInit)) {
+        CaptureRefs.insert(Ref);
+        if (Coroutine && Capture.capturesVariable() &&
+            Capture.getCaptureKind() == LCK_ByCopy)
+          CoroutineCaptureRefs.insert(Ref);
+      }
+      // An init capture that looks the data up, like `[pValue =
+      // mp_Items.f_FindEqual(_Key)]`, is tracked like a local.
+      if (Capture.capturesVariable()) {
+        if (auto *Variable = dyn_cast<VarDecl>(Capture.getCapturedVar());
+            Variable && Variable->isInitCapture())
+          VisitVarDecl(Variable);
+      }
+    }
+    // A local it captures by reference and assigns a lookup, `[&pEntry] {
+    // pEntry = mp_Items.f_FindEqual(0); }`, holds it after the lambda is
+    // called.
+    TCRecursive<void(const Stmt *)> Assigns = [&](const Stmt *S) {
+      if (!S || isa<LambdaExpr>(S))
+        return;
+      // Also a parameter of it, what the calls of it are given for it,
+      // `auto fSet = [&](int *_pValue) { pValue = _pValue; };
+      // fSet(&mp_Value)` (lambdaArguments).
+      auto IsLookup = [&](const Expr *Value) {
+        if (isLookupIntoActor(Value))
+          return true;
+        const auto *Ref = dyn_cast<DeclRefExpr>(Value->IgnoreParenImpCasts());
+        const auto *Parameter =
+            Ref ? dyn_cast<ParmVarDecl>(Ref->getDecl()) : nullptr;
+        return Parameter &&
+               Parameter->getDeclContext() == Lambda->getCallOperator() &&
+               llvm::any_of(lambdaArguments(Lambda, Parameter),
+                            [&](const Expr *Argument) {
+                              return isLookupIntoActor(Argument);
+                            });
+      };
+      if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+          Assign && Assign->getOpcode() == BO_Assign &&
+          IsLookup(Assign->getRHS()))
+        for (const DeclRefExpr *Ref : assignedVariables(Assign->getLHS()))
+          if (const auto *Variable =
+                  dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()));
+              Variable && Variable->hasLocalStorage() &&
+              !isa<ParmVarDecl>(Variable) &&
+              canHoldLookup(Variable->getType()) &&
+              llvm::any_of(
+                  Lambda->captures(), [&](const LambdaCapture &Capture) {
+                    return Capture.capturesVariable() &&
+                           Capture.getCapturedVar() == Ref->getDecl() &&
+                           Capture.getCaptureKind() == LCK_ByRef;
+                  }))
+            addLookup(Variable);
+      for (const Stmt *Child : keptChildren(S))
+        Assigns(Child);
+    };
+    // Not one of a coroutine that runs elsewhere, but one that runs here,
+    // called directly or by `fg_CallSafe(Lambda)`.
+    if (!Coroutine || runsHere(Lambda))
+      Assigns(Lambda->getBody());
+    return true;
+  }
+
+  /// What the calls of \p Lambda in the function it is made in give its
+  /// parameter \p Parameter, `fSet(&mp_Value)`.
+  static llvm::SmallVector<const Expr *, 2>
+  lambdaArguments(const LambdaExpr *Lambda, const ParmVarDecl *Parameter) {
+    llvm::SmallVector<const Expr *, 2> Arguments;
+    const auto *Outer =
+        dyn_cast_or_null<FunctionDecl>(Lambda->getLambdaClass()->getParent());
+    if (!Outer || !Outer->getBody())
+      return Arguments;
+    llvm::SmallVector<const Stmt *, 32> Work{Outer->getBody()};
+    while (!Work.empty()) {
+      const Stmt *S = Work.pop_back_val();
+      if (!S)
+        continue;
+      if (const auto *Call = dyn_cast<CallExpr>(S);
+          Call && calledLambda(Call) == Lambda) {
+        // Not shifted again for an explicit object parameter (argumentOf).
+        if (const Expr *Argument =
+                argumentOf(Call, Lambda->getCallOperator(),
+                           Parameter->getFunctionScopeIndex()))
+          Arguments.push_back(Argument);
+      }
+      for (const Stmt *Child : keptChildren(S))
+        Work.push_back(Child);
+    }
+    return Arguments;
+  }
+
+  /// Whether \p Lambda is called where it is made, `[&] { ... }()`, or run
+  /// right away by `fg_CallSafe`, also held in a local first, `auto fLookup =
+  /// [&] { ... };` and `fg_CallSafe(fLookup)`.
+  static bool runsHere(const LambdaExpr *Lambda) {
+    ASTContext &Context = Lambda->getCallOperator()->getASTContext();
+    DynTypedNode Node = DynTypedNode::create(*Lambda);
+    for (int Depth = 0; Depth < 8; ++Depth) {
+      const auto Parents = instantiatedParents(Node, Context);
+      if (Parents.empty())
+        return false;
+      if (const auto *Local = Parents[0].get<VarDecl>())
+        return Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+               calledInScope(Local, Lambda, Context);
+      const auto *Parent = Parents[0].get<Expr>();
+      if (!Parent)
+        return false;
+      auto IsFirst = [&](const Expr *Argument) {
+        return Argument->IgnoreUnlessSpelledInSource() ==
+               Node.get<Expr>()->IgnoreUnlessSpelledInSource();
+      };
+      if (const auto *Invoke = dyn_cast<CXXOperatorCallExpr>(Parent))
+        return Invoke->getOperator() == OO_Call && Invoke->getNumArgs() >= 1 &&
+               IsFirst(Invoke->getArg(0));
+      if (const auto *Call = dyn_cast<CallExpr>(Parent))
+        return Call->getNumArgs() >= 1 && IsFirst(Call->getArg(0)) &&
+               calleeName(Call) == "fg_CallSafe";
+      if (!isa<ImplicitCastExpr, MaterializeTemporaryExpr, CXXBindTemporaryExpr,
+               ParenExpr, CXXConstructExpr, ExprWithCleanups>(Parent))
+        return false;
+      Node = Parents[0];
+    }
+    return false;
+  }
+
+  /// Whether \p Lambda, which \p Local holds, is called or run by
+  /// `fg_CallSafe` in the scope of \p Local.
+  static bool calledInScope(const VarDecl *Local, const LambdaExpr *Lambda,
+                            ASTContext &Context) {
+    const auto Declarations = instantiatedParents(*Local, Context);
+    if (Declarations.empty() || !Declarations[0].get<DeclStmt>())
+      return false;
+    const auto Scopes = instantiatedParents(Declarations[0], Context);
+    const Stmt *Scope = Scopes.empty() ? nullptr : Scopes[0].get<Stmt>();
+    TCRecursive<bool(const Stmt *)> Calls = [&](const Stmt *S) {
+      if (!S)
+        return false;
+      if (const auto *Invoke = dyn_cast<CXXOperatorCallExpr>(S);
+          Invoke && Invoke->getOperator() == OO_Call &&
+          Invoke->getNumArgs() >= 1 &&
+          calledLambda(Invoke->getArg(0)) == Lambda)
+        return true;
+      if (const auto *Call = dyn_cast<CallExpr>(S);
+          Call && Call->getNumArgs() >= 1 &&
+          calleeName(Call) == "fg_CallSafe" &&
+          calledLambda(Call->getArg(0)) == Lambda)
+        return true;
+      return llvm::any_of(keptChildren(S), Calls);
+    };
+    return Calls(Scope);
+  }
+
+  llvm::SmallPtrSet<const DeclRefExpr *, 8> CoroutineCaptureRefs;
+
+  llvm::SmallPtrSet<const DeclRefExpr *, 8> CaptureRefs;
+
+  /// The ranges of loops over copies the loops own, and their iterators.
+  llvm::SmallPtrSet<const VarDecl *, 4> OwnedRanges;
+
+  /// The iterators of loops over the data of the actor, like
+  /// `for (auto &Entry : mp_Items)`, with their loops. Going on to the next
+  /// entry after a suspension uses the iterator.
+  llvm::DenseMap<const VarDecl *, const CXXForRangeStmt *> RangeIterators;
+
+  bool VisitCXXForRangeStmt(CXXForRangeStmt *For) {
+    const auto *Begin =
+        For->getBeginStmt()
+            ? dyn_cast_or_null<VarDecl>(For->getBeginStmt()->getSingleDecl())
+            : nullptr;
+    if (!Begin || !For->getRangeInit() || RangeIterators.contains(Begin))
+      return true;
+    // A member array, `int m_Values[2]`, can't lose its entries, nor can one
+    // of FixedArrayTypes, like a `std::array`.
+    if (isFixedArrayType(For->getRangeInit()->getType(),
+                         Begin->getASTContext()) &&
+        isHeldByValue(relationToActor(For->getRangeInit())))
+      return true;
+    // A copy of the collection, like `mp_Values.f_Copy()`, which the loop
+    // owns, isn't the data of the actor.
+    const Expr *Range =
+        skipWrappers(For->getRangeInit())->IgnoreParenImpCasts();
+    if (const CMemberCall Call = memberCallOf(Range);
+        Call && Call->isPRValue() && Call->getType()->getAsCXXRecordDecl() &&
+        Call->getImplicitObjectArgument()->getType()->getAsCXXRecordDecl() &&
+        Call->getType()->getAsCXXRecordDecl()->getCanonicalDecl() ==
+            Call->getImplicitObjectArgument()
+                ->getType()
+                ->getAsCXXRecordDecl()
+                ->getCanonicalDecl()) {
+      // So isn't what its iterator and its entries refer to.
+      if (const auto *RangeVariable =
+              For->getRangeStmt() ? dyn_cast_or_null<VarDecl>(
+                                        For->getRangeStmt()->getSingleDecl())
+                                  : nullptr)
+        OwnedRanges.insert(RangeVariable);
+      OwnedRanges.insert(Begin);
+      return true;
+    }
+    // Nor what the loop's function holds itself, which erasing entries of
+    // the actor can't change: a list made where the loop is, `{&m_Client,
+    // &m_UDP}`, or a local array, also a member of a local held by value
+    // (isLocalStorage). A local collection or wrapper is the actor's data
+    // when it is what it refers to, not a copy of its own (isRooted).
+    const Expr *Held = For->getRangeInit()->IgnoreImplicit()->IgnoreParens();
+    if (isa<CXXStdInitializerListExpr, InitListExpr>(Held) ||
+        (isLocalStorage(Held) && Held->getType()->isArrayType()))
+      return true;
+    // Also over what a copy of a shared owner keeps alive, whose entries can
+    // be erased (isRootedForLookup).
+    if (isLookupIntoActor(For->getRangeInit()) ||
+        isRootedForLookup(For->getRangeInit())) {
+      RangeIterators[Begin] = For;
+      addLookup(Begin);
+    }
+    return true;
+  }
+
+  bool VisitVarDecl(VarDecl *Variable) {
+    // Also a static local, `static int *pValue = &mp_Items[0]`, whose storage
+    // doesn't keep the entry.
+    if (resolveReferenceCapture(Variable) == Variable &&
+        (Variable->hasLocalStorage() || Variable->isStaticLocal() ||
+         Variable->isInitCapture()) &&
+        !isa<ParmVarDecl>(Variable) &&
+        (canHoldLookup(Variable->getType()) ||
+         // Of a temporary a reference extends, its own type, `CBase const
+         // &Guard = CGuard{...}` (extendsTemporary).
+         [&] {
+           QualType Temporary;
+           return extendsTemporary(Variable, &Temporary) &&
+                  canHoldLookup(Temporary);
+         }()) &&
+        Variable->getInit() && !LookupSet.contains(Variable)) {
+      if (isLookupIntoActor(Variable->getInit()))
+        addLookup(Variable);
+      else
+        PendingSites.push_back({Variable, Variable->getInit()});
+    }
+    addRevalidation(Variable);
+    return true;
+  }
+
+  /// The coroutine looked at, whose own returns aren't followed.
+  const FunctionDecl *CurrentCoroutine = nullptr;
+
+
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<const Expr *, 4>>
+      KeptLaterValues;
+
+
+  // Only assigning a new pointer looks the data up again. Assigning through a
+  // reference, or adjusting a pointer, uses what it refers to. A pointer
+  // that is assigned a lookup is tracked too.
+  bool VisitBinaryOperator(BinaryOperator *Binary) {
+    if (Binary->getOpcode() != BO_Assign)
+      return true;
+    addAssigned(Binary->getLHS(), Binary->getRHS());
+    // Also either of a conditional, `(bFirst ? pFirst : pSecond) = ...`,
+    // which isn't assigned unconditionally.
+    const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+        assignedVariables(Binary->getLHS());
+    if (CurrentHolder)
+      for (const DeclRefExpr *Ref : Targets)
+        if (!CallbackCopies.contains(Ref->getDecl()) &&
+            !(isUnresolvedReference(Ref->getDecl())))
+          CallbackAssignments[CurrentHolder].push_back(
+              {resolveReferenceCapture(Ref->getDecl()),
+               isLookupIntoActor(Binary->getRHS()),
+               Targets.size() == 1 && isUnconditionalInCallback(Binary)});
+    // Also what a reference bound to either of a conditional is bound to,
+    // `int *&pAlias = bChoose ? pFirst : pSecond`.
+    llvm::SmallVector<const DeclRefExpr *, 4> Expanded(Targets.begin(),
+                                                       Targets.end());
+    for (size_t iTarget = 0; iTarget < Expanded.size() && iTarget < 64;
+         ++iTarget)
+      if (const auto *Alias = dyn_cast<VarDecl>(Expanded[iTarget]->getDecl());
+          Alias && isUnresolvedReference(Alias) && Alias->hasLocalStorage() &&
+          Alias->getInit())
+        for (const DeclRefExpr *Bound : assignedVariables(Alias->getInit()))
+          Expanded.push_back(Bound);
+    // Also of a static local, `static int *s_pEntry; s_pEntry = ...`, and a
+    // parameter, which point where they were assigned to.
+    for (const DeclRefExpr *Ref : Expanded)
+      if (const auto *Variable =
+              dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()));
+          Variable &&
+          (Variable->hasLocalStorage() || Variable->isStaticLocal()) &&
+          !CallbackCopies.contains(Variable) &&
+          Variable->getType()->isPointerType() &&
+          !LookupSet.contains(Variable)) {
+        if (isLookupIntoActor(Binary->getRHS()))
+          addLookup(Variable);
+        else
+          PendingSites.push_back({Variable, Binary->getRHS()});
+      }
+    return true;
+  }
+
+  // Swapping pointers, `fg_Swap(pEntry, pOther)`, gives each the other's
+  // value, and exchanging one, `fg_Exchange(pOther, pEntry)`, the first the
+  // second's.
+  bool visitCall(CallExpr *Call) {
+    // A function whose body can be seen that assigns a pointer it is given
+    // by reference what it is given, `void fg_Set(int *&o_pValue, int
+    // *_pValue) { o_pValue = _pValue; }`, gives it that, also when it may,
+    // in a branch, also a lambda, `fSet(pValue, mp_Items.f_FindEqual(1))`.
+    unsigned Offset = 0;
+    if (const FunctionDecl *Callee = setterCalled(Call, Offset)) {
+      // Of each pointer it is given, what it has after the call: what it is
+      // assigned last on every path, `o_pValue = _pSecond`, and what it may
+      // be assigned after that, in a branch.
+      llvm::SmallDenseMap<unsigned, llvm::SmallVector<CSetParameter, 2>, 2>
+          ByTarget;
+      for (CSetParameter Set : setParameters(Callee))
+        if (Set.Target + Offset < Call->getNumArgs() &&
+            Set.Source + Offset < Call->getNumArgs()) {
+          Set.Target += Offset;
+          Set.Source += Offset;
+          ByTarget[Set.Target].push_back(Set);
+        }
+      // One that can throw before it assigns it, to a `try` around the call
+      // that catches it, `try { fg_Set(pValue, &Local); } catch (...) {}`,
+      // may leave it what it was.
+      const auto *Prototype = Callee->getType()->getAs<FunctionProtoType>();
+      const bool MayLeave = !(Prototype && Prototype->isNothrow()) &&
+                            insideTryBlock(Call, Callee->getASTContext());
+      for (const auto &[iTarget, Sets] : ByTarget) {
+        // Also through a cast to a reference to it, `static_cast<int *&>(
+        // pValue)`.
+        // Also one given by its address, `fg_Set(&pValue, ...)`.
+        const Expr *Named = setTargetArgument(Call, Sets.front(), 0);
+        if (!Named)
+          continue;
+        const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+            assignedVariables(Named);
+        const DeclRefExpr *Ref = Targets.size() == 1 ? Targets[0] : nullptr;
+        const auto *Variable =
+            Ref ? dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()))
+                : nullptr;
+        if (!Variable || !Variable->hasLocalStorage() ||
+            isa<ParmVarDecl>(Variable) || !Variable->getType()->isPointerType())
+          continue;
+        const CSetParameter *Last = nullptr;
+        for (const CSetParameter &Set : Sets)
+          if (Set.Always)
+            Last = &Set;
+        // A lookup it may be given after the last it surely is, which it
+        // then may hold.
+        const Expr *Maybe = nullptr;
+        for (const CSetParameter &Set :
+             llvm::make_range(Last ? Last + 1 : Sets.begin(), Sets.end()))
+          if (isLookupIntoActor(Call->getArg(Set.Source)))
+            Maybe = Call->getArg(Set.Source);
+        if (Maybe) {
+          AssignedRefs[Ref] = Maybe;
+          MaybeAssignedRefs.insert(Ref);
+          addLookup(Variable);
+        } else if (Last) {
+          if (!MayLeave)
+            AssignedRefs[Ref] = Call->getArg(Last->Source);
+          if (isLookupIntoActor(Call->getArg(Last->Source)))
+            addLookup(Variable);
+        }
+      }
+    }
+    // A member function of the actor whose body can be seen that assigns a
+    // pointer it is given by reference a lookup into the data, `bool
+    // f_Find(int *&o_pValue) { o_pValue = mp_Items.f_FindEqual(0); ... }`,
+    // gives it that, maybe.
+    if (const CMemberCall Member = memberCallOf(Call);
+        Member && Member->getImplicitObjectArgument() &&
+        Member->getMethodDecl() &&
+        refersToOwnObject(Member->getImplicitObjectArgument(),
+                          &Member->getMethodDecl()->getASTContext()))
+      if (const FunctionDecl *Callee =
+              Member->getMethodDecl() ? Member->getMethodDecl()->getDefinition()
+                                      : nullptr;
+          Callee && Callee->getBody() && !callsOverride(Member))
+        for (unsigned iArgument = 0;
+             iArgument < Member->getNumArgs() &&
+             iArgument + Member->firstParameter() < Callee->getNumParams();
+             ++iArgument) {
+          const ParmVarDecl *Parameter =
+              Callee->getParamDecl(iArgument + Member->firstParameter());
+          const QualType Type = Parameter->getType();
+          if (!Type->isReferenceType() ||
+              !Type.getNonReferenceType()->isPointerType() ||
+              Type.getNonReferenceType().isConstQualified())
+            continue;
+          const auto *Ref = dyn_cast<DeclRefExpr>(
+              Member->getArg(iArgument)->IgnoreParenImpCasts());
+          const auto *Variable =
+              Ref ? dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()))
+                  : nullptr;
+          if (!Variable || !Variable->hasLocalStorage() ||
+              isa<ParmVarDecl>(Variable) ||
+              !Variable->getType()->isPointerType())
+            continue;
+          const Expr *Lookup = nullptr;
+          // The parameter, also through a local reference to it, `int *&pOutput
+          // = o_pValue`.
+          auto IsParameter = [&](const Expr *E) {
+            for (int Depth = 0; E && Depth < 8; ++Depth) {
+              const auto *Target =
+                  dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+              if (!Target)
+                return false;
+              if (Target->getDecl() == Parameter)
+                return true;
+              const auto *Alias = dyn_cast<VarDecl>(Target->getDecl());
+              if (!Alias || !Alias->getType()->isReferenceType() ||
+                  isa<ParmVarDecl>(Alias) || !Alias->hasLocalStorage())
+                return false;
+              E = Alias->getInit();
+            }
+            return false;
+          };
+          const ASTContext &CalleeContext = Callee->getASTContext();
+          TCRecursive<void(const Stmt *)> Find = [&](const Stmt *S) {
+            if (!S || Lookup || isa<LambdaExpr>(S))
+              return;
+            if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+                Assign && Assign->getOpcode() == BO_Assign &&
+                IsParameter(Assign->getLHS()) &&
+                isLookupIntoActor(Assign->getRHS()))
+              Lookup = Assign->getRHS();
+            // Not in the branch a constant condition never takes, `if
+            // (mc_bUseCache)` of `false`.
+            if (const auto *If = dyn_cast<IfStmt>(S);
+                If && !If->isConstexpr() && !If->isConsteval() &&
+                !If->getConditionVariable() &&
+                !If->getCond()->isValueDependent()) {
+              bool Taken = false;
+              if (foldsCondition(If->getCond(), Taken, CalleeContext)) {
+                Find(If->getInit());
+                Find(If->getCond());
+                Find(Taken ? If->getThen() : If->getElse());
+                return;
+              }
+            }
+            for (const Stmt *Child : keptChildren(S, CalleeContext))
+              Find(Child);
+          };
+          Find(Callee->getBody());
+          if (Lookup) {
+            AssignedRefs[Ref] = Lookup;
+            MaybeAssignedRefs.insert(Ref);
+            addLookup(Variable);
+          }
+        }
+    // Also of `std::ranges::swap`, a call of the object that customizes it.
+    const auto [SwapLeft, SwapRight] = swappedArguments(Call);
+    const bool Swaps = SwapLeft != nullptr;
+    if (!Swaps &&
+        (isMemberOrOperatorCall(Call) ||
+         Call->getNumArgs() != 2 || (!isExchangeFunction(calleeName(Call)))))
+      return true;
+    auto Gives = [&](const Expr *To, const Expr *From) {
+      // Also through a cast to a reference, `static_cast<int *&>(pEntry)`.
+      const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+          assignedVariables(To);
+      const DeclRefExpr *Ref = Targets.size() == 1 ? Targets[0] : nullptr;
+      const auto *Variable =
+          Ref ? dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()))
+              : nullptr;
+      if (!Variable || !Variable->hasLocalStorage() ||
+          isa<ParmVarDecl>(Variable) || !canHoldLookup(Variable->getType()) ||
+          Variable->getType()->isReferenceType())
+        return;
+      if (!isLookupIntoActor(From))
+        return;
+      // A swap exchanges what the two hold where it runs, which the flow
+      // does with both: only an exchange is an assignment.
+      if (!Swaps)
+        AssignedRefs[Ref] = From;
+      addLookup(Variable);
+    };
+    if (Swaps) {
+      Gives(SwapLeft, SwapRight);
+      Gives(SwapRight, SwapLeft);
+    } else
+      Gives(Call->getArg(0), Call->getArg(1));
+    return true;
+  }
+
+  // Assigning an iterator, or a handle, with its `operator=`, like `iEntry =
+  // mp_Items.f_GetIterator(Key)`, looks the data up again, as assigning a
+  // pointer does.
+  bool VisitCXXOperatorCallExpr(CXXOperatorCallExpr *Call) {
+    if (Call->getOperator() != OO_Equal || Call->getNumArgs() != 2)
+      return true;
+    return assignHandle(Call->getArg(0), Call->getArg(1));
+  }
+  // Also called by name, `iEntry.operator=(mp_Items.f_GetIterator(Key))`.
+  bool visitMemberCall(CMemberCall Call) {
+    if (!Call->getMethodDecl() ||
+        Call->getMethodDecl()->getOverloadedOperator() != OO_Equal ||
+        Call->getNumArgs() != 1 || !Call->getImplicitObjectArgument())
+      return true;
+    return assignHandle(Call->getImplicitObjectArgument(), Call->getArg(0));
+  }
+  // Each call, also as a member call in each of its forms (CMemberCall).
+  bool VisitCallExpr(CallExpr *Call) {
+    if (!visitCall(Call))
+      return false;
+    const CMemberCall Member = memberCallOf(Call);
+    return !Member || visitMemberCall(Member);
+  }
+  bool assignHandle(const Expr *Left, const Expr *Right) {
+    const auto *Ref = dyn_cast<DeclRefExpr>(Left->IgnoreParenImpCasts());
+    if (!Ref || !(isIteratorType(Ref->getType()) ||
+                  isReferenceHandle(Ref->getType())))
+      return true;
+    if (!Ref->getDecl()->getType()->isReferenceType() ||
+        resolveReferenceCapture(Ref->getDecl()) != Ref->getDecl())
+      AssignedRefs[Ref] = Right;
+    if (const auto *Variable =
+            dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()));
+        Variable && Variable->hasLocalStorage() &&
+        !isa<ParmVarDecl>(Variable) && !CallbackCopies.contains(Variable) &&
+        isLookupIntoActor(Right))
+      addLookup(Variable);
+    return true;
+  }
+
+private:
+  /// Records \p Variable when it holds the result of
+  /// `co_await fg_OnResume(...)`, which keeps the re-validation registered
+  /// while it lives.
+  void addRevalidation(const VarDecl *Variable) {
+    // A static one, `static auto Guard = co_await ...`, registers only for the
+    // call that first runs it.
+    if (!Variable->getInit() || !Variable->hasLocalStorage())
+      return;
+    // A guard of phases, like `co_await f_CheckDestroyedOnResume()`, ends the
+    // coroutine on resume once the actor is in one of them.
+    if (const unsigned Guarded = guardedPhasesOfHolder(
+            Variable->getInit(), &Variable->getASTContext());
+        Guarded && !isReferencedHolder(Variable)) {
+      HolderPhases[Variable] = Guarded;
+      Revalidations[Variable];
+    }
+    // The registration, or either of a conditional, `bChoose ? co_await
+    // fg_OnResume(A) : co_await fg_OnResume(B)`, which re-validates what both
+    // do.
+    llvm::SmallVector<const CallExpr *, 2> Calls;
+    // An alternative that registers no re-validation, like a guard, `bChoose
+    // ? co_await fg_OnResume(...) : co_await f_CheckDestroyedOnResume()`,
+    // re-validates nothing.
+    bool bEveryAlternative = true;
+    // Also an awaiter made before, `co_await fg_Move(Awaiter)`, and either
+    // value awaited, `co_await (bChoose ? fg_OnResume(A) : fg_OnResume(B))`.
+    for (const CoroutineSuspendExpr *Await :
+         holderAwaits(Variable->getInit(), &Variable->getASTContext())) {
+      if (!Await) {
+        bEveryAlternative = false;
+        continue;
+      }
+      for (const CallExpr *Call : onResumeCalls(Await->getOperand()))
+        if (Call)
+          Calls.push_back(Call);
+        else
+          bEveryAlternative = false;
+    }
+    if (Calls.empty())
+      return;
+    std::optional<std::remove_reference_t<decltype(Revalidations[Variable])>>
+        Common;
+    std::optional<std::remove_reference_t<decltype(Revalidations[Variable])>>
+        CommonCompared;
+    for (const CallExpr *Call : Calls) {
+      std::remove_reference_t<decltype(Revalidations[Variable])> Variables;
+      std::remove_reference_t<decltype(Revalidations[Variable])> ComparedOnly;
+      // What the re-validation assigns, or passes on to be assigned. A callback
+      // that returns something, like the exception that ends the coroutine
+      // when `pNamespace != &Namespace`, validates everything it reads; one
+      // that returns nothing doesn't re-validate what it only reads. What it
+      // assigns lookups to is tracked too, for when the registration ends
+      // before a suspension.
+      // A variable the callback captures by copy is a member of the closure,
+      // so assigning it doesn't re-validate the variable of the coroutine.
+      for (const Expr *Argument : Call->arguments()) {
+        const LambdaExpr *Lambda = asLambda(Argument);
+        if (!Lambda)
+          continue;
+        HolderStarted[Variable] |= startedPhases(
+            Lambda->getBody(), Lambda->getCallOperator()->getASTContext());
+        // One that removes entries of the data of the actor, `mp_Items.f_Clear()`,
+        // can remove what it just looked up, and what the callbacks
+        // registered before it looked up, in that collection.
+        if (CRemovals Removed = removals(Lambda->getBody()); Removed.any()) {
+          CRemovals &Holder = HolderRemovals[Variable];
+          Holder.bUnknown |= Removed.bUnknown;
+          for (const auto &[Field, Depth] : Removed.Fields)
+            Holder.add(Field, Depth);
+        }
+        llvm::SmallPtrSet<const ValueDecl *, 4> Copies;
+        for (const LambdaCapture &Capture : Lambda->captures()) {
+          if (Capture.capturesVariable() &&
+              Capture.getCaptureKind() == LCK_ByCopy)
+            Copies.insert(Capture.getCapturedVar());
+        }
+        RefCollector Refs;
+        Refs.Owner = this;
+        Refs.bValidating = !Lambda->getCallOperator()->getReturnType()->isVoidType();
+        // Those after one that can return without an error, `if (_bSkip)
+        // return nullptr;`, don't run on every path that succeeds.
+        Refs.TopLevel = statementsBeforeSuccess(Lambda->getBody());
+        // Also what an `if` among them assigns on every path, and in its
+        // initializer, `if (pValue = ...; !pValue)`, which runs each time.
+        for (const BinaryOperator *Assign :
+             everyPathAssignments(Lambda->getBody()))
+          Refs.TopLevel.insert(Assign);
+        for (const Stmt *Statement : llvm::SmallVector<const Stmt *, 8>(
+                 Refs.TopLevel.begin(), Refs.TopLevel.end())) {
+          for (const BinaryOperator *Assign : alwaysRunAssignments(Statement))
+            Refs.TopLevel.insert(Assign);
+        }
+        // What a branch that leaves with an error assigns, like `pEntry =
+        // nullptr; return DMibErrorInstance(...)`, doesn't matter where the
+        // coroutine goes on.
+        {
+          TCRecursive<void(const Stmt *)> InError = [&](const Stmt *S) {
+            if (!S || isa<LambdaExpr>(S))
+              return;
+            if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+                Assign && Assign->getOpcode() == BO_Assign)
+              Refs.TopLevel.insert(Assign);
+            for (const Stmt *Child : keptChildren(S))
+              InError(Child);
+          };
+          TCRecursive<void(const Stmt *)> FindBranches = [&](const Stmt *S) {
+            if (!S || isa<LambdaExpr>(S))
+              return;
+            if (const auto *If = dyn_cast<IfStmt>(S))
+              for (const Stmt *Branch : keptBranches(If))
+                if (Branch && leavesWithError(Branch))
+                  InError(Branch);
+            for (const Stmt *Child : keptChildren(S))
+              FindBranches(Child);
+          };
+          FindBranches(Lambda->getBody());
+        }
+        Refs.TraverseStmt(Lambda->getBody());
+        // Testing a pointer kept from before for null, like `if (!pEntry)
+        // return ...`, doesn't tell its entry is still there.
+        for (const ValueDecl *Ref : Refs.Decls) {
+          if (!Copies.contains(Ref) && !Refs.onlyNullTested(Ref))
+            Variables.push_back(resolveReferenceCapture(Ref));
+        }
+        // What a validating callback keeps pointing to the same data: what it
+        // compares with another pointer, like `pDistribution !=
+        // pInitialDistribution`. References made from those, like `auto
+        // &Distribution = *pDistribution`, are re-validated with them. A
+        // pointer it only tests for null, like `if (!pEntry)`, still points to
+        // the entry it was looked up as, which can be gone.
+        if (Refs.bValidating) {
+          llvm::SmallPtrSet<const ValueDecl *, 4> Compared;
+          llvm::SmallPtrSet<const ValueDecl *, 4> StaleCompared;
+          llvm::SmallPtrSet<const ValueDecl *, 4> FreshCompared;
+          // What the callback assigns a lookup to on every path, in a
+          // statement of its body, and where it does: an assignment in a
+          // branch, or of something else, may leave it pointing to what it did
+          // before.
+          llvm::DenseMap<const ValueDecl *, SourceLocation> FreshlyAssigned;
+          // What it assigns something else than a fresh lookup, like a pointer
+          // kept from before, `pEntry = pSaved`, or only in a branch.
+          llvm::SmallPtrSet<const ValueDecl *, 4> Unfresh;
+          {
+            const llvm::SmallPtrSet<const Stmt *, 8> TopLevel =
+                statementsBeforeSuccess(Lambda->getBody());
+            const SourceManager &LambdaSM =
+                Lambda->getCallOperator()->getASTContext().getSourceManager();
+            // A lookup made here, not a pointer kept from before, like
+            // `pEntry = pSaved` with `int *pSaved = pEntry`.
+            // Also through a cast or arithmetic, `static_cast<int
+            // *>(pSaved)` or `pSaved + 0`, as a value of a conditional, or to
+            // a part of what it points to, `&pSaved->m_Value` or
+            // `&pSaved[0]`.
+            TCRecursive<bool(const Expr *, int)> IsKept =
+                [&](const Expr *Value, int Level) {
+                  if (!Value || Level > 8)
+                    return false;
+                  Value = Value->IgnoreParenImpCasts();
+                  if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Value))
+                    return IsKept(Cast->getSubExpr(), Level + 1);
+                  if (const auto *Unary = dyn_cast<UnaryOperator>(Value);
+                      Unary && (Unary->getOpcode() == UO_AddrOf ||
+                                Unary->getOpcode() == UO_Deref))
+                    return IsKept(Unary->getSubExpr(), Level + 1);
+                  if (const auto *Binary = dyn_cast<BinaryOperator>(Value)) {
+                    if (Binary->getOpcode() == BO_Comma)
+                      return IsKept(Binary->getRHS(), Level + 1);
+                    if (Binary->isAdditiveOp())
+                      return IsKept(Binary->getLHS()->getType()->isPointerType()
+                                        ? Binary->getLHS()
+                                        : Binary->getRHS(),
+                                    Level + 1);
+                  }
+                  if (const auto *Conditional =
+                          dyn_cast<AbstractConditionalOperator>(Value))
+                    return llvm::any_of(keptArms(Conditional),
+                                        [&](const Expr *Arm) {
+                                          return IsKept(Arm, Level + 1);
+                                        });
+                  if (const auto *Member = dyn_cast<MemberExpr>(Value))
+                    return IsKept(Member->getBase(), Level + 1);
+                  if (const auto *Subscript =
+                          dyn_cast<ArraySubscriptExpr>(Value))
+                    return IsKept(Subscript->getBase(), Level + 1);
+                  // Also moved or forwarded, `fg_Move(pSaved)`, or given
+                  // back by a helper, `fg_Identity(pSaved)`.
+                  if (const auto *Call = dyn_cast<CallExpr>(Value)) {
+                    const StringRef Name = calleeName(Call);
+                    if (Call->getNumArgs() == 1 &&
+                        (isMoveFunction(Name) || isForwardFunction(Name)))
+                      return IsKept(Call->getArg(0), Level + 1);
+                    // Also what a lambda called here gives back, `[&] {
+                    // return bRefresh ? lookup : pValue; }()`.
+                    if (const CXXMethodDecl *Called = calledInPlaceLambda(Call);
+                        Called && llvm::any_of(returnedValues(Called),
+                                               [&](const Expr *Returned) {
+                                                 return IsKept(Returned,
+                                                               Level + 1);
+                                               }))
+                      return true;
+                    return llvm::any_of(returnedArguments(Call),
+                                        [&](const Expr *Argument) {
+                                          return IsKept(Argument, Level + 1);
+                                        });
+                  }
+                  const auto *ValueRef = dyn_cast<DeclRefExpr>(Value);
+                  return ValueRef && isa<VarDecl>(ValueRef->getDecl()) &&
+                         LambdaSM.isBeforeInTranslationUnit(
+                             ValueRef->getDecl()->getLocation(),
+                             Lambda->getBody()->getBeginLoc());
+                };
+            // An `if` among the statements of the body that assigns it on every
+            // path, `if (Mode) pEntry = mp_Items.f_FindEqual(1); else pEntry =
+            // mp_Items.f_FindEqual(2);`, assigns it where it is, a fresh lookup
+            // when each of them is one.
+            llvm::DenseMap<const BinaryOperator *, SourceLocation> Covered;
+            if (const auto *Body = dyn_cast<CompoundStmt>(Lambda->getBody())) {
+              const llvm::SmallPtrSet<const BinaryOperator *, 4> EveryPath =
+                  everyPathAssignments(Body);
+              for (const Stmt *Statement : Body->body()) {
+                if (const auto *If = dyn_cast<IfStmt>(Statement))
+                  for (const BinaryOperator *Assign : EveryPath)
+                    if (If->getSourceRange().fullyContains(
+                            Assign->getSourceRange()))
+                      Covered.try_emplace(Assign, If->getBeginLoc());
+                // Also the initializer of one, `if (pValue = ...; !pValue)`,
+                // which runs each time.
+                for (const BinaryOperator *Assign :
+                     alwaysRunAssignments(Statement))
+                  Covered.try_emplace(Assign, Statement->getBeginLoc());
+              }
+            }
+            // Where it is last assigned what isn't fresh, and a fresh lookup:
+            // what isn't, before a fresh one, `pValue = nullptr; pValue =
+            // mp_Items.f_FindEqual(_Key);`, doesn't matter.
+            llvm::DenseMap<const ValueDecl *, SourceLocation> UnfreshAt;
+            llvm::DenseMap<const ValueDecl *, SourceLocation> LastFresh;
+            auto Later =
+                [&](llvm::DenseMap<const ValueDecl *, SourceLocation> &Map,
+                    const ValueDecl *Assigned, SourceLocation At) {
+                  auto [It, Inserted] = Map.try_emplace(Assigned, At);
+                  if (!Inserted &&
+                      LambdaSM.isBeforeInTranslationUnit(It->second, At))
+                    It->second = At;
+                };
+            for (const auto &Nodes : matchEach<BinaryOperator>(
+                     binaryOperator(hasOperatorName("=")).bind("assign"),
+                     *Lambda->getBody(),
+                     Lambda->getCallOperator()->getASTContext())) {
+              const auto *Assign = Nodes.getNodeAs<BinaryOperator>("assign");
+              // Also through a cast to a reference, `static_cast<int
+              // *&>(pEntry) = ...`; either of a conditional, `(bFirst ? pFirst
+              // : pSecond) = ...`, isn't assigned on every resume.
+              const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+                  assignedVariables(Assign->getLHS());
+              if (Targets.size() != 1) {
+                for (const DeclRefExpr *Target : Targets) {
+                  Unfresh.insert(resolveReferenceCapture(Target->getDecl()));
+                  Later(UnfreshAt, resolveReferenceCapture(Target->getDecl()),
+                        Assign->getBeginLoc());
+                }
+                continue;
+              }
+              const DeclRefExpr *Target = Targets[0];
+              const ValueDecl *Assigned = resolveReferenceCapture(Target->getDecl());
+              // What a branch that leaves with an error assigns doesn't
+              // matter.
+              if (!TopLevel.contains(Assign) && Refs.TopLevel.contains(Assign))
+                continue;
+              const bool Kept = IsKept(Assign->getRHS(), 0);
+              const auto CoveredAt = Covered.find(Assign);
+              if ((CoveredAt == Covered.end() && !TopLevel.contains(Assign)) ||
+                  Kept || !isLookupIntoActor(Assign->getRHS())) {
+                Unfresh.insert(Assigned);
+                Later(UnfreshAt, Assigned, Assign->getBeginLoc());
+                continue;
+              }
+              const SourceLocation At = CoveredAt != Covered.end()
+                                            ? CoveredAt->second
+                                            : Assign->getBeginLoc();
+              Later(LastFresh, Assigned, Assign->getBeginLoc());
+              auto [It, Inserted] = FreshlyAssigned.try_emplace(Assigned, At);
+              if (!Inserted &&
+                  LambdaSM.isBeforeInTranslationUnit(At, It->second))
+                It->second = At;
+            }
+            for (const auto &[Assigned, At] : UnfreshAt)
+              if (const auto Fresh = LastFresh.find(Assigned);
+                  Fresh != LastFresh.end() &&
+                  LambdaSM.isBeforeInTranslationUnit(At, Fresh->second))
+                Unfresh.erase(Assigned);
+            for (const ValueDecl *Assigned : Unfresh)
+              FreshlyAssigned.erase(Assigned);
+          }
+          // Only comparisons that end the coroutine with an error when the
+          // pointer doesn't match, on every resume that succeeds.
+          const llvm::SmallPtrSet<const BinaryOperator *, 4> Gates =
+              mismatchTests(Lambda->getBody());
+          for (const auto &Nodes : matchEach<BinaryOperator>(
+                   binaryOperator(
+                       anyOf(hasOperatorName("=="), hasOperatorName("!=")))
+                       .bind("compare"),
+                   *Lambda->getBody(),
+                   Lambda->getCallOperator()->getASTContext())) {
+            const auto *Compare = Nodes.getNodeAs<BinaryOperator>("compare");
+            const bool Gate = Gates.contains(Compare);
+            // Compared with a fresh lookup, like `pDistribution !=
+            // mp_Distributions.f_FindEqual(Key)`, or a local of the callback
+            // that holds one: a null test, or a comparison with another pointer
+            // kept from before, doesn't tell the entry is still there.
+            auto Fresh = [&](const Expr *E) {
+              E = E->IgnoreParenImpCasts();
+              // What a cast or an offset is of, `static_cast<CValue *>(pSaved)`
+              // or `pSaved + 0`, which points where that does.
+              for (int Depth = 0; Depth < 8; ++Depth)
+                if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
+                    Cast && Cast->getType()->isPointerType())
+                  E = Cast->getSubExpr()->IgnoreParenImpCasts();
+                else if (const auto *Offset = dyn_cast<BinaryOperator>(E);
+                         Offset && Offset->isAdditiveOp() &&
+                         Offset->getType()->isPointerType())
+                  E = (Offset->getLHS()->getType()->isPointerType()
+                           ? Offset->getLHS()
+                           : Offset->getRHS())
+                          ->IgnoreParenImpCasts();
+                else
+                  break;
+              // The address of a variable, `&Value`, is fresh as it is.
+              if (const auto *Address = dyn_cast<UnaryOperator>(E);
+                  Address && Address->getOpcode() == UO_AddrOf &&
+                  isa<DeclRefExpr>(Address->getSubExpr()->IgnoreParenImpCasts()))
+                E = Address->getSubExpr()->IgnoreParenImpCasts();
+              if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+                const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+                if (!Local)
+                  return false;
+                // Looked up again by the callback before, like `pValue =
+                // mp_Items.f_FindEqual(Key)`.
+                if (auto It = FreshlyAssigned.find(resolveReferenceCapture(Local));
+                    It != FreshlyAssigned.end() &&
+                    Lambda->getCallOperator()
+                        ->getASTContext()
+                        .getSourceManager()
+                        .isBeforeInTranslationUnit(It->second,
+                                                   Compare->getBeginLoc()))
+                  return true;
+                const auto *Body = Lambda->getBody();
+                return Local->hasLocalStorage() && Local->getInit() &&
+                       !isChangedVariable(Local) &&
+                       !Lambda->getCallOperator()
+                            ->getASTContext()
+                            .getSourceManager()
+                            .isBeforeInTranslationUnit(Local->getLocation(),
+                                                       Body->getBeginLoc()) &&
+                       isLookupIntoActor(Local->getInit());
+              }
+              return isLookupIntoActor(E);
+            };
+            // Also the address of a reference, `&Value`.
+            auto ComparedRef = [](const Expr *Side) -> const DeclRefExpr * {
+              Side = Side->IgnoreParenImpCasts();
+              if (const auto *Address = dyn_cast<UnaryOperator>(Side);
+                  Address && Address->getOpcode() == UO_AddrOf)
+                Side = Address->getSubExpr()->IgnoreParenImpCasts();
+              return dyn_cast<DeclRefExpr>(Side);
+            };
+            const auto *Left = ComparedRef(Compare->getLHS());
+            const auto *Right = ComparedRef(Compare->getRHS());
+            // Compared with a fresh lookup anywhere, which its result tells
+            // about, like `return mp_Items.f_FindEqual(Key) == &Value;`: one
+            // whose result is acted on, a condition or returned, also through a
+            // local it is saved in or a call it is given to, not one that is
+            // discarded, `(void)(pEntry != ...)`, `fg_Log(pEntry != ...)` or
+            // `bool bSame = pEntry != ...;` that nothing reads.
+            ASTContext &CallbackContext =
+                Lambda->getCallOperator()->getASTContext();
+            TCRecursive<bool(const Expr *, int)> ActedOn =
+                [&](const Expr *E, int Depth) {
+                  if (Depth > 4)
+                    return true;
+                  // What reads the local \p Saved acts on it.
+                  auto ReadsActOn = [&](const ValueDecl *Saved) {
+                    bool Acted = false;
+                    TCRecursive<void(const Stmt *)> Visit =
+                        [&](const Stmt *Inner) {
+                          if (!Inner || Acted)
+                            return;
+                          if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner);
+                              Ref && Ref->getDecl() == Saved)
+                            Acted = ActedOn(Ref, Depth + 1);
+                          for (const Stmt *Child : keptChildren(Inner))
+                            Visit(Child);
+                        };
+                    Visit(Lambda->getBody());
+                    return Acted;
+                  };
+                  DynTypedNode Node = DynTypedNode::create(*E);
+                  for (int Level = 0; Level < 32; ++Level) {
+                    const auto Parents =
+                        instantiatedParents(Node, CallbackContext);
+                    if (Parents.empty())
+                      return false;
+                    const DynTypedNode &Parent = Parents[0];
+                    const Stmt *Child = Node.get<Stmt>();
+                    // An `if` acts on it when a branch leaves with an
+                    // error, not when it only logs, `if (!bSame)
+                    // fg_Log(...)`.
+                    if (const auto *If = Parent.get<IfStmt>())
+                      return Child == If->getCond() &&
+                             (llvm::any_of(keptBranches(If),
+                                           [&](const Stmt *Branch) {
+                                             return leavesWithError(Branch);
+                                           }));
+                    if (const auto *While = Parent.get<WhileStmt>())
+                      return Child == While->getCond();
+                    if (const auto *Do = Parent.get<DoStmt>())
+                      return Child == Do->getCond();
+                    if (const auto *For = Parent.get<ForStmt>())
+                      return Child == For->getCond();
+                    // What a call is given, `fg_Log(pEntry != ...)`, is acted on
+                    // only as the call's result is.
+                    if (Parent.get<ReturnStmt>())
+                      return true;
+                    if (Parent.get<CompoundStmt>() || Parent.get<LambdaExpr>())
+                      return false;
+                    if (const auto *Cast = Parent.get<ExplicitCastExpr>();
+                        Cast && Cast->getType()->isVoidType())
+                      return false;
+                    if (const auto *Saved = Parent.get<VarDecl>())
+                      return ReadsActOn(Saved);
+                    if (const auto *Assign = Parent.get<BinaryOperator>();
+                        Assign && Assign->isAssignmentOp()) {
+                      if (Child != Assign->getRHS())
+                        return false;
+                      if (const auto *Target = dyn_cast<DeclRefExpr>(
+                              Assign->getLHS()->IgnoreParenImpCasts());
+                          Target && isa<VarDecl>(Target->getDecl()) &&
+                          cast<VarDecl>(Target->getDecl())->hasLocalStorage())
+                        return ReadsActOn(Target->getDecl());
+                      return true;
+                    }
+                    // The left side of a comma is discarded.
+                    if (const auto *Comma = Parent.get<BinaryOperator>();
+                        Comma && Comma->getOpcode() == BO_Comma &&
+                        Child == Comma->getLHS())
+                      return false;
+                    // The condition of a conditional whose value is acted
+                    // on, not `bool bIgnored = p != ... ? true : false`.
+                    // Which part of a conditional it is, is told by where it
+                    // is, since the parents skip parentheses around it.
+                    if (const auto *Conditional =
+                            Parent.get<ConditionalOperator>()) {
+                      const SourceManager &CallbackSM =
+                          CallbackContext.getSourceManager();
+                      if (CallbackSM.isBeforeInTranslationUnit(
+                              Child->getBeginLoc(),
+                              Conditional->getQuestionLoc()))
+                        return ActedOn(Conditional, Depth + 1);
+                      // A value of a conditional is acted on only when it is
+                      // chosen: the other one must be an error, `bCheck ? (p
+                      // == ... ? ...) : fg_MakeError(...)`.
+                      const Expr *Other =
+                          CallbackSM.isBeforeInTranslationUnit(
+                              Child->getBeginLoc(), Conditional->getColonLoc())
+                              ? Conditional->getFalseExpr()
+                              : Conditional->getTrueExpr();
+                      if (!isErrorResult(
+                              skipWrappers(Other)->IgnoreParenImpCasts()))
+                        return false;
+                    } else if (const auto *Conditional =
+                                   Parent.get<AbstractConditionalOperator>();
+                               Conditional && Child == Conditional->getCond())
+                      return ActedOn(Conditional, Depth + 1);
+                    Node = Parent;
+                  }
+                  return true;
+                };
+            // Of a callback that ends the coroutine with an error, the
+            // result when the pointer doesn't match, `p == pFresh` false, must
+            // be one: not `p == pFresh || !pFresh ? CExceptionPointer{} :
+            // ...`, which goes on when the entry is gone.
+            const QualType CallbackResult =
+                Lambda->getCallOperator()->getReturnType();
+            const bool ErrorResult = !CallbackResult->isBooleanType() &&
+                                     !CallbackResult->isIntegerType();
+            // Through any number of unchanged copies of what tells it,
+            // `bool b1 = b0;`, each once.
+            llvm::SmallPtrSet<const VarDecl *, 8> FollowedSaved;
+            TCRecursive<bool(const Expr *, bool, int)> MismatchFails =
+                [&](const Expr *E, bool Value, int Depth) {
+                  if (Depth > 1024)
+                    return false;
+                  DynTypedNode Node = DynTypedNode::create(*E);
+                  for (int Level = 0; Level < 32; ++Level) {
+                    const auto Parents =
+                        instantiatedParents(Node, CallbackContext);
+                    if (Parents.empty())
+                      return false;
+                    const DynTypedNode &Parent = Parents[0];
+                    const Stmt *Child = Node.get<Stmt>();
+                    if (Parent.get<ParenExpr>() || Parent.get<ImplicitCastExpr>() ||
+                        Parent.get<ExprWithCleanups>()) {
+                      Node = Parent;
+                      continue;
+                    }
+                    if (const auto *Not = Parent.get<UnaryOperator>();
+                        Not && Not->getOpcode() == UO_LNot) {
+                      Value = !Value;
+                      Node = Parent;
+                      continue;
+                    }
+                    // What decides a `&&` when false, or a `||` when true.
+                    if (const auto *Logical = Parent.get<BinaryOperator>();
+                        Logical && Logical->isLogicalOp()) {
+                      if ((Logical->getOpcode() == BO_LAnd) == Value)
+                        return false;
+                      Node = Parent;
+                      continue;
+                    }
+                    // The condition, also in parentheses, which the parents
+                    // skip.
+                    auto IsCondition = [&](const Expr *Condition) {
+                      return Condition && Child &&
+                             !CallbackContext.getSourceManager()
+                                  .isBeforeInTranslationUnit(
+                                      Child->getBeginLoc(),
+                                      Condition->getBeginLoc()) &&
+                             !CallbackContext.getSourceManager()
+                                  .isBeforeInTranslationUnit(
+                                      Condition->getEndLoc(),
+                                      Child->getEndLoc());
+                    };
+                    // A statement of the body before what can return success,
+                    // which runs on every resume that does.
+                    if (const auto *If = Parent.get<IfStmt>()) {
+                      if (!IsCondition(If->getCond()) ||
+                          !Refs.TopLevel.contains(If))
+                        return false;
+                      if (const Stmt *Mismatch =
+                              Value ? If->getThen() : If->getElse())
+                        return leavesWithError(Mismatch);
+                      // Without a branch for it, `if (p == pFresh) return
+                      // {};`, what follows, when the other always leaves.
+                      const auto Around =
+                          instantiatedParents(*If, CallbackContext);
+                      const auto *Block = Around.empty()
+                                              ? nullptr
+                                              : Around[0].get<CompoundStmt>();
+                      if (!Block || !alwaysLeaves(If->getThen()))
+                        return false;
+                      const auto *Next = llvm::find(Block->body(), If);
+                      return Next != Block->body_end() &&
+                             ++Next != Block->body_end() &&
+                             leavesWithError(*Next);
+                    }
+                    // Chosen by what is acted on: not a value of another
+                    // conditional whose other value is success.
+                    if (const auto *Conditional =
+                            Parent.get<ConditionalOperator>()) {
+                      if (!IsCondition(Conditional->getCond()))
+                        return false;
+                      return isErrorResult(skipWrappers(
+                                               Value ? Conditional->getTrueExpr()
+                                                     : Conditional->getFalseExpr())
+                                               ->IgnoreParenImpCasts()) &&
+                             ActedOn(Conditional, Depth + 1);
+                    }
+                    // Saved, `bool bSame = p == ...`, and acted on where it is
+                    // read, unless it is changed before, `bSame = true`.
+                    if (const auto *Saved = Parent.get<VarDecl>()) {
+                      if (isChangedVariable(Saved) ||
+                          !FollowedSaved.insert(Saved).second)
+                        return false;
+                      bool Fails = false;
+                      TCRecursive<void(const Stmt *)> Visit =
+                          [&](const Stmt *Inner) {
+                            if (!Inner || Fails)
+                              return;
+                            if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner);
+                                Ref && Ref->getDecl() == Saved)
+                              Fails = MismatchFails(Ref, Value, Depth + 1);
+                            for (const Stmt *Inside : keptChildren(Inner))
+                              Visit(Inside);
+                          };
+                      Visit(Lambda->getBody());
+                      return Fails;
+                    }
+                    return false;
+                  }
+                  return false;
+                };
+            if (Fresh(Compare->getLHS()) != Fresh(Compare->getRHS()) &&
+                (ErrorResult
+                     ? MismatchFails(Compare, Compare->getOpcode() == BO_NE, 0)
+                     : ActedOn(Compare, 0))) {
+              if (Left)
+                FreshCompared.insert(resolveReferenceCapture(Left->getDecl()));
+              if (Right)
+                FreshCompared.insert(resolveReferenceCapture(Right->getDecl()));
+            }
+            if (!Gate)
+              continue;
+            // A fresh lookup compared with a pointer kept from before, which
+            // then still points to the same data: not with null. Two pointers
+            // kept from before, `pValue != pSaved`, tell nothing of either.
+            if (Fresh(Compare->getLHS()) == Fresh(Compare->getRHS())) {
+              if (!Fresh(Compare->getLHS())) {
+                if (Left)
+                  StaleCompared.insert(resolveReferenceCapture(Left->getDecl()));
+                if (Right)
+                  StaleCompared.insert(resolveReferenceCapture(Right->getDecl()));
+              }
+              continue;
+            }
+            ASTContext &LambdaContext = Lambda->getCallOperator()->getASTContext();
+            if (nullPointerConstantOf(Compare->getLHS(), LambdaContext,
+                                      Expr::NPC_ValueDependentIsNotNull) ||
+                nullPointerConstantOf(Compare->getRHS(), LambdaContext,
+                                      Expr::NPC_ValueDependentIsNotNull))
+              continue;
+            if (Left)
+              Compared.insert(resolveReferenceCapture(Left->getDecl()));
+            if (Right)
+              Compared.insert(resolveReferenceCapture(Right->getDecl()));
+          }
+          for (const ValueDecl *Ref : Refs.Decls) {
+            const ValueDecl *Resolved = resolveReferenceCapture(Ref);
+            if (!Copies.contains(Ref) && Compared.contains(Resolved))
+              SameData[Variable].insert(Resolved);
+          }
+          // What refers into the data of the actor is re-validated only by a
+          // fresh lookup, compared with it or assigned, or given to what can
+          // assign it: not by reading it, like `*pEntry == 0`, nor by comparing
+          // it with other pointers kept from before.
+          // Also an iterator or a reference handle, which only testing,
+          // `if (!iEntry)`, doesn't re-validate either.
+          llvm::erase_if(Variables, [&](const ValueDecl *Validated) {
+            const QualType Type = Validated->getType();
+            const bool Refers = Type->isPointerType() ||
+                                Type->isReferenceType() ||
+                                isIteratorType(Type) || isReferenceHandle(Type);
+            return (StaleCompared.contains(Validated) || Refers) &&
+                   !Compared.contains(Validated) &&
+                   !FreshCompared.contains(Validated) &&
+                   !FreshlyAssigned.count(Validated) &&
+                   !(Refs.Assigned.contains(Validated) &&
+                     !Unfresh.contains(Validated));
+          });
+          for (const ValueDecl *Validated : Variables)
+            if (FreshCompared.contains(Validated) &&
+                !Refs.Assigned.contains(Validated) &&
+                !FreshlyAssigned.count(Validated) &&
+                !llvm::is_contained(ComparedOnly, Validated))
+              ComparedOnly.push_back(Validated);
+        }
+        // A flag copied from an entry before, like `pDestroyed =
+        // pEntry->m_pDestroyed`, that the callback tests and leaves with an
+        // error for, like `if (*pDestroyed) return DMibErrorInstance(...)`,
+        // re-validates the entry and what is made from it.
+        if (Refs.bValidating && !isReferencedHolder(Variable)) {
+          for (const ValueDecl *Entry : flagTestedEntries(Lambda->getBody())) {
+            Variables.push_back(Entry);
+            SameData[Variable].insert(Entry);
+          }
+        }
+        // What it reads through, also of what it doesn't re-validate, which
+        // it reads on every resume, `fg_Read(*pEntry)`.
+        {
+          llvm::SmallVector<const ValueDecl *, 8> Read(Variables.begin(),
+                                                       Variables.end());
+          // Not a copy it captures that is independent, nor of one at its own
+          // level, made where the callback is, a use of its own storage,
+          // `[Entry]` reading `Entry.m_Value`, only one through a borrowed
+          // part of it, `*Entry.m_pPeer` (OwnLevelCopies, throughBorrowedPart).
+          ASTContext &CallbackContext =
+              Lambda->getCallOperator()->getASTContext();
+          // Of this callback only.
+          llvm::SmallPtrSet<const ValueDecl *, 4> OwnLevelCopies;
+          for (const ValueDecl *Ref : Refs.Decls) {
+            const QualType Copied = Ref->getType().getNonReferenceType();
+            if (Copies.contains(Ref) &&
+                (isIndependentType(Copied, CallbackContext) ||
+                 !hasBorrowedParts(Copied, CallbackContext)))
+              continue;
+            if (Copies.contains(Ref) &&
+                isCopyAtOwnLevel(Copied, CallbackContext))
+              OwnLevelCopies.insert(resolveReferenceCapture(Ref));
+            if (const ValueDecl *Resolved = resolveReferenceCapture(Ref);
+                !llvm::is_contained(Read, Resolved))
+              Read.push_back(Resolved);
+          }
+          addCallbackEarlyUses(Variable, Lambda, Read, Variables,
+                               OwnLevelCopies);
+        }
+        auto SavedCopies = std::move(CallbackCopies);
+        CallbackCopies = std::move(Copies);
+        const VarDecl *SavedHolder = CurrentHolder;
+        const CompoundStmt *SavedBody = CurrentCallbackBody;
+        CurrentHolder = Variable;
+        CurrentCallbackBody = Lambda->getCompoundStmtBody();
+        TraverseStmt(Lambda->getBody());
+        CurrentHolder = SavedHolder;
+        CurrentCallbackBody = SavedBody;
+        CallbackCopies = std::move(SavedCopies);
+      }
+      if (auto Removed = HolderRemovals.find(Variable);
+          Removed != HolderRemovals.end()) {
+        llvm::erase_if(Variables, [&](const ValueDecl *Validated) {
+          return mayRemove(Removed->second, Validated);
+        });
+        llvm::erase_if(ComparedOnly, [&](const ValueDecl *Validated) {
+          return mayRemove(Removed->second, Validated);
+        });
+      }
+      if (!Common)
+        Common = std::move(Variables);
+      else
+        llvm::erase_if(*Common, [&](const ValueDecl *Validated) {
+          return !llvm::is_contained(Variables, Validated);
+        });
+      if (!CommonCompared)
+        CommonCompared = std::move(ComparedOnly);
+      else
+        llvm::erase_if(*CommonCompared, [&](const ValueDecl *Validated) {
+          return !llvm::is_contained(ComparedOnly, Validated);
+        });
+    }
+    if (!bEveryAlternative) {
+      Common->clear();
+      CommonCompared->clear();
+    }
+    llvm::append_range(Revalidations[Variable], *Common);
+    llvm::append_range(ComparedRevalidations[Variable], *CommonCompared);
+  }
+
+  /// The collections of the data of the actor a callback can remove entries
+  /// of, or whether that can't be told.
+  /// Of a member of the actor, how many collections deep what is removed or
+  /// looked up is: what is removed from a collection of it, `mp_Items`, at 0,
+  /// from one in an entry of that, `mp_Items[0].m_Children`, at 1; what is
+  /// looked up in it, `mp_Items.f_FindEqual(0)`, at 1, in that, at 2. A
+  /// removal can remove a lookup that is deeper.
+  struct CRemovals {
+    llvm::SmallDenseMap<const FieldDecl *, unsigned, 2> Fields;
+    bool bUnknown = false;
+    bool any() const { return bUnknown || !Fields.empty(); }
+    /// Adds \p Field at \p Depth, the least of those when \p Least, of
+    /// removals, else the most, of lookups.
+    void add(const FieldDecl *Field, unsigned Depth, bool Least = true) {
+      auto [It, Inserted] = Fields.try_emplace(Field, Depth);
+      if (!Inserted)
+        It->second =
+            Least ? std::min(It->second, Depth) : std::max(It->second, Depth);
+    }
+  };
+
+  /// What \p Body removes entries of, with a member function like `f_Remove`
+  /// or `f_Clear` of a collection of the data of the actor, also through the
+  /// member functions of the actor it calls, `f_Tidy()`, and the lambdas it
+  /// calls, `[&] { mp_Items.f_Clear(); }()`, and those of a scope exit it
+  /// makes, `g_OnScopeExit / [this] { mp_Items.f_Clear(); }`, which runs
+  /// before it returns, but not in the other lambdas it only makes, nor in a
+  /// branch a constant condition never takes, `if (false)`. A member
+  /// function of the actor that isn't const and can't be looked into can
+  /// remove anything.
+  CRemovals removals(const Stmt *Body) const {
+    CRemovals Removals;
+    llvm::SmallPtrSet<const Stmt *, 8> Visited;
+    // A scope exit whose guard is a local of the callback that it clears,
+    // `Rollback.f_Clear();`, before it can return without an error, after
+    // which the coroutine doesn't resume, never removes what the coroutine
+    // reads after.
+    if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(Body)) {
+      const auto Statements = Compound->body();
+      for (auto It = Statements.begin(); It != Statements.end(); ++It) {
+        const auto *Declaration = dyn_cast<DeclStmt>(*It);
+        const auto *Guard =
+            Declaration && Declaration->isSingleDecl()
+                ? dyn_cast<VarDecl>(Declaration->getSingleDecl())
+                : nullptr;
+        const LambdaExpr *Exit = Guard && !Guard->getType()->isReferenceType()
+                                     ? scopeExitOperand(Guard->getInit())
+                                     : nullptr;
+        if (!Exit)
+          continue;
+        if (isClearedBeforeLeaving(Guard, Compound, [](const Stmt *S) {
+              return mayReturnSuccess(S);
+            }))
+          Visited.insert(Exit->getBody());
+      }
+    }
+    auto Children = [&](const Stmt *S) {
+      return Context ? evaluatedChildren(S, *Context) : evaluatedChildren(S);
+    };
+    TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+      // Not what isn't evaluated, `noexcept(mp_Items.f_Clear())` or
+      // `__builtin_constant_p(&m_Count)` (hasUnevaluatedOperands).
+      if (!S || Removals.bUnknown || isa<LambdaExpr>(S) ||
+          hasUnevaluatedOperands(S))
+        return;
+      if (const auto *Made = dyn_cast<Expr>(S))
+        if (const LambdaExpr *Exit = scopeExitOperand(Made);
+            Exit && Visited.insert(Exit->getBody()).second)
+          Visit(Exit->getBody());
+      // Also what moves the entries of a collection whose entries don't
+      // stay where they are, `m_Items.reserve(...)` of a vector, which leaves
+      // what points to them dangling.
+      static const llvm::SmallVector<StringRef, 16> RelocatingMethods = [] {
+        llvm::SmallVector<StringRef, 16> List;
+        splitOptionList("f_Reserve*;f_Insert*;f_Add*;f_Append*;f_Emplace*;"
+                        "f_Push*;f_Shrink*;f_SetCapacity*;reserve;"
+                        "shrink_to_fit;push_back;push_front;emplace*;insert*;"
+                        "append",
+                        List);
+        return List;
+      }();
+      // A collection given to a free helper that can change it, `fg_Erase(
+      // mp_Items)` with `TCMap<int, int> &_Items`, which removes entries
+      // when it removes them or assigns it, or when it can't be looked into,
+      // also as an argument of a member function with an explicit object
+      // parameter other than its object, `Processor.f_Process(mp_Items)`.
+      // A member function called on it, also with an explicit object
+      // parameter, also an operator, is told by MemberChange, below, by
+      // the same analysis of its body, with its object as the collection.
+      // Also through one of its own that does, `f_GetArray(_Len)` of
+      // `f_SetLen(_Len); return f_GetArray();`.
+      auto Named = [](llvm::ArrayRef<StringRef> Patterns) {
+        return [Patterns](const CXXMethodDecl *Method) {
+          return Method->getIdentifier() &&
+                 matchesNamePattern(identifierTextOf(Method), Patterns);
+        };
+      };
+      // How a member function called on a collection, \p S, changes it, and
+      // the collection: the same in the callback and in a helper's body, so
+      // that they can't disagree.
+      // - Removes: one named as removing, `mp_Items.f_Remove(1)`, also a
+      //   member operator, or one whose body can change its object, told by
+      //   the analysis of a helper's body (BodyRemoves) with its object,
+      //   `this` or its explicit object parameter, as the collection, to a
+      //   depth: `mp_Values << 42` of an `operator <<` that calls `f_Clear`;
+      //   also a call operator without a body, which has no name to tell
+      //   by.
+      // - Relocates: one named as moving the entries of what doesn't keep
+      //   them where they are, `m_Items.reserve(...)` of a vector.
+      // - Assigns: an assignment operator, also compound, also called by
+      //   name, also with an explicit object parameter, whatever its
+      //   qualifiers.
+      // Not the call operator of a lambda, whose call is looked into below.
+      enum class EChange { Removes, Relocates, Assigns };
+      using CChange = std::pair<EChange, const Expr *>;
+      // BodyRemoves of a definition and its collection, its parameter or,
+      // when negative, `this`, at a depth, as worked out, none while it is.
+      TCRecursive<std::optional<int>(const FunctionDecl *, int, int, bool,
+                                       bool, bool)> BodyRemoves;
+      llvm::DenseMap<std::tuple<const FunctionDecl *, int, int, int>,
+                     std::optional<int>>
+          BodyRemovesMemo;
+      // How much deeper than an object, \p Of relative to it
+      // (objectRelation), a change of it changes, \p Union when that can end
+      // a member of a union, which ends what holds the union: as deep as the
+      // object, for the object itself or what it holds by value, also its
+      // own state; for an entry, or what an owning pointer owns, as deep as
+      // it is stored (StoredDepth); one less for a union, or for an
+      // iterator, \p Type, also through a pointer to one, which removes from
+      // the collection it is in; anything, c_Everything, for what can't be
+      // told.
+      // As \p iParameter of BodyRemoves, `this` of a destructor of what is
+      // destroyed, whose own state, what it holds by value, doesn't count,
+      // only what it changes through what it refers to, a pointer or a
+      // reference it holds, what it owns, or what can't be told.
+      constexpr int c_BorrowedThis = -(1 << 21);
+      // Of parameter n given a copy or a view of what it is analysed for,
+      // `fg_Clear(CView _View)` or `CView const &_View`, also borrowed: only
+      // what changes through its borrowed parts counts, c_BorrowedThis - 1 -
+      // n.
+      auto BorrowedParameter = [](unsigned iParameter) {
+        return c_BorrowedThis - 1 - int(iParameter);
+      };
+      // What is reached through a pointer held in it, which can point back
+      // to what holds it, `m_pOwner->mp_Items`, is as anything.
+      auto OffsetOf = [](const CObjectRelation &Of, QualType Type, bool Union) {
+        if (Of.Kind == EObjectRelation::Unknown || Of.bThroughPointer)
+          return c_Everything;
+        if (!Type.isNull()) {
+          Type = Type.getNonReferenceType();
+          if (Type->isPointerType())
+            Type = Type->getPointeeType();
+        }
+        const bool Iterator = !Type.isNull() && isIteratorType(Type);
+        return int(Of.StoredDepth) - (Union || Iterator ? 1 : 0);
+      };
+      // \p InBody: in the body of a helper or a member function, where an
+      // operator without a body to look into, other than a lookup, is an
+      // unknown change of its object.
+      // The object of the actor, `this` or an actor object parameter, which
+      // the collections of the callback are members of (objectRelation).
+      auto IsActor = [&](const Expr *E) { return isActorObject(E); };
+      using CIsObject = std::function<bool(const Expr *)>;
+      // Whether \p Relation is the collection, also a member of it or what
+      // can't be told, not an entry of it nor another object.
+      auto IsCollection = [](const CObjectRelation &Relation) {
+        return Relation.Kind == EObjectRelation::SameObject ||
+               Relation.Kind == EObjectRelation::Subobject ||
+               Relation.Kind == EObjectRelation::Unknown;
+      };
+      // Whether assigning \p Target, \p Of relative to the object, or with
+      // \p Moved moving it, changes what is reached from the object: of the
+      // collection itself, a member of it or what can't be told, a class;
+      // reached through an entry of it, also in the body of a member function
+      // of an entry, \p OfEntry, only a collection, `mp_Items[0].m_Children =
+      // {}`, not plain data, `mp_Items[0].m_Value = 1`; and any assignment of
+      // a member of a union, which can end the life of another member of it.
+      // With \p Receiver, \p Target is what an assignment operator is called
+      // on, also through a pointer to it, `pItems->operator=(...)`; else a
+      // pointer it is is assigned, not what it points to.
+      // What \p E is relative to the object (objectRelation), nothing of it
+      // when it is a copy, a value a member function made from it,
+      // `mp_Items.f_Copy()`, whose entries are its own.
+      auto RelationTo = [&](const Expr *E, const CIsObject &IsObject) {
+        // Of the value a constant condition chooses, also one the context
+        // evaluates, `(c_bOther ? g_Other : _Items)`.
+        CObjectRelation Of =
+            objectRelation(E, IsObject, const_cast<ASTContext *>(Context));
+        // Not the own storage of a copy (isCopyStorage), unless it has
+        // borrowed parts (hasBorrowedParts), through which what it is given
+        // to or called on can change what the source's lead to: that is
+        // gone through as of what is destroyed (c_BorrowedThis), its own
+        // storage not counted. What its borrowed parts lead to, also what a
+        // copy of a shared owner points to, isn't a copy's own.
+        if (isCopyStorage(Of) && Context) {
+          QualType Type = E->getType().getNonReferenceType();
+          if (Type->isPointerType())
+            Type = Type->getPointeeType();
+          if (!hasBorrowedParts(Type, *Context))
+            Of = CObjectRelation{};
+        }
+        return Of;
+      };
+      // \p InUnion: the object is in a member of a union, like a helper's
+      // parameter given one, `fg_Reset(mp_Items.m_Empty)`.
+      auto AssignmentChanges = [&](const Expr *Target,
+                                   const CObjectRelation &Of, bool OfEntry,
+                                   bool Moved, bool Receiver = false,
+                                   bool InUnion = false) {
+        if (Of.Kind == EObjectRelation::Unrelated || isCopyStorage(Of))
+          return false;
+        // Nor a write into a local, `View.m_pItems = nullptr`, which is none
+        // of what it refers to (isLocalStorage), unless an operator of it
+        // does what it is written to (Receiver).
+        if (!Receiver && isLocalStorage(Target))
+          return false;
+        // A local pointer pointed elsewhere, also one into a union, `pSlot =
+        // &Other`, writes nothing of what it pointed to; a pointer an object
+        // holds (isStoredPointer), also through a reference parameter that
+        // refers to one where it is given, `int *&_pSlot`, or a local
+        // reference to that, is.
+        const bool Stored = isStoredPointer(Target) || aliasesGiven(Target);
+        if (!Receiver && Target->getType()->isPointerType() && !Stored)
+          return false;
+        // In a member of a union at any depth, also through casts or a local
+        // alias, `int &Slot = mp_Items.m_Empty; Slot = 0`, or of the object
+        // in one.
+        if (!Moved && (Of.bInUnion ||
+                       (InUnion && (Of.Kind == EObjectRelation::SameObject ||
+                                    Of.Kind == EObjectRelation::Subobject))))
+          return true;
+        QualType Type = Target->getType().getNonReferenceType();
+        if (Type->isPointerType()) {
+          // A local pointer pointed elsewhere, also through a cast or a
+          // reference to it, `pItems = &Other`, changes nothing of what it
+          // pointed to; a pointer the collection holds (isStoredPointer),
+          // `_Items.m_pData = nullptr`, is its own state.
+          if (!Receiver)
+            return Stored && !OfEntry && Of.Kind != EObjectRelation::Entry &&
+                   IsCollection(Of);
+          Type = Type->getPointeeType();
+        }
+        // An entry replaced, `mp_Items[0] = CEntry{}`, or moved from,
+        // `fg_Move(mp_Items[0])`, also a subobject of one, changes the
+        // collections it holds too, and ends what an owning pointer it holds
+        // owns, also as a member at any depth, `mp_Items[0].m_Holder = {}`,
+        // and, replaced, the member of a union it holds, `mp_Items[0].m_State
+        // = CState{.m_Float = 1}` (heldContents).
+        if (OfEntry || Of.Kind == EObjectRelation::Entry) {
+          const CHeldContents Held = heldContents(Type);
+          return Moved ? Held.bCollection || Held.bOwned : Held.any();
+        }
+        // Of the collection itself, also its own state, `_Items.m_nSize = 0`;
+        // a move only of what is made of a class.
+        return IsCollection(Of) && (!Moved || Type->isRecordType());
+      };
+      // \p IsObject: the object the collection is, or, in the callback, the
+      // actor, whose members the collections are. \p OfEntry: in the body of
+      // a member function of an entry, or of a helper given one.
+      // \p Offset: of Removes, how much deeper than the collection what it
+      // removes is (OffsetOf), when its body tells.
+      auto MemberChange = [&](const Stmt *Of, int Depth, bool InBody,
+                              bool OfEntry, const CIsObject &IsObject,
+                              bool InUnion = false, int *Offset = nullptr,
+                              bool ObjectIsPart =
+                                  false) -> std::optional<CChange> {
+        if (Offset)
+          *Offset = 0;
+        const auto *Call = dyn_cast<CallExpr>(Of);
+        if (!Call)
+          return std::nullopt;
+        const auto *Method =
+            dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
+        // Called through a pointer to a member function, `(this->*fClear)()`:
+        // told by the name of the one it can be seen to point to, else an
+        // unknown change of what it is called on.
+        if (const CMemberCall Member = memberCallOf(Call);
+            !Method && Member)
+          if (const auto *Pointer =
+                  dyn_cast<BinaryOperator>(Member->getCallee()->IgnoreParens());
+              Pointer && Pointer->isPtrMemOp()) {
+            // Of one that an override can run, unless it is a lookup, an
+            // unknown change too.
+            // Not on what can only be of its class, a variable or a member
+            // that isn't a reference, `(_Wrapper.m_Items.*fCount)()`. One
+            // that moves the entries of what doesn't keep them where they
+            // are relocates, also by name.
+            const CXXMethodDecl *Pointed =
+                pointedMemberFunction(Pointer->getRHS());
+            // An assignment operator assigns, `(this->*fAssign)(CItems{})`.
+            if (Pointed && CXXOperatorCallExpr::isAssignmentOp(
+                               Pointed->getOverloadedOperator()))
+              return std::make_pair(EChange::Assigns, Pointer->getLHS());
+            const Expr *Receiver = Pointer->getLHS()->IgnoreParenImpCasts();
+            const auto *Named0 =
+                Pointer->getOpcode() == BO_PtrMemD
+                    ? (isa<DeclRefExpr>(Receiver)
+                           ? cast<DeclRefExpr>(Receiver)->getDecl()
+                       : isa<MemberExpr>(Receiver)
+                           ? cast<MemberExpr>(Receiver)->getMemberDecl()
+                           : nullptr)
+                    : nullptr;
+            const bool Exact = Named0 && isa<VarDecl, FieldDecl>(Named0) &&
+                               !Named0->getType()->isReferenceType();
+            if (!Pointed || Named(removingMethods())(Pointed) ||
+                (Pointed->isVirtual() && !Pointed->hasAttr<FinalAttr>() &&
+                 !Pointed->getParent()->hasAttr<FinalAttr>() && !Exact &&
+                 !(Pointed->getIdentifier() &&
+                   llvm::is_contained(CallbackLookupFunctions,
+                                      identifierTextOf(Pointed))) &&
+                 Pointed->getOverloadedOperator() != OO_Subscript))
+              return std::make_pair(EChange::Removes, Pointer->getLHS());
+            QualType Collection =
+                Pointer->getLHS()->getType().getNonReferenceType();
+            if (Collection->isPointerType())
+              Collection = Collection->getPointeeType();
+            if (Named(RelocatingMethods)(Pointed) && Context &&
+                Collection->getAsCXXRecordDecl() &&
+                !matchesTypeName(Collection, NodeStableContainers, *Context))
+              return std::make_pair(EChange::Relocates, Pointer->getLHS());
+            return std::nullopt;
+          }
+        if (!Method)
+          return std::nullopt;
+        const Expr *Object = nullptr;
+        if (const CMemberCall Member = memberCallOf(Call))
+          Object = Member->getImplicitObjectArgument();
+        else if (Call->getNumArgs() >= 1 && !Method->isStatic() &&
+                 (Method->isExplicitObjectMemberFunction() ||
+                  isa<CXXOperatorCallExpr>(Call)))
+          Object = Call->getArg(0);
+        if (!Object)
+          return std::nullopt;
+        // Of a local, or the own storage of a copy, what changes its own
+        // storage doesn't count, only what changes through its borrowed
+        // parts (c_BorrowedThis).
+        auto IsCopyReceiver = [&](const Expr *Receiver) {
+          return (!Receiver->getType()->isPointerType() &&
+                  isLocalStorage(Receiver)) ||
+                 isCopyStorage(RelationTo(Receiver, IsObject));
+        };
+        if (CXXOperatorCallExpr::isAssignmentOp(
+                Method->getOverloadedOperator())) {
+          // One written for the class is a member function too,
+          // `m_Registration = CRegistration{}` of `CRegistration
+          // &operator=(CRegistration &&)`: what the body that runs changes
+          // (calledDefinition) counts besides what assigning does, and one
+          // that can't be seen, or past the depth, can end its object.
+          if (Method->getOverloadedOperator() == OO_Equal &&
+              !Method->isTrivial() && Offset &&
+              !isIteratorType(Object->getType().getNonReferenceType())) {
+            const CObjectRelation Assigned = RelationTo(Object, IsObject);
+            if (Assigned.Kind != EObjectRelation::Unrelated) {
+              const FunctionDecl *Definition = calledDefinition(Call);
+              if (!Definition || Depth >= 4) {
+                *Offset = -1;
+                return std::make_pair(EChange::Removes, Object);
+              }
+              if (const std::optional<int> Removed = BodyRemoves(
+                      Definition,
+                      IsCopyReceiver(Object) ? c_BorrowedThis
+                      : Method->isExplicitObjectMemberFunction() ? 0
+                                                                 : -1,
+                      Depth + 1,
+                      (OfEntry || Assigned.Kind == EObjectRelation::Entry) &&
+                          !isCollectionType(Object->getType()),
+                      Assigned.bInUnion,
+                      isPartOfObject(Object, IsObject, ObjectIsPart))) {
+                *Offset = *Removed;
+                return std::make_pair(EChange::Removes, Object);
+              }
+            }
+          }
+          return std::make_pair(EChange::Assigns, Object);
+        }
+        if (Method->getParent()->isLambda())
+          return std::nullopt;
+        // A destructor called, `pItems->~CItems()`, ends its object.
+        if (isa<CXXDestructorDecl>(Method)) {
+          if (Offset)
+            *Offset = -1;
+          return std::make_pair(EChange::Removes, Object);
+        }
+        // Of the collection itself, also through a pointer to it,
+        // `pItems->reserve(...)`, whose implicit object is the pointer.
+        QualType Collection = Object->IgnoreParenImpCasts()->getType();
+        if (Collection->isPointerType())
+          Collection = Collection->getPointeeType();
+        auto NotStable = [&] {
+          return Context && Collection->getAsCXXRecordDecl() &&
+                 !matchesTypeName(Collection, NodeStableContainers, *Context);
+        };
+        // One that removes by name removes what is in its object, and, when
+        // its body can be seen, also what that does, like `delete this`,
+        // which ends the object itself.
+        if (Named(removingMethods())(Method)) {
+          // Of a copy with storage of its own (isCopyAtOwnLevel), what it
+          // removes of that is none of its source's: only what its body
+          // removes through its borrowed parts is (c_BorrowedThis),
+          // `Copy.f_Clear()` of `auto Copy = mp_Items`. Not of a view, whose
+          // entries are what it refers to.
+          if (QualType Copied = Object->getType().getNonReferenceType();
+              Context && !Copied->isPointerType() &&
+              isCopyAtOwnLevel(Copied, *Context) && IsCopyReceiver(Object)) {
+            const FunctionDecl *Definition = calledDefinition(Call);
+            if (!Definition || !Definition->getBody() || Depth >= 4 ||
+                callsOverride(Call))
+              return std::nullopt;
+            const CObjectRelation Receiver = RelationTo(Object, IsObject);
+            const std::optional<int> Removed = BodyRemoves(
+                Definition, c_BorrowedThis, Depth + 1,
+                (OfEntry || Receiver.Kind == EObjectRelation::Entry) &&
+                    !isCollectionType(Object->getType()),
+                Receiver.bInUnion,
+                isPartOfObject(Object, IsObject, ObjectIsPart));
+            if (!Removed)
+              return std::nullopt;
+            if (Offset)
+              *Offset = std::min(0, *Removed);
+            return std::make_pair(EChange::Removes, Object);
+          }
+          // An override that can run instead, whose body isn't seen, can end
+          // its object too.
+          if (Offset && callsOverride(Call))
+            *Offset = -1;
+          else if (const FunctionDecl *Definition = Method->getDefinition();
+                   Offset && Depth < 4 && Definition && Definition->getBody()) {
+            const CObjectRelation Receiver = RelationTo(Object, IsObject);
+            if (const std::optional<int> Removed = BodyRemoves(
+                    Definition,
+                    IsCopyReceiver(Object)                     ? c_BorrowedThis
+                    : Method->isExplicitObjectMemberFunction() ? 0
+                                                               : -1,
+                    Depth + 1,
+                    (OfEntry || Receiver.Kind == EObjectRelation::Entry) &&
+                        !isCollectionType(Object->getType()),
+                    Receiver.bInUnion,
+                    isPartOfObject(Object, IsObject, ObjectIsPart)))
+              *Offset = std::min(0, *Removed);
+          } else if (Offset &&
+                     !isPartOfObject(Object, IsObject, ObjectIsPart) &&
+                     !isIteratorType(Object->getType().getNonReferenceType()))
+            // One whose body can't be seen can end its object too, `delete
+            // this`, unless that is part of another (isPartOfObject), or an
+            // iterator, which removes the entry it is at.
+            *Offset = -1;
+          return std::make_pair(EChange::Removes, Object);
+        }
+        if (Named(RelocatingMethods)(Method) && NotStable())
+          return std::make_pair(EChange::Relocates, Object);
+        // Of a container whose entries stay where they are when others are
+        // added or removed (NodeStableContainers), one that doesn't remove
+        // by name keeps each entry where it is, whatever its body does,
+        // `mp_Items.f_Insert(fg_Move(Node))`, `mp_Items.f_IsEmpty()`.
+        if (Context && Collection->getAsCXXRecordDecl() && !NotStable())
+          return std::nullopt;
+        // A member function of the actor itself, not of a collection of it,
+        // `f_TidyOther()`, is told by its name and those of its own that it
+        // calls, and its body is gone through below, for the collections it
+        // changes. In the body of a member function of a collection, `this`
+        // is the collection.
+        const CObjectRelation Receiver = RelationTo(Object, IsObject);
+        if (!InBody && Receiver.Kind == EObjectRelation::SameObject)
+          return callsOwnMethod(Method, removingMethods())
+                     ? std::optional<CChange>(
+                           std::make_pair(EChange::Removes, Object))
+                     : std::nullopt;
+        // A lookup, one of CallbackLookupFunctions, `f_FindEqual`, is told by
+        // its name, whatever its body does.
+        const bool Lookup =
+            (Method->getIdentifier() &&
+             llvm::is_contained(CallbackLookupFunctions, identifierTextOf(Method))) ||
+            Method->getOverloadedOperator() == OO_Subscript;
+        // A virtual one that an override can run, of a collection, also a
+        // const one, runs a body that isn't the one seen, an unknown change,
+        // unless it is a lookup.
+        // Also an entry that holds a collection, whose override can change
+        // that.
+        const bool OfCollection =
+            Receiver.Kind != EObjectRelation::Unrelated &&
+            (IsCollection(Receiver) || changesCollection(Object->getType()));
+        // What can't be seen can end a member of a union in it too.
+        auto Unknown = [&] {
+          if (Offset && holdsUnion(Object->getType()))
+            *Offset = -1;
+          return std::make_pair(EChange::Removes, Object);
+        };
+        // An override that can run instead, whose body isn't seen, of what is
+        // reached from the object, is like one that can't be seen, which can
+        // end its object (mayEnd).
+        if (!Lookup && callsOverride(Call) &&
+            Receiver.Kind != EObjectRelation::Unrelated) {
+          if (Offset)
+            *Offset = -1;
+          return std::make_pair(EChange::Removes, Object);
+        }
+        // Nor a lookup, nor one that can't change its object whose body can't
+        // be seen; one whose body can be is gone through, it can change
+        // mutable members, or cast its constness away, `const_cast<CItems
+        // *>(this)->f_Clear()`.
+        // A call operator without one stays an unknown change, below.
+        if (Lookup ||
+            (hasConstObject(Method) &&
+             !(Method->getDefinition() && Method->getDefinition()->getBody()) &&
+             Method->getOverloadedOperator() != OO_Call))
+          return std::nullopt;
+        // Of what is reached from the object (objectRelation): the
+        // collection, also a member of it or through an alias, a reference or
+        // a pointer to it, or a cast or a conditional of it, and an entry of
+        // it, whose body is gone through as one of an entry, where only what
+        // changes a collection counts, not an update of the entry,
+        // `mp_Items[0].f_Update()`, nor a step of an iterator into it.
+        if (Receiver.Kind == EObjectRelation::Unrelated)
+          return std::nullopt;
+        const FunctionDecl *Definition = Method->getDefinition();
+        if (!Definition || !Definition->getBody())
+          return OfCollection && (Method->getOverloadedOperator() == OO_Call ||
+                                  (InBody &&
+                                   Method->getOverloadedOperator() != OO_None))
+                     ? std::optional<CChange>(Unknown())
+                     : std::nullopt;
+        if (Depth < 4)
+          if (const std::optional<int> Removed = BodyRemoves(
+                  Definition,
+                  IsCopyReceiver(Object)                     ? c_BorrowedThis
+                  : Method->isExplicitObjectMemberFunction() ? 0
+                                                             : -1,
+                  Depth + 1,
+                  (OfEntry || Receiver.Kind == EObjectRelation::Entry) &&
+                      !isCollectionType(Object->getType()),
+                  Receiver.bInUnion ||
+                      (InUnion &&
+                       (Receiver.Kind == EObjectRelation::SameObject ||
+                        Receiver.Kind == EObjectRelation::Subobject)),
+                  isPartOfObject(Object, IsObject, ObjectIsPart))) {
+            if (Offset)
+              *Offset = *Removed;
+            return std::make_pair(EChange::Removes, Object);
+          }
+        // Past the depth, what it changes can't be told: as one that can't
+        // be seen, it can end its object.
+        if (Depth >= 4) {
+          if (Offset)
+            *Offset = -1;
+          return std::make_pair(EChange::Removes, Object);
+        }
+        return std::nullopt;
+      };
+      // Whether the body of \p Definition can remove entries of the
+      // collection, its parameter \p iParameter, or `this` when it is
+      // negative, also the explicit object parameter of a member function:
+      // a member function called in it on that is told as MemberChange tells
+      // it, as if it were called in the callback, to a depth. It also
+      // changes it by assigning it, or what is reached from it, by deleting
+      // anything reached from it, by moving it, or by giving it, or what is
+      // reached from it, to any other function or constructor that can
+      // change it, which can't be told. Also in the body of any lambda it
+      // makes, called there or not.
+      // What destroying an object of \p Type, also each element of an array
+      // of them, changes through what it refers to (c_BorrowedThis), as deep
+      // as that, of its destructor's body, also the destructors of its
+      // members and bases that run after it; or of one that can't be seen,
+      // anything of what it keeps, which it can end. None when nothing runs.
+      // \p Own: also its own state, of the object analysed itself. \p
+      // OfEntry: what it keeps are entries, not collections, whose plain data
+      // its destructor can restore, `m_rValue = m_Saved`.
+      TCRecursive<std::optional<int>(QualType, int, bool, bool)> DestructionChanges = [&](QualType Type, int Depth, bool Own,
+                                   bool OfEntry) -> std::optional<int> {
+        if (Type.isNull())
+          return std::nullopt;
+        Type = Type.getNonReferenceType();
+        const CXXRecordDecl *Record =
+            Type->getBaseElementTypeUnsafe()->getAsCXXRecordDecl();
+        if (!Record || !Record->hasDefinition() ||
+            Record->hasTrivialDestructor())
+          return std::nullopt;
+        const CXXDestructorDecl *Destructor = Record->getDestructor();
+        const FunctionDecl *Body =
+            Destructor ? Destructor->getDefinition() : nullptr;
+        // One that can't be seen can end what it keeps, unless it keeps
+        // nothing but its own, independent of anything (isIndependentType),
+        // or is a collection of what destroying changes nothing of, which
+        // destroys only its storage and its elements, `TCVector<CEntry *>`.
+        if (!Body || !Body->getBody() || Depth >= 4) {
+          if (isIndependentType(Type, Record->getASTContext()))
+            return std::nullopt;
+          const auto *Specialization =
+              dyn_cast<ClassTemplateSpecializationDecl>(Record);
+          if (Specialization && Depth < 4 && isCollectionType(Type) &&
+              llvm::all_of(
+                  Specialization->getTemplateArgs().asArray(),
+                  [&](const TemplateArgument &Argument) {
+                    if (Argument.getKind() != TemplateArgument::Type)
+                      return Argument.getKind() == TemplateArgument::Integral;
+                    const QualType Element = Argument.getAsType();
+                    return Element->isPointerType() ||
+                           Element->isScalarType() ||
+                           !DestructionChanges(Element, Depth + 1, Own,
+                                               OfEntry);
+                  }))
+            return std::nullopt;
+          return std::optional<int>(-1);
+        }
+        return BodyRemoves(Body, Own ? -1 : c_BorrowedThis, Depth + 1, OfEntry,
+                           false, true);
+      };
+      // What it gives is how much deeper than the collection the shallowest
+      // of what it changes is (OffsetOf), none when it changes nothing.
+      // \p Part: whether what is analysed is part of another object where it
+      // is called on or given (isPartOfObject), which can't end itself.
+      BodyRemoves = [&](const FunctionDecl *Definition, int iParameter,
+                        int Depth, bool OfEntry, bool InUnion,
+                        bool Part) -> std::optional<int> {
+        const auto Key = std::make_tuple(Definition, iParameter, Depth,
+                                         int(OfEntry) | (int(InUnion) << 1) |
+                                             (int(Part) << 2));
+        if (const auto It = BodyRemovesMemo.find(Key);
+            It != BodyRemovesMemo.end())
+          return It->second;
+        BodyRemovesMemo[Key] = std::nullopt;
+        // Of \p iParameter -2 - n, what the parameter n points to: given the
+        // address of a local pointer, `fg_Redirect(&pItems)`, `*_ppItems` is
+        // the pointer to the object, not the object.
+        const bool Borrowed = iParameter <= c_BorrowedThis;
+        const bool ThroughParameter = iParameter <= -2 && !Borrowed;
+        const int iIndex = ThroughParameter ? -2 - iParameter
+                           : Borrowed       ? c_BorrowedThis - 1 - iParameter
+                                            : iParameter;
+        // Of what is destroyed, or a copy called on, its receiver, also an
+        // explicit object parameter (receiverOf); of a copy or a view given,
+        // that parameter (BorrowedParameter).
+        const ParmVarDecl *Parameter =
+            Borrowed && iIndex < 0 ? receiverOf(Definition)
+            : iIndex >= 0 && unsigned(iIndex) < Definition->getNumParams()
+                ? Definition->getParamDecl(iIndex)
+                : nullptr;
+        // The collection, the parameter or `this`, and what an expression is
+        // relative to it (objectRelation): the collection itself, also a
+        // member of it, `_Items.m_Index`, or through a local reference or
+        // pointer to it, `auto *pItems = &_Items`; an entry of it, `_Items[0]`,
+        // what a member function of it gives by pointer or reference,
+        // `_Items.f_FindEqual(1)`, or a local iterator made from it, `auto
+        // iEntry = _Items.f_GetIterator()`, which only what is deleted, or
+        // removes by name, counts of.
+        const CIsObject IsObject = [&](const Expr *E) {
+          if (!Parameter)
+            return isa<CXXThisExpr>(E);
+          // Of a reference to a local pointer, `CItems *&o_pItems`, the
+          // parameter is that pointer itself.
+          if (ThroughParameter && !Parameter->getType()->isReferenceType()) {
+            const auto *Deref = dyn_cast<UnaryOperator>(E);
+            if (!Deref || Deref->getOpcode() != UO_Deref)
+              return false;
+            E = Deref->getSubExpr()->IgnoreParenImpCasts();
+          }
+          const auto *Ref = dyn_cast<DeclRefExpr>(E);
+          return Ref && Ref->getDecl() == Parameter;
+        };
+        // Of what is destroyed (c_BorrowedThis), not its own state: what it
+        // holds inline, not through a pointer or a reference, nor what an
+        // owning pointer or a collection of it holds, which can be what it
+        // keeps through a wrapper, `m_pItems->f_Clear()` of a `TCPointer`
+        // made from `&mp_Items` (StoredDepth).
+        // Also what it reaches only through its members held by value and
+        // the storage it owns (isOwnedStoragePointer), `delete[] m_pData` of
+        // a copy, not through what it borrows (isBorrowedField).
+        auto OwnStorage = [&](const Expr *E) {
+          for (int Depth = 0; E && Depth < 32; ++Depth) {
+            E = E->IgnoreParenImpCasts();
+            if (IsObject(E))
+              return true;
+            if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+                Unary && (Unary->getOpcode() == UO_Deref ||
+                          Unary->getOpcode() == UO_AddrOf)) {
+              E = Unary->getSubExpr();
+              continue;
+            }
+            if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E)) {
+              E = Subscript->getBase();
+              continue;
+            }
+            const auto *Member = dyn_cast<MemberExpr>(E);
+            const auto *Field =
+                Member ? dyn_cast<FieldDecl>(Member->getMemberDecl()) : nullptr;
+            if (!Field || isBorrowedField(Field) ||
+                isSharedPointerType(Field->getType(),
+                                    Definition->getASTContext()))
+              return false;
+            E = Member->getBase();
+          }
+          return false;
+        };
+        auto Relation = [&](const Expr *E) {
+          const CObjectRelation Of = RelationTo(E, IsObject);
+          if (Borrowed &&
+              (Of.Kind == EObjectRelation::SameObject ||
+               Of.Kind == EObjectRelation::Subobject ||
+               Of.Kind == EObjectRelation::Entry) &&
+              !Of.bThroughPointer && (Of.StoredDepth == 0 || OwnStorage(E)))
+            return CObjectRelation{};
+          return Of;
+        };
+        auto Reached = [&](const Expr *E) {
+          const CObjectRelation Of = Relation(E);
+          return IsCollection(Of) || Of.Kind == EObjectRelation::Entry;
+        };
+        // Whether giving \p Given to \p Callee, for its parameter \p To, or
+        // to what isn't known when null, can change what it is reached from:
+        // not a copy, nor by a pointer or a reference to const. How much
+        // deeper than the collection what it can change is (OffsetOf): of
+        // one whose body can be seen, what that body changes of it
+        // (BodyRemoves); of one that can't be seen, what it holds, and, given
+        // a pointer or a reference to a class, also what it is given itself,
+        // which it can delete or deallocate (mayEnd).
+        // With \p Dispatched, the call can run an override of \p Callee
+        // (callsOverride), whose body isn't seen.
+        // \p Declared: the type of the parameter when there is no \p To, of
+        // a call through a pointer to a function, `g_fHook(_Entry)` of `void
+        // (*g_fHook)(CEntry &)` (argumentParameterType).
+        auto GivenChanges = [&](const Expr *Given, const FunctionDecl *Callee,
+                                const ParmVarDecl *To, bool MovedOn = false,
+                                bool Dispatched = false,
+                                std::optional<QualType> Declared =
+                                    std::nullopt) -> std::optional<int> {
+          // The address of a local pointer to it, `fg_Clear(&pItems)`, which
+          // can be followed to it.
+          const Expr *Followed = Given;
+          if (const Expr *Pointer = addressedLocalPointer(Given))
+            Followed = Pointer;
+          const CObjectRelation Of = Relation(Followed);
+          if (Of.Kind == EObjectRelation::Unrelated)
+            return std::nullopt;
+          const bool Union =
+              Of.bInUnion ||
+              (InUnion && (Of.Kind == EObjectRelation::SameObject ||
+                           Of.Kind == EObjectRelation::Subobject));
+          // Nor what isn't made of a class moved or forwarded, a number or a
+          // pointer, `fg_Move(m_Count)`, as in the callback.
+          if (MovedOn && !Given->getType()->isRecordType())
+            return std::nullopt;
+          if (To)
+            Declared = To->getType();
+          const bool Typed = Declared.has_value();
+          QualType Type = Typed ? *Declared : Given->getType();
+          // Not by value, a copy, unless the copy shares or refers to what
+          // its source does, a view or a shared owner, `fg_Clear(CView
+          // _View)` (isIndependentType).
+          const ASTContext *TypeContext = To ? &To->getASTContext() : Context;
+          const bool SharedValue =
+              Typed && TypeContext && !Type->isReferenceType() &&
+              !Type->isPointerType() && Type->isRecordType() &&
+              !isIndependentType(Type, *TypeContext);
+          if (Typed && !(Type->isReferenceType() || Type->isPointerType()) &&
+              !SharedValue)
+            return std::nullopt;
+          // Not a pointer to it moved or forwarded, `fg_Move(pSelf)`, one of
+          // MoveFunctions or ForwardFunctions, which gives the pointer, not
+          // what it points to; any other function given it by a reference,
+          // `CItems *&`, can change that.
+          if (MovedOn && Type->isReferenceType() &&
+              Type.getNonReferenceType()->isPointerType() &&
+              Given->getType()->isPointerType())
+            return std::nullopt;
+          const QualType Parameter = Type;
+          if (Type->isReferenceType() || Type->isPointerType())
+            Type = Type->getPointeeType();
+          // Of a pointer to it given by a reference, also to const, `CItems
+          // *const &`, what it points to.
+          if (Type->isPointerType() && Given->getType()->isPointerType())
+            Type = Type->getPointeeType();
+          // Not by a pointer or a reference to const, but a reference to a
+          // pointer to const, `CItems const *&`, through which what it points
+          // to can be deleted, `delete _pItems; _pItems = nullptr;`
+          // (keepsChangeable).
+          // Nor by a reference or a pointer to const, unless it is to what has
+          // borrowed parts, a view or a wrapper, `CView const &_View`, which
+          // what they lead to can be changed through.
+          const bool BorrowedConst =
+              Typed && TypeContext && !SharedValue &&
+              (Parameter->isReferenceType() || Parameter->isPointerType()) &&
+              Type->isRecordType() && !keepsChangeable(Parameter) &&
+              !Given->getType()->isPointerType() &&
+              hasBorrowedParts(Type, *TypeContext);
+          if (!SharedValue && !BorrowedConst &&
+              (Typed ? !keepsChangeable(Parameter) : Type.isConstQualified()))
+            return std::nullopt;
+          const CHeldContents Held = heldContents(Given->getType());
+          // Moved or forwarded: the collection, a collection in an entry, or
+          // the entry when it holds one, `fg_Move(*this)`, not a union, which
+          // a move doesn't end a member of.
+          if (MovedOn) {
+            if (!((IsCollection(Of) && !OfEntry) ||
+                  ((OfEntry || Of.Kind == EObjectRelation::Entry) &&
+                   (Held.bCollection || Held.bOwned))))
+              return std::nullopt;
+            return OffsetOf(Of, Followed->getType(), false);
+          }
+          // To one whose body can be seen, as deep as what that changes.
+          if (const FunctionDecl *Definition = Callee && To && !Dispatched
+                                                   ? Callee->getDefinition()
+                                                   : nullptr;
+              Definition && Definition->getBody() && Depth < 4 &&
+              To->getFunctionScopeIndex() < Definition->getNumParams()) {
+            // A local pointer given by a reference to it, `fg_Set(pItems,
+            // _Items)` of `CItems *&o_pItems`, is that pointer: pointing it
+            // elsewhere changes nothing of what it points to, like given by
+            // its address.
+            const auto *Named =
+                dyn_cast<DeclRefExpr>(Given->IgnoreParenImpCasts());
+            const auto *Local =
+                Named ? dyn_cast<VarDecl>(Named->getDecl()) : nullptr;
+            // Also the pointer analysed as such, given on by reference.
+            const bool LocalPointer =
+                Followed != Given ||
+                (((Local && Local->hasLocalStorage() &&
+                   !isa<ParmVarDecl>(Local) &&
+                   Local->getType()->isPointerType()) ||
+                  (ThroughParameter && IsObject(Given->IgnoreParenImpCasts()) &&
+                   Given->getType()->isPointerType())) &&
+                 To->getType()->isReferenceType() &&
+                 To->getType().getNonReferenceType()->isPointerType());
+            // Of a copy, or a view given to const, only what changes through
+            // its borrowed parts (BorrowedParameter).
+            const std::optional<int> Within = BodyRemoves(
+                Definition,
+                SharedValue || BorrowedConst
+                    ? BorrowedParameter(To->getFunctionScopeIndex())
+                : LocalPointer ? -2 - int(To->getFunctionScopeIndex())
+                               : int(To->getFunctionScopeIndex()),
+                Depth + 1,
+                (OfEntry || Of.Kind == EObjectRelation::Entry) &&
+                    !isCollectionType(Given->getType()),
+                Union, !LocalPointer && isPartOfObject(Given, IsObject, Part));
+            if (!Within)
+              return std::nullopt;
+            const int Base = OffsetOf(Of, QualType(), false);
+            return Base == c_Everything || *Within == c_Everything
+                       ? c_Everything
+                       : Base + *Within;
+          }
+          // Not to const to one that can't be seen, which is taken to only
+          // read it, as of what has no borrowed parts.
+          if (BorrowedConst)
+            return std::nullopt;
+          // To one that can't be seen: given a pointer, or a reference to a
+          // class, what it is given itself, which it can delete or
+          // deallocate, `fg_Delete(mp_Items[0].m_pValue)` or
+          // `free(m_Entries.f_FindEqual(0))`; else what it holds, the
+          // collection, also a collection, an owning pointer or a union in an
+          // entry (heldContents), or a member of a union.
+          if (mayEnd(Parameter))
+            return OffsetOf(Of, Followed->getType(), true);
+          if (!(Union || (IsCollection(Of) && !OfEntry) ||
+                ((OfEntry || Of.Kind == EObjectRelation::Entry) && Held.any())))
+            return std::nullopt;
+          return OffsetOf(Of, Followed->getType(),
+                          Union || holdsUnion(Followed->getType()));
+        };
+        // The shallowest of what it changes, and when that is anything.
+        std::optional<int> Removes;
+        auto Note = [&](std::optional<int> Offset) {
+          if (Offset && (!Removes || *Offset < *Removes))
+            Removes = Offset;
+        };
+        auto Done = [&] { return Removes && *Removes == c_Everything; };
+        // What an assignment of \p Target, \p Of, changes (AssignmentChanges).
+        auto Assigned = [&](const Expr *Target, const CObjectRelation &Of,
+                            bool Moved, bool Receiver) -> std::optional<int> {
+          // The pointer that is the object pointed elsewhere, `*_ppItems =
+          // &g_Other`, changes nothing of what it pointed to.
+          // Also a local pointer given by reference, `o_pItems = &_Items` of
+          // `fg_Set(pItems, _Items)`.
+          if (!Receiver && Target->getType()->isPointerType() &&
+              (ThroughParameter ? IsObject(Target->IgnoreParenImpCasts()) ||
+                                      (Of.Kind == EObjectRelation::SameObject &&
+                                       !Of.bThroughPointer)
+                                : IsObject(Target->IgnoreParenImpCasts()) &&
+                                      !aliasesGiven(Target)))
+            return std::nullopt;
+          if (!AssignmentChanges(Target, Of, OfEntry, Moved, Receiver,
+                                 Moved ? false : InUnion))
+            return std::nullopt;
+          // Replacing what holds a union by value ends a member of it.
+          return OffsetOf(
+              Of, QualType(),
+              !Moved && (Of.bInUnion ||
+                         (InUnion && (Of.Kind == EObjectRelation::SameObject ||
+                                      Of.Kind == EObjectRelation::Subobject)) ||
+                         ((Receiver || !Target->getType()->isPointerType()) &&
+                          holdsUnion(Target->getType()))));
+        };
+        // Each node once, also one that several elements of the control
+        // flow or the parts of an await share.
+        llvm::DenseSet<const Stmt *> Found;
+        TCRecursive<void(const Stmt *)> Find = [&](const Stmt *Inner) {
+          // Not what isn't evaluated, `__builtin_constant_p(&m_Count)`
+          // (hasUnevaluatedOperands), which neither changes nor gives on.
+          if (!Inner || Done() || hasUnevaluatedOperands(Inner) ||
+              !Found.insert(Inner).second)
+            return;
+          // A lambda, what it captures and its body, called or not.
+          // Of a generic one, also the bodies it is instantiated with.
+          // Of a generic one, only the bodies it is instantiated with, not
+          // its pattern, whose calls aren't resolved.
+          if (const auto *Lambda = dyn_cast<LambdaExpr>(Inner)) {
+            for (const Expr *Capture : Lambda->capture_inits())
+              Find(Capture);
+            if (const FunctionTemplateDecl *Template =
+                    Lambda->getCallOperator()->getDescribedFunctionTemplate())
+              for (const FunctionDecl *Instance : Template->specializations())
+                Find(Instance->getBody());
+            else
+              Find(Lambda->getBody());
+            return;
+          }
+          // A call that consumes its object, and also what it is given,
+          // below.
+          if (const Expr *Consumed = consumedObject(Inner))
+            Note(Assigned(Consumed, Relation(Consumed), /*Moved=*/true,
+                          /*Receiver=*/false));
+          // What lets it escape, a pointer to it kept where the body doesn't
+          // own it and the object doesn't hold it, `g_pSaved = &_Items`, also
+          // a static local made with one,
+          // through which anything can end it later, as what can't be seen
+          // can (mayEnd).
+          auto Escapes = [&](const Expr *Value) {
+            const CObjectRelation Of = Relation(Value);
+            if (Of.Kind != EObjectRelation::Unrelated && !isCopyStorage(Of))
+              Note(OffsetOf(Of, QualType(), true));
+          };
+          if (const auto *Keep = dyn_cast<BinaryOperator>(Inner);
+              Keep && Keep->getOpcode() == BO_Assign &&
+              Keep->getRHS()->getType()->isPointerType() &&
+              Relation(Keep->getLHS()).Kind == EObjectRelation::Unrelated) {
+            // Kept in a global or static, or in the object of the member
+            // function analysed for one of its parameters, also a member of
+            // either, or in what a parameter or a local refers to or points
+            // to, `_Slot.m_pItems = &_Items`, whose aliases aren't followed;
+            // not in a local itself, nor in a parameter itself, which gives
+            // it back to the caller, `_pValue = _Items.f_FindEqual(1)`, nor
+            // within the object itself, its own state, `m_pFirst =
+            // &(*this)[0]`, nor in a local array, `Batch[0] = &_Items`, nor in
+            // the object a constructor makes, `m_pItems = &_Items`, whose
+            // destructor tells what it does with it (keptByMade).
+            const Expr *Root = Keep->getLHS();
+            bool Indirect = false;
+            bool InPart = false;
+            // Through a local reference to a local, `auto &Alias = View`, or
+            // an unchanged local pointer to one, `pView->m_pItems`
+            // (addressedExpr), to where it is stored.
+            for (int Steps = 0; Root && Steps < 16; ++Steps) {
+              Root = Root->IgnoreParenImpCasts();
+              if (const auto *Alias = dyn_cast<DeclRefExpr>(Root))
+                if (const auto *Local = dyn_cast<VarDecl>(Alias->getDecl());
+                    Local && Local->hasLocalStorage() &&
+                    !isa<ParmVarDecl>(Local) &&
+                    Local->getType()->isReferenceType() && Local->getInit()) {
+                  Root = Local->getInit();
+                  continue;
+                }
+              if (const auto *Member = dyn_cast<MemberExpr>(Root);
+                  Member && Member->isArrow())
+                if (const Expr *Pointed = addressedExpr(Member->getBase())) {
+                  InPart = true;
+                  Root = Pointed;
+                  continue;
+                }
+              if (const auto *Member = dyn_cast<MemberExpr>(Root)) {
+                Indirect |=
+                    Member->isArrow() &&
+                    !isa<CXXThisExpr>(Member->getBase()->IgnoreParenImpCasts());
+                InPart = true;
+                Root = Member->getBase();
+              } else if (const auto *Subscript =
+                             dyn_cast<ArraySubscriptExpr>(Root)) {
+                Indirect |= !Subscript->getBase()
+                                 ->IgnoreParenImpCasts()
+                                 ->getType()
+                                 ->isArrayType();
+                InPart = true;
+                Root = Subscript->getBase();
+              } else if (const auto *Deref = dyn_cast<UnaryOperator>(Root);
+                         Deref && Deref->getOpcode() == UO_Deref) {
+                Indirect = true;
+                InPart = true;
+                Root = Deref->getSubExpr();
+              } else
+                break;
+            }
+            const auto *Ref = Root ? dyn_cast<DeclRefExpr>(Root) : nullptr;
+            const auto *Variable =
+                Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+            if ((Variable && !Variable->hasLocalStorage()) ||
+                (Parameter && Root && isa<CXXThisExpr>(Root) &&
+                 !isa<CXXConstructorDecl>(Definition)) ||
+                Indirect ||
+                (Variable && InPart && Variable->getType()->isReferenceType()))
+              Escapes(Keep->getRHS());
+          }
+          if (const auto *Declaration = dyn_cast<DeclStmt>(Inner))
+            for (const Decl *Declared : Declaration->decls())
+              if (const auto *Kept = dyn_cast<VarDecl>(Declared);
+                  Kept && !Kept->hasLocalStorage() && Kept->getInit() &&
+                  (Kept->getType()->isPointerType() ||
+                   Kept->getType()->isReferenceType()))
+                Escapes(Kept->getInit());
+          // A constructor inherited, `using CBase::CBase;`, runs the one it
+          // inherits, given what it is given as it is: of the object, or of a
+          // parameter, the same one of that, as deep as its body changes;
+          // one that can't be seen, given a parameter it can change, can end
+          // it (mayEnd).
+          if (const auto *Inherited = dyn_cast<CXXInheritedCtorInitExpr>(Inner);
+              Inherited && Inherited->getConstructor()) {
+            const CXXConstructorDecl *Base = Inherited->getConstructor();
+            const FunctionDecl *Definition = Base->getDefinition();
+            const ParmVarDecl *Given =
+                Parameter && unsigned(iIndex) < Base->getNumParams()
+                    ? Base->getParamDecl(iIndex)
+                    : nullptr;
+            if (!Parameter || Given) {
+              if (Definition && Definition->getBody() && Depth < 4)
+                Note(BodyRemoves(Definition, iParameter, Depth + 1, OfEntry,
+                                 InUnion, Part));
+              else if (Given && keepsChangeable(Given->getType()))
+                Note(mayEnd(Given->getType()) ? -1 : 0);
+            }
+          }
+          // What writes besides assignments and calls: inline assembly, its
+          // outputs and the pointers it is given, which it can write through
+          // or end, and an atomic operation other than a load, through the
+          // pointer it is given.
+          if (const auto *Asm = dyn_cast<GCCAsmStmt>(Inner)) {
+            for (const Expr *Output : Asm->outputs())
+              if (const CObjectRelation Of = Relation(Output);
+                  Of.Kind != EObjectRelation::Unrelated)
+                Note(OffsetOf(Of, QualType(), true));
+            for (const Expr *Input : Asm->inputs())
+              if (const CObjectRelation Of = Relation(Input);
+                  Of.Kind != EObjectRelation::Unrelated &&
+                  Input->getType()->isPointerType())
+                Note(OffsetOf(Of, QualType(), true));
+          } else if (isa<MSAsmStmt>(Inner))
+            Note(-1);
+          if (const auto *Atomic = dyn_cast<AtomicExpr>(Inner);
+              Atomic && Atomic->getOp() != AtomicExpr::AO__atomic_load &&
+              Atomic->getOp() != AtomicExpr::AO__atomic_load_n &&
+              Atomic->getOp() != AtomicExpr::AO__c11_atomic_load)
+            if (const CObjectRelation Of = Relation(Atomic->getPtr());
+                Of.Kind != EObjectRelation::Unrelated)
+              Note(OffsetOf(Of, QualType(), false));
+          // Deleting what is reached from it, anything of it, as in the
+          // callback. Not a write into a local, `View.m_pItems = &_Items` or
+          // `Batch[0] = ...`, which is none of the object, though what it
+          // holds can refer to it (isLocalStorage).
+          if (const auto *Assign = dyn_cast<BinaryOperator>(Inner);
+              Assign && Assign->isAssignmentOp()) {
+            if (!isLocalStorage(Assign->getLHS()))
+              Note(Assigned(Assign->getLHS(), Relation(Assign->getLHS()),
+                            /*Moved=*/false, /*Receiver=*/false));
+          } else if (const auto *Delete = dyn_cast<CXXDeleteExpr>(Inner);
+                     Delete && Reached(Delete->getArgument()))
+            Note(c_Everything);
+          // Moving it, cast to an rvalue reference, or the object of a
+          // member function qualified `&&`, `f_GetIteratorDestructive() &&`,
+          // which empties it; given to `fg_Move` it is given on, below.
+          // Of the collection, not of a pointer to it, `fg_Move(_pItems)`.
+          else if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Inner);
+                   Cast && Cast->getTypeAsWritten()->isRValueReferenceType() &&
+                   Cast->getSubExpr()->getType()->isRecordType())
+            Note(Assigned(Cast->getSubExpr(), Relation(Cast->getSubExpr()),
+                          /*Moved=*/true, /*Receiver=*/false));
+          else if (const auto *Construct = dyn_cast<CXXConstructExpr>(Inner)) {
+            const CXXConstructorDecl *Constructor =
+                Construct->getConstructor();
+            for (unsigned iArgument = 0;
+                 iArgument < Construct->getNumArgs() && !Done(); ++iArgument)
+              Note(GivenChanges(Construct->getArg(iArgument), Constructor,
+                                Constructor &&
+                                        iArgument < Constructor->getNumParams()
+                                    ? Constructor->getParamDecl(iArgument)
+                                    : nullptr));
+          } else if (const auto *Call = dyn_cast<CallExpr>(Inner)) {
+            const FunctionDecl *Callee = Call->getDirectCallee();
+            const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Callee);
+            // A member function called on it, told as in the callback; its
+            // object, also the first argument of one with an explicit object
+            // parameter or of a member operator, isn't given on.
+            // Also the object written for a static member operator,
+            // `CRemover{}(_Items, 0)`, which isn't one of its parameters.
+            const unsigned FirstGiven =
+                !isa<CXXMemberCallExpr>(Call) && Call->getNumArgs() >= 1 &&
+                        Method &&
+                        (Method->isExplicitObjectMemberFunction() ||
+                         isa<CXXOperatorCallExpr>(Call))
+                    ? 1
+                    : 0;
+            // Of what is destroyed (c_BorrowedThis), a member function called
+            // on it or on what it holds inline, `~CGuard() { f_Cleanup(); }`:
+            // what that changes through what it refers to, as the destructor
+            // itself; one that can't be seen can end what it keeps.
+            const Expr *Receiver = nullptr;
+            if (Borrowed && Method && !Method->isStatic() &&
+                !isa<CXXDestructorDecl>(Method)) {
+              if (const CMemberCall Member = memberCallOf(Call))
+                Receiver = Member->getImplicitObjectArgument();
+              else if (FirstGiven == 1)
+                Receiver = Call->getArg(0);
+            }
+            if (Receiver) {
+              const CObjectRelation Of = RelationTo(Receiver, IsObject);
+              const FunctionDecl *Definition =
+                  callsOverride(Call) ? nullptr : Method->getDefinition();
+              // Of what it holds inline, only one whose body can be seen, the
+              // rest is its own state.
+              if ((Of.Kind == EObjectRelation::SameObject ||
+                   Of.Kind == EObjectRelation::Subobject) &&
+                  !Of.bThroughPointer && Of.StoredDepth == 0) {
+                if (Definition && Definition->getBody())
+                  Note(Depth < 4 ? BodyRemoves(Definition, c_BorrowedThis,
+                                               Depth + 1, false, false, true)
+                                 : std::optional<int>(-1));
+                else if (Of.Kind == EObjectRelation::SameObject)
+                  Note(-1);
+              }
+            }
+            // Removing by name also of an entry, `iEntry.f_Remove()`, what
+            // it is called on, and as much deeper as its body removes.
+            int Within = 0;
+            if (const auto Change =
+                    MemberChange(Call, Depth, true, OfEntry, IsObject, InUnion,
+                                 &Within, Part)) {
+              const CObjectRelation Of = Relation(Change->second);
+              if (Change->first == EChange::Assigns)
+                Note(Assigned(Change->second, Of, /*Moved=*/false,
+                              /*Receiver=*/true));
+              else if (Reached(Change->second)) {
+                const int Base = OffsetOf(Of, Change->second->getType(), false);
+                Note(Base == c_Everything || Within == c_Everything
+                         ? c_Everything
+                         : Base + Within);
+              }
+            }
+            // The other arguments, given on to what can't be told.
+            const unsigned Offset = argumentShift(Call, Method);
+            const bool MovedOn =
+                !isMemberOrOperatorCall(Call) &&
+                (isMoveFunction(calleeName(Call)) ||
+                 isForwardFunction(calleeName(Call)));
+            for (unsigned iArgument = FirstGiven;
+                 iArgument < Call->getNumArgs() && !Done(); ++iArgument)
+              Note(GivenChanges(
+                  Call->getArg(iArgument), Callee,
+                  Callee && iArgument >= Offset &&
+                          iArgument - Offset < Callee->getNumParams()
+                      ? Callee->getParamDecl(iArgument - Offset)
+                      : nullptr,
+                  MovedOn, callsOverride(Call),
+                  Callee ? std::nullopt
+                         : argumentParameterType(Call, iArgument)));
+          }
+          for (const Stmt *Child : Children(Inner))
+            Find(Child);
+        };
+        // What destroying an object of \p Type changes of what it was made
+        // from and keeps, \p Kept (keptByMade): its destructor's body, also
+        // the destructors of its members and bases that run after it, as
+        // deep as that changes of what it holds; one that can't be seen can
+        // end what it holds.
+        auto Destroyed = [&](QualType Type, llvm::ArrayRef<const Expr *> Kept) {
+          llvm::SmallVector<CObjectRelation, 4> Related;
+          for (const Expr *Made : Kept)
+            if (const CObjectRelation Of = Relation(Made);
+                Of.Kind != EObjectRelation::Unrelated)
+              Related.push_back(Of);
+          if (Related.empty())
+            return;
+          const std::optional<int> Within = DestructionChanges(
+              Type, Depth, false, keepsOnlyEntries(Kept, Related));
+          if (!Within)
+            return;
+          for (const CObjectRelation &Of : Related) {
+            const int Base = OffsetOf(Of, QualType(), false);
+            Note(Base == c_Everything || *Within == c_Everything
+                     ? c_Everything
+                     : Base + *Within);
+          }
+        };
+        // Of the object itself, `this` in its destructor, a member or a base
+        // destroyed after the body, which is in it.
+        // Not a shared owner of what is destroyed (c_BorrowedThis), which it
+        // holds as a copy of what it keeps, whose source owns what it points
+        // to still (destroysOnlySharedCopy): what its destructor changes
+        // through it counts, its release doesn't.
+        auto PartDestroyed = [&](QualType Type) {
+          if (Parameter || (Borrowed && isSharedPointerType(
+                                            Type, Definition->getASTContext())))
+            return;
+          if (const std::optional<int> Within =
+                  DestructionChanges(Type, Depth, !Borrowed, false))
+            Note(*Within);
+        };
+        // Everything that runs, as the control flow lists it: the statements
+        // of its body, the member and base initializers of a constructor, the
+        // allocation of `new`, and what runs implicitly, the destructors of
+        // locals, temporaries, members and bases and the cleanup functions of
+        // variables; each call there told the same way, its body when it can
+        // be seen, else as what can't be (GivenChanges, Destroyed).
+        // Also what runs where an exception is caught (addExceptionEdges).
+        CFG::BuildOptions Options;
+        Options.AddInitializers = true;
+        Options.AddImplicitDtors = true;
+        Options.AddTemporaryDtors = true;
+        Options.AddLifetime = true;
+        Options.AddScopes = true;
+        Options.AddLoopExit = true;
+        Options.AddCXXNewAllocator = true;
+        Options.AddCXXDefaultInitExprInCtors = true;
+        ASTContext &DefinitionContext = Definition->getASTContext();
+        const std::unique_ptr<CFG> Graph = buildGraph(
+            Definition, Definition->getBody(), DefinitionContext, Options);
+        if (Graph)
+          addExceptionEdges(*Graph, DefinitionContext);
+        if (!Graph) {
+          // Its control flow can't be built: what is written, also the
+          // initializers, and then anything.
+          if (const auto *Constructor =
+                  dyn_cast<CXXConstructorDecl>(Definition))
+            for (const CXXCtorInitializer *Initializer : Constructor->inits())
+              Find(Initializer->getInit());
+          Find(Definition->getBody());
+          Note(-1);
+        } else {
+          const llvm::BitVector Reachable = reachableBlocks(*Graph);
+          // What the control flow lists of an operand that isn't evaluated,
+          // `noexcept(f_Clear())` (hasUnevaluatedOperands), doesn't run.
+          // Each node once in each state, though the parts of an await
+          // share their operand (childrenOnce).
+          llvm::DenseSet<const Stmt *> Unevaluated;
+          llvm::DenseSet<std::pair<const Stmt *, int>> Marked;
+          TCRecursive<void(const Stmt *, bool)> Mark = [&](const Stmt *S,
+                                                             bool Inside) {
+            if (!S || !Marked.insert({S, Inside ? 1 : 0}).second)
+              return;
+            if (Inside)
+              Unevaluated.insert(S);
+            const bool Operands = Inside || hasUnevaluatedOperands(S);
+            for (const Stmt *Child : childrenOnce(S))
+              Mark(Child, Operands);
+          };
+          Mark(Definition->getBody(), false);
+          if (const auto *Constructor =
+                  dyn_cast<CXXConstructorDecl>(Definition))
+            for (const CXXCtorInitializer *Initializer : Constructor->inits())
+              Mark(Initializer->getInit(), false);
+          for (const CFGBlock *Block : *Graph) {
+            if (!Block || !Reachable.test(Block->getBlockID()))
+              continue;
+            for (const CFGElement &Element : *Block) {
+              if (Done())
+                break;
+              switch (Element.getKind()) {
+              case CFGElement::Statement:
+              case CFGElement::Constructor:
+              case CFGElement::CXXRecordTypedCall:
+                if (!Unevaluated.contains(Element.castAs<CFGStmt>().getStmt()))
+                  Find(Element.castAs<CFGStmt>().getStmt());
+                break;
+              case CFGElement::Initializer:
+                Find(Element.castAs<CFGInitializer>()
+                         .getInitializer()
+                         ->getInit());
+                break;
+              case CFGElement::NewAllocator:
+                // The placement arguments given to the allocation function.
+                if (const CXXNewExpr *New =
+                        Element.castAs<CFGNewAllocator>().getAllocatorExpr()) {
+                  const FunctionDecl *Allocator = New->getOperatorNew();
+                  for (unsigned iArgument = 0;
+                       iArgument < New->getNumPlacementArgs() && !Done();
+                       ++iArgument)
+                    Note(GivenChanges(
+                        New->getPlacementArg(iArgument), Allocator,
+                        Allocator && iArgument + 1 < Allocator->getNumParams()
+                            ? Allocator->getParamDecl(iArgument + 1)
+                            : nullptr));
+                }
+                break;
+              case CFGElement::AutomaticObjectDtor: {
+                const VarDecl *Variable =
+                    Element.castAs<CFGAutomaticObjDtor>().getVarDecl();
+                if (destroysOnlySharedCopy(Variable->getType(),
+                                           Variable->getInit(), Variable,
+                                           Definition->getBody()))
+                  break;
+                llvm::SmallVector<const Expr *, 4> Kept =
+                    keptByMade(Variable->getInit());
+                llvm::append_range(Kept,
+                                   keptLater(Variable, Definition->getBody()));
+                Destroyed(Variable->getType(), Kept);
+                break;
+              }
+              case CFGElement::TemporaryDtor: {
+                const CXXBindTemporaryExpr *Temporary =
+                    Element.castAs<CFGTemporaryDtor>().getBindTemporaryExpr();
+                if (!destroysOnlySharedCopy(Temporary->getType(),
+                                            Temporary->getSubExpr(), nullptr,
+                                            nullptr))
+                  Destroyed(Temporary->getType(),
+                            keptByMade(Temporary->getSubExpr()));
+                break;
+              }
+              case CFGElement::MemberDtor:
+                PartDestroyed(
+                    Element.castAs<CFGMemberDtor>().getFieldDecl()->getType());
+                break;
+              case CFGElement::BaseDtor:
+                PartDestroyed(Element.castAs<CFGBaseDtor>()
+                                  .getBaseSpecifier()
+                                  ->getType());
+                break;
+              case CFGElement::DeleteDtor:
+                // The delete itself, a statement, is told with it.
+                break;
+              case CFGElement::CleanupFunction: {
+                // `__attribute__((cleanup(fg_Free)))` gives the address of
+                // the variable to the function where its scope ends: what
+                // it holds then, any value it is given, its initializer or
+                // what it is assigned. Of a pointer, the function's object is
+                // what the address it is given points to, the pointer, so
+                // pointing that elsewhere changes nothing of what it pointed
+                // to.
+                const auto Cleanup = Element.castAs<CFGCleanupFunction>();
+                const VarDecl *Variable = Cleanup.getVarDecl();
+                const FunctionDecl *Function = Cleanup.getFunctionDecl();
+                // Any value it can hold at an exit that reaches the
+                // cleanup: its initializer and each value it is assigned,
+                // also one a later exit doesn't see, `if (bEarly) return;`.
+                llvm::SmallVector<const Expr *, 4> Values;
+                if (Variable->getInit())
+                  Values.push_back(Variable->getInit());
+                TCRecursive<void(const Stmt *)> Assigned =
+                    [&](const Stmt *S) {
+                      if (!S)
+                        return;
+                      if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+                          Assign && Assign->getOpcode() == BO_Assign)
+                        if (const auto *Target = dyn_cast<DeclRefExpr>(
+                                Assign->getLHS()->IgnoreParenImpCasts());
+                            Target && Target->getDecl() == Variable)
+                          Values.push_back(Assign->getRHS());
+                      for (const Stmt *Child : keptChildren(S))
+                        Assigned(Child);
+                    };
+                Assigned(Definition->getBody());
+                llvm::SmallVector<CObjectRelation, 4> Related;
+                for (const Expr *Value : Values)
+                  if (const CObjectRelation Of = Relation(Value);
+                      Of.Kind != EObjectRelation::Unrelated)
+                    Related.push_back(Of);
+                if (Related.empty())
+                  break;
+                const FunctionDecl *Body =
+                    Function ? Function->getDefinition() : nullptr;
+                const bool Pointer = Variable->getType()->isPointerType();
+                const std::optional<int> Within =
+                    Body && Body->getBody() && Depth < 4 &&
+                            Body->getNumParams() >= 1
+                        ? BodyRemoves(Body, Pointer ? -2 : 0, Depth + 1, false,
+                                      false, true)
+                        : std::optional<int>(-1);
+                if (Within)
+                  for (const CObjectRelation &Of : Related) {
+                    const int Base = OffsetOf(Of, QualType(), false);
+                    Note(Base == c_Everything || *Within == c_Everything
+                             ? c_Everything
+                             : Base + *Within);
+                  }
+                break;
+              }
+              case CFGElement::LifetimeEnds:
+              case CFGElement::LoopExit:
+              case CFGElement::FullExprCleanup:
+              case CFGElement::ScopeBegin:
+              case CFGElement::ScopeEnd:
+                break;
+              }
+            }
+          }
+        }
+        BodyRemovesMemo[Key] = Removes;
+        return Removes;
+      };
+      // How deep what a change of \p Relation, of \p Type, changes is: of an
+      // entry, a collection in it or what it holds, as deep as what it is
+      // stored at, of a value made from what it is in, like a view,
+      // `mp_Items.f_View().f_Remove(1)`, what it is made from (StoredDepth),
+      // of an iterator, the collection it is in, and of a member of a union
+      // in it, or of one that has a union in it, the entry itself, which that
+      // can end the member of.
+      // Of an offset (OffsetOf) of what is changed and how much deeper than
+      // that what it changes is, \p Within, the depth of what is changed.
+      auto Deeper = [&](int Offset, int Within) {
+        if (Offset == c_Everything || Within == c_Everything ||
+            Offset + Within <= 0)
+          return 0u;
+        return unsigned(Offset + Within);
+      };
+      // \p Within: how much deeper than that what it changes is, as the
+      // body of what changes it tells (BodyRemoves).
+      auto DepthOf = [&](const CObjectRelation &Relation, QualType Type,
+                         int Within = 0) {
+        return Deeper(
+            OffsetOf(Relation, Type, Relation.bInUnion || holdsUnion(Type)),
+            Within);
+      };
+      const auto *Explicit = dyn_cast_or_null<CXXMethodDecl>(
+          isa<CallExpr>(S) ? cast<CallExpr>(S)->getDirectCallee() : nullptr);
+      if (Explicit && !Explicit->isExplicitObjectMemberFunction())
+        Explicit = nullptr;
+      // Also the arguments of a member operator after its object, like
+      // those of a call operator of what consumes itself, `CWorker{}(
+      // mp_Items)`, and of a free operator.
+      const auto *Operator = dyn_cast_or_null<CXXMethodDecl>(
+          isa<CXXOperatorCallExpr>(S) ? cast<CallExpr>(S)->getDirectCallee()
+                                      : nullptr);
+      const unsigned Shift = Operator && !Explicit ? 1 : 0;
+      // What giving \p Given to \p Callee, a function, a constructor or a
+      // destructor, for its parameter \p iParameter, or, when negative, as
+      // what its object keeps (keptByMade), can change, as in a helper's
+      // body: its body, as deep as that changes, unless an override can run
+      // instead, \p Dispatched (callsOverride), or one that can't be seen.
+      auto GivenTo = [&](const FunctionDecl *Callee, const Expr *Given,
+                         int iParameter, bool Dispatched) {
+        const QualType Type =
+            iParameter >= 0 && unsigned(iParameter) < Callee->getNumParams()
+                ? Callee->getParamDecl(iParameter)->getType()
+                : Given->getType();
+        // Not by value, nor by a pointer or a reference to const, also of a
+        // pointer whose pointee is, but what a const pointer by reference
+        // points to, `CItems *const &` (keepsChangeable). Except, to one
+        // whose body can be seen, a view or a wrapper, what has borrowed
+        // parts, `fg_Clear(CView _View)` or `CView const &`, which what they
+        // lead to can be changed through: as by a copy (BorrowedParameter).
+        QualType Held = Type.getNonReferenceType();
+        if (Held->isPointerType())
+          Held = Held->getPointeeType();
+        const bool BorrowedGiven =
+            iParameter >= 0 && !keepsChangeable(Type) &&
+            !Given->getType()->isPointerType() && Held->isRecordType() &&
+            !Dispatched && Callee->getDefinition() &&
+            Callee->getDefinition()->getBody() &&
+            hasBorrowedParts(Held, Callee->getASTContext());
+        if (iParameter >= 0 && !keepsChangeable(Type) && !BorrowedGiven)
+          return;
+        // A collection of the object, also a member of one, or an entry
+        // of one, also a collection in it, counted against the outermost
+        // member, not the object itself or another object.
+        // Also the address of a local pointer to it, `fg_Clear(&pItems)`,
+        // which the helper can follow to it.
+        const Expr *Argument = Given;
+        bool AddressOfLocal = false;
+        if (const Expr *Pointer = addressedLocalPointer(Argument)) {
+          Argument = Pointer;
+          AddressOfLocal = true;
+        }
+        const CObjectRelation Of = RelationTo(Argument, IsActor);
+        const FieldDecl *Field =
+            (Of.Kind == EObjectRelation::Subobject ||
+             Of.Kind == EObjectRelation::Entry) &&
+                    Of.Outermost
+                ? dyn_cast<FieldDecl>(Of.Outermost->getMemberDecl())
+                : nullptr;
+        const FunctionDecl *Definition =
+            Dispatched ? nullptr : Callee->getDefinition();
+        // A local pointer given by a reference to it, `fg_Set(pItems,
+        // Local)` of `CItems *&o_pItems`, is that pointer, as by its
+        // address.
+        const bool LocalByReference =
+            iParameter >= 0 && !AddressOfLocal && Type->isReferenceType() &&
+            Type.getNonReferenceType()->isPointerType() && [&] {
+              const auto *Ref = dyn_cast<DeclRefExpr>(Argument->IgnoreParens());
+              const auto *Local =
+                  Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+              return Local && Local->hasLocalStorage() &&
+                     Local->getType()->isPointerType();
+            }();
+        // Of the address of a local pointer, or of one by reference, what
+        // the parameter points to, or is, is the pointer, and what that
+        // points to the object.
+        const int iObject = iParameter < 0 ? -1
+                            : AddressOfLocal || LocalByReference
+                                ? -2 - iParameter
+                                : iParameter;
+        // What can't be told, like what an accessor that can give the
+        // collection or another gives, `mp_Items.f_Select(bOwn)`, or a local
+        // pointer whose address is taken, `fg_Clear(&pItems)`, also the
+        // object itself, given to one that can't be seen or whose body
+        // changes it, can remove anything; as an entry, not a collection,
+        // when it isn't one, `fg_Refresh(pEntry)` by `CEntry *&`. Not a
+        // local pointer, by its address or by a reference to it, given to
+        // one that can't be seen, which looks it up again, as in the
+        // callback, `m_pRefresher->f_Refresh(pEntry)`.
+        if (!Field) {
+          if (Of.Kind != EObjectRelation::Unknown &&
+              Of.Kind != EObjectRelation::SameObject)
+            return;
+          if (!Definition || !Definition->getBody()) {
+            if (!AddressOfLocal && !LocalByReference)
+              Removals.bUnknown = true;
+            return;
+          }
+          const std::optional<int> Within = BodyRemoves(
+              Definition,
+              BorrowedGiven ? BorrowedParameter(iParameter) : iObject, 0,
+              iParameter >= 0 && !AddressOfLocal && !LocalByReference &&
+                  !isCollectionType(Given->getType()),
+              Of.bInUnion,
+              !AddressOfLocal && !LocalByReference && isPartOfObject(Given));
+          if (!Within)
+            return;
+          // Of the object itself given to a helper that only names its
+          // members, `_pThis->mp_Other.f_Clear()` of `fg_ClearOther(this)`,
+          // only those members (fieldsNamedThrough).
+          if (Of.Kind == EObjectRelation::SameObject && iParameter >= 0 &&
+              !AddressOfLocal && !LocalByReference &&
+              unsigned(iParameter) < Definition->getNumParams())
+            if (const std::optional<llvm::SmallVector<const FieldDecl *, 4>>
+                    Fields = fieldsNamedThrough(
+                        Definition->getBody(),
+                        Definition->getParamDecl(iParameter))) {
+              for (const FieldDecl *Named : *Fields)
+                Removals.add(Named, Deeper(0, *Within));
+              return;
+            }
+          Removals.bUnknown = true;
+          return;
+        }
+        // Of what is in an entry, also a collection in it, a change of
+        // what the entry holds, not a removal of the entry, unless it is
+        // in a union or has one in it, which can end the entry's other
+        // member (DepthOf), or the helper can't be seen and can end what
+        // it is given, a pointer or a reference to a class (mayEnd); with
+        // a body, as deep as what that changes.
+        if (!Definition || !Definition->getBody()) {
+          Removals.add(Field, iParameter < 0 || mayEnd(Type)
+                                  ? Deeper(OffsetOf(Of, QualType(), true), 0)
+                                  : DepthOf(Of, Given->getType()));
+          return;
+        }
+        if (const std::optional<int> Within = BodyRemoves(
+                Definition,
+                BorrowedGiven ? BorrowedParameter(iParameter) : iObject, 0,
+                iParameter >= 0 && Of.Kind == EObjectRelation::Entry &&
+                    !isCollectionType(Given->getType()),
+                iParameter >= 0 && Of.bInUnion,
+                !AddressOfLocal && !LocalByReference && isPartOfObject(Given)))
+          Removals.add(Field, Deeper(OffsetOf(Of, QualType(), false), *Within));
+      };
+      // Also the arguments of a member function, `Processor.f_Apply(
+      // mp_Items)`, which are its parameters as they are.
+      if (const auto *Helper = dyn_cast<CallExpr>(S))
+        if (const FunctionDecl *Callee = Helper->getDirectCallee())
+          for (unsigned iArgument = Explicit || Operator ? 1 : 0;
+               iArgument < Helper->getNumArgs() &&
+               iArgument - Shift < Callee->getNumParams();
+               ++iArgument)
+            GivenTo(Callee, Helper->getArg(iArgument), int(iArgument - Shift),
+                    callsOverride(Helper));
+      // What a constructor is given, `CReset Reset(mp_Items)`, which also
+      // runs its initializers.
+      if (const auto *Construct = dyn_cast<CXXConstructExpr>(S))
+        if (const CXXConstructorDecl *Constructor = Construct->getConstructor())
+          for (unsigned iArgument = 0; iArgument < Construct->getNumArgs() &&
+                                       iArgument < Constructor->getNumParams();
+               ++iArgument)
+            GivenTo(Constructor, Construct->getArg(iArgument), int(iArgument),
+                    false);
+      // What the destructor of a local or a temporary made here runs where
+      // it goes, of what it was made from and keeps (keptByMade),
+      // `CClearOnExit Cleanup{mp_Items}`.
+      // What it changes through what it refers to (DestructionChanges)
+      // counts of each value it keeps, as deep as that, with no telling
+      // which member keeps which.
+      // Also what a local is given after it is made (keptLater).
+      auto Destroyed = [&](QualType Type, const Expr *Made,
+                           const VarDecl *Local) {
+        if (destroysOnlySharedCopy(Type, Made, Local, Body))
+          return;
+        llvm::SmallVector<const Expr *, 4> Values = keptByMade(Made);
+        if (Local)
+          llvm::append_range(Values, keptLater(Local, Body));
+        llvm::SmallVector<const Expr *, 4> Kept;
+        llvm::SmallVector<CObjectRelation, 4> Related;
+        for (const Expr *Value : Values)
+          if (const CObjectRelation Of = RelationTo(Value, IsActor);
+              Of.Kind != EObjectRelation::Unrelated) {
+            Kept.push_back(Value);
+            Related.push_back(Of);
+          }
+        if (Related.empty())
+          return;
+        const std::optional<int> Within =
+            DestructionChanges(Type, 0, false, keepsOnlyEntries(Kept, Related));
+        if (!Within)
+          return;
+        for (const CObjectRelation &Of : Related) {
+          const FieldDecl *Field =
+              (Of.Kind == EObjectRelation::Subobject ||
+               Of.Kind == EObjectRelation::Entry) &&
+                      Of.Outermost
+                  ? dyn_cast<FieldDecl>(Of.Outermost->getMemberDecl())
+                  : nullptr;
+          if (!Field) {
+            Removals.bUnknown = true;
+            return;
+          }
+          Removals.add(Field, Deeper(OffsetOf(Of, QualType(), false), *Within));
+        }
+      };
+      // A local, also an array, whose destructor runs where its scope ends;
+      // a temporary, also one whose life a reference extends, is told where
+      // it is made, below.
+      if (const auto *Declaration = dyn_cast<DeclStmt>(S))
+        for (const Decl *Declared : Declaration->decls())
+          if (const auto *Local = dyn_cast<VarDecl>(Declared);
+              Local && Local->hasLocalStorage() && Local->getInit() &&
+              !Local->getType()->isReferenceType())
+            Destroyed(Local->getType(), Local->getInit(), Local);
+      if (const auto *Temporary = dyn_cast<CXXBindTemporaryExpr>(S))
+        Destroyed(Temporary->getType(), Temporary->getSubExpr(), nullptr);
+
+      // Also through a local iterator into it, `auto iEntry =
+      // mp_Items.f_GetIterator(1); iEntry.f_Remove();`, what it was made
+      // from, or anything when it is changed.
+      auto RemovedFrom = [&](const Expr *Object) -> const Expr * {
+        const auto *Ref = dyn_cast<DeclRefExpr>(Object->IgnoreParenImpCasts());
+        const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+        if (!Local || !Local->hasLocalStorage() || isa<ParmVarDecl>(Local) ||
+            !isIteratorType(Local->getType().getNonReferenceType()) ||
+            !Local->getInit())
+          return Object;
+        if (const Expr *Value = assignedValueAt(Local, Ref))
+          return Value;
+        Removals.bUnknown = true;
+        return Object;
+      };
+      // A member function called on a collection of the data that changes
+      // it, as MemberChange tells, the same as in a helper's body: one that
+      // removes, also through a local iterator into it, or one that moves the
+      // entries of what doesn't keep them where they are.
+      // Of what objectRelation tells of an expression relative to the actor,
+      // \p Kinds, the collection it is a member of, or anything when it is
+      // the actor itself or can't be told.
+      // \p Depth: what is changed is in the collection that deep, 0 for a
+      // collection of the actor itself, or for an entry, what it holds;
+      // deeper by what the body of what changes it tells, like a member
+      // function of the collection that changes only what an entry holds.
+      auto Record = [&](const CObjectRelation &Relation,
+                        std::initializer_list<EObjectRelation> Kinds,
+                        unsigned Depth = 0) {
+        if (Relation.Kind == EObjectRelation::Unrelated)
+          return false;
+        if (Relation.Kind == EObjectRelation::SameObject ||
+            Relation.Kind == EObjectRelation::Unknown) {
+          Removals.bUnknown = true;
+          return true;
+        }
+        if (!llvm::is_contained(Kinds, Relation.Kind))
+          return false;
+        if (const auto *Field =
+                Relation.Outermost
+                    ? dyn_cast<FieldDecl>(Relation.Outermost->getMemberDecl())
+                    : nullptr)
+          Removals.add(Field, Depth);
+        else
+          Removals.bUnknown = true;
+        return true;
+      };
+      int Within = 0;
+      const auto Change =
+          MemberChange(S, 0, false, false, IsActor, false, &Within);
+      const CObjectRelation RemovedOf =
+          Change && Change->first == EChange::Removes
+              ? RelationTo(RemovedFrom(Change->second), IsActor)
+              : CObjectRelation{};
+      const bool Removed =
+          Change && Change->first == EChange::Removes &&
+          Record(RemovedOf,
+                 {EObjectRelation::Subobject, EObjectRelation::Entry},
+                 Deeper(OffsetOf(RemovedOf, Change->second->getType(), false),
+                        Within));
+      if (!Removed) {
+        if (Change && Change->first == EChange::Relocates) {
+          const CObjectRelation Relocated = RelationTo(Change->second, IsActor);
+          Record(Relocated,
+                 {EObjectRelation::Subobject, EObjectRelation::Entry},
+                 DepthOf(Relocated, QualType()));
+        }
+        if (const CMemberCall Own = memberCallOf(S);
+            Own && Own->getMethodDecl() && Own->getImplicitObjectArgument() &&
+            objectRelation(Own->getImplicitObjectArgument(), IsActor,
+                           &Own->getMethodDecl()->getASTContext())
+                    .Kind ==
+                EObjectRelation::SameObject) {
+          // On the object, also through an unchanged local pointer to it,
+          // `pThis->f_Tidy()`, and any override of a virtual one.
+          for (const CXXMethodDecl *Method : dispatchedMethods(Own)) {
+            const FunctionDecl *Definition = nullptr;
+            if (Method->hasBody(Definition) && Definition) {
+              if (Visited.insert(Definition->getBody()).second)
+                Visit(Definition->getBody());
+            } else if (!hasConstObject(Method) && !Method->isStatic())
+              Removals.bUnknown = true;
+          }
+        } else if (const auto *Invoke = dyn_cast<CXXOperatorCallExpr>(S);
+                   Invoke && Invoke->getOperator() == OO_Call &&
+                   Invoke->getNumArgs() >= 1) {
+          // Of a generic one, the body it is instantiated with for the call.
+          if (const LambdaExpr *Lambda = calledLambda(Invoke->getArg(0))) {
+            const FunctionDecl *Called = Invoke->getDirectCallee();
+            const Stmt *Body = Called && Called->getBody() ? Called->getBody()
+                                                           : Lambda->getBody();
+            if (Visited.insert(Body).second)
+              Visit(Body);
+          }
+        } else if (const auto *Free = dyn_cast<CallExpr>(S);
+                   Free && !isMemberOrOperatorCall(Free) &&
+                   llvm::any_of(Free->arguments(), [&](const Expr *Argument) {
+                     return objectRelation(Argument, IsActor,
+                                           const_cast<ASTContext *>(Context))
+                                .Kind ==
+                            EObjectRelation::SameObject;
+                   })) {
+          // A free helper given the object, `fg_Clear(this)`, removes what it
+          // does, and one that can't be looked into can remove anything.
+          const FunctionDecl *Callee = Free->getDirectCallee();
+          const FunctionDecl *Definition = nullptr;
+          if (Callee && Callee->hasBody(Definition) && Definition) {
+            if (Visited.insert(Definition->getBody()).second)
+              Visit(Definition->getBody());
+          } else
+            Removals.bUnknown = true;
+        }
+      }
+      // Assigning a collection of the data, `mp_Items = {}`, removes its
+      // entries: also a built-in compound assignment, `mp_Union.m_Count += 1`
+      // of a member of a union, also by an assignment operator, also compound,
+      // called by name, `mp_Items.operator=(...)`, also with an explicit
+      // object parameter, as MemberChange tells.
+      const Expr *Assigned = nullptr;
+      bool AssignedReceiver = false;
+      if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+          Assign && Assign->isAssignmentOp())
+        Assigned = Assign->getLHS();
+      else if (Change && Change->first == EChange::Assigns) {
+        Assigned = Change->second;
+        AssignedReceiver = true;
+      }
+      // The collection itself, also through a local reference or a pointer
+      // to it, `auto &Items = mp_Items; Items = {};`, a collection in an
+      // entry of it, or a member of a union, as AssignmentChanges tells, not
+      // plain data of an entry.
+      if (const CObjectRelation Of =
+              Assigned ? RelationTo(Assigned, IsActor) : CObjectRelation{};
+          Assigned && AssignmentChanges(Assigned, Of, false, /*Moved=*/false,
+                                        AssignedReceiver))
+        Record(Of, {EObjectRelation::Subobject, EObjectRelation::Entry},
+               DepthOf(Of,
+                       AssignedReceiver || !Assigned->getType()->isPointerType()
+                           ? Assigned->getType()
+                           : QualType()));
+      // Moving a collection of the data removes all its entries: given to
+      // one of MoveFunctions or ForwardFunctions, `fg_Move(mp_Items)`, cast to
+      // an rvalue reference, or the object of a member function qualified
+      // `&&`, `f_GetIteratorDestructive() &&`. The collection itself, a member
+      // of the object, also through a local reference to it, not what is in
+      // an entry of it.
+      const Expr *Moved = nullptr;
+      if (const auto *Move = dyn_cast<CallExpr>(S);
+          Move && !isMemberOrOperatorCall(Move) &&
+          Move->getNumArgs() == 1 &&
+          (isMoveFunction(calleeName(Move)) ||
+           isForwardFunction(calleeName(Move))))
+        Moved = Move->getArg(0);
+      else if (const auto *Cast = dyn_cast<ExplicitCastExpr>(S);
+               Cast && Cast->getTypeAsWritten()->isRValueReferenceType())
+        Moved = Cast->getSubExpr();
+      else if (const Expr *Consumed = consumedObject(S))
+        Moved = Consumed;
+      if (const CObjectRelation Of =
+              Moved ? RelationTo(Moved, IsActor) : CObjectRelation{};
+          Moved && Moved->getType()->isRecordType() &&
+          AssignmentChanges(Moved, Of, false, /*Moved=*/true))
+        Record(Of, {EObjectRelation::Subobject, EObjectRelation::Entry},
+               DepthOf(Of, QualType()));
+      // Deleting what is reached from a collection of the data, also from an
+      // entry of it, `delete mp_Items[0].m_pNext`, as in a helper's body.
+      if (const auto *Delete = dyn_cast<CXXDeleteExpr>(S))
+        Record(RelationTo(Delete->getArgument(), IsActor),
+               {EObjectRelation::Subobject, EObjectRelation::Entry});
+      for (const Stmt *Child : Children(S))
+        Visit(Child);
+    };
+    Visit(Body);
+    return Removals;
+  }
+
+  /// The collections \p Variable can be a lookup into: of its initializer and
+  /// what it is assigned, or whether that can't be told.
+  CRemovals lookupFields(const ValueDecl *Variable) const {
+    CRemovals Fields;
+    bool bAny = false;
+    auto Add = [&](const Expr *Value) {
+      if (!Value || !isLookupIntoActor(Value))
+        return;
+      bAny = true;
+      // As deep as the entry or what an owning pointer owns it is in, at
+      // least of a collection of the actor, or as deep as anything when that
+      // can't be told.
+      const CObjectRelation Of = relationToActor(Value);
+      const unsigned Depth = Of.Kind == EObjectRelation::Entry ||
+                                     Of.Kind == EObjectRelation::Subobject
+                                 ? std::max(1u, Of.EntryDepth)
+                                 : ~0u;
+      if (const FieldDecl *Field = outermostField(Value))
+        Fields.add(Field, Depth, /*Least=*/false);
+      else
+        Fields.bUnknown = true;
+    };
+    if (const auto *Local = dyn_cast<VarDecl>(Variable))
+      Add(Local->getInit());
+    for (const auto &[Ref, Value] : AssignedRefs)
+      if (resolveReferenceCapture(Ref->getDecl()) == Variable)
+        Add(Value);
+    if (!bAny)
+      Fields.bUnknown = true;
+    return Fields;
+  }
+
+public:
+  /// Whether removing \p Removals can remove what \p Variable refers to.
+  bool mayRemove(const CRemovals &Removals, const ValueDecl *Variable) const {
+    if (!Removals.any())
+      return false;
+    if (Removals.bUnknown)
+      return true;
+    const CRemovals Fields = lookupFields(Variable);
+    return Fields.bUnknown ||
+           llvm::any_of(Fields.Fields, [&](const auto &Looked) {
+             const auto Removed = Removals.Fields.find(Looked.first);
+             return Removed != Removals.Fields.end() &&
+                    Removed->second < Looked.second;
+           });
+  }
+
+  /// What the callback of each holder removes entries of.
+  llvm::DenseMap<const VarDecl *, CRemovals> HolderRemovals;
+
+private:
+
+  /// The entries whose copied flags \p Body tests in an `if` that leaves with
+  /// an error: what the flag variable was copied from a member of.
+  static llvm::SmallVector<const ValueDecl *, 2>
+  flagTestedEntries(const Stmt *Body) {
+    llvm::SmallVector<const ValueDecl *, 2> Entries;
+    // In order, until the callback can return success: a test after that,
+    // or one a jump can pass, doesn't always run.
+    const auto *Compound = dyn_cast_or_null<CompoundStmt>(Body);
+    if (!Compound || hasJumps(Compound))
+      return Entries;
+    for (const Stmt *S : Compound->body()) {
+      if (const auto *If = dyn_cast<IfStmt>(S);
+          If && !If->getInit() && !If->getConditionVariable() &&
+          leavesWithError(If->getThen())) {
+        collectFlags(If->getCond(), Entries);
+        if (mayReturnSuccess(If->getElse()))
+          break;
+        continue;
+      }
+      if (mayReturnSuccess(S))
+        break;
+    }
+    return Entries;
+  }
+
+  /// The comparisons of pointers that \p Body, a callback, leaves with an
+  /// error for when they don't match, like `if (pEntry !=
+  /// mp_Items.f_FindEqual(Key)) return DMibErrorInstance(...)`, in order,
+  /// until the callback can return success: a test after that, or one a jump
+  /// can pass, doesn't always run, and one whose result isn't acted on
+  /// doesn't keep the coroutine from going on.
+  static llvm::SmallPtrSet<const BinaryOperator *, 4>
+  mismatchTests(const Stmt *Body) {
+    llvm::SmallPtrSet<const BinaryOperator *, 4> Tests;
+    const auto *Compound = dyn_cast_or_null<CompoundStmt>(Body);
+    if (!Compound || hasJumps(Compound))
+      return Tests;
+    for (const Stmt *S : Compound->body()) {
+      const auto *If = dyn_cast<IfStmt>(S);
+      if (If && !If->getInit() && !If->getConditionVariable()) {
+        if (leavesWithError(If->getThen())) {
+          collectMismatches(If->getCond(), /*Error=*/true, Tests, Body);
+          if (mayReturnSuccess(If->getElse()))
+            break;
+          continue;
+        }
+        if (If->getElse() && leavesWithError(If->getElse())) {
+          collectMismatches(If->getCond(), /*Error=*/false, Tests, Body);
+          if (mayReturnSuccess(If->getThen()))
+            break;
+          continue;
+        }
+      }
+      if (mayReturnSuccess(S))
+        break;
+    }
+    return Tests;
+  }
+
+  /// Collects the comparisons in \p E, a condition that leads to an error
+  /// when it is \p Error, that are true or false when the pointers don't
+  /// match: `!=` for true and `==` for false, also combined with other
+  /// conditions and through `!`.
+  static void
+  collectMismatches(const Expr *E, bool Error,
+                    llvm::SmallPtrSetImpl<const BinaryOperator *> &Tests,
+                    const Stmt *Callback) {
+    if (stackNearlyExhausted())
+      return withStack([&] { collectMismatches(E, Error, Tests, Callback); });
+    if (!E)
+      return;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
+      return collectMismatches(Cleanups->getSubExpr(), Error, Tests, Callback);
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+        Unary && Unary->getOpcode() == UO_LNot)
+      return collectMismatches(Unary->getSubExpr(), !Error, Tests, Callback);
+    const auto *Binary = dyn_cast<BinaryOperator>(E);
+    if (!Binary)
+      return;
+    // Through the other conditions it is combined with: a mismatch makes
+    // `A || Mismatch` lead to the error, but `A && Mismatch` only when `A` is
+    // true, so only beside a test of whether a pointer it compares is set,
+    // like `pInitial && pEntry != pInitial`. The same for `&&` and `||`
+    // leading away from it.
+    if (Binary->isLogicalOp()) {
+      if ((Binary->getOpcode() == BO_LOr) == Error) {
+        collectMismatches(Binary->getLHS(), Error, Tests, Callback);
+        collectMismatches(Binary->getRHS(), Error, Tests, Callback);
+        return;
+      }
+      if (testsPointerSet(Binary->getLHS(), Binary->getRHS(), Error, Callback))
+        collectMismatches(Binary->getRHS(), Error, Tests, Callback);
+      if (testsPointerSet(Binary->getRHS(), Binary->getLHS(), Error, Callback))
+        collectMismatches(Binary->getLHS(), Error, Tests, Callback);
+      return;
+    }
+    if ((Binary->getOpcode() == BO_NE && Error) ||
+        (Binary->getOpcode() == BO_EQ && !Error))
+      Tests.insert(Binary);
+  }
+
+  /// Whether \p Guard tests that a pointer that \p Other reads is set, like
+  /// `pInitial` or `pInitial != nullptr`, or, unless \p Set, that it isn't,
+  /// like `!pInitial`: a pointer kept from before, not a fresh lookup that
+  /// \p Callback makes before the test, which is null when the entry is gone.
+  static bool testsPointerSet(const Expr *Guard, const Expr *Other, bool Set,
+                              const Stmt *Callback) {
+    if (stackNearlyExhausted())
+      return withStack(
+          [&] { return testsPointerSet(Guard, Other, Set, Callback); });
+    Guard = Guard->IgnoreParenImpCasts();
+    if (const auto *Unary = dyn_cast<UnaryOperator>(Guard);
+        Unary && Unary->getOpcode() == UO_LNot)
+      return testsPointerSet(Unary->getSubExpr(), Other, !Set, Callback);
+    const Expr *Pointer = Guard;
+    if (const auto *Binary = dyn_cast<BinaryOperator>(Guard);
+        Binary && Binary->isEqualityOp()) {
+      auto IsNull = [](const Expr *E) {
+        E = E->IgnoreParenImpCasts();
+        return isa<CXXNullPtrLiteralExpr, GNUNullExpr>(E) ||
+               (isa<IntegerLiteral>(E) &&
+                cast<IntegerLiteral>(E)->getValue().isZero());
+      };
+      if (IsNull(Binary->getRHS()))
+        Pointer = Binary->getLHS();
+      else if (IsNull(Binary->getLHS()))
+        Pointer = Binary->getRHS();
+      else
+        return false;
+      if (Binary->getOpcode() == BO_EQ)
+        Set = !Set;
+    }
+    if (!Set)
+      return false;
+    const auto *Ref = dyn_cast<DeclRefExpr>(Pointer->IgnoreParenImpCasts());
+    if (!Ref || !Ref->getType()->isPointerType())
+      return false;
+    // Declared or assigned by the callback.
+    if (Callback) {
+      if (const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+          Local && Callback->getSourceRange().fullyContains(
+                       SourceRange(Local->getLocation())))
+        return false;
+      // Assigned before the test, like a fresh lookup; the pointer found
+      // first, `pInitial = pValue` after the test, is kept from before.
+      const SourceManager &SM = Ref->getDecl()->getASTContext().getSourceManager();
+      bool Assigned = false;
+      TCRecursive<void(const Stmt *)> FindAssignment = [&](const Stmt *S) {
+        if (!S || Assigned)
+          return;
+        if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+            Assign && Assign->isAssignmentOp() &&
+            SM.isBeforeInTranslationUnit(Assign->getBeginLoc(),
+                                         Guard->getBeginLoc()))
+          if (const auto *Target = dyn_cast<DeclRefExpr>(
+                  Assign->getLHS()->IgnoreParenImpCasts());
+              Target && Target->getDecl() == Ref->getDecl())
+            Assigned = true;
+        for (const Stmt *Child : keptChildren(S, Ref->getDecl()->getASTContext()))
+          FindAssignment(Child);
+      };
+      FindAssignment(Callback);
+      if (Assigned)
+        return false;
+    }
+    bool Reads = false;
+    TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+      if (!S || Reads)
+        return;
+      if (const auto *Inner = dyn_cast<DeclRefExpr>(S);
+          Inner && Inner->getDecl() == Ref->getDecl())
+        Reads = true;
+      for (const Stmt *Child : keptChildren(S, Ref->getDecl()->getASTContext()))
+        Visit(Child);
+    };
+    Visit(Other);
+    return Reads;
+  }
+
+
+  /// Whether \p Value can be an empty result, like `{}` or `nullptr`, also
+  /// one of the values of a conditional.
+  static bool isEmptyValue(const Expr *Value) { return !isErrorResult(Value); }
+
+  /// The statements of \p Body, a callback, that run on every path that
+  /// succeeds: those up to and with the first one that can return without an
+  /// error, `if (_bSkip) return nullptr;`, also past what wraps them, like the
+  /// cleanups of `pEntry = mp_Items.f_FindEqual(0)` with a key given by
+  /// reference, and those of a block in it, `{ pEntry = ...; }`, which runs
+  /// each time it does, and those before what can leave a lambda it calls
+  /// there that captures nothing by copy, `[&] { pEntry = ...; }()`.
+  static llvm::SmallPtrSet<const Stmt *, 8>
+  statementsBeforeSuccess(const Stmt *Body) {
+    llvm::SmallPtrSet<const Stmt *, 8> Statements;
+    // The least depth each lambda has been added at, past which again adds
+    // nothing more: a chain of helpers that each call the one before more
+    // than once, `auto f1 = [&] { f0(); f0(); };`, would add the first a
+    // number of times that grows exponentially with the chain.
+    llvm::DenseMap<const LambdaExpr *, int> AddedAt;
+    TCRecursive<void(const Stmt *, int)> AddCalled =
+        [&](const Stmt *Statement, int Depth) {
+          const auto *Call = dyn_cast<CallExpr>(Statement);
+          const LambdaExpr *Called = Call ? calledLambda(Call) : nullptr;
+          if (!Called || Depth >= 16 ||
+              llvm::any_of(Called->captures(),
+                           [](const LambdaCapture &Capture) {
+                             return Capture.getCaptureKind() == LCK_ByCopy;
+                           }))
+            return;
+          if (auto [It, Inserted] = AddedAt.try_emplace(Called, Depth);
+              !Inserted) {
+            if (It->second <= Depth)
+              return;
+            It->second = Depth;
+          }
+          for (const Stmt *Inner : statementsBeforeLeaving(Called->getBody())) {
+            Statements.insert(Inner);
+            if (const auto *E = dyn_cast<Expr>(Inner))
+              AddCalled(E->IgnoreImplicit()->IgnoreParens(), Depth + 1);
+          }
+        };
+    TCRecursive<bool(const CompoundStmt *, int)> Add =
+        [&](const CompoundStmt *Block, int Depth) {
+          for (const Stmt *Statement : Block->body()) {
+            Statements.insert(Statement);
+            if (const auto *E = dyn_cast<Expr>(Statement)) {
+              Statements.insert(E->IgnoreImplicit()->IgnoreParens());
+              AddCalled(E->IgnoreImplicit()->IgnoreParens(), Depth);
+            }
+            if (const auto *Inner = dyn_cast<CompoundStmt>(Statement);
+                Inner && Depth < 16) {
+              if (!Add(Inner, Depth + 1))
+                return false;
+              continue;
+            }
+            // Nor past a jump, `if (_bSkip) goto Done;`, which can skip
+            // them, or a label, which one can jump to past them.
+            if (mayReturnSuccess(Statement) || hasJumps(Statement))
+              return false;
+          }
+          return true;
+        };
+    if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(Body))
+      Add(Compound, 0);
+    return Statements;
+  }
+
+  /// Whether \p S can return without an error, like `return {};`.
+  static bool mayReturnSuccess(const Stmt *S) {
+    if (stackNearlyExhausted())
+      return withStack([&] { return mayReturnSuccess(S); });
+    if (!S || isa<LambdaExpr>(S))
+      return false;
+    if (const auto *Return = dyn_cast<ReturnStmt>(S)) {
+      if (!Return->getRetValue())
+        return true;
+      const Expr *Value = skipWrappers(Return->getRetValue())->IgnoreParenImpCasts();
+      return isEmptyValue(Value);
+    }
+    // Not in a branch an `if constexpr` discards.
+    for (const Stmt *Child : evaluatedChildren(S)) {
+      if (mayReturnSuccess(Child))
+        return true;
+    }
+    return false;
+  }
+
+  /// Whether \p S always leaves the callback, with a return or a throw.
+  static bool alwaysLeaves(const Stmt *S) {
+    if (stackNearlyExhausted())
+      return withStack([&] { return alwaysLeaves(S); });
+    if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(S))
+      return !Compound->body_empty() && alwaysLeaves(Compound->body_back());
+    if (const auto *If = dyn_cast_or_null<IfStmt>(S))
+      return llvm::all_of(keptBranches(If), [&](const Stmt *Branch) {
+        return Branch && alwaysLeaves(Branch);
+      });
+    if (const auto *E = dyn_cast_or_null<Expr>(S))
+      return isa<CXXThrowExpr>(E->IgnoreParenImpCasts());
+    return isa_and_nonnull<ReturnStmt>(S);
+  }
+
+  static bool leavesWithError(const Stmt *S) {
+    if (stackNearlyExhausted())
+      return withStack([&] { return leavesWithError(S); });
+    if (mayReturnSuccess(S))
+      return false;
+    if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(S))
+      return !Compound->body_empty() && leavesWithError(Compound->body_back());
+    if (const auto *Return = dyn_cast_or_null<ReturnStmt>(S)) {
+      const Expr *Value = Return->getRetValue();
+      if (!Value)
+        return false;
+      return !isEmptyValue(Value);
+    }
+    // Both branches, like `if (bDetailed) return ...; else return ...;`.
+    if (const auto *If = dyn_cast_or_null<IfStmt>(S))
+      return llvm::all_of(keptBranches(If), [&](const Stmt *Branch) {
+        return Branch && leavesWithError(Branch);
+      });
+    if (const auto *E = dyn_cast_or_null<Expr>(S))
+      return isa<CXXThrowExpr>(E->IgnoreParenImpCasts());
+    return false;
+  }
+
+  static void collectFlags(const Expr *E,
+                           llvm::SmallVectorImpl<const ValueDecl *> &Entries) {
+    if (stackNearlyExhausted())
+      return withStack([&] { collectFlags(E, Entries); });
+    if (!E)
+      return;
+    E = E->IgnoreParenImpCasts();
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
+      return collectFlags(Cleanups->getSubExpr(), Entries);
+    // Only a flag tested as such, alone or in a disjunction: a negated flag
+    // leaves when it is not set.
+    if (const auto *Binary = dyn_cast<BinaryOperator>(E)) {
+      if (Binary->getOpcode() == BO_LOr) {
+        collectFlags(Binary->getLHS(), Entries);
+        collectFlags(Binary->getRHS(), Entries);
+      }
+      // Compared to be set, like `*pDeleted == true`.
+      if (const Expr *Flag = comparedToBeSet(Binary))
+        collectFlags(Flag, Entries);
+      return;
+    }
+    const Expr *Operand = nullptr;
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+        Unary && Unary->getOpcode() == UO_Deref)
+      Operand = Unary->getSubExpr();
+    else if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
+             Call && Call->getOperator() == OO_Star && Call->getNumArgs() == 1)
+      Operand = Call->getArg(0);
+    // Also an atomic one loaded, `pDeleted->f_Load()`.
+    else if (const CMemberCall Load = memberCallOf(E);
+             Load && Load->getMethodDecl() &&
+             Load->getMethodDecl()->getIdentifier() &&
+             (identifierTextOf(Load->getMethodDecl()) == "f_Load" ||
+              identifierTextOf(Load->getMethodDecl()) == "load")) {
+      const Expr *Object =
+          Load->getImplicitObjectArgument()->IgnoreParenImpCasts();
+      const auto *Named =
+          Load->memberExpr();
+      if (const auto *Arrow = dyn_cast<CXXOperatorCallExpr>(Object);
+          Arrow && Arrow->getOperator() == OO_Arrow && Arrow->getNumArgs() == 1)
+        Operand = Arrow->getArg(0);
+      else if (const auto *Deref = dyn_cast<UnaryOperator>(Object);
+               Deref && Deref->getOpcode() == UO_Deref)
+        Operand = Deref->getSubExpr();
+      else if (const auto *Dereferenced = dyn_cast<CXXOperatorCallExpr>(Object);
+               Dereferenced && Dereferenced->getOperator() == OO_Star &&
+               Dereferenced->getNumArgs() == 1)
+        Operand = Dereferenced->getArg(0);
+      else if (Named && Named->isArrow())
+        Operand = Object;
+    }
+    if (!Operand)
+      return;
+    const auto *Ref = dyn_cast<DeclRefExpr>(Operand->IgnoreParenImpCasts());
+    if (!Ref)
+      return;
+    const auto *Flag = dyn_cast<VarDecl>(resolveReferenceCapture(Ref->getDecl()));
+    const Expr *Init =
+        Flag && Flag->getInit() ? skipWrappers(Flag->getInit()) : nullptr;
+    // Through the members to the entry the flag was copied from, a member
+    // that tells it was removed, like `m_pDestroyed`.
+    const Expr *Base = Init ? Init->IgnoreParenImpCasts() : nullptr;
+    if (const auto *Flag = dyn_cast_or_null<MemberExpr>(Base);
+        !Flag || !isRemovalFlagName(Flag->getMemberDecl()))
+      return;
+    bool Member = false;
+    while (const auto *Access = dyn_cast_or_null<MemberExpr>(Base)) {
+      Member = true;
+      Base = Access->getBase()->IgnoreParenImpCasts();
+      if (const auto *Deref = dyn_cast<UnaryOperator>(Base);
+          Deref && Deref->getOpcode() == UO_Deref)
+        Base = Deref->getSubExpr()->IgnoreParenImpCasts();
+      // What a handle refers to.
+      else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Base);
+               Operator && Operator->getNumArgs() == 1 &&
+               (Operator->getOperator() == OO_Star ||
+                Operator->getOperator() == OO_Arrow) &&
+               isReferenceHandle(Operator->getArg(0)->getType()))
+        Base = Operator->getArg(0)->IgnoreParenImpCasts();
+      else if (const CMemberCall Call = memberCallOf(Base);
+               Call && isReferenceHandle(Call->getImplicitObjectArgument()
+                                             ->IgnoreParenImpCasts()
+                                             ->getType()))
+        Base = Call->getImplicitObjectArgument()->IgnoreParenImpCasts();
+    }
+    // Also a copy that a mutable callback captured, which it can change.
+    if (const auto *Entry = dyn_cast_or_null<DeclRefExpr>(Base);
+        Entry && Member && !isChangedVariable(Flag) && isUnchangedAt(Ref)) {
+      const ValueDecl *Resolved = resolveReferenceCapture(Entry->getDecl());
+      // What the flag was copied from must still be that entry.
+      if (const auto *Variable = dyn_cast<VarDecl>(Resolved);
+          Variable && !Variable->getType()->isReferenceType() &&
+          isChangedVariable(Variable))
+        return;
+      Entries.push_back(Resolved);
+    }
+  }
+
+  /// Whether \p Holder is used other than by being destroyed, like moved
+  /// away, which can end the registration before its scope does.
+  static bool isReferencedHolder(const VarDecl *Holder) {
+    const auto *Function =
+        dyn_cast_or_null<FunctionDecl>(Holder->getParentFunctionOrMethod());
+    if (!Function || !Function->getBody())
+      return true;
+    bool Referenced = false;
+    TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+      if (!S || Referenced)
+        return;
+      // Casting it to void, like `(void)Guard`, keeps it.
+      if (const auto *Cast = dyn_cast<ExplicitCastExpr>(S);
+          Cast && Cast->getType()->isVoidType())
+        if (const auto *Ref =
+                dyn_cast<DeclRefExpr>(Cast->getSubExpr()->IgnoreParenImpCasts());
+            Ref && Ref->getDecl() == Holder)
+          return;
+      // Nor what isn't evaluated, `sizeof(Guard)`, or a branch of an `if
+      // constexpr` that is discarded.
+      if (hasUnevaluatedOperands(S))
+        return;
+      if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
+          Typeid && !Typeid->isPotentiallyEvaluated())
+        return;
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(S);
+          Ref && Ref->getDecl() == Holder)
+        Referenced = true;
+      // Nor what only looks at it, given by a reference to const,
+      // `fg_Inspect(Guard)` of `fg_Inspect(COnResumeScope const &_Guard)`.
+      if (const auto *Call = dyn_cast<CallExpr>(S))
+        if (const FunctionDecl *Callee = Call->getDirectCallee()) {
+          const unsigned Offset = argumentShift(Call, Callee);
+          for (const Stmt *Child : evaluatedChildren(S)) {
+            const auto *Argument = dyn_cast<Expr>(Child);
+            const auto *Ref =
+                Argument ? dyn_cast<DeclRefExpr>(Argument->IgnoreParenImpCasts())
+                         : nullptr;
+            bool Inspected = false;
+            if (Ref && Ref->getDecl() == Holder)
+              for (unsigned iArgument = Offset; iArgument < Call->getNumArgs() &&
+                                                iArgument - Offset <
+                                                    Callee->getNumParams();
+                   ++iArgument)
+                if (Call->getArg(iArgument) == Argument) {
+                  const QualType Type =
+                      Callee->getParamDecl(iArgument - Offset)->getType();
+                  Inspected = Type->isLValueReferenceType() &&
+                              Type.getNonReferenceType().isConstQualified();
+                }
+            if (!Inspected)
+              Visit(Child);
+          }
+          return;
+        }
+      for (const Stmt *Child : evaluatedChildren(S))
+        Visit(Child);
+    };
+    Visit(Function->getBody());
+    return Referenced;
+  }
+
+  /// The holder of the `fg_OnResume` registration whose callback is being
+  /// traversed.
+  const VarDecl *CurrentHolder = nullptr;
+  /// The body of the callback of CurrentHolder.
+  const CompoundStmt *CurrentCallbackBody = nullptr;
+
+  /// Whether \p Assignment is a statement of the body of the callback being
+  /// traversed, before anything that can return, also in an `if` among them
+  /// that assigns what it does on every path, `if (Mode) pEntry = ...; else
+  /// pEntry = ...;`.
+  bool isUnconditionalInCallback(const BinaryOperator *Assignment) const {
+    if (!CurrentCallbackBody)
+      return false;
+    for (const Stmt *Statement : CurrentCallbackBody->body()) {
+      const auto *E = dyn_cast<Expr>(Statement);
+      if (E && E->IgnoreImplicit()->IgnoreParens() == Assignment)
+        return true;
+      if (canReturn(Statement))
+        break;
+    }
+    return everyPathAssignments(CurrentCallbackBody).contains(Assignment);
+  }
+
+  /// Adds to CallbackEarlyUses of \p Holder what its callback \p Lambda uses
+  /// of \p Validated, the pointers and references it re-validates, before
+  /// it first assigns it, compares it, or gives it to what can assign it:
+  /// what it reads through it, `pEntry->m_Value`, not what tests it for null,
+  /// `if (!pEntry)`.
+  /// Of what it doesn't re-validate, \p Revalidated, only what it reads
+  /// through, `*pEntry`, not copies of the pointer, `pOther = pEntry`.
+  /// \p OwnLevelCopies: the tracked variables it captures copies of at their
+  /// own level (isCopyAtOwnLevel), of which only uses through borrowed parts
+  /// count (throughBorrowedPart).
+  template <typename t_CVariables, typename t_CRevalidated>
+  void addCallbackEarlyUses(
+      const VarDecl *Holder, const LambdaExpr *Lambda,
+      const t_CVariables &Validated, const t_CRevalidated &Revalidated,
+      const llvm::SmallPtrSetImpl<const ValueDecl *> &OwnLevelCopies) {
+    ASTContext &CallbackContext = Lambda->getCallOperator()->getASTContext();
+    const SourceManager &SM = CallbackContext.getSourceManager();
+    // What is fresh in the callback, looked up each time it runs, is told by
+    // whitelists; anything else is taken as what can be kept from before the
+    // suspension.
+    auto InCallback = [&](const Decl *Declaration) {
+      return Lambda->getBody() &&
+             Lambda->getBody()->getSourceRange().fullyContains(
+                 SourceRange(Declaration->getLocation()));
+    };
+    const CompoundStmt *CallbackBody = Lambda->getCompoundStmtBody();
+    llvm::DenseMap<const VarDecl *, llvm::SmallVector<const DeclRefExpr *, 4>>
+        UsedInCallback;
+    llvm::SmallPtrSet<const ValueDecl *, 4> CapturedInCallback;
+    if (CallbackBody) {
+      llvm::SmallVector<const Stmt *, 32> Pending{CallbackBody};
+      while (!Pending.empty()) {
+        const Stmt *S = Pending.pop_back_val();
+        if (!S)
+          continue;
+        if (const auto *Ref = dyn_cast<DeclRefExpr>(S))
+          if (const auto *Used = dyn_cast<VarDecl>(Ref->getDecl()))
+            UsedInCallback[Used].push_back(Ref);
+        if (const auto *Inner = dyn_cast<LambdaExpr>(S))
+          for (const LambdaCapture &Capture : Inner->captures())
+            if (Capture.capturesVariable())
+              CapturedInCallback.insert(Capture.getCapturedVar());
+        for (const Stmt *Child : keptChildren(S))
+          Pending.push_back(Child);
+      }
+    }
+    // Whether each use of \p Variable in the callback only reads it, or, with
+    // \p Assigns, is the left of a plain assignment: not changed otherwise,
+    // `++pEntry` or `pEntry += 1`, nor through a cast, `static_cast<CEntry
+    // *&>(pEntry) = ...`, nor given by its address or by a reference to
+    // non-const, also bound to one, nor captured by a lambda.
+    auto OnlyRead = [&](const VarDecl *Variable, bool Assigns) {
+      if (CapturedInCallback.contains(Variable) || !CallbackBody)
+        return false;
+      // A reference, which nothing can make refer to another, `auto &Entry =
+      // mp_Items[0];`, of the callback.
+      if (InCallback(Variable) && Variable->getType()->isReferenceType() &&
+          !Variable->getType().getNonReferenceType()->isPointerType())
+        return true;
+      if (InCallback(Variable))
+        for (const DeclRefExpr *Use : UsedInCallback.lookup(Variable))
+          if (Use->refersToEnclosingVariableOrCapture())
+            return false;
+      // The variable as it is, past parentheses and conversions that keep
+      // it, to a reference to const.
+      auto Named = [&](const Stmt *Child) {
+        const auto *E = dyn_cast_or_null<Expr>(Child);
+        while (E) {
+          E = E->IgnoreParens();
+          const auto *Cast = dyn_cast<ImplicitCastExpr>(E);
+          if (!Cast || Cast->getCastKind() != CK_NoOp)
+            break;
+          E = Cast->getSubExpr();
+        }
+        const auto *Ref = dyn_cast_or_null<DeclRefExpr>(E);
+        return Ref && Ref->getDecl() == Variable;
+      };
+      // Whether \p Parent uses its child \p Child, the variable, in one of
+      // the ways that don't change it: read, `pEntry->m_Value`, the object of
+      // a member access, `Entry.m_Value`, copied, or, with Assigns, assigned.
+      // Not given to a function or a constructor by a reference, also to
+      // const, which it can be changed through or given back by.
+      auto Allowed = [&](const Stmt *Parent, const Stmt *Child) {
+        if (const auto *Cast = dyn_cast<ImplicitCastExpr>(Parent))
+          return Cast->getCastKind() == CK_LValueToRValue;
+        if (const auto *Member = dyn_cast<MemberExpr>(Parent))
+          return Member->getBase() == Child;
+        if (const auto *Binary = dyn_cast<BinaryOperator>(Parent))
+          return Assigns && Binary->getOpcode() == BO_Assign &&
+                 Binary->getLHS() == Child;
+        if (isa<CXXConstructExpr>(Parent))
+          return false;
+        // Not given by a reference, also to const, which a function can
+        // change it through, `const_cast<CEntry *&>(_pEntry) = ...`, or give
+        // back: only read, its value given.
+        if (isa<CallExpr>(Parent))
+          return false;
+        // Copied, not bound to a reference, also to const, through which it
+        // can be changed after, `const_cast<CEntry *&>(Alias) = ...`.
+        if (const auto *Declaration = dyn_cast<DeclStmt>(Parent)) {
+          for (const Decl *D : Declaration->decls())
+            if (const auto *Alias = dyn_cast<VarDecl>(D);
+                Alias && Alias->getInit() == Child &&
+                Alias->getType()->isReferenceType())
+              return false;
+          return true;
+        }
+        return false;
+      };
+      // Each node once, also an operand an await shares with its common
+      // expression, which nested awaits would otherwise go through
+      // exponentially often.
+      llvm::SmallVector<const Stmt *, 32> Pending{CallbackBody};
+      llvm::SmallPtrSet<const Stmt *, 32> Visited;
+      while (!Pending.empty()) {
+        const Stmt *Parent = Pending.pop_back_val();
+        if (!Parent || !Visited.insert(Parent).second)
+          continue;
+        for (const Stmt *Child : keptChildren(Parent)) {
+          if (!Child)
+            continue;
+          // Of the variable as it is, also in parentheses, `(pEntry) =
+          // pSaved`, where what uses it is, past them.
+          const auto *Wrapper = dyn_cast<ImplicitCastExpr>(Parent);
+          if (Named(Child) && !isa<ParenExpr>(Parent) &&
+              !(Wrapper && Wrapper->getCastKind() == CK_NoOp) &&
+              !Allowed(Parent, Child))
+            return false;
+          Pending.push_back(Child);
+        }
+      }
+      return true;
+    };
+    // Whether \p E is a lookup of the object, which looks up again each time
+    // the callback runs: a call of one of CallbackLookupFunctions, also
+    // `operator[]`, also with an explicit object parameter, on a member of
+    // the object, `mp_Items.f_FindEqual(_Key)`, `this->mp_Items[_Key]` or
+    // `&mp_Items[_Key]`, and what is reached from such a lookup again, a
+    // member of what it gives, `mp_Items[_Key].m_Data`, what an owning
+    // pointer there owns, `mp_Items[_Key].m_pData->m_Value`, or a lookup in
+    // it, also through a local of the callback that is one itself
+    // (IsFreshLocal). Nothing else, also through what the callback has from
+    // before, a pointer member the object keeps, `m_pCached->m_Value`, or a
+    // member function that isn't a lookup, is known to look up again.
+    TCRecursive<bool(const VarDecl *)> IsFreshLocal;
+    // Whether \p E is reached from the object, `this`, only through what is
+    // looked up again each time: none when it isn't, else whether a lookup
+    // is on the way.
+    TCRecursive<std::optional<bool>(const Expr *, int)> FreshPath =
+        [&](const Expr *E, int Depth) -> std::optional<bool> {
+      if (!E || Depth > 32)
+        return std::nullopt;
+      if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
+        E = Cleanups->getSubExpr();
+      // Not the value of a pointer stored in what is looked up, `auto
+      // *pParent = mp_Nodes[Key].m_pParent`, which can be kept from before
+      // (isStoredPointer).
+      if (const auto *Read = dyn_cast<ImplicitCastExpr>(E->IgnoreParens());
+          Read && Read->getCastKind() == CK_LValueToRValue &&
+          Read->getType()->isPointerType() &&
+          isStoredPointer(Read->getSubExpr()))
+        return std::nullopt;
+      E = E->IgnoreParenImpCasts();
+      // Not through a pointer reached without a lookup, which can be kept
+      // from before, `*m_pCached`.
+      if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+          Unary &&
+          (Unary->getOpcode() == UO_AddrOf || Unary->getOpcode() == UO_Deref)) {
+        const std::optional<bool> Of =
+            FreshPath(Unary->getSubExpr(), Depth + 1);
+        if (Of && !*Of && Unary->getOpcode() == UO_Deref &&
+            !isa<CXXThisExpr>(Unary->getSubExpr()->IgnoreParenImpCasts()))
+          return std::nullopt;
+        return Of;
+      }
+      if (isa<CXXThisExpr>(E))
+        return false;
+      // A local of the callback that is looked up each time itself.
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+        const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+        if (Local && InCallback(Local) && IsFreshLocal(Local))
+          return true;
+        return std::nullopt;
+      }
+      // A member of the object, not a pointer it keeps, which can point to
+      // what is kept from before, nor a reference it keeps, `m_rCached =
+      // mp_Maps[0]`, which looking through doesn't look up again, or a
+      // member of what is looked up.
+      if (const auto *Member = dyn_cast<MemberExpr>(E)) {
+        if (!isa<FieldDecl>(Member->getMemberDecl()))
+          return std::nullopt;
+        const std::optional<bool> Base =
+            FreshPath(Member->getBase(), Depth + 1);
+        // Also of what is looked up, `mp_Items[0].m_rValue`, which a lookup
+        // of what holds it doesn't look up again.
+        if (Base && Member->getMemberDecl()->getType()->isReferenceType())
+          return std::nullopt;
+        if (!Base ||
+            (!*Base && Member->isArrow() &&
+             !isa<CXXThisExpr>(Member->getBase()->IgnoreParenImpCasts())))
+          return std::nullopt;
+        // Nor through a pointer stored in what is looked up,
+        // `mp_Nodes[Key].m_pParent->m_Value`.
+        if (Member->isArrow() &&
+            !isa<CXXThisExpr>(Member->getBase()->IgnoreParenImpCasts()) &&
+            isStoredPointer(Member->getBase()))
+          return std::nullopt;
+        return Base;
+      }
+      if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E)) {
+        const std::optional<bool> Base =
+            FreshPath(Subscript->getBase(), Depth + 1);
+        return Base && *Base ? Base : std::nullopt;
+      }
+      auto Listed = [&](const FunctionDecl *Callee) {
+        if (!Callee)
+          return false;
+        const std::string Name = Callee->getNameAsString();
+        return llvm::is_contained(CallbackLookupFunctions, StringRef(Name));
+      };
+      const auto *Call = dyn_cast<CallExpr>(E);
+      const auto *Method =
+          Call ? dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee())
+               : nullptr;
+      if (!Method || Method->isStatic())
+        return std::nullopt;
+      const Expr *Object = nullptr;
+      if (const CMemberCall Member = memberCallOf(Call))
+        Object = Member->getImplicitObjectArgument();
+      else if ((isa<CXXOperatorCallExpr>(Call) ||
+                Method->isExplicitObjectMemberFunction()) &&
+               Call->getNumArgs() > 0)
+        Object = Call->getArg(0);
+      if (!Object)
+        return std::nullopt;
+      // What an owning pointer on the way owns, `->`, `*` or its pointer,
+      // `f_Get()` or `get()`.
+      const OverloadedOperatorKind Operator = Method->getOverloadedOperator();
+      const bool Owner =
+          ((Operator == OO_Arrow || Operator == OO_Star) &&
+           Method->getNumParams() ==
+               (Method->isExplicitObjectMemberFunction() ? 1u : 0u)) ||
+          (Method->getIdentifier() &&
+           (identifierTextOf(Method) == "f_Get" || identifierTextOf(Method) == "get") &&
+           Method->getReturnType()->isPointerType() &&
+           hasOverloadedOperator(Method->getParent(), {OO_Arrow}) == true);
+      const bool Lookup = Operator == OO_Subscript || Listed(Method);
+      if (!Owner && !Lookup)
+        return std::nullopt;
+      // Not on what a pointer reached without a lookup points to,
+      // `mp_pCached->f_FindEqual(0)`, nor on an owning pointer the object
+      // holds itself.
+      const std::optional<bool> Base = FreshPath(Object, Depth + 1);
+      if (!Base || (!*Base && (Owner || Object->getType()->isPointerType())))
+        return std::nullopt;
+      return Lookup || *Base;
+    };
+    // Not a copy of a local, also through `&` and `*`, `auto *pApplication =
+    // pFirst;`, which is a copy, not a lookup, however fresh.
+    auto IsThisLookup = [&](const Expr *E) {
+      for (const Expr *Bare = E; Bare;) {
+        if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(Bare))
+          Bare = Cleanups->getSubExpr();
+        Bare = Bare->IgnoreParenImpCasts();
+        if (isa<DeclRefExpr>(Bare))
+          return false;
+        const auto *Unary = dyn_cast<UnaryOperator>(Bare);
+        if (!Unary ||
+            (Unary->getOpcode() != UO_AddrOf && Unary->getOpcode() != UO_Deref))
+          break;
+        Bare = Unary->getSubExpr();
+      }
+      const std::optional<bool> Path = FreshPath(E, 0);
+      return Path && *Path;
+    };
+    // Whether a local of the callback, \p Local, is looked up each time the
+    // callback runs: it is automatic, made directly by a lookup of the object
+    // (IsThisLookup), and only read after (OnlyRead).
+    llvm::DenseMap<const VarDecl *, bool> FreshLocals;
+    IsFreshLocal = [&](const VarDecl *Local) {
+      if (const auto It = FreshLocals.find(Local); It != FreshLocals.end())
+        return It->second;
+      FreshLocals[Local] = false;
+      // Not a reference to a pointer stored in what is looked up, `auto
+      // *const &pSaved = mp_Nodes[0].m_pSaved`, whose reads are of that
+      // pointer (isStoredPointer).
+      const bool Fresh =
+          Local->hasLocalStorage() &&
+          !(Local->getType()->isReferenceType() &&
+            Local->getType().getNonReferenceType()->isPointerType() &&
+            Local->getInit() && isStoredPointer(Local->getInit())) &&
+          IsThisLookup(Local->getInit()) && OnlyRead(Local, /*Assigns=*/false);
+      FreshLocals[Local] = Fresh;
+      return Fresh;
+    };
+    for (const ValueDecl *Variable : Validated) {
+      const QualType Type = Variable->getType();
+      if (!Type->isPointerType() && !Type->isReferenceType())
+        continue;
+      // A local of the callback, `auto *pApplication =
+      // mp_Applications.f_FindEqual(_Application);`, is looked up each time
+      // the callback runs, not kept from before the suspension, when it is
+      // fresh (IsFreshLocal). Not a static or thread_local one, whose
+      // initializer runs once, nor one that is or can be a copy of what is
+      // kept from before, also through arithmetic, a move or a forward.
+      if (const auto *Local = dyn_cast<VarDecl>(Variable);
+          Local && InCallback(Local) && IsFreshLocal(Local))
+        continue;
+      const bool OnlyThrough = Type->isPointerType() &&
+                               !llvm::is_contained(Revalidated, Variable);
+      // Where it is looked up again, and read.
+      llvm::SmallVector<const DeclRefExpr *, 2> Revalidations;
+      llvm::SmallVector<const DeclRefExpr *, 2> Uses;
+      // A comparison that decides where the callback goes, `if (pEntry !=
+      // mp_Items.f_FindEqual(1))` or `return pEntry == ...;`, not one only
+      // logged, `fg_Log(pEntry == ...)`.
+      auto Decides = [&](const BinaryOperator *Comparison) {
+        DynTypedNode Node = DynTypedNode::create(*Comparison);
+        for (int Depth = 0; Depth < 16; ++Depth) {
+          const auto Parents = instantiatedParents(Node, CallbackContext);
+          if (Parents.empty())
+            return false;
+          const Stmt *Child = Node.get<Stmt>();
+          if (Parents[0].get<ReturnStmt>())
+            return true;
+          if (const auto *If = Parents[0].get<IfStmt>())
+            return If->getCond() == Child;
+          if (const auto *While = Parents[0].get<WhileStmt>())
+            return While->getCond() == Child;
+          if (const auto *Conditional = Parents[0].get<ConditionalOperator>())
+            return Conditional->getCond() == Child;
+          const auto *Logical = Parents[0].get<BinaryOperator>();
+          const auto *Not = Parents[0].get<UnaryOperator>();
+          if (!Parents[0].get<ImplicitCastExpr>() &&
+              !Parents[0].get<ParenExpr>() &&
+              !(Logical && Logical->isLogicalOp()) &&
+              !(Not && Not->getOpcode() == UO_LNot))
+            return false;
+          Node = Parents[0];
+        }
+        return false;
+      };
+      TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+        if (!S)
+          return;
+        // Also in a lambda called where it is made, `[&] { fg_Log(*pEntry);
+        // }()`, which runs then.
+        if (const auto *Inner = dyn_cast<LambdaExpr>(S)) {
+          if (runsHere(Inner))
+            Visit(Inner->getBody());
+          return;
+        }
+        // Not what never runs, in a branch of an `if constexpr` that is
+        // discarded or that a constant condition never takes.
+        for (const Stmt *Child : evaluatedChildren(S, CallbackContext))
+          Visit(Child);
+        const auto *Ref = dyn_cast<DeclRefExpr>(S);
+        if (!Ref || resolveReferenceCapture(Ref->getDecl()) != Variable ||
+            isInNeverTakenBranch(DynTypedNode::create(*Ref), CallbackContext))
+          return;
+        bool Revalidates = false;
+        bool Reads = true;
+        // What is done with its value where it stops being handed on
+        // unchanged (valueEndOf), also past its address, `&Entry`, compared.
+        CValueEnd End = valueEndOf(Ref, {}, CallbackContext);
+        if (const auto *Address = End.Consumer.get<UnaryOperator>();
+            Address && Address->getOpcode() == UO_AddrOf)
+          End = valueEndOf(Address, {}, CallbackContext);
+        const DynTypedNode &Parent = End.Consumer;
+        const Stmt *Child = End.Top;
+        // Nothing done to the entry (storageUsesOf), tested, `pEntry && ...`,
+        // `if (!pEntry)` or `bool(pEntry)`, not compared for equality, which
+        // can look it up again, nor assigned, which can be a lookup again.
+        if (const auto *Equality = Parent.get<BinaryOperator>();
+            End.Uses.none() &&
+            !(Equality && (Equality->isEqualityOp() ||
+                           (Equality->getOpcode() == BO_Assign &&
+                            Child == Equality->getLHS())))) {
+          Reads = false;
+        } else if (const auto *Alias = Parent.get<VarDecl>();
+                   Alias && Alias->getType()->isReferenceType()) {
+          // Bound to a reference, `int *&pAlias = pEntry;`, which reads
+          // nothing: what is done through it is.
+          Reads = false;
+        } else if (const auto *Binary = Parent.get<BinaryOperator>()) {
+          // Not assigned a copy of what is kept from before the
+          // suspension, `pEntry = pSaved;`, which isn't looked up again.
+          // Assigning it doesn't read it.
+          if (Binary->getOpcode() == BO_Assign && Child == Binary->getLHS()) {
+            Reads = false;
+            Revalidates = IsThisLookup(Binary->getRHS());
+          } else if (Binary->isEqualityOp()) {
+            Reads = false;
+            Revalidates =
+                !nullPointerConstantOf(Binary->getLHS(), CallbackContext,
+                                       Expr::NPC_ValueDependentIsNotNull) &&
+                !nullPointerConstantOf(Binary->getRHS(), CallbackContext,
+                                       Expr::NPC_ValueDependentIsNotNull) &&
+                Decides(Binary);
+          }
+        } else if (const auto *Call = Parent.get<CallExpr>()) {
+          const FunctionDecl *Callee = Call->getDirectCallee();
+          for (unsigned iArgument = 0; iArgument < Call->getNumArgs();
+               ++iArgument)
+            if (Call->getArg(iArgument) == Child &&
+                (!Callee || (iArgument < Callee->getNumParams() &&
+                             Callee->getParamDecl(iArgument)
+                                 ->getType()
+                                 ->isReferenceType() &&
+                             !Callee->getParamDecl(iArgument)
+                                  ->getType()
+                                  .getNonReferenceType()
+                                  .isConstQualified() &&
+                             (!Callee->getDefinition() ||
+                              !Callee->getDefinition()->getBody() ||
+                              callsOverride(Call) ||
+                              RefCollector::helperLooksUpAgain(
+                                  Callee->getDefinition(), iArgument)))))
+              Revalidates = true;
+        }
+        // Through it, `*pEntry`, `pEntry->m_Value` or `pEntry[0]`, where its
+        // value stops being handed on unchanged (valueEndOf).
+        auto Through = [&] {
+          return valueEndOf(Ref, {}, CallbackContext).Kind ==
+                 EValueEnd::Dereferenced;
+        };
+        if (Revalidates)
+          Revalidations.push_back(Ref);
+        else if (Reads && (!OnlyThrough || Through()) &&
+                 (!OwnLevelCopies.contains(Variable) ||
+                  throughBorrowedPart(Ref, CallbackContext)))
+          Uses.push_back(Ref);
+      };
+      Visit(Lambda->getBody());
+      // The place of \p Node in \p Block, also past what wraps it that the
+      // parents skip, like the cleanups of `pEntry = mp_Items.f_FindEqual(1)`.
+      auto PlaceIn = [](const CompoundStmt *Block,
+                        const Stmt *Node) -> std::optional<size_t> {
+        size_t iStatement = 0;
+        for (const Stmt *Statement : Block->body()) {
+          if (Statement == Node ||
+              (isa<Expr>(Statement) &&
+               cast<Expr>(Statement)->IgnoreImplicit() == Node))
+            return iStatement;
+          ++iStatement;
+        }
+        return std::nullopt;
+      };
+      // The statements of blocks that the look up again runs as a part of
+      // wherever the block runs, not in a branch or a loop of it, by the
+      // block, and their place in it.
+      auto Unconditional = [&](const Stmt *At) {
+        llvm::SmallVector<std::pair<const CompoundStmt *, size_t>, 4> Places;
+        DynTypedNode Node = DynTypedNode::create(*At);
+        for (int Depth = 0; Depth < 64; ++Depth) {
+          const auto Parents = instantiatedParents(Node, CallbackContext);
+          if (Parents.empty() || Parents[0].get<LambdaExpr>())
+            break;
+          if (const auto *Block = Parents[0].get<CompoundStmt>()) {
+            const std::optional<size_t> Place =
+                PlaceIn(Block, Node.get<Stmt>());
+            if (!Place)
+              break;
+            Places.push_back({Block, *Place});
+          } else if (const Stmt *Up = Parents[0].get<Stmt>();
+                     !Up ||
+                     isa<IfStmt, SwitchStmt, SwitchCase, WhileStmt, DoStmt,
+                         ForStmt, CXXForRangeStmt, AbstractConditionalOperator,
+                         CXXTryStmt, CXXCatchStmt>(Up) ||
+                     (isa<BinaryOperator>(Up) &&
+                      cast<BinaryOperator>(Up)->isLogicalOp()))
+            break;
+          Node = Parents[0];
+        }
+        return Places;
+      };
+      // Whether every path through \p S looks it up again: one that does
+      // where it runs, not in a branch of it, a block with a statement that
+      // does, and an `if` whose branches each do.
+      TCRecursive<bool(const Stmt *, int)> Always = [&](const Stmt *S,
+                                                          int Depth) {
+        if (!S || Depth > 16)
+          return false;
+        if (const auto *If = dyn_cast<IfStmt>(S))
+          return If->getElse() && !If->isConsteval() &&
+                 llvm::all_of(keptBranches(If), [&](const Stmt *Branch) {
+                   return Always(Branch, Depth + 1);
+                 });
+        if (const auto *Block = dyn_cast<CompoundStmt>(S))
+          return llvm::any_of(Block->body(), [&](const Stmt *Statement) {
+            return Always(Statement, Depth + 1);
+          });
+        if (isa<SwitchStmt, WhileStmt, DoStmt, ForStmt, CXXForRangeStmt,
+                CXXTryStmt>(S))
+          return false;
+        return llvm::any_of(Revalidations, [&](const DeclRefExpr *Again) {
+          DynTypedNode Node = DynTypedNode::create(*Again);
+          for (int Level = 0; Level < 64; ++Level) {
+            if (Node.get<Stmt>() == S ||
+                (isa<Expr>(S) &&
+                 cast<Expr>(S)->IgnoreImplicit() == Node.get<Stmt>()))
+              return true;
+            const auto Parents = instantiatedParents(Node, CallbackContext);
+            if (Parents.empty() || Parents[0].get<LambdaExpr>())
+              return false;
+            const Stmt *Up = Parents[0].get<Stmt>();
+            if (!Up ||
+                isa<IfStmt, SwitchStmt, WhileStmt, DoStmt, ForStmt,
+                    CXXForRangeStmt, AbstractConditionalOperator, CXXTryStmt>(
+                    Up) ||
+                (isa<BinaryOperator>(Up) &&
+                 cast<BinaryOperator>(Up)->isLogicalOp()))
+              return Up == S;
+            Node = Parents[0];
+          }
+          return false;
+        });
+      };
+      // Before the look up again on its path: in a statement of a block that
+      // comes after one that looks it up on every path through it, or in the
+      // same one, after it, not in another branch, `if (_bFirst) pEntry =
+      // ...; else fg_Log(*pEntry);`.
+      auto Covered = [&](const DeclRefExpr *Use) {
+        {
+          DynTypedNode Node = DynTypedNode::create(*Use);
+          for (int Depth = 0; Depth < 64; ++Depth) {
+            const auto Parents = instantiatedParents(Node, CallbackContext);
+            if (Parents.empty() || Parents[0].get<LambdaExpr>())
+              break;
+            if (const auto *Block = Parents[0].get<CompoundStmt>())
+              if (const std::optional<size_t> Place =
+                      PlaceIn(Block, Node.get<Stmt>())) {
+                size_t iStatement = 0;
+                for (const Stmt *Statement : Block->body()) {
+                  if (iStatement++ >= *Place)
+                    break;
+                  if (Always(Statement, 0))
+                    return true;
+                }
+              }
+            Node = Parents[0];
+          }
+        }
+        return llvm::any_of(Revalidations, [&](const DeclRefExpr *Again) {
+          // Not a use in what the assignment that looks it up again
+          // evaluates first, `pEntry = mp_Items.f_FindEqual(pEntry->m_Key)`.
+          {
+            DynTypedNode Node = DynTypedNode::create(*Again);
+            for (int Depth = 0; Depth < 8; ++Depth) {
+              const auto Parents = instantiatedParents(Node, CallbackContext);
+              if (Parents.empty())
+                break;
+              if (const auto *Assign = Parents[0].get<BinaryOperator>();
+                  Assign && Assign->isAssignmentOp()) {
+                const SourceRange Range = Assign->getRHS()->getSourceRange();
+                if (!SM.isBeforeInTranslationUnit(Use->getBeginLoc(),
+                                                  Range.getBegin()) &&
+                    !SM.isBeforeInTranslationUnit(Range.getEnd(),
+                                                  Use->getBeginLoc()))
+                  return false;
+                break;
+              }
+              if (!Parents[0].get<ParenExpr>() &&
+                  !Parents[0].get<ImplicitCastExpr>())
+                break;
+              Node = Parents[0];
+            }
+          }
+          const auto Before = Unconditional(Again);
+          DynTypedNode Node = DynTypedNode::create(*Use);
+          for (int Depth = 0; Depth < 64; ++Depth) {
+            const auto Parents = instantiatedParents(Node, CallbackContext);
+            if (Parents.empty() || Parents[0].get<LambdaExpr>())
+              return false;
+            if (const auto *Block = Parents[0].get<CompoundStmt>())
+              if (const std::optional<size_t> Place =
+                      PlaceIn(Block, Node.get<Stmt>()))
+                for (const auto &[Of, At] : Before)
+                  if (Of == Block &&
+                      (At < *Place ||
+                       (At == *Place &&
+                        SM.isBeforeInTranslationUnit(Again->getBeginLoc(),
+                                                     Use->getBeginLoc()))))
+                    return true;
+            Node = Parents[0];
+          }
+          return false;
+        });
+      };
+      // All of them when it doesn't re-validate it.
+      for (const DeclRefExpr *Use : Uses)
+        if (!Covered(Use))
+          CallbackEarlyUses[Holder].push_back({Variable, Use->getBeginLoc()});
+    }
+  }
+
+  /// Whether \p S can return or jump, outside of the lambdas in it.
+  /// The assignments of the `if` statements among those of \p Body, before
+  /// anything that can return, that assign a variable a lookup made there on
+  /// every path through them, `if (Mode) pEntry = mp_Items.f_FindEqual(1);
+  /// else pEntry = mp_Items.f_FindEqual(2);`, as a statement of each branch,
+  /// also of nested ones: not a pointer kept from before on one of them,
+  /// `pEntry = pSaved`, which may be gone.
+  llvm::SmallPtrSet<const BinaryOperator *, 4>
+  everyPathAssignments(const Stmt *Body) const {
+    llvm::SmallPtrSet<const BinaryOperator *, 4> Assignments;
+    const auto *Block = dyn_cast_or_null<CompoundStmt>(Body);
+    if (!Block)
+      return Assignments;
+    TCRecursive<bool(const Stmt *, const ValueDecl *,
+                       llvm::SmallVectorImpl<const BinaryOperator *> &, int)> EveryPath = [&](const Stmt *S, const ValueDecl *Variable,
+                        llvm::SmallVectorImpl<const BinaryOperator *> &List,
+                        int Depth) {
+          if (!S || Depth > 16)
+            return false;
+          if (const auto *Inner = dyn_cast<CompoundStmt>(S)) {
+            for (const Stmt *Statement : Inner->body()) {
+              if (EveryPath(Statement, Variable, List, Depth + 1))
+                return true;
+              if (canReturn(Statement) || canBreak(Statement))
+                return false;
+            }
+            return false;
+          }
+          // A branch that leaves with an error, `else return
+          // fg_MakeError(...);`, doesn't go on to what follows, but the other
+          // must assign it.
+          // Also each case of a `switch` with a default, through what it
+          // falls through to until a `break`, or one that leaves with an
+          // error.
+          if (const auto *Switch = dyn_cast<SwitchStmt>(S)) {
+            const auto *Body =
+                dyn_cast_or_null<CompoundStmt>(Switch->getBody());
+            if (!Body)
+              return false;
+            auto Unlabeled = [](const Stmt *Statement, bool &Default) {
+              while (true)
+                if (const auto *Case = dyn_cast<CaseStmt>(Statement))
+                  Statement = Case->getSubStmt();
+                else if (const auto *Other = dyn_cast<DefaultStmt>(Statement)) {
+                  Default = true;
+                  Statement = Other->getSubStmt();
+                } else
+                  return Statement;
+            };
+            const auto Statements = Body->body();
+            bool HasDefault = false;
+            bool AnyCase = false;
+            for (auto It = Statements.begin(); It != Statements.end(); ++It) {
+              if (!isa<SwitchCase>(*It))
+                continue;
+              AnyCase = true;
+              bool Assigns = false;
+              bool Leaves = false;
+              for (auto Next = It; Next != Statements.end(); ++Next) {
+                bool Default = false;
+                const Stmt *Statement = Unlabeled(*Next, Default);
+                if (Next == It)
+                  HasDefault |= Default;
+                if (isa<BreakStmt>(Statement))
+                  break;
+                if (EveryPath(Statement, Variable, List, Depth + 1)) {
+                  Assigns = true;
+                  break;
+                }
+                if (leavesWithError(Statement)) {
+                  Leaves = true;
+                  break;
+                }
+                // Also one that can leave the case, `if (_bSkip) break;`.
+                if (canReturn(Statement) || canBreak(Statement))
+                  break;
+              }
+              if (!Assigns && !Leaves)
+                return false;
+            }
+            return AnyCase && HasDefault;
+          }
+          if (const auto *If = dyn_cast<IfStmt>(S)) {
+            // Of one only one branch of which runs, that one (keptBranches).
+            if (const llvm::SmallVector<const Stmt *, 2> Branches =
+                    keptBranches(If);
+                Branches.size() == 1)
+              return Branches.front() &&
+                     EveryPath(Branches.front(), Variable, List, Depth + 1);
+            if (!If->getElse() || If->isConsteval())
+              return false;
+            const bool Then =
+                EveryPath(If->getThen(), Variable, List, Depth + 1);
+            const bool Else =
+                EveryPath(If->getElse(), Variable, List, Depth + 1);
+            return (Then && (Else || leavesWithError(If->getElse()))) ||
+                   (Else && leavesWithError(If->getThen()));
+          }
+          const auto *E = dyn_cast<Expr>(S);
+          const auto *Assign =
+              E ? dyn_cast<BinaryOperator>(E->IgnoreImplicit()->IgnoreParens())
+                : nullptr;
+          if (!Assign || Assign->getOpcode() != BO_Assign)
+            return false;
+          const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+              assignedVariables(Assign->getLHS());
+          // Not a pointer kept from before, but one the callback looks up
+          // itself, `if (auto *pFound = mp_Items.f_FindEqual(_Key); !pFound)
+          // ... else pEntry = pFound;`.
+          auto FreshLocal = [&](const Expr *Value) {
+            const auto *Ref =
+                dyn_cast<DeclRefExpr>(Value->IgnoreParenImpCasts());
+            const auto *Local =
+                Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+            const auto *Owner =
+                Local ? dyn_cast<FunctionDecl>(Local->getDeclContext())
+                      : nullptr;
+            return Owner && Owner->getBody() == Block &&
+                   Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
+                   !Local->getType()->isReferenceType() && Local->getInit() &&
+                   !isChangedVariable(Local) &&
+                   isLookupIntoActor(Local->getInit());
+          };
+          if (Targets.size() != 1 ||
+              resolveReferenceCapture(Targets[0]->getDecl()) != Variable ||
+              (isa<DeclRefExpr>(Assign->getRHS()->IgnoreParenImpCasts())
+                   ? !FreshLocal(Assign->getRHS())
+                   : !isLookupIntoActor(Assign->getRHS())))
+            return false;
+          List.push_back(Assign);
+          return true;
+        };
+    for (const Stmt *Statement : Block->body()) {
+      if (isa<IfStmt, SwitchStmt>(Statement)) {
+        llvm::SmallVector<const ValueDecl *, 4> Candidates;
+        TCRecursive<void(const Stmt *)> Find = [&](const Stmt *S) {
+          if (!S || isa<LambdaExpr>(S))
+            return;
+          if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+              Assign && Assign->getOpcode() == BO_Assign)
+            for (const DeclRefExpr *Target :
+                 assignedVariables(Assign->getLHS()))
+              if (const ValueDecl *Variable =
+                      resolveReferenceCapture(Target->getDecl());
+                  !llvm::is_contained(Candidates, Variable))
+                Candidates.push_back(Variable);
+          for (const Stmt *Child : keptChildren(S))
+            Find(Child);
+        };
+        Find(Statement);
+        for (const ValueDecl *Candidate : Candidates) {
+          llvm::SmallVector<const BinaryOperator *, 4> List;
+          if (EveryPath(Statement, Candidate, List, 0))
+            Assignments.insert(List.begin(), List.end());
+        }
+      }
+      if (canReturn(Statement))
+        break;
+    }
+    return Assignments;
+  }
+
+  /// Whether \p S can leave the `switch` or loop it is in, with a `break`
+  /// that isn't in one of its own.
+  static bool canBreak(const Stmt *S) {
+    if (!S || isa<LambdaExpr, SwitchStmt, ForStmt, WhileStmt, DoStmt,
+                  CXXForRangeStmt>(S))
+      return false;
+    if (isa<BreakStmt>(S))
+      return true;
+    return llvm::any_of(keptChildren(S), canBreak);
+  }
+
+  static bool canReturn(const Stmt *S) {
+    if (!S || isa<LambdaExpr>(S))
+      return false;
+    if (isa<ReturnStmt, CoreturnStmt, CXXThrowExpr, GotoStmt,
+            IndirectGotoStmt>(S))
+      return true;
+    return llvm::any_of(keptChildren(S), canReturn);
+  }
+
+public:
+  /// The variables each registration's callback keeps pointing to the same
+  /// data, whose derived references it re-validates too.
+  llvm::DenseMap<const VarDecl *, llvm::SmallPtrSet<const ValueDecl *, 4>>
+      SameData;
+
+  /// What a callback assigns to a variable it re-validates.
+  struct CCallbackAssignment {
+    const ValueDecl *Assigned;
+    /// Whether it assigns a lookup into the data of the actor.
+    bool bLookup;
+    /// Whether every run of the callback assigns it: a statement of its body
+    /// before anything that can return.
+    bool bUnconditional;
+  };
+
+  /// What each registration's callback assigns to the variables it
+  /// re-validates, in the order of the callback.
+  llvm::DenseMap<const VarDecl *, llvm::SmallVector<CCallbackAssignment, 4>>
+      CallbackAssignments;
+
+  /// What each registration's callback uses of what it re-validates before
+  /// it does, like `pEntry->m_Value` before `pEntry =
+  /// mp_Items.f_FindEqual(Key)`: on a later resume, it uses it stale.
+  llvm::DenseMap<const VarDecl *,
+                 llvm::SmallVector<std::pair<const ValueDecl *, SourceLocation>,
+                                   2>>
+      CallbackEarlyUses;
+
+private:
+  /// The variables the `fg_OnResume` callback being traversed captures by
+  /// copy.
+  llvm::SmallPtrSet<const ValueDecl *, 4> CallbackCopies;
+
+private:
+  /// Collects the variables a callback assigns: on the left of an
+  /// assignment, or passed by non-const reference, also to a call that is not
+  /// resolved yet, which may assign them; or with bValidating, every variable
+  /// it refers to.
+  class RefCollector : public OncePerTypeVisitor<RefCollector> {
+  public:
+    llvm::SmallVector<const ValueDecl *, 8> Decls;
+    /// What it assigns, or gives to what can assign it.
+    llvm::SmallPtrSet<const ValueDecl *, 8> Assigned;
+    bool bValidating = false; // Everything referred to counts.
+    /// The statements of the body of the callback, which run on every path.
+    llvm::SmallPtrSet<const Stmt *, 8> TopLevel;
+    /// What tells lookups into the actor, of a value assigned.
+    const BodyCollector *Owner = nullptr;
+    bool VisitDeclRefExpr(DeclRefExpr *Ref) {
+      if (bValidating)
+        Decls.push_back(Ref->getDecl());
+      ++Uses[Ref->getDecl()];
+      if (NullTests.contains(Ref) || ConditionalTargets.contains(Ref))
+        ++TestUses[Ref->getDecl()];
+      return true;
+    }
+    bool VisitBinaryOperator(BinaryOperator *Binary) {
+      if (Binary->isAssignmentOp())
+        add(Binary->getLHS());
+      // Assigned only on some paths, `if (bRefresh) pEntry = ...`, it isn't
+      // looked up again on the others.
+      if (Binary->getOpcode() == BO_Assign && !TopLevel.contains(Binary))
+        if (const auto *Target =
+                dyn_cast<DeclRefExpr>(Binary->getLHS()->IgnoreParenImpCasts()))
+          ConditionalTargets.insert(Target);
+      // `pEntry == nullptr` tests it.
+      if (Binary->isEqualityOp()) {
+        auto IsNull = [](const Expr *E) {
+          E = E->IgnoreParenImpCasts();
+          return isa<CXXNullPtrLiteralExpr, GNUNullExpr>(E) ||
+                 (isa<IntegerLiteral>(E) &&
+                  cast<IntegerLiteral>(E)->getValue().isZero());
+        };
+        if (IsNull(Binary->getRHS()))
+          addNullTest(Binary->getLHS());
+        else if (IsNull(Binary->getLHS()))
+          addNullTest(Binary->getRHS());
+      }
+      return true;
+    }
+    // `!pEntry` and `if (pEntry)` test it, and so does `bool(pEntry)`.
+    bool VisitCastExpr(CastExpr *Cast) {
+      if (Cast->getCastKind() == CK_PointerToBoolean)
+        addNullTest(Cast->getSubExpr());
+      return true;
+    }
+    /// Whether every use of \p Decl only tests whether it is null, which
+    /// doesn't tell that what it points to is still there, or assigns it on
+    /// some paths only.
+    bool onlyNullTested(const ValueDecl *Decl) const {
+      const auto It = Uses.find(Decl);
+      return It != Uses.end() && It->second == TestUses.lookup(Decl);
+    }
+    bool VisitCallExpr(CallExpr *Call) {
+      if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Call)) {
+        // Like a built-in one, `iEntry = mp_Items.f_GetIterator(1)`: not a
+        // copy of one kept from before, `iEntry = iSaved`, which may be gone,
+        // nor one assigned on some paths only, `if (bRefresh) iEntry = ...`.
+        if (Operator->getOperator() == OO_Equal &&
+            Operator->getNumArgs() == 2) {
+          const Expr *Value = Operator->getArg(1);
+          if (isa<DeclRefExpr>(skipWrappers(Value)->IgnoreParenImpCasts()) ||
+              (Owner && !Owner->isLookupIntoActor(Value)))
+            return true;
+          add(Operator->getArg(0));
+          if (!TopLevel.contains(Operator))
+            if (const auto *Target = dyn_cast<DeclRefExpr>(
+                    Operator->getArg(0)->IgnoreParenImpCasts()))
+              ConditionalTargets.insert(Target);
+          return true;
+        }
+        if (Operator->isAssignmentOp() && Operator->getNumArgs() >= 1)
+          add(Operator->getArg(0));
+        return true;
+      }
+      // Also one called through an unchanged local pointer to it, `fNoOp(p)`
+      // of `auto fNoOp = &fg_NoOp`.
+      const FunctionDecl *Callee = Call->getDirectCallee();
+      if (!Callee && !isMemberOrOperatorCall(Call))
+        Callee = calleeThroughPointer(Call);
+      for (unsigned iArgument = 0; iArgument < Call->getNumArgs(); ++iArgument) {
+        if (!Callee) {
+          add(Call->getArg(iArgument));
+          continue;
+        }
+        if (iArgument >= Callee->getNumParams())
+          break;
+        const QualType Type = Callee->getParamDecl(iArgument)->getType();
+        // Not given to one whose body can be seen and doesn't look it up
+        // again, like `void fg_NoOp(int *&_pEntry) {}` or one that only puts
+        // back what it is given, `_pEntry = _pSaved`, or does so on some
+        // paths only. Not of a virtual one, which can run an override whose
+        // body isn't the one seen.
+        const FunctionDecl *Definition = Callee->getDefinition();
+        if (Definition && Definition->getBody() &&
+            iArgument < Definition->getNumParams() && !callsOverride(Call) &&
+            !helperLooksUpAgain(Definition, iArgument))
+          continue;
+        if (Type->isReferenceType() &&
+            !Type.getNonReferenceType().isConstQualified()) {
+          add(Call->getArg(iArgument));
+          // Given to what can look it up again on some paths only, `if
+          // (bRefresh) fg_Refresh(pEntry)`.
+          if (!isTopLevelCall(Call))
+            if (const auto *Target = dyn_cast<DeclRefExpr>(
+                    Call->getArg(iArgument)->IgnoreParenImpCasts()))
+              ConditionalTargets.insert(Target);
+        }
+      }
+      return true;
+    }
+
+  public:
+    /// Whether \p Definition, a helper whose body can be seen, assigns its
+    /// parameter at \p Index in a statement of its body, on every path, what
+    /// isn't made from a pointer it is given, `_pSaved`, also cast,
+    /// `static_cast<int *>(_pEntry)`, or offset, `_pEntry + 0`, which is what
+    /// the caller had. Not after
+    /// what can leave first, `if (_pEntry) return;`. Also by giving it to
+    /// another that does, the same way, or to what can assign it and whose
+    /// body can't be seen, and not to one that puts back what it is given,
+    /// `fg_Restore(_pEntry, _pSaved)`. Each once for the AST; one that gives
+    /// it back to itself doesn't by that while it is told, nor one whose
+    /// recursion doesn't settle.
+    static bool helperLooksUpAgain(const FunctionDecl *Definition,
+                                   unsigned Index) {
+      struct CLooksUp {
+        TCSummaries<std::pair<const FunctionDecl *, unsigned>, bool> Decided{
+            &RefCollector::helperLooksUpAgainUncached, false, false};
+      };
+      return astCache<CLooksUp>(Definition->getASTContext())
+          .Decided.get({Definition, Index});
+    }
+
+    static bool helperLooksUpAgainUncached(
+        const std::pair<const FunctionDecl *, unsigned> &Key) {
+      const FunctionDecl *const Definition = Key.first;
+      const ParmVarDecl *Parameter = Definition->getParamDecl(Key.second);
+      const auto *Body = dyn_cast<CompoundStmt>(Definition->getBody());
+      if (!Body)
+        return false;
+      const llvm::SmallPtrSet<const Stmt *, 8> Always =
+          statementsBeforeLeaving(Body);
+      // The argument of \p Call that is the parameter given by a reference
+      // that can change it, `fg_Refresh(_pEntry)`, if one is.
+      auto GivenChangeable =
+          [&](const CallExpr *Call) -> std::optional<unsigned> {
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        for (unsigned iArgument = 0; iArgument < Call->getNumArgs();
+             ++iArgument) {
+          const auto *Ref = dyn_cast<DeclRefExpr>(
+              Call->getArg(iArgument)->IgnoreParenImpCasts());
+          if (!Ref || Ref->getDecl() != Parameter)
+            continue;
+          if (!Callee)
+            return iArgument;
+          if (iArgument >= Callee->getNumParams())
+            continue;
+          const QualType Type = Callee->getParamDecl(iArgument)->getType();
+          if (Type->isReferenceType() &&
+              !Type.getNonReferenceType().isConstQualified())
+            return iArgument;
+        }
+        return std::nullopt;
+      };
+      // What can change the parameter in a statement, an assignment, `++`,
+      // taking its address, which can be written through, or giving it to
+      // what can change it.
+      TCRecursive<bool(const Stmt *)> Changes = [&](const Stmt *S) {
+        if (!S || isa<LambdaExpr>(S))
+          return false;
+        if (const auto *Call = dyn_cast<CallExpr>(S);
+            Call && GivenChangeable(Call))
+          return true;
+        const Expr *Changed = nullptr;
+        if (const auto *Binary = dyn_cast<BinaryOperator>(S);
+            Binary && Binary->isAssignmentOp())
+          Changed = Binary->getLHS();
+        else if (const auto *Unary = dyn_cast<UnaryOperator>(S);
+                 Unary && (Unary->isIncrementDecrementOp() ||
+                           Unary->getOpcode() == UO_AddrOf))
+          Changed = Unary->getSubExpr();
+        if (const auto *Ref = Changed ? dyn_cast<DeclRefExpr>(
+                                            Changed->IgnoreParenImpCasts())
+                                      : nullptr;
+            Ref && Ref->getDecl() == Parameter)
+          return true;
+        return llvm::any_of(keptChildren(S), Changes);
+      };
+      // Whether \p Assign gives it what isn't made from a pointer it is given.
+      auto IsFresh = [&](const BinaryOperator *Assign) {
+        // Not one made from a pointer it is given, `_pEntry + 0`, also the
+        // one it assigns, which is what the caller had, but a lookup with
+        // other parameters, `mp_Items.f_FindEqual(_Key)`, is.
+        // Also through a local made from one, `int *pSaved = _pEntry;
+        // _pEntry = pSaved;`, and one that is changed may be.
+        bool FromPointer = false;
+        llvm::SmallPtrSet<const VarDecl *, 4> FollowedLocals;
+        llvm::SmallPtrSet<const FunctionDecl *, 4> FollowedCalls;
+        TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+          if (!S || FromPointer || isa<LambdaExpr>(S))
+            return;
+          // Also the address of what a reference parameter refers to,
+          // `&_Value`, which is what the caller gave, like `*pEntry`.
+          if (const auto *Address = dyn_cast<UnaryOperator>(S);
+              Address && Address->getOpcode() == UO_AddrOf)
+            if (const auto *Ref = dyn_cast<DeclRefExpr>(
+                    Address->getSubExpr()->IgnoreParenImpCasts()))
+              if (const auto *Given = dyn_cast<ParmVarDecl>(Ref->getDecl());
+                  Given && Given->getType()->isReferenceType()) {
+                FromPointer = true;
+                return;
+              }
+          if (const auto *Ref = dyn_cast<DeclRefExpr>(S)) {
+            // Not another that a statement before looks up again, `o_pValue =
+            // &mp_Items[_Key]; o_pMember = &o_pValue->m_Value;`.
+            auto RefreshedBefore = [&](const ParmVarDecl *Other) {
+              if (Other == Parameter ||
+                  !helperLooksUpAgain(Definition,
+                                      Other->getFunctionScopeIndex()))
+                return false;
+              const SourceManager &SM =
+                  Definition->getASTContext().getSourceManager();
+              return llvm::any_of(Body->body(), [&](const Stmt *Statement) {
+                const auto *Earlier = dyn_cast<BinaryOperator>(Statement);
+                const auto *Target =
+                    Earlier && Earlier->getOpcode() == BO_Assign
+                        ? dyn_cast<DeclRefExpr>(
+                              Earlier->getLHS()->IgnoreParenImpCasts())
+                        : nullptr;
+                return Target && Target->getDecl() == Other &&
+                       Always.contains(Statement) &&
+                       SM.isBeforeInTranslationUnit(Earlier->getEndLoc(),
+                                                    Assign->getBeginLoc());
+              });
+            };
+            if (const auto *Given = dyn_cast<ParmVarDecl>(Ref->getDecl());
+                Given &&
+                Given->getType().getNonReferenceType()->isPointerType()) {
+              if (!RefreshedBefore(Given))
+                FromPointer = true;
+            }
+            // Nor one saved in a global or a static, `_pEntry = g_pSaved`.
+            else if (const auto *Saved = dyn_cast<VarDecl>(Ref->getDecl());
+                     Saved && Saved->hasGlobalStorage() &&
+                     Saved->getType().getNonReferenceType()->isPointerType())
+              FromPointer = true;
+            else if (const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+                     Local && Local->hasLocalStorage() &&
+                     !isa<ParmVarDecl>(Local) &&
+                     (Local->getType()->isPointerType() ||
+                      Local->getType()->isReferenceType()) &&
+                     FollowedLocals.insert(Local).second) {
+              if (isChangedVariable(Local))
+                FromPointer = true;
+              else
+                Visit(Local->getInit());
+            }
+          }
+          // Nor what a free function gives back of those, `fg_LoadSaved()`
+          // of `return g_pSaved;`, each once, or anything when its body
+          // can't be seen.
+          if (const auto *Call = dyn_cast<CallExpr>(S);
+              Call && !isMemberOrOperatorCall(Call) &&
+              Call->getType()->isPointerType()) {
+            const FunctionDecl *Called = Call->getDirectCallee();
+            const FunctionDecl *CalledDefinition =
+                Called ? Called->getDefinition() : nullptr;
+            if (!Called || (!CalledDefinition && !Called->getBuiltinID()))
+              FromPointer = true;
+            else if (CalledDefinition && FollowedCalls.insert(Called).second)
+              for (const Expr *Returned : returnedValues(CalledDefinition))
+                Visit(Returned);
+          }
+          for (const Stmt *Child : keptChildren(S))
+            Visit(Child);
+        };
+        Visit(Assign->getRHS());
+        return !FromPointer && !Changes(Assign->getRHS());
+      };
+      // Whether \p Assign assigns the parameter, also through a local
+      // reference bound to it, `int *&pAlias = _pEntry; pAlias = ...`.
+      auto AssignsParameter = [&](const BinaryOperator *Assign) {
+        const auto *Target =
+            Assign && Assign->getOpcode() == BO_Assign
+                ? dyn_cast<DeclRefExpr>(Assign->getLHS()->IgnoreParenImpCasts())
+                : nullptr;
+        const ValueDecl *Named = Target ? Target->getDecl() : nullptr;
+        for (int Level = 0; Level < 16 && Named && Named != Parameter;
+             ++Level) {
+          const auto *Alias = dyn_cast<VarDecl>(Named);
+          const auto *Bound =
+              Alias && Alias->hasLocalStorage() && !isa<ParmVarDecl>(Alias) &&
+                      Alias->getType()->isReferenceType() && Alias->getInit()
+                  ? dyn_cast<DeclRefExpr>(
+                        Alias->getInit()->IgnoreParenImpCasts())
+                  : nullptr;
+          Named = Bound ? Bound->getDecl() : nullptr;
+        }
+        return Target && Named == Parameter;
+      };
+      // Not when a lambda in it can change it later, like a scope exit that
+      // puts back what the caller had, `g_OnScopeExit / [&] { _pEntry =
+      // pSaved; }`.
+      {
+        bool LambdaChanges = false;
+        TCRecursive<void(const Stmt *)> FindLambdas = [&](const Stmt *S) {
+          if (!S || LambdaChanges)
+            return;
+          if (const auto *Lambda = dyn_cast<LambdaExpr>(S)) {
+            LambdaChanges = Changes(Lambda->getBody());
+            return;
+          }
+          for (const Stmt *Child : keptChildren(S))
+            FindLambdas(Child);
+        };
+        FindLambdas(Body);
+        if (LambdaChanges)
+          return false;
+      }
+      // An `if` that assigns it a fresh one on every path through it, `if
+      // (_bFirst) _pEntry = mp_Items.f_FindEqual(1); else _pEntry = ...;`.
+      TCRecursive<bool(const Stmt *, int)> EveryPathFresh = [&](const Stmt *S,
+                                                                  int Level) {
+        if (!S || Level > 16)
+          return false;
+        if (const auto *Block = dyn_cast<CompoundStmt>(S)) {
+          for (const Stmt *Statement : Block->body()) {
+            if (EveryPathFresh(Statement, Level + 1))
+              return true;
+            if (canReturn(Statement))
+              return false;
+          }
+          return false;
+        }
+        if (const auto *If = dyn_cast<IfStmt>(S))
+          return If->getElse() && !If->isConsteval() &&
+                 llvm::all_of(keptBranches(If), [&](const Stmt *Branch) {
+                   return EveryPathFresh(Branch, Level + 1);
+                 });
+        const auto *E = dyn_cast<Expr>(S);
+        const auto *Assign =
+            E ? dyn_cast<BinaryOperator>(E->IgnoreImplicit()->IgnoreParens())
+              : nullptr;
+        return Assign && AssignsParameter(Assign) && IsFresh(Assign);
+      };
+      // The last of what it is assigned in the statements of its body tells,
+      // `_pEntry = mp_Items.f_FindEqual(1); _pEntry = _pSaved;` gives back
+      // what the caller had.
+      bool LooksUp = false;
+      for (const Stmt *Statement : Body->body()) {
+        // After what can leave, only if nothing changes it again.
+        if (!Always.contains(Statement)) {
+          if (Changes(Statement))
+            return false;
+          continue;
+        }
+        if (isa<IfStmt>(Statement) && EveryPathFresh(Statement, 0)) {
+          LooksUp = true;
+          continue;
+        }
+        // Given to another, `fg_Refresh(_pEntry)`, what it does with it.
+        if (const auto *Call = dyn_cast<CallExpr>(
+                isa<Expr>(Statement)
+                    ? cast<Expr>(Statement)->IgnoreImplicit()->IgnoreParens()
+                    : Statement)) {
+          if (const std::optional<unsigned> iArgument = GivenChangeable(Call)) {
+            const FunctionDecl *Callee = Call->getDirectCallee();
+            const FunctionDecl *CalleeDefinition =
+                Callee ? Callee->getDefinition() : nullptr;
+            if (!CalleeDefinition || !CalleeDefinition->getBody() ||
+                callsOverride(Call))
+              LooksUp = true;
+            else
+              LooksUp = *iArgument < CalleeDefinition->getNumParams() &&
+                        helperLooksUpAgain(CalleeDefinition, *iArgument);
+            continue;
+          }
+        }
+        const auto *Assign = dyn_cast<BinaryOperator>(
+            isa<Expr>(Statement) ? cast<Expr>(Statement)->IgnoreImplicit()
+                                 : Statement);
+        const auto *Target =
+            Assign && Assign->getOpcode() == BO_Assign
+                ? dyn_cast<DeclRefExpr>(Assign->getLHS()->IgnoreParenImpCasts())
+                : nullptr;
+        // Also through a local reference bound to it, `int *&pAlias =
+        // _pEntry; pAlias = ...`.
+        const ValueDecl *Named = Target ? Target->getDecl() : nullptr;
+        for (int Depth = 0; Depth < 16 && Named && Named != Parameter;
+             ++Depth) {
+          const auto *Alias = dyn_cast<VarDecl>(Named);
+          const auto *Bound =
+              Alias && Alias->hasLocalStorage() && !isa<ParmVarDecl>(Alias) &&
+                      Alias->getType()->isReferenceType() && Alias->getInit()
+                  ? dyn_cast<DeclRefExpr>(
+                        Alias->getInit()->IgnoreParenImpCasts())
+                  : nullptr;
+          Named = Bound ? Bound->getDecl() : nullptr;
+        }
+        if (!Target || Named != Parameter) {
+          if (Changes(Statement))
+            LooksUp = false;
+          continue;
+        }
+        LooksUp = IsFresh(Assign);
+      }
+      return LooksUp;
+    }
+
+  private:
+    /// Whether \p Call is a statement of the body, or all of one.
+    bool isTopLevelCall(const CallExpr *Call) const {
+      return llvm::any_of(TopLevel, [&](const Stmt *Statement) {
+        const auto *Value = dyn_cast<Expr>(Statement);
+        return Value && Value->IgnoreImplicit()->IgnoreParens() == Call;
+      });
+    }
+    llvm::SmallPtrSet<const DeclRefExpr *, 4> NullTests;
+    llvm::SmallPtrSet<const DeclRefExpr *, 4> ConditionalTargets;
+    llvm::DenseMap<const ValueDecl *, unsigned> Uses;
+    llvm::DenseMap<const ValueDecl *, unsigned> TestUses;
+    void addNullTest(const Expr *E) {
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+          Ref && Ref->getType()->isPointerType())
+        NullTests.insert(Ref);
+    }
+    // Assigning a reference writes through it, which doesn't look the data up
+    // again; a reference to a pointer rebinds the pointer.
+    void add(const Expr *E) {
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+          Ref && !(isUnresolvedReference(Ref->getDecl()))) {
+        Decls.push_back(Ref->getDecl());
+        Assigned.insert(Ref->getDecl());
+      }
+    }
+  };
+
+  /// Whether \p Init looks up data of the actor, like
+  /// `mp_Items.f_FindEqual(_Key)` or `&mp_Items[_Key]`, also through a local
+  /// alias of the container or of an earlier lookup. Dereferencing an owning
+  /// pointer, like `*mp_pInternal`, gives data that lives as long as the
+  /// actor.
+public:
+  /// Each expression is decided once in a question, as the collector is
+  /// then, also one that several ways lead to, like the argument a helper
+  /// returns as it is, `fg_Const(...)`, whose nesting would otherwise take
+  /// exponential time.
+  bool isLookupIntoActor(const Expr *Init) const {
+    if (LookupDeciding)
+      return LookupDecided.get({Init, LookupQuestion});
+    ++LookupQuestion;
+    LookupDeciding = true;
+    const llvm::scope_exit Leave([&] { LookupDeciding = false; });
+    return LookupDecided.get({Init, LookupQuestion});
+  }
+
+private:
+  /// Whether a question of isLookupIntoActor is answered, and its number.
+  mutable bool LookupDeciding = false;
+  mutable unsigned LookupQuestion = 0;
+  /// Whether each expression looks up data of the actor in each question
+  /// (isLookupIntoActor); one that reaches itself doesn't, while it is
+  /// decided, and one whose recursion doesn't settle does.
+  mutable TCSummaries<std::pair<const Expr *, unsigned>, bool> LookupDecided{
+      [this](const std::pair<const Expr *, unsigned> &Key) {
+        return decideLookupIntoActor(Key.first);
+      },
+      false, true};
+
+  bool decideLookupIntoActor(const Expr *Init) const {
+    // Braces that bind a reference are what they are given, `CValue
+    // &Value{*mp_Items.f_FindEqual(_Key)}`.
+    if (const auto *List = dyn_cast<InitListExpr>(Init->IgnoreParens());
+        List && List->isGLValue() && List->getNumInits() == 1)
+      return isLookupIntoActor(List->getInit(0));
+    // A temporary that a reference is bound to, like the copy of a bit-field,
+    // `unsigned const &Bits = mp_Items[1].m_Bits`, or a value a call gives,
+    // is its own, unless it can hold a lookup itself, like a handle.
+    for (const Expr *Bound = Init;;) {
+      if (const auto *Materialize = dyn_cast<MaterializeTemporaryExpr>(Bound)) {
+        if (!canHoldLookup(Materialize->getType()))
+          return false;
+        break;
+      }
+      if (const auto *Full = dyn_cast<FullExpr>(Bound))
+        Bound = Full->getSubExpr();
+      else if (const auto *Paren = dyn_cast<ParenExpr>(Bound))
+        Bound = Paren->getSubExpr();
+      else if (const auto *Cast = dyn_cast<ImplicitCastExpr>(Bound))
+        Bound = Cast->getSubExpr();
+      else
+        break;
+    }
+    const Expr *E = Init->IgnoreParenImpCasts();
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
+      return isLookupIntoActor(Cleanups->getSubExpr());
+    // The condition that a GNU `?:` gives, `pEntry ?: pOther`.
+    if (const auto *Opaque = dyn_cast<OpaqueValueExpr>(E))
+      return Opaque->getSourceExpr() &&
+             isLookupIntoActor(Opaque->getSourceExpr());
+    // What a coroutine of the actor's own object that can be seen gives back,
+    // awaited, `co_await fp_Find(_Key)` of `co_return
+    // mp_Items.f_FindEqual(_Key);`.
+    // Also of a coroutine lambda, `co_await fFind()` of `[this]() ->
+    // TCFuture<int *> { co_return mp_Items.f_FindEqual(1); }`. Not of a
+    // branch that a constant condition leaves out, `if (t_bCached)`.
+    if (const auto *Await = dyn_cast<CoawaitExpr>(E)) {
+      const Expr *Operand =
+          skipWrappers(Await->getOperand())->IgnoreParenImpCasts();
+      // Also moved, `co_await fg_Move(Pending)`, and kept in a local before,
+      // `auto Pending = fp_Find(_Key);`, which is the call it holds.
+      const LambdaExpr *CalledSafe = nullptr;
+      for (int Step = 0; Step < 8; ++Step) {
+        // And what `fg_CallSafe` calls, `co_await fg_CallSafe([this]() ->
+        // TCFuture<int *> { ... })`, which gives what that does, also a local
+        // one, moved, `fg_CallSafe(fg_Move(fFind))`.
+        if (const auto *Safe = dyn_cast<CallExpr>(Operand);
+            Safe && calleeName(Safe) == "fg_CallSafe" &&
+            Safe->getNumArgs() >= 1) {
+          const Expr *Called =
+              skipWrappers(Safe->getArg(0))->IgnoreParenImpCasts();
+          if (const auto *Move = dyn_cast<CallExpr>(Called);
+              Move && Move->getNumArgs() == 1 &&
+              isMoveOrForwardFunction(calleeName(Move)))
+            Called = Move->getArg(0);
+          if (const LambdaExpr *Lambda = calledLambda(Called)) {
+            CalledSafe = Lambda;
+            break;
+          }
+        }
+        if (const auto *Move = dyn_cast<CallExpr>(Operand);
+            Move && Move->getNumArgs() == 1 &&
+            isMoveOrForwardFunction(calleeName(Move))) {
+          Operand = skipWrappers(Move->getArg(0))->IgnoreParenImpCasts();
+          continue;
+        }
+        // Also moved by its member, `Find.f_Move()` of a future, which gives
+        // it moved, like `fg_Move(Find)`.
+        if (const CMemberCall Move = memberCallOf(Operand);
+            Move && Move->getNumArgs() == 0 && Move->getMethodDecl() &&
+            Move->getMethodDecl()->getIdentifier() &&
+            identifierTextOf(Move->getMethodDecl()) == "f_Move" &&
+            Move->getImplicitObjectArgument() &&
+            Move->getImplicitObjectArgument()
+                ->getType()
+                ->getAsCXXRecordDecl() &&
+            Move->getImplicitObjectArgument()
+                ->getType()
+                ->getAsCXXRecordDecl()
+                ->getIdentifier() &&
+            Move->getImplicitObjectArgument()
+                ->getType()
+                ->getAsCXXRecordDecl()
+                ->getName()
+                .starts_with("TCFuture")) {
+          Operand = skipWrappers(Move->getImplicitObjectArgument())
+                        ->IgnoreParenImpCasts();
+          continue;
+        }
+        // Also given a context for its error, `fp_Find(1) % "Finding"`,
+        // which gives the same result.
+        if (const auto *WithError = dyn_cast<CXXOperatorCallExpr>(Operand);
+            WithError && WithError->getOperator() == OO_Percent &&
+            WithError->getNumArgs() == 2 &&
+            WithError->getType()->getAsCXXRecordDecl() &&
+            WithError->getType()->getAsCXXRecordDecl()->getIdentifier() &&
+            identifierTextOf(WithError->getType()->getAsCXXRecordDecl()).starts_with(
+                "TCFuture")) {
+          Operand = skipWrappers(WithError->getArg(0))->IgnoreParenImpCasts();
+          continue;
+        }
+        const auto *Ref = dyn_cast<DeclRefExpr>(Operand);
+        const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+        if (!Local || !Local->hasLocalStorage() || isa<ParmVarDecl>(Local) ||
+            Local->getType()->isReferenceType())
+          break;
+        const Expr *Value = assignedValueAt(Local, Ref);
+        if (!Value)
+          break;
+        Operand = skipWrappers(Value)->IgnoreParenImpCasts();
+      }
+      const FunctionDecl *Definition =
+          CalledSafe ? CalledSafe->getCallOperator() : nullptr;
+      if (const CMemberCall Call = memberCallOf(Operand);
+          !Definition && Call && Call->getImplicitObjectArgument() &&
+          Call->getMethodDecl() &&
+          refersToOwnObject(Call->getImplicitObjectArgument(),
+                            &Call->getMethodDecl()->getASTContext()) &&
+          !callsOverride(Call))
+        Definition = Call->getMethodDecl()->getDefinition();
+      else if (const auto *Invoke = dyn_cast<CXXOperatorCallExpr>(Operand);
+               Invoke && Invoke->getOperator() == OO_Call &&
+               Invoke->getNumArgs() >= 1)
+        if (const LambdaExpr *Lambda = calledLambda(Invoke->getArg(0)))
+          Definition = Lambda->getCallOperator();
+      // Also a free or static one, `co_await fg_Find(this, 1)`, which looks
+      // it up in what it is given, like a free function does.
+      const CallExpr *Free = nullptr;
+      if (const auto *Call = dyn_cast<CallExpr>(Operand);
+          !Definition && Call &&
+          !isMemberOrOperatorCall(Call) &&
+          Call->getDirectCallee() && calleeName(Call) != "fg_CallSafe")
+        if (const auto *Method =
+                dyn_cast<CXXMethodDecl>(Call->getDirectCallee());
+            !Method || Method->isStatic()) {
+          Definition = Call->getDirectCallee()->getDefinition();
+          Free = Call;
+        }
+      if (const auto *Coroutine =
+              Definition
+                  ? dyn_cast_or_null<CoroutineBodyStmt>(Definition->getBody())
+                  : nullptr) {
+        const ASTContext &DefinitionContext = Definition->getASTContext();
+        bool Lookup = false;
+        llvm::SmallVector<const Expr *, 4> Values;
+        TCRecursive<void(const Stmt *)> Returns = [&](const Stmt *S) {
+          if (!S || Lookup || isa<LambdaExpr>(S))
+            return;
+          // Of what can run (canRunIn).
+          if (const auto *Return = dyn_cast<CoreturnStmt>(S)) {
+            if (!canRunIn(Return, Definition->getBody(), Definition,
+                          const_cast<ASTContext &>(DefinitionContext)))
+              return;
+            if (Return->getOperand())
+              Values.push_back(Return->getOperand());
+            Lookup =
+                Return->getOperand() && isLookupIntoActor(Return->getOperand());
+            return;
+          }
+          for (const Stmt *Child : keptChildren(S, DefinitionContext))
+            Returns(Child);
+        };
+        Returns(Coroutine->getBody());
+        // What it is given by reference, a lookup or the actor's data, or by
+        // a pointer to the actor, `this`, unless it gives back only members
+        // of that, which live with it.
+        // Not when it gives only what is static, `co_return "Ready";`.
+        if (!Lookup && Free && !Values.empty() &&
+            !onlyStatic(Values, E->isGLValue()) &&
+            (E->getType()->isPointerType() || isIteratorType(E->getType()) ||
+             E->isGLValue()))
+          for (unsigned iArgument = 0; iArgument < Free->getNumArgs() &&
+                                       iArgument < Definition->getNumParams();
+               ++iArgument) {
+            const ParmVarDecl *Parameter = Definition->getParamDecl(iArgument);
+            const Expr *Argument = Free->getArg(iArgument);
+            if (givesOnlyMembers(Values, Parameter) &&
+                !isLookupIntoActor(Argument))
+              continue;
+            if ((Parameter->getType()->isReferenceType() &&
+                 !Argument->getType()->isPointerType() &&
+                 isRootedForLookup(Argument)) ||
+                (Parameter->getType()->isPointerType() &&
+                 (isa<CXXThisExpr>(Argument->IgnoreParenImpCasts()) ||
+                  isRootedForLookup(Argument))))
+              return true;
+          }
+        return Lookup;
+      }
+    }
+    // The value of a statement expression, `({ mp_Items.f_FindEqual(1); })`.
+    if (const auto *Statement = dyn_cast<StmtExpr>(E)) {
+      const auto *Value =
+          Statement->getSubStmt()->body_empty()
+              ? nullptr
+              : dyn_cast<Expr>(Statement->getSubStmt()->body_back());
+      return Value && isLookupIntoActor(Value);
+    }
+    // What a lambda called in place gives back, `[this] { return
+    // mp_Items.f_FindEqual(1); }()`, of any of its returns, also of what it
+    // is given, `[](int &_Value) { return &_Value; }(mp_Items[0])`.
+    // Also of one held in a local, `fFind(mp_Items)` of `auto fFind =
+    // [](TCMap<int, CEntry> &_Items) { return _Items.f_FindEqual(1); }`, what
+    // it looks up in what it is given by reference, like a free function.
+    const CXXMethodDecl *Operator = calledInPlaceLambda(E);
+    if (const auto *Invoke = dyn_cast<CXXOperatorCallExpr>(E);
+        !Operator && Invoke && Invoke->getOperator() == OO_Call &&
+        Invoke->getNumArgs() >= 1 && calledLambda(Invoke->getArg(0)))
+      Operator = dyn_cast_or_null<CXXMethodDecl>(Invoke->getDirectCallee());
+    if (const auto *Call = dyn_cast<CallExpr>(E); Operator && Call) {
+      for (const bool Addressed : {false, true})
+        for (const Expr *Argument : returnedArguments(Call, Addressed))
+          if (isLookupIntoActor(Argument))
+            return true;
+      const llvm::SmallVector<const Expr *, 4> Values =
+          returnedValues(Operator);
+      if (llvm::any_of(Values, [&](const Expr *Value) {
+            return isLookupIntoActor(Value);
+          }))
+        return true;
+      const FunctionDecl *Definition = Operator->getDefinition();
+      const unsigned Offset = argumentShift(Call, Operator);
+      if (Definition && !Values.empty() && !returnsOnlyStatic(Definition) &&
+          (Call->getType()->isPointerType() ||
+           isIteratorType(Call->getType()) || Call->isGLValue()))
+        for (unsigned iArgument = Offset;
+             iArgument < Call->getNumArgs() &&
+             iArgument - Offset < Definition->getNumParams();
+             ++iArgument) {
+          const ParmVarDecl *Parameter =
+              Definition->getParamDecl(iArgument - Offset);
+          const Expr *Argument = Call->getArg(iArgument);
+          if (givesOnlyMembers(Values, Parameter) &&
+              !isLookupIntoActor(Argument))
+            continue;
+          // Also by a pointer to the actor, `fFind(this)`, like a free
+          // function.
+          if ((Parameter->getType()->isReferenceType() &&
+               !Argument->getType()->isPointerType() &&
+               isRootedForLookup(Argument)) ||
+              (Parameter->getType()->isPointerType() &&
+               (isa<CXXThisExpr>(Argument->IgnoreParenImpCasts()) ||
+                isRootedForLookup(Argument))))
+            return true;
+        }
+      return false;
+    }
+    // Moved, `fg_Move(mp_Items.f_FindEqual(1))`, it is what is moved.
+    if (const auto *Move = dyn_cast<CallExpr>(E);
+        Move && Move->getNumArgs() == 1 &&
+        (isMoveFunction(calleeName(Move)) ||
+         isForwardFunction(calleeName(Move))))
+      return isLookupIntoActor(Move->getArg(0));
+    // The address of a local that isn't a reference, `&pEntry`, also taken
+    // with `std::addressof(pEntry)`, is of the local itself, not of what it
+    // points to, also through local references bound to it, `&pAlias` of
+    // `auto *&pAlias = pEntry`.
+    int Aliases = 0;
+    const Expr *Addressed = nullptr;
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+        Unary && Unary->getOpcode() == UO_AddrOf)
+      Addressed = Unary->getSubExpr();
+    else if (const auto *Call = dyn_cast<CallExpr>(E); isAddressOfCall(Call))
+      Addressed = Call->getArg(0);
+    if (Addressed)
+      if (const auto *Ref =
+              dyn_cast<DeclRefExpr>(Addressed->IgnoreParenImpCasts()))
+        for (const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+             Local && Local->hasLocalStorage();) {
+          static constexpr int MaxAliases = 1024;
+          if (!Local->getType()->isReferenceType())
+            return false;
+          const auto *Bound = !isa<ParmVarDecl>(Local) && Local->getInit()
+                                  ? dyn_cast<DeclRefExpr>(
+                                        Local->getInit()->IgnoreParenImpCasts())
+                                  : nullptr;
+          if (!Bound || ++Aliases > MaxAliases)
+            break;
+          Local = dyn_cast<VarDecl>(Bound->getDecl());
+        }
+    // Also a pointer given a unary plus, `+mp_Items.f_FindEqual(1)`.
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+        Unary && (Unary->getOpcode() == UO_AddrOf ||
+                  Unary->getOpcode() == UO_Deref ||
+                  (Unary->getOpcode() == UO_Plus &&
+                   Unary->getType()->isPointerType())))
+      return isLookupIntoActor(Unary->getSubExpr());
+    // Not a static member, `m_Items[0].c_Value`, which isn't in the entry.
+    if (const auto *Member = dyn_cast<MemberExpr>(E))
+      return !isa<VarDecl, EnumConstantDecl>(Member->getMemberDecl()) &&
+             isLookupIntoActor(Member->getBase());
+    // Also through a pointer to the member, `mp_Items[1].*pmValue`.
+    if (const auto *Pointer = dyn_cast<BinaryOperator>(E);
+        Pointer && Pointer->isPtrMemOp() &&
+        !Pointer->getType()->isSpecificPlaceholderType(BuiltinType::BoundMember))
+      return isLookupIntoActor(Pointer->getLHS());
+    // A handle made from a lookup, like `CHandle Handle{*pEntry}`.
+    if (const auto *List = dyn_cast<InitListExpr>(E);
+        List && isReferenceHandle(List->getType()))
+      return llvm::any_of(List->inits(), [&](const Expr *Init) {
+        return isLookupIntoActor(Init);
+      });
+    // Also with parentheses, `CHandle Handle(*pEntry)` of an aggregate.
+    if (const auto *List = dyn_cast<CXXParenListInitExpr>(E);
+        List && isReferenceHandle(List->getType()))
+      return llvm::any_of(List->getInitExprs(), [&](const Expr *Init) {
+        return isLookupIntoActor(Init);
+      });
+    // A copy or a move of an iterator refers to the same entry, `auto iCopy =
+    // iEntry`, which holds pointers rather than references.
+    if (const auto *Construct = dyn_cast<CXXConstructExpr>(E);
+        Construct && Construct->getNumArgs() == 1 &&
+        Construct->getConstructor()->isCopyOrMoveConstructor() &&
+        isIteratorType(Construct->getType()))
+      return isLookupIntoActor(Construct->getArg(0));
+    // A copy of a handle refers to the same entry, and a handle made from a
+    // lookup, like `CHandle Handle(*pEntry, Tag)`, to the entry.
+    if (const auto *Construct = dyn_cast<CXXConstructExpr>(E);
+        Construct && Construct->getNumArgs() >= 1 &&
+        isReferenceHandle(Construct->getType())) {
+      if (Construct->getNumArgs() == 1)
+        return isLookupIntoActor(Construct->getArg(0));
+      const CXXConstructorDecl *Constructor = Construct->getConstructor();
+      for (unsigned iArgument = 0; iArgument < Construct->getNumArgs() &&
+                                   iArgument < Constructor->getNumParams();
+           ++iArgument) {
+        const QualType Type = Constructor->getParamDecl(iArgument)->getType();
+        if ((Type->isReferenceType() || Type->isPointerType()) &&
+            isLookupIntoActor(Construct->getArg(iArgument)))
+          return true;
+      }
+      return false;
+    }
+    if (const auto *Bind = dyn_cast<CXXBindTemporaryExpr>(E))
+      return isLookupIntoActor(Bind->getSubExpr());
+    // Pointer arithmetic, like `m_Buffer.f_GetArray() + Index`, and pointer
+    // casts stay in the data.
+    if (const auto *Binary = dyn_cast<BinaryOperator>(E);
+        Binary && Binary->isAdditiveOp() && Binary->getType()->isPointerType())
+      return isLookupIntoActor(Binary->getLHS()->getType()->isPointerType()
+                                   ? Binary->getLHS()
+                                   : Binary->getRHS());
+    // Also to a reference, `static_cast<int &>(mp_Items[1])`, whose type is
+    // the type it refers to.
+    if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
+        Cast && (Cast->getType()->isPointerType() ||
+                 Cast->getTypeAsWritten()->isReferenceType()))
+      return isLookupIntoActor(Cast->getSubExpr());
+    // What a comma gives, `(f_Prepare(), mp_Items.f_FindEqual(Key))`, and
+    // what an assignment of a pointer assigns, `(pEntry =
+    // mp_Items.f_FindEqual(Key))`; of anything else, an assignment, also a
+    // compound one, or a prefix increment, refers to what it changes,
+    // `(mp_Items[0] = 1)` or `++mp_Items[0]`, also an overloaded one.
+    if (const auto *Binary = dyn_cast<BinaryOperator>(E);
+        Binary && (Binary->getOpcode() == BO_Comma ||
+                   (Binary->getOpcode() == BO_Assign &&
+                    Binary->getType()->isPointerType())))
+      return isLookupIntoActor(Binary->getRHS());
+    if (const auto *Binary = dyn_cast<BinaryOperator>(E);
+        Binary && Binary->isAssignmentOp())
+      return isLookupIntoActor(Binary->getLHS());
+    if (const auto *Step = dyn_cast<UnaryOperator>(E);
+        Step && Step->isPrefix() && Step->isIncrementDecrementOp() &&
+        !Step->getType()->isPointerType())
+      return isLookupIntoActor(Step->getSubExpr());
+    // A pointer stepped, `p++` or `++p`, gives one into the same data.
+    if (const auto *Step = dyn_cast<UnaryOperator>(E);
+        Step && Step->isIncrementDecrementOp() &&
+        Step->getType()->isPointerType())
+      return isLookupIntoActor(Step->getSubExpr());
+    if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(E);
+        Operator && Operator->isGLValue() && Operator->getNumArgs() >= 1 &&
+        (Operator->isAssignmentOp() ||
+         ((Operator->getOperator() == OO_PlusPlus ||
+           Operator->getOperator() == OO_MinusMinus) &&
+          Operator->getNumArgs() == 1)))
+      return isLookupIntoActor(Operator->getArg(0));
+    // Either value of a conditional, like `bFirst ? mp_Items(1) : mp_Items(2)`,
+    // or the one a constant condition chooses.
+    if (const auto *Conditional = dyn_cast<AbstractConditionalOperator>(E)) {
+      if (bool Chosen = false;
+          Context && !Conditional->getCond()->isValueDependent() &&
+          foldsCondition(Conditional->getCond(), Chosen, *Context))
+        return isLookupIntoActor(Chosen ? Conditional->getTrueExpr()
+                                        : Conditional->getFalseExpr());
+      return llvm::any_of(keptArms(Conditional), [&](const Expr *Arm) {
+        return isLookupIntoActor(Arm);
+      });
+    }
+    if (const auto *Materialize = dyn_cast<MaterializeTemporaryExpr>(E))
+      return isLookupIntoActor(Materialize->getSubExpr());
+    if (const CMemberCall Call = memberCallOf(E)) {
+      // The storage of one of FixedArrayTypes held in the object,
+      // `m_Values.data()` or `m_Values.front()` of a `std::array`, lives with
+      // it, like its elements by subscript, and so does the object itself
+      // that an accessor gives, `mp_Items.f_Entries()` of `return *this;`.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method &&
+          ((isFixedArrayType(Call->getImplicitObjectArgument()->getType(),
+                             Method->getASTContext()) &&
+            isHeldByValue(
+                relationToActor(Call->getImplicitObjectArgument()))) ||
+           (givesItsObject(Method) && !callsOverride(Call))))
+        return isLookupIntoActor(Call->getImplicitObjectArgument());
+      // An operator called by its name, `mp_pOwner.operator*()` or
+      // `.operator->()`, is like the operator, `*mp_pOwner`.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method &&
+          (Method->getOverloadedOperator() == OO_Star ||
+           Method->getOverloadedOperator() == OO_Arrow) &&
+          Method->getNumParams() == 0) {
+        if (isOptionalHolder(Call->getImplicitObjectArgument()->getType()))
+          return isRootedForLookup(Call->getImplicitObjectArgument());
+        return isLookupIntoActor(Call->getImplicitObjectArgument());
+      }
+      // What a handle or an iterator refers to, like `Mapping.f_GetResult()`,
+      // `iEntry.f_GetCurrent()`, `iEntry.operator->()` or the conversion to
+      // the reference or pointer.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method &&
+          (Method->getReturnType()->isReferenceType() ||
+           Method->getReturnType()->isPointerType() ||
+           isa<CXXConversionDecl>(Method)) &&
+          (isReferenceHandle(Call->getImplicitObjectArgument()
+                                 ->IgnoreParenImpCasts()
+                                 ->getType()) ||
+           isIteratorType(Call->getImplicitObjectArgument()
+                              ->IgnoreParenImpCasts()
+                              ->getType())) &&
+          isLookupIntoActor(Call->getImplicitObjectArgument()))
+        return true;
+      // The pointer of an owning pointer member, like `mp_pInternal.f_Get()`
+      // or `mp_pValue.get()`, lives as long as the actor, unless the owning
+      // pointer is in an entry, `mp_Items[Key].m_pValue.f_Get()`, which can
+      // be removed. What an optional holds, which f_Get() returns a reference
+      // to, can be cleared.
+      // Only of a pointer, which has `operator->`, not of what holds its
+      // data otherwise, like `int *f_Get()` of a vector it can clear.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method && Method->getIdentifier() &&
+          (identifierTextOf(Method) == "f_Get" || identifierTextOf(Method) == "get") &&
+          Method->getReturnType()->isPointerType() &&
+          hasOverloadedOperator(Method->getParent(), {OO_Arrow}) == true)
+        return isLookupIntoActor(Call->getImplicitObjectArgument());
+      // A value it gives, like the count `f_GetLen()` returns, also bound to
+      // a reference that extends it, is its own.
+      if (!Call->isGLValue() && !canHoldLookup(Call->getType()))
+        return false;
+      // One of the actor itself whose body can be seen, and that isn't
+      // overridden, gives what it returns: a lookup only when that is one,
+      // not a member that lives with the object, `return m_Value;`, a global,
+      // or what it is given, `return _pValue;`, unless that is one.
+      // Also through an unchanged local pointer to it, `pThis->f_Get()` with
+      // `auto *pThis = this`, or `(*this).f_Get()`, or a parameter that is
+      // the object of the actor, `_pThis->f_Get()`.
+      auto IsThis = [&](const Expr *Object) {
+        return objectRelation(
+                   Object,
+                   [](const Expr *Of) {
+                     if (const auto *Ref = dyn_cast<DeclRefExpr>(Of))
+                       return isActorObjectParameter(Ref->getDecl());
+                     return isa<CXXThisExpr>(Of);
+                   },
+                   const_cast<ASTContext *>(Context))
+                   .Kind == EObjectRelation::SameObject;
+      };
+      // Also a virtual one called by name, `CApp::f_Name()`, which runs the
+      // body that is seen.
+      // Also what is named for the object of the actor, the `m_pThis` of an
+      // internal, or an unchanged local reference to it, `CApp &This =
+      // *this`, of a member function of the actor.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method &&
+          (IsThis(Call->getImplicitObjectArgument()) ||
+           (isActorClass(Method->getParent()) &&
+            isOwnActorObject(Call->getImplicitObjectArgument()))) &&
+          !callsOverride(Call))
+        if (const FunctionDecl *Definition = Method->getDefinition();
+            Definition && Definition->getBody() &&
+            !isa<CoroutineBodyStmt>(Definition->getBody())) {
+          llvm::SmallVector<const Expr *, 2> Values;
+          TCRecursive<void(const Stmt *)> Returns = [&](const Stmt *S) {
+            if (!S || isa<LambdaExpr>(S))
+              return;
+            // Not what never runs, in a branch an `if constexpr` discards or
+            // a constant condition never takes, or after what always leaves,
+            // `if constexpr (t_bDefault) return &m_Default;` (canRunIn).
+            if (const auto *Return = dyn_cast<ReturnStmt>(S)) {
+              if (Return->getRetValue() &&
+                  canRunIn(
+                      Return, Definition->getBody(), Definition,
+                      const_cast<ASTContext &>(Definition->getASTContext())))
+                Values.push_back(Return->getRetValue());
+              return;
+            }
+            for (const Stmt *Child :
+                 evaluatedChildren(S, Definition->getASTContext()))
+              Returns(Child);
+          };
+          Returns(Definition->getBody());
+          // What it gives back of what it is given, also cast or through a
+          // local, `return static_cast<int *>(_pValue);`.
+          for (const Expr *Argument : returnedArguments(Call))
+            if (isLookupIntoActor(Argument))
+              return true;
+          // Also a member of what it is given by reference, `return
+          // _Value.m_Name;` or `return &_Value.m_Name;`, which is in that.
+          if (!Values.empty())
+            return llvm::any_of(Values, [&](const Expr *Value) {
+              const Expr *Part = skipWrappers(Value)->IgnoreParenImpCasts();
+              if (const auto *Address = dyn_cast<UnaryOperator>(Part);
+                  Address && Address->getOpcode() == UO_AddrOf)
+                Part = Address->getSubExpr()->IgnoreParenImpCasts();
+              bool Member = false;
+              while (const auto *Access = dyn_cast<MemberExpr>(Part)) {
+                if (Access->isArrow() ||
+                    !isa<FieldDecl>(Access->getMemberDecl()))
+                  break;
+                Member = true;
+                Part = Access->getBase()->IgnoreParenImpCasts();
+              }
+              if (const auto *Ref = dyn_cast<DeclRefExpr>(Part); Member && Ref)
+                if (const auto *Parameter =
+                        dyn_cast<ParmVarDecl>(Ref->getDecl());
+                    Parameter && Parameter->getType()->isReferenceType() &&
+                    Call->parameterArgument(Parameter) &&
+                    isLookupIntoActor(Call->parameterArgument(Parameter)))
+                  return true;
+              const auto *Given = dyn_cast<DeclRefExpr>(
+                  skipWrappers(Value)->IgnoreParenImpCasts());
+              if (const auto *Parameter =
+                      Given ? dyn_cast<ParmVarDecl>(Given->getDecl()) : nullptr)
+                return Call->parameterArgument(Parameter) &&
+                       isLookupIntoActor(Call->parameterArgument(Parameter));
+              // A lookup in what it is given by reference, `return
+              // _Items.f_FindEqual(1);` of `f_Find(mp_Items)`.
+              if (const CMemberCall Lookup = memberCallOf(
+                      skipWrappers(Value)->IgnoreParenImpCasts());
+                  Lookup && Lookup->getImplicitObjectArgument() &&
+                  Lookup->getMethodDecl() &&
+                  (Lookup->getType()->isPointerType() ||
+                   isIteratorType(Lookup->getType()) || Lookup->isGLValue()) &&
+                  !returnsOnlyStatic(Lookup->getMethodDecl()))
+                if (const auto *Object = dyn_cast<DeclRefExpr>(
+                        Lookup->getImplicitObjectArgument()
+                            ->IgnoreParenImpCasts()))
+                  if (const auto *Parameter =
+                          dyn_cast<ParmVarDecl>(Object->getDecl());
+                      Parameter && Parameter->getType()->isReferenceType() &&
+                      Call->parameterArgument(Parameter) &&
+                      isRootedForLookup(Call->parameterArgument(Parameter)))
+                    return true;
+              return isLookupIntoActor(Value);
+            });
+        }
+      // Not one that can be seen to give back only what has static storage,
+      // `char const *f_Category() const { return "Downloads"; }`, unless an
+      // override can give something else.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method && returnsOnlyStatic(Method) && !callsOverride(Call))
+        return false;
+      // One of another object that can be seen to give back only members of
+      // its own, `int &f_Value() { return m_Value; }`, which live with it,
+      // gives a lookup when the object is one.
+      if (const CXXMethodDecl *Method = Call->getMethodDecl();
+          Method && !callsOverride(Call))
+        if (const FunctionDecl *Definition = Method->getDefinition();
+            Definition && Definition->getBody() &&
+            !isa<CoroutineBodyStmt>(Definition->getBody())) {
+          const llvm::SmallVector<const Expr *, 4> Values =
+              returnedValues(Definition);
+          if (!Values.empty() && givesOnlyMembers(Values, explicitObjectOf(Definition)))
+            return isLookupIntoActor(Call->getImplicitObjectArgument());
+        }
+      // Not into a member that is const itself, `TCMap<int, int> const
+      // m_Configuration`, also in one, whose entries nothing can remove, unlike
+      // one through a reference to const, when they hold only values: what
+      // a pointer in one points to, `TCMap<int, CEntry> const mp_Index` of
+      // `int *m_pValue`, can be removed from elsewhere.
+      const QualType Entry =
+          Call->getType()->isPointerType() || Call->getType()->isReferenceType()
+              ? Call->getType()->getPointeeType()
+              : Call->getType();
+      for (const Expr *Object =
+               !Entry.isNull() && !Entry->isDependentType() && Context &&
+                       holdsOnlyValues(Entry, *Context) &&
+                       Call->getImplicitObjectArgument()
+                   ? Call->getImplicitObjectArgument()->IgnoreParenImpCasts()
+                   : nullptr;
+           const auto *Member = dyn_cast_or_null<MemberExpr>(Object);
+           Object = Member->getBase()->IgnoreParenImpCasts()) {
+        const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+        if (!Field || Field->getType()->isReferenceType() ||
+            Field->getType()->isPointerType() || Field->isMutable())
+          break;
+        if (Field->getType().isConstQualified())
+          return false;
+        if (Member->isArrow())
+          break;
+      }
+      return isRootedForLookup(Call->getImplicitObjectArgument());
+    }
+    // The object itself that an accessor with an explicit object parameter
+    // gives, `mp_Items.f_Explicit()` of `CItems &f_Explicit(this CItems &)`.
+    if (const auto *Call = dyn_cast<CallExpr>(E);
+        Call && !isMemberOrOperatorCall(Call) &&
+        Call->getNumArgs() >= 1)
+      if (const auto *Method =
+              dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
+          Method && Method->isExplicitObjectMemberFunction() &&
+          givesItsObject(Method) && !callsOverride(Call))
+        return isLookupIntoActor(Call->getArg(0));
+    // An iterator of the data from a free function, `begin(mp_Items)`, also
+    // a pointer into it, like `begin` of a vector gives.
+    if (const auto *Free = dyn_cast<CallExpr>(E);
+        Free && !isMemberOrOperatorCall(Free) &&
+        Free->getNumArgs() == 1 &&
+        (isIteratorType(Free->getType()) || Free->getType()->isPointerType()) &&
+        llvm::is_contained({StringRef("begin"), StringRef("cbegin"),
+                            StringRef("rbegin"), StringRef("crbegin"),
+                            StringRef("end"), StringRef("cend"),
+                            StringRef("rend"), StringRef("crend")},
+                           calleeName(Free))) {
+      // Of an array the object holds, `std::begin(m_Values)`, also a
+      // `std::array`, which lives with it, like its elements by subscript.
+      if (Free->getDirectCallee() &&
+          isFixedArrayType(Free->getArg(0)->getType(),
+                           Free->getDirectCallee()->getASTContext()) &&
+          isHeldByValue(relationToActor(Free->getArg(0))))
+        return isLookupIntoActor(Free->getArg(0));
+      return isRootedForLookup(Free->getArg(0));
+    }
+    // What a function called through a pointer to it gives, `fFind(mp_Items,
+    // 1)` of `auto fFind = &fg_Find;`, which can find it in what it is given.
+    if (const auto *Indirect = dyn_cast<CallExpr>(E);
+        Indirect && !isMemberOrOperatorCall(Indirect) &&
+        !Indirect->getDirectCallee() &&
+        (Indirect->isGLValue() || canHoldLookup(Indirect->getType())) &&
+        llvm::any_of(Indirect->arguments(), [&](const Expr *Given) {
+          return isRootedForLookup(Given);
+        }))
+      return true;
+    // What a free function whose body can be seen gives back as it is given
+    // it, `fg_Identity(mp_Items.f_FindEqual(1))` of `int *fg_Identity(int
+    // *_pValue) { return _pValue; }`.
+    // Only that, when each return gives one of them that it doesn't change,
+    // `return o_pTo;` of `fg_StrCopy(Buffer, m_Text)`, not what it reads of
+    // the others.
+    if (const auto *Free = dyn_cast<CallExpr>(E);
+        Free && !isMemberOrOperatorCall(Free)) {
+      for (const Expr *Argument : returnedArguments(Free))
+        if (isLookupIntoActor(Argument))
+          return true;
+      if (const FunctionDecl *Callee = Free->getDirectCallee()) {
+        const llvm::SmallVector<const Expr *, 4> Values =
+            returnedValues(Callee);
+        if (!Values.empty() && llvm::all_of(Values, [&](const Expr *Value) {
+              const auto *Ref = dyn_cast<DeclRefExpr>(
+                  skipWrappers(Value)->IgnoreParenCasts());
+              const auto *Parameter =
+                  Ref ? dyn_cast<ParmVarDecl>(Ref->getDecl()) : nullptr;
+              return Parameter && !isChangedVariable(Parameter) &&
+                     (Parameter->getType()->isPointerType() ||
+                      (Free->isGLValue() &&
+                       Parameter->getType()->isReferenceType()));
+            }))
+          return false;
+      }
+    }
+    // What a free function gives of what it is given by reference, a pointer
+    // or iterator into it, like `fg_FindEqual(mp_Items, Key)`, which looks it
+    // up like the member function does.
+    if (const auto *Free = dyn_cast<CallExpr>(E);
+        Free && !isMemberOrOperatorCall(Free) &&
+        Free->getDirectCallee() &&
+        (Free->getType()->isPointerType() || isIteratorType(Free->getType()) ||
+         Free->isGLValue()) &&
+        !isMoveFunction(calleeName(Free)) &&
+        !isForwardFunction(calleeName(Free)) && !isAddressOfCall(Free) &&
+        // Not one that can be seen to give only what has static storage,
+        // `return "Name";`.
+        !returnsOnlyStatic(Free->getDirectCallee())) {
+      // A member function with an explicit object, `int &f_Value(this CApp
+      // &_Self) { return _Self.m_Value; }`, that gives only members of the
+      // object, which live with it: a lookup when the object is one,
+      // `mp_Items[1].f_Value()`.
+      if (const auto *Method = dyn_cast<CXXMethodDecl>(Free->getDirectCallee());
+          Method && Method->isExplicitObjectMemberFunction())
+        if (const FunctionDecl *Definition = Method->getDefinition();
+            Definition && Definition->getNumParams() >= 1) {
+          const ParmVarDecl *Self = Definition->getParamDecl(0);
+          const llvm::SmallVector<const Expr *, 4> Values =
+              returnedValues(Definition);
+          if (!Values.empty() && llvm::all_of(Values, [&](const Expr *Value) {
+                const Expr *Part = Value->IgnoreParenImpCasts();
+                if (const auto *Address = dyn_cast<UnaryOperator>(Part);
+                    Address && Address->getOpcode() == UO_AddrOf)
+                  Part = Address->getSubExpr()->IgnoreParenImpCasts();
+                bool Member = false;
+                while (const auto *Access = dyn_cast<MemberExpr>(Part)) {
+                  if (!isa<FieldDecl>(Access->getMemberDecl()) ||
+                      Access->isArrow())
+                    return false;
+                  Member = true;
+                  Part = Access->getBase()->IgnoreParenImpCasts();
+                }
+                const auto *Ref = dyn_cast<DeclRefExpr>(Part);
+                return Member && Ref && Ref->getDecl() == Self;
+              }))
+            return Free->getNumArgs() >= 1 &&
+                   isLookupIntoActor(Free->getArg(0));
+        }
+      // One whose body can be seen to only give the address of what it is
+      // given by reference, `return &_Value;`, gives that: the address of a
+      // lookup, `fg_Address(*mp_Items.f_FindEqual(1))`, is one, but not that
+      // of what the object holds, `fg_Address(m_Value)`.
+      const llvm::SmallVector<const Expr *, 4> Values =
+          returnedValues(Free->getDirectCallee());
+      if (!Values.empty() && llvm::all_of(Values, [](const Expr *Value) {
+            const auto *Address =
+                dyn_cast<UnaryOperator>(Value->IgnoreParenImpCasts());
+            const auto *Ref =
+                Address && Address->getOpcode() == UO_AddrOf
+                    ? dyn_cast<DeclRefExpr>(
+                          Address->getSubExpr()->IgnoreParenImpCasts())
+                    : nullptr;
+            const auto *Parameter =
+                Ref ? dyn_cast<ParmVarDecl>(Ref->getDecl()) : nullptr;
+            return Parameter && Parameter->getType()->isReferenceType();
+          })) {
+        for (const Expr *Argument : returnedArguments(Free, /*Addressed=*/true))
+          if (isLookupIntoActor(Argument))
+            return true;
+        return false;
+      }
+      // Nor one whose body can be seen to give only what it allocates, a copy
+      // of what it is given, `fg_ConstructObject<int>(Allocator,
+      // mp_Items[1])` of `return new t_CObject(...)`, which has its own
+      // storage.
+      if (!Values.empty() && llvm::all_of(Values, [](const Expr *Value) {
+            return isa<CXXNewExpr>(Value->IgnoreParenImpCasts());
+          }))
+        return false;
+      for (unsigned iArgument = 0;
+           iArgument < Free->getNumArgs() &&
+           iArgument < Free->getDirectCallee()->getNumParams();
+           ++iArgument) {
+        const QualType Parameter =
+            Free->getDirectCallee()->getParamDecl(iArgument)->getType();
+        const Expr *Argument = Free->getArg(iArgument);
+        const FunctionDecl *Definition =
+            Free->getDirectCallee()->getDefinition();
+        // Unless its body can be seen to give back only members of what it is
+        // given, which live with it, `return _App.m_Value;`: a lookup when
+        // what it is given is one, `fg_Value(mp_Items[1])`.
+        if (Parameter->isReferenceType() &&
+            !Argument->getType()->isPointerType() &&
+            isRootedForLookup(Argument)) {
+          if (!(Definition && !Values.empty() &&
+                givesOnlyMembers(Values, Definition->getParamDecl(iArgument))))
+            return true;
+          if (isLookupIntoActor(Argument))
+            return true;
+        }
+        // Also the object given by a pointer, `fs_Find(this, 1)`, to one whose
+        // body can be seen, like a member function of it, unless it gives back
+        // only members of it, which live with it, `return
+        // &_pThis->m_Fixed;`.
+        if (Parameter->isPointerType() && Definition && !Values.empty() &&
+            (isa<CXXThisExpr>(Argument->IgnoreParenImpCasts()) ||
+             isRootedForLookup(Argument)) &&
+            !givesOnlyMembers(Values, Definition->getParamDecl(iArgument)))
+          return true;
+      }
+    }
+    // A pointer that a free function gives back as it is, `fg_Const(pEntry)`
+    // of `t_CType const &fg_Const(t_CType const &_Value)`: a reference to an
+    // argument of the type it returns.
+    if (const auto *Free = dyn_cast<CallExpr>(E);
+        Free && !isMemberOrOperatorCall(Free) &&
+        Free->getDirectCallee() && Free->isGLValue() &&
+        Free->getType()->isPointerType())
+      for (unsigned iArgument = 0;
+           iArgument < Free->getNumArgs() &&
+           iArgument < Free->getDirectCallee()->getNumParams();
+           ++iArgument)
+        if (Free->getDirectCallee()
+                ->getParamDecl(iArgument)
+                ->getType()
+                ->isReferenceType() &&
+            Free->getArg(iArgument)->getType()->isPointerType() &&
+            Free->getArg(iArgument)
+                    ->getType()
+                    ->getPointeeType()
+                    .getUnqualifiedType() ==
+                Free->getType()->getPointeeType().getUnqualifiedType() &&
+            isLookupIntoActor(Free->getArg(iArgument)))
+          return true;
+    // The address of a lookup, `std::addressof(mp_Items[Key])`.
+    if (const auto *Address = dyn_cast<CallExpr>(E); isAddressOfCall(Address))
+      return isLookupIntoActor(Address->getArg(0));
+    // The old value of what `fg_Exchange` assigns, `fg_Exchange(pEntry,
+    // nullptr)`, is what it pointed to.
+    if (const auto *Exchange = dyn_cast<CallExpr>(E);
+        Exchange && Exchange->getNumArgs() == 2 &&
+        (isExchangeFunction(calleeName(Exchange))))
+      return isLookupIntoActor(Exchange->getArg(0));
+    if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
+        Call && Call->getNumArgs() >= 1) {
+      // `m_Items[Key]`, and `m_Items(Key)`, which finds or adds an entry of a
+      // `TCMap`, like a member call.
+      // A value it gives, like `int operator[](int) const`, is its own, like
+      // that of a member function.
+      // An element of a `std::array` held in the object lives with it, like
+      // one of a built-in array.
+      if (Call->getOperator() == OO_Subscript && Call->getDirectCallee() &&
+          isFixedArrayType(Call->getArg(0)->getType(),
+                           Call->getDirectCallee()->getASTContext()) &&
+          isHeldByValue(relationToActor(Call->getArg(0))))
+        return isLookupIntoActor(Call->getArg(0));
+      // The object itself that a member operator gives, `mp_Items()` of
+      // `return *this;`.
+      if (const auto *Method =
+              dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
+          Method && !Method->isStatic() && givesItsObject(Method) &&
+          !callsOverride(Call))
+        return isLookupIntoActor(Call->getArg(0));
+      // Nor one whose body can be seen to give only what the object holds,
+      // `return m_Axis[_iAxis];` of a `TCVec`, which lives with it.
+      if (const auto *Method =
+              dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
+          Method && (Call->getOperator() == OO_Subscript ||
+                     Call->getOperator() == OO_Call))
+        if (const FunctionDecl *Definition = calledDefinition(Call);
+            Definition && !isa<CoroutineBodyStmt>(Definition->getBody())) {
+          const llvm::SmallVector<const Expr *, 4> Values =
+              returnedValues(Definition);
+          if (!Values.empty() && givesOnlyMembers(Values, explicitObjectOf(Definition)))
+            return isLookupIntoActor(Call->getArg(0));
+        }
+      // Also of what a callable is given, `fFind(mp_Items, 1)` of a
+      // `TCFunction<CEntry *(TCMap<int, CEntry> &, int)>`, which it can find
+      // what it gives in.
+      if (Call->getOperator() == OO_Call)
+        return (Call->isGLValue() || canHoldLookup(Call->getType())) &&
+               llvm::any_of(Call->arguments(), [&](const Expr *Given) {
+                 return isRootedForLookup(Given);
+               });
+      if (Call->getOperator() == OO_Subscript)
+        return (Call->isGLValue() || canHoldLookup(Call->getType())) &&
+               isRootedForLookup(Call->getArg(0));
+      // What an optional holds can be cleared, `mp_Value.f_Clear()`, unlike
+      // what an owning pointer member points to.
+      if (Call->getOperator() == OO_Arrow || Call->getOperator() == OO_Star) {
+        if (isOptionalHolder(Call->getArg(0)->getType()))
+          return isRootedForLookup(Call->getArg(0));
+        return isLookupIntoActor(Call->getArg(0));
+      }
+    }
+    // An element of an array held in the object, `mp_Values[Index]`, lives
+    // with what holds the array; one through a pointer is a lookup, also
+    // through a lookup, `pEntry[0]` like `*pEntry`.
+    if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E)) {
+      const Expr *Base = Subscript->getBase()->IgnoreParenImpCasts();
+      if (Base->getType()->isConstantArrayType())
+        return isLookupIntoActor(Base);
+      return isRootedForLookup(Subscript->getBase()) || isLookupIntoActor(Base);
+    }
+    // A copy of an earlier lookup, like `auto *pAlias = pValue`, also of one
+    // assigned before.
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
+      // A name of a structured binding of a reference, `auto &[Value] =
+      // mp_Items[0]`, is in what that refers to.
+      if (const auto *Binding = dyn_cast<BindingDecl>(Ref->getDecl())) {
+        const auto *Decomposed =
+            dyn_cast_or_null<VarDecl>(Binding->getDecomposedDecl());
+        return Decomposed && Decomposed->getType()->isReferenceType() &&
+               Binding->getBinding() &&
+               isLookupIntoActor(Binding->getBinding());
+      }
+      const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl());
+      if (Variable && OwnedRanges.contains(Variable))
+        return false;
+      if (Variable && LookupSet.contains(Variable))
+        return true;
+      // What it holds where it is read, `p = mp_Items.f_FindEqual(0); return
+      // p;` in a getter, when that can be told, and else what it is made with.
+      if (!Variable || isa<ParmVarDecl>(Variable) ||
+          !(Variable->hasLocalStorage() || Variable->isInitCapture()) ||
+          !canHoldLookup(Variable->getType()))
+        return false;
+      const Expr *Value = Variable->isInitCapture()
+                              ? Variable->getInit()
+                              : assignedValueAt(Variable, Ref);
+      // Also any of those that branches that each assign it leave, `if
+      // (_bFirst) pValue = mp_Items.f_FindEqual(1); else pValue = ...`.
+      if (!Value && !Variable->isInitCapture()) {
+        const llvm::SmallVector<const Expr *, 2> Values =
+            assignedValuesAt(Variable, Ref);
+        if (!Values.empty())
+          return llvm::any_of(Values, [&](const Expr *Held) {
+            return isLookupIntoActor(Held);
+          });
+      }
+      // Else any of what it may hold: what any assignment gives it, `if
+      // (_bFind) pValue = mp_Items.f_FindEqual(_Key);`, or what it is made
+      // with.
+      if (!Value && !Variable->isInitCapture())
+        if (const auto *Function = dyn_cast_or_null<FunctionDecl>(
+                Variable->getParentFunctionOrMethod());
+            Function && Function->getBody()) {
+          for (const Expr *Assigned : assignmentsOf(Function, Variable))
+            if (isLookupIntoActor(Assigned))
+              return true;
+        }
+      if (!Value)
+        Value = Variable->getInit();
+      return Value && isLookupIntoActor(Value);
+    }
+    return false;
+  }
+
+  /// \p Declaration when it is a local reference, not a capture, that is
+  /// bound where it is declared; null otherwise.
+  static const VarDecl *localReferenceAlias(const ValueDecl *Declaration) {
+    const auto *Alias = dyn_cast<VarDecl>(Declaration);
+    return Alias && isUnresolvedReference(Alias) && Alias->hasLocalStorage() &&
+                   Alias->getInit()
+               ? Alias
+               : nullptr;
+  }
+
+public:
+  void addAssigned(const Expr *Left, const Expr *Right) {
+    // Either of a conditional may be assigned, and keep what it held.
+    const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+        assignedVariables(Left);
+    // One assigned through a local pointer to it, `*ppEntry = ...`, is
+    // assigned where that is written, which is where the pointer is read,
+    // not where the name it points to is.
+    const auto *Deref = dyn_cast<UnaryOperator>(Left->IgnoreParenImpCasts());
+    const auto *Through =
+        Deref && Deref->getOpcode() == UO_Deref
+            ? dyn_cast<DeclRefExpr>(Deref->getSubExpr()->IgnoreParenImpCasts())
+            : nullptr;
+    for (const DeclRefExpr *Ref : Targets) {
+      if (!Ref->getType()->isPointerType())
+        continue;
+      // A local reference bound to either of a conditional of pointers
+      // assigns either, also through references bound to such references,
+      // `int *&z = c ? a : q;` with `int *&a = b ? p : q;`.
+      if (const VarDecl *First = localReferenceAlias(Ref->getDecl())) {
+        llvm::SmallVector<const ValueDecl *, 4> Bound;
+        llvm::SmallPtrSet<const ValueDecl *, 4> Expanded;
+        bool Maybe = Targets.size() > 1;
+        llvm::SmallVector<const VarDecl *, 4> Pending = {First};
+        while (!Pending.empty()) {
+          const VarDecl *Alias = Pending.pop_back_val();
+          if (!Expanded.insert(Alias).second)
+            continue;
+          const llvm::SmallVector<const DeclRefExpr *, 2> Initial =
+              assignedVariables(Alias->getInit());
+          Maybe |= Initial.size() > 1;
+          for (const DeclRefExpr *Target : Initial)
+            if (const VarDecl *Next = localReferenceAlias(Target->getDecl()))
+              Pending.push_back(Next);
+            else
+              Bound.push_back(resolveReferenceCapture(Target->getDecl()));
+        }
+        for (const ValueDecl *Target : Bound)
+          AssignedThrough[Ref].push_back({Target, Right, Maybe});
+        continue;
+      }
+      if (isUnresolvedReference(Ref->getDecl()))
+        continue;
+      if (!Left->getSourceRange().fullyContains(Ref->getSourceRange())) {
+        if (Through && Targets.size() == 1)
+          AssignedThrough[Through].push_back({Ref->getDecl(), Right, false});
+        continue;
+      }
+      AssignedRefs[Ref] = Right;
+      if (Targets.size() > 1)
+        MaybeAssignedRefs.insert(Ref);
+    }
+  }
+};
+
+/// Whether the pointer \p Variable of the function that declares it may point
+/// into the data of the actor where \p Lambda captures it, following the
+/// lookups and other values assigned to it along the control flow. True when
+/// that can't be told.
+bool intoActorAtCapture(const VarDecl *Variable, const LambdaExpr *Lambda,
+                        ASTContext &Context) {
+  const auto *Outer =
+      dyn_cast_or_null<FunctionDecl>(Variable->getParentFunctionOrMethod());
+  Stmt *Body = Outer ? Outer->getBody() : nullptr;
+  if (!Body)
+    return true;
+  if (auto *CoroutineBody = dyn_cast<CoroutineBodyStmt>(Body))
+    Body = CoroutineBody->getBody();
+  BodyCollector Collector;
+  Collector.Context = &Context;
+  // The objects of actors that its parameters point to, and `this` of a
+  // member of an actor.
+  for (const ParmVarDecl *Parameter : Outer->parameters()) {
+    if (refersToActorClass(Parameter->getType()))
+      Collector.ActorObjects.insert(Parameter);
+  }
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(Outer);
+      Method && !Method->isStatic() && isActorClass(Method->getParent()))
+    Collector.ThisIsActor = true;
+  for (size_t nLookups = SIZE_MAX; nLookups != Collector.Lookups.size();) {
+    nLookups = Collector.Lookups.size();
+    Collector.TraverseStmt(Body);
+    Collector.propagateLookups();
+  }
+  CFG::BuildOptions Options;
+  Options.setAllAlwaysAdd();
+  const std::unique_ptr<CFG> Graph = buildGraph(Outer, Body, Context, Options);
+  if (Graph)
+    addExceptionEdges(*Graph, Context);
+  if (!Graph)
+    return true;
+  const llvm::BitVector Reachable = reachableBlocks(*Graph);
+  // Whether the pointer may point into the data at the end of each block,
+  // and anywhere in it, which an exception carries to a handler
+  // (isHandlerDispatch).
+  llvm::DenseMap<const CFGBlock *, bool> AtEnd;
+  llvm::DenseMap<std::pair<const CFGBlock *, const CFGBlock *>, bool> Thrown;
+  auto Transfer = [&](const Stmt *S, bool &Into) {
+    if (const auto *Declaration = dyn_cast<DeclStmt>(S)) {
+      for (const Decl *D : Declaration->decls()) {
+        if (D == Variable)
+          Into = Variable->getInit() &&
+                 Collector.isLookupIntoActor(Variable->getInit());
+      }
+    } else if (const auto *Binary = dyn_cast<BinaryOperator>(S);
+               Binary && Binary->getOpcode() == BO_Assign) {
+      if (const auto *Ref =
+              dyn_cast<DeclRefExpr>(Binary->getLHS()->IgnoreParenImpCasts());
+          Ref && Ref->getDecl() == Variable)
+        Into = Collector.isLookupIntoActor(Binary->getRHS());
+    }
+  };
+  auto Entry = [&](const CFGBlock *Block) {
+    bool Into = false;
+    for (const CFGBlock::AdjacentBlock &Predecessor : Block->preds()) {
+      if (const CFGBlock *Pred = Predecessor.getReachableBlock())
+        Into = Into || (isHandlerDispatch(Block) ? Thrown.lookup({Pred, Block})
+                                                 : AtEnd.lookup(Pred));
+    }
+    return Into;
+  };
+  // Looking again only at the successors of a block whose state changed.
+  {
+    std::deque<const CFGBlock *> Work;
+    llvm::BitVector Queued(Graph->getNumBlockIDs());
+    auto Enqueue = [&](const CFGBlock *Block) {
+      if (Block && Reachable.test(Block->getBlockID()) &&
+          !Queued.test(Block->getBlockID())) {
+        Queued.set(Block->getBlockID());
+        Work.push_back(Block);
+      }
+    };
+    Enqueue(&Graph->getEntry());
+    for (const CFGBlock *Block : llvm::reverse(*Graph))
+      Enqueue(Block);
+    while (!Work.empty()) {
+      const CFGBlock *Block = Work.front();
+      Work.pop_front();
+      Queued.reset(Block->getBlockID());
+      bool Into = Entry(Block);
+      // Of each handler dispatch after it, before and after each element in
+      // the block of its own `try` (inDispatchTry).
+      llvm::SmallVector<std::pair<const CFGBlock *, bool>, 2> Anywhere;
+      for (const CFGBlock::AdjacentBlock &Successor : Block->succs())
+        if (const CFGBlock *To = Successor.getReachableBlock();
+            To && isHandlerDispatch(To))
+          Anywhere.push_back({To, false});
+      for (const CFGElement &Element : *Block) {
+        llvm::SmallVector<bool *, 2> InTry;
+        for (auto &[Dispatch, Carried] : Anywhere)
+          if (inDispatchTry(Dispatch, Element, Context))
+            InTry.push_back(&Carried);
+        for (bool *Carried : InTry)
+          *Carried = *Carried || Into;
+        if (const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>())
+          Transfer(Statement->getStmt(), Into);
+        for (bool *Carried : InTry)
+          *Carried = *Carried || Into;
+      }
+      bool Changed = false;
+      auto Set = [&](bool &Value, bool Into) {
+        if (Into && !Value) {
+          Value = true;
+          Changed = true;
+        }
+      };
+      Set(AtEnd.try_emplace(Block, false).first->second, Into);
+      for (const auto &[Dispatch, Carried] : Anywhere)
+        Set(Thrown.try_emplace({Block, Dispatch}, false).first->second,
+            Carried);
+      if (Changed)
+        for (const CFGBlock::AdjacentBlock &Successor : Block->succs())
+          Enqueue(Successor.getReachableBlock());
+    }
+  }
+  for (const CFGBlock *Block : *Graph) {
+    if (!Reachable.test(Block->getBlockID()))
+      continue;
+    bool Into = Entry(Block);
+    for (const CFGElement &Element : *Block) {
+      const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>();
+      if (!Statement)
+        continue;
+      if (Statement->getStmt() == Lambda)
+        return Into;
+      Transfer(Statement->getStmt(), Into);
+    }
+  }
+  return true;
+}
+
+/// What names \p Variable in a diagnostic: itself, or the first name of a
+/// structured binding, which has no name of its own.
+static const NamedDecl *nameOf(const VarDecl *Variable) {
+  if (const auto *Decomposition = dyn_cast<DecompositionDecl>(Variable);
+      Decomposition && !Decomposition->bindings().empty())
+    return Decomposition->bindings()[0];
+  return Variable;
+}
+
+} // namespace
+
+/// The lambda the call \p Called runs, `fStop()`, `fStop.operator()()`,
+/// `fg_CallSafe(fStop)` or `fg_OnResume(fStop)`, which runs it when it is
+/// awaited, or null.
+static const LambdaExpr *invokedLambda(const CallExpr *Called) {
+  if (const LambdaExpr *Lambda = calledLambda(Called))
+    return Lambda;
+  // Also by `std::invoke(fStop)`, which calls it right away.
+  if (Called->getNumArgs() >= 1 &&
+      (calleeName(Called) == "fg_CallSafe" ||
+       calleeName(Called) == "fg_OnResume" || isStdInvoke(Called)))
+    return asLambda(Called->getArg(0));
+  return nullptr;
+}
+
+/// Whether the condition \p Condition of a test of removal flags only reads
+/// them: it doesn't suspend, which can come after a flag is read, like
+/// `*pDeleted || (co_await ..., false)`, nor call what can remove the entry
+/// after it is read, like `*pDeleted || (f_Stop(), false)`.
+static bool onlyReadsFlags(const Expr *Condition) {
+  TCRecursive<bool(const Stmt *)> Suspends = [&](const Stmt *S) {
+    if (!S || isa<LambdaExpr>(S))
+      return false;
+    if (isa<CoroutineSuspendExpr>(S))
+      return true;
+    return llvm::any_of(keptChildren(S), Suspends);
+  };
+  // A call other than of what reads the flag.
+  TCRecursive<bool(const Stmt *)> Calls = [&](const Stmt *S) {
+    if (!S || isa<LambdaExpr>(S))
+      return false;
+    if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(S)) {
+      switch (Operator->getOperator()) {
+      case OO_Star:
+      case OO_Arrow:
+      case OO_Exclaim:
+      case OO_EqualEqual:
+      case OO_ExclaimEqual:
+        break;
+      default:
+        return true;
+      }
+    } else if (const CMemberCall Member = memberCallOf(S)) {
+      const CXXMethodDecl *Method = Member->getMethodDecl();
+      if (!Method ||
+          !(isa<CXXConversionDecl>(Method) ||
+            (Method->getIdentifier() &&
+             (identifierTextOf(Method) == "f_Load" || identifierTextOf(Method) == "load"))))
+        return true;
+    } else if (isa<CallExpr>(S)) {
+      return true;
+    }
+    return llvm::any_of(keptChildren(S), Calls);
+  };
+  return !Suspends(Condition) && !Calls(Condition);
+}
+
+/// Whether calling \p Function is known not to throw: it is trivial,
+/// `noexcept` or a `nothrow` builtin, like `__builtin_debugtrap`, or its
+/// definition in the translation unit does nothing, like the constructor of
+/// `CNoReturn`.
+static bool knownNotToThrow(const FunctionDecl *Function) {
+  if (!Function)
+    return false;
+  if (Function->isTrivial() || Function->hasAttr<NoThrowAttr>())
+    return true;
+  if (const auto *Prototype = Function->getType()->getAs<FunctionProtoType>();
+      Prototype && Prototype->isNothrow())
+    return true;
+  const FunctionDecl *Definition = nullptr;
+  if (!Function->hasBody(Definition))
+    return false;
+  const auto *Body = dyn_cast_or_null<CompoundStmt>(Definition->getBody());
+  if (!Body || !Body->body_empty())
+    return false;
+  if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(Definition))
+    return Constructor->getNumCtorInitializers() == 0;
+  return true;
+}
+
+/// Whether \p E, an argument, is a constant or names what is, without
+/// evaluating anything that can throw or need destroying: a literal, `__FILE__`
+/// or `__LINE__`, a variable, a member of one or the address of one, also a
+/// default argument that is. Not a `thread_local` variable made at run time,
+/// whose initializer the first use in a thread runs, which can throw.
+static bool isPlainArgument(const Expr *E) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return isPlainArgument(E); });
+  if (!E)
+    return false;
+  E = E->IgnoreParenImpCasts();
+  // Of a `thread_local` that isn't initialized with a constant where it is
+  // defined, also one not defined here.
+  auto MadeInThread = [](const ValueDecl *Named) {
+    // Also a binding of a `thread_local` structured binding, `auto [pName]`,
+    // made with the variable it decomposes, and, of one of a tuple-like
+    // type, by its own variable, which calls `get<...>()`, which can throw.
+    if (const auto *Binding = dyn_cast_or_null<BindingDecl>(Named)) {
+      if (const VarDecl *Holding = Binding->getHoldingVar();
+          Holding && Holding->getTLSKind() != VarDecl::TLS_None)
+        return true;
+      Named = Binding->getDecomposedDecl();
+    }
+    const auto *Variable = dyn_cast_or_null<VarDecl>(Named);
+    if (!Variable || Variable->getTLSKind() != VarDecl::TLS_Dynamic)
+      return false;
+    const VarDecl *Definition = Variable->getDefinition();
+    return !Definition || !Definition->hasConstantInitialization();
+  };
+  if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(E))
+    return isPlainArgument(Default->getExpr());
+  if (const auto *Named = dyn_cast<DeclRefExpr>(E))
+    return !MadeInThread(Named->getDecl());
+  if (isa<IntegerLiteral, StringLiteral, CharacterLiteral, CXXBoolLiteralExpr,
+          FloatingLiteral, CXXNullPtrLiteralExpr, PredefinedExpr>(E))
+    return true;
+  if (const auto *Member = dyn_cast<MemberExpr>(E))
+    return isa<FieldDecl, VarDecl>(Member->getMemberDecl()) &&
+           !MadeInThread(Member->getMemberDecl()) &&
+           isPlainArgument(Member->getBase());
+  if (const auto *Address = dyn_cast<UnaryOperator>(E))
+    return Address->getOpcode() == UO_AddrOf &&
+           isPlainArgument(Address->getSubExpr());
+  return false;
+}
+
+/// Whether \p S is a call that can't leave its block, of what is known not to
+/// throw, with plain arguments (isPlainArgument): `fg_OutputDebugBreakFileLine(
+/// __FILE__, __LINE__)`, also a variable a constructor makes, `CNoReturn
+/// NoReturn;`. \p Callee is set to what it calls.
+static bool isPlainCall(const Stmt *S, const FunctionDecl **Callee = nullptr) {
+  const FunctionDecl *Called = nullptr;
+  llvm::SmallVector<const Expr *, 4> Arguments;
+  if (const auto *Declaration = dyn_cast<DeclStmt>(S)) {
+    const auto *Variable =
+        Declaration->isSingleDecl()
+            ? dyn_cast<VarDecl>(Declaration->getSingleDecl())
+            : nullptr;
+    // Of an automatic variable, whose constructor runs when it is reached,
+    // not a static or constexpr one, `static constexpr CNoReturn Stop;`.
+    const auto *Construct =
+        Variable && Variable->getInit() && Variable->hasLocalStorage() &&
+                !Variable->isConstexpr()
+            ? dyn_cast<CXXConstructExpr>(Variable->getInit())
+            : nullptr;
+    if (!Construct)
+      return false;
+    // Nor an array without elements, `CNoReturn Stops[0];`, which constructs
+    // none, nor one whose size isn't constant.
+    if (Variable->getType()->isArrayType()) {
+      const ASTContext &Context = Variable->getASTContext();
+      const ConstantArrayType *Array =
+          Context.getAsConstantArrayType(Variable->getType());
+      if (!Array || Context.getConstantArrayElementCount(Array) == 0)
+        return false;
+    }
+    Called = Construct->getConstructor();
+    Arguments.append(Construct->arg_begin(), Construct->arg_end());
+  } else if (const auto *Call = dyn_cast<CallExpr>(S)) {
+    // Of the function named directly, `fg_Stop(...)`, not one an expression
+    // gives, which evaluates it first, `fg_Get(pEntry).fs_Stop()`.
+    const auto *Named =
+        dyn_cast<DeclRefExpr>(Call->getCallee()->IgnoreParenImpCasts());
+    if (isMemberOrOperatorCall(Call) || !Named)
+      return false;
+    Called = Call->getDirectCallee();
+    Arguments.append(Call->arg_begin(), Call->arg_end());
+  } else {
+    return false;
+  }
+  if (Callee)
+    *Callee = Called;
+  return knownNotToThrow(Called) && llvm::all_of(Arguments, isPlainArgument);
+}
+
+/// Whether \p S, a statement of a block before what doesn't return, can't
+/// leave the block: a plain call (isPlainCall), also in a block or in the
+/// `do { ... } while (false)` of a macro, `DMibPDebugBreak`, an assembler
+/// statement without operands, or an empty statement. Nothing else is known not to, like what makes and destroys an
+/// object, whose destructor can throw.
+static bool cannotLeave(const Stmt *S, int Depth = 0) {
+  if (stackNearlyExhausted())
+    return withStack([&] { return cannotLeave(S, Depth); });
+  if (!S || Depth > 8)
+    return false;
+  if (isa<NullStmt>(S))
+    return true;
+  // Also the trap of `DMibPDebugBreak` on x86, `__asm__ ("int $3")`, which
+  // has no operands, and isn't an `asm goto`, which can jump out.
+  // Not an `asm goto`, nor Microsoft's assembler, whose jumps,
+  // `__asm jmp Out`, can leave it.
+  if (const auto *Asm = dyn_cast<GCCAsmStmt>(S))
+    return !Asm->isAsmGoto() && Asm->getNumOutputs() == 0 &&
+           Asm->getNumInputs() == 0;
+  if (isa<AsmStmt>(S))
+    return false;
+  if (isa<DeclStmt>(S))
+    return false;
+  if (const auto *Block = dyn_cast<CompoundStmt>(S))
+    return llvm::all_of(Block->body(), [&](const Stmt *Inner) {
+      return cannotLeave(Inner, Depth + 1);
+    });
+  if (const auto *Do = dyn_cast<DoStmt>(S)) {
+    const Expr *Condition = Do->getCond()->IgnoreParenImpCasts();
+    const auto *Bool = dyn_cast<CXXBoolLiteralExpr>(Condition);
+    const auto *Integer = dyn_cast<IntegerLiteral>(Condition);
+    return ((Bool && !Bool->getValue()) ||
+            (Integer && Integer->getValue().isZero())) &&
+           cannotLeave(Do->getBody(), Depth + 1);
+  }
+  return isPlainCall(S);
+}
+
+/// Whether the statement \p S of a block is one the analyzer takes as not
+/// returning, after which the block doesn't go on: a plain call (isPlainCall)
+/// of a function declared `analyzer_noreturn` that is known not to throw, or a
+/// variable whose constructor is, `CNoReturn NoReturn;`. Not one that can
+/// throw, like `fg_MibSafeCheck`, which does when safe checks throw.
+static bool endsAnalysis(const Stmt *S) {
+  const FunctionDecl *Callee = nullptr;
+  return isPlainCall(S, &Callee) && Callee &&
+         Callee->hasAttr<AnalyzerNoReturnAttr>();
+}
+
+/// Whether the block \p Block ends in what the analyzer takes as not
+/// returning on each of its paths: it has a statement that does
+/// (endsAnalysis), before which each of its statements can't leave it
+/// (cannotLeave), like the failure branch of `DMibFastCheck`. Any other, like
+/// `delete pEntry; if (_bReturn) return; fg_Stop();`, can go on.
+static bool blockEndsAnalysis(const CompoundStmt *Block) {
+  // Not one that can be entered other than at its start, at a label or a
+  // `case` or `default` in it, `goto Erase; { fg_Stop(); Erase: ...; }`.
+  {
+    llvm::SmallVector<const Stmt *, 16> Pending{Block};
+    while (!Pending.empty()) {
+      const Stmt *S = Pending.pop_back_val();
+      if (!S || isa<LambdaExpr, BlockExpr>(S))
+        continue;
+      if (isa<LabelStmt, SwitchCase>(S))
+        return false;
+      for (const Stmt *Child : keptChildren(S))
+        Pending.push_back(Child);
+    }
+  }
+  for (const Stmt *S : Block->body()) {
+    if (endsAnalysis(S))
+      return true;
+    if (!cannotLeave(S))
+      return false;
+  }
+  return false;
+}
+
+/// Whether calling \p Method can free or end the life of what it doesn't
+/// create, also through what it calls, as clang instantiated them: deletes,
+/// ends lives in place, `pEntry->~CEntry()`, or calls what can't be followed,
+/// one without a body, through a pointer, or a virtual function that isn't
+/// final. An intrusive container that only links, `m_TimerQueue.f_Remove(
+/// pTimer)`, doesn't, and an owning one, `mp_Items.f_Remove(Key)`, does.
+static bool mayFree(const FunctionDecl *Method) {
+  if (!Method)
+    return true;
+  struct CMemo {
+    llvm::DenseMap<const FunctionDecl *, bool> Decided;
+  };
+  const ASTContext &Context = Method->getASTContext();
+  auto &Decided = astCache<CMemo>(Context).Decided;
+  if (auto It = Decided.find(Method); It != Decided.end())
+    return It->second;
+  // Each function it can reach once, of which only so many are followed.
+  llvm::SmallPtrSet<const FunctionDecl *, 32> Reached;
+  llvm::SmallPtrSet<const Expr *, 8> Defaults;
+  llvm::SmallVector<const FunctionDecl *, 32> Work;
+  bool Frees = false;
+  auto Reach = [&](const FunctionDecl *Callee) {
+    if (Frees)
+      return;
+    if (!Callee) {
+      Frees = true;
+      return;
+    }
+    // What only runs while compiling, like the constructor of the Microsoft
+    // STL's `_Literal_zero`, which calls one that has no body, `CompareResult
+    // < 0`.
+    if (Callee->isConsteval())
+      return;
+    // What doesn't return, and can't throw to a `catch` around it after which
+    // the code goes on, like `abort()`, can't free what is used after the
+    // call.
+    if (const auto *Prototype = Callee->getType()->getAs<FunctionProtoType>();
+        Callee->isNoReturn() && Prototype && Prototype->isNothrow())
+      return;
+    if (unsigned Builtin = Callee->getBuiltinID()) {
+      const std::string Owned = Context.BuiltinInfo.getName(Builtin);
+      const StringRef Name = Owned;
+      Frees = Name.contains("free") || Name.contains("delete") ||
+              Name.contains("realloc");
+      return;
+    }
+    if (Callee->isTrivial())
+      return;
+    if (const auto *Member = dyn_cast<CXXMethodDecl>(Callee);
+        Member && Member->isVirtual() && !Member->hasAttr<FinalAttr>() &&
+        !Member->getParent()->hasAttr<FinalAttr>()) {
+      Frees = true;
+      return;
+    }
+    const FunctionDecl *Definition = nullptr;
+    if (!Callee->hasBody(Definition) || !Definition->getBody() ||
+        Definition->isDependentContext() || Reached.size() >= 512) {
+      Frees = true;
+      return;
+    }
+    if (Reached.insert(Definition).second)
+      Work.push_back(Definition);
+  };
+  auto ReachDestructor = [&](QualType Type) {
+    if (const CXXRecordDecl *Record =
+            Context.getBaseElementType(Type)->getAsCXXRecordDecl())
+      if (Record->hasDefinition() && !Record->hasTrivialDestructor())
+        Reach(Record->getDestructor());
+  };
+  Reach(Method);
+  while (!Work.empty() && !Frees) {
+    const FunctionDecl *Function = Work.pop_back_val();
+    llvm::SmallVector<const Stmt *, 32> Statements{Function->getBody()};
+    // A constructor also runs its initializers, and a destructor those of
+    // its members and bases.
+    if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(Function))
+      for (const CXXCtorInitializer *Initializer : Constructor->inits())
+        Statements.push_back(Initializer->getInit());
+    if (const auto *Destructor = dyn_cast<CXXDestructorDecl>(Function)) {
+      const CXXRecordDecl *Record = Destructor->getParent();
+      for (const FieldDecl *Field : Record->fields())
+        ReachDestructor(Field->getType());
+      for (const CXXBaseSpecifier &Base : Record->bases())
+        ReachDestructor(Base.getType());
+    }
+    while (!Statements.empty() && !Frees) {
+      const Stmt *S = Statements.pop_back_val();
+      if (!S)
+        continue;
+      if (isa<CXXDeleteExpr, CXXPseudoDestructorExpr>(S)) {
+        Frees = true;
+        break;
+      }
+      // A default argument or member initializer, each once, which the
+      // calls of a function share.
+      if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(S)) {
+        if (Defaults.insert(Default->getExpr()).second)
+          Statements.push_back(Default->getExpr());
+        continue;
+      }
+      if (const auto *Default = dyn_cast<CXXDefaultInitExpr>(S)) {
+        if (Defaults.insert(Default->getExpr()).second)
+          Statements.push_back(Default->getExpr());
+        continue;
+      }
+      // What a lambda does runs when it is called, through its call operator.
+      if (const auto *Lambda = dyn_cast<LambdaExpr>(S)) {
+        for (const Expr *Init : Lambda->capture_inits())
+          Statements.push_back(Init);
+        continue;
+      }
+      // A coroutine runs the body written, and what it awaits and returns:
+      // what makes and ends its frame, and suspends and resumes it, doesn't
+      // free what it doesn't create.
+      if (const auto *Coroutine = dyn_cast<CoroutineBodyStmt>(S)) {
+        Statements.push_back(Coroutine->getBody());
+        continue;
+      }
+      if (const auto *Return = dyn_cast<CoreturnStmt>(S)) {
+        Statements.push_back(Return->getOperand());
+        continue;
+      }
+      if (const auto *Suspend = dyn_cast<CoroutineSuspendExpr>(S)) {
+        Statements.push_back(Suspend->getOperand());
+        continue;
+      }
+      if (const auto *Call = dyn_cast<CallExpr>(S)) {
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        // Ending the life of one in place, `pEntry->~CEntry()`.
+        if (isa_and_nonnull<CXXDestructorDecl>(Callee)) {
+          Frees = true;
+          break;
+        }
+        // Also a virtual one called by its qualified name, which is final
+        // there.
+        const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Callee);
+        if (const CMemberCall Member = memberCallOf(Call);
+            Member && Method && Method->isVirtual())
+          if (Member->hasQualifier()) {
+            const FunctionDecl *Definition = nullptr;
+            if (!Callee->hasBody(Definition) || !Definition->getBody())
+              Frees = true;
+            else if (Reached.insert(Definition).second)
+              Work.push_back(Definition);
+            for (const Stmt *Child : evaluatedChildren(S, Context))
+              Statements.push_back(Child);
+            continue;
+          }
+        Reach(Callee);
+      } else if (const auto *Construct = dyn_cast<CXXConstructExpr>(S)) {
+        Reach(Construct->getConstructor());
+        ReachDestructor(Construct->getType());
+      } else if (const auto *New = dyn_cast<CXXNewExpr>(S)) {
+        // Allocating doesn't free, unless constructing throws.
+        if (const CXXConstructExpr *Construct = New->getConstructExpr())
+          Reach(Construct->getConstructor());
+      } else if (const auto *Temporary = dyn_cast<CXXBindTemporaryExpr>(S)) {
+        Reach(Temporary->getTemporary()->getDestructor());
+      } else if (const auto *Declaration = dyn_cast<DeclStmt>(S)) {
+        for (const Decl *D : Declaration->decls())
+          if (const auto *Variable = dyn_cast<VarDecl>(D)) {
+            ReachDestructor(Variable->getType());
+            Statements.push_back(Variable->getInit());
+          }
+        continue;
+      }
+      // A block that ends in what the analyzer takes as not returning, like
+      // the failure branch of `DMibFastCheck` with its `CNoReturn`, doesn't go
+      // on after it, so what it calls before can't free what is used after
+      // the call, unless it can leave before, `if (_bReturn) return;`.
+      if (const auto *Block = dyn_cast<CompoundStmt>(S);
+          Block && blockEndsAnalysis(Block))
+        continue;
+      for (const Stmt *Child : evaluatedChildren(S, Context))
+        Statements.push_back(Child);
+    }
+  }
+  Decided[Method] = Frees;
+  return Frees;
+}
+
+void CoroutineActorReferenceCheck::checkFunction(const FunctionDecl *Function,
+                                                 const LambdaExpr *Lambda,
+                                                 ASTContext &Context) {
+  Stmt *Body = Function->getBody();
+  if (!Body)
+    return;
+  if (auto *CoroutineBody = dyn_cast<CoroutineBodyStmt>(Body))
+    Body = CoroutineBody->getBody();
+
+  // A copy of a pointer that is only found to be a lookup later in the
+  // source, like in a loop, is found by going over the body until nothing new
+  // is.
+  BodyCollector Collector;
+  Collector.Context = &Context;
+  Collector.NodeStableContainers = NodeStableContainerList;
+  Collector.CallbackLookupFunctions = CallbackLookupFunctionList;
+  Collector.CurrentCoroutine = Function;
+  // The objects of other actors that its parameters point to, like `CApp
+  // *_pOther` of a member of an actor too, which can remove their entries
+  // while it is suspended.
+  for (const ParmVarDecl *Parameter : Function->parameters()) {
+    if (refersToActorClass(Parameter->getType()))
+      Collector.ActorObjects.insert(Parameter);
+  }
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(Function);
+      Method && !Method->isStatic() &&
+      (isActorClass(Method->getParent()) ||
+       (Lambda && isActorClass(enclosingThisClass(Lambda)))))
+    Collector.ThisIsActor = true;
+  // A function that isn't a member of the actor, also a lambda's call
+  // operator or a member of another class, gets the object of an actor
+  // through its parameters and captures.
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(Function);
+      !Method || Method->isStatic() || !isActorClass(Method->getParent())) {
+    // What a lambda captures, like `[pActor]` of an actor's object, and the
+    // objects its init captures look up data of, like `[pEntry =
+    // _pActor->mp_Items.f_FindEqual(_Key)]`.
+    if (Lambda) {
+      for (const LambdaCapture &Capture : Lambda->captures()) {
+        if (Capture.capturesVariable() &&
+            refersToActorClass(Capture.getCapturedVar()->getType()))
+          Collector.ActorObjects.insert(Capture.getCapturedVar());
+      }
+      // Also the objects that the locals it captures look up data of, like
+      // `[pEntry]` of `auto *pEntry = _pActor->mp_Items.f_FindEqual(_Key)`.
+      llvm::SmallVector<const Expr *, 8> Inits(captureInitsOf(Lambda));
+      for (const LambdaCapture &Capture : Lambda->captures()) {
+        const auto *Variable = capturedVariableOf(Capture);
+        if (Variable && !Variable->isInitCapture() &&
+            Variable->hasLocalStorage() && !isa<ParmVarDecl>(Variable))
+          llvm::append_range(Inits, valuesOf(Variable));
+      }
+      // Through all nodes: a matcher of the parent map's traversal skips the
+      // callee of a member call, like `_pActor` of
+      // `_pActor->mp_Items.f_FindEqual(_Key)`.
+      // Also through the locals they are made from, like `q` of `auto *q =
+      // p`.
+      llvm::SmallPtrSet<const VarDecl *, 8> Followed;
+      TCRecursive<void(const Stmt *)> AddActors = [&](const Stmt *S) {
+        if (!S)
+          return;
+        if (const auto *Ref = dyn_cast<DeclRefExpr>(S)) {
+          if (refersToActorClass(Ref->getDecl()->getType()))
+            Collector.ActorObjects.insert(Ref->getDecl());
+          else if (const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+                   Local && Local->hasLocalStorage() &&
+                   !isa<ParmVarDecl>(Local) && Followed.insert(Local).second)
+            for (const Expr *Value : valuesOf(Local))
+              AddActors(Value);
+        }
+        for (const Stmt *Child : keptChildren(S))
+          AddActors(Child);
+      };
+      for (const Expr *Init : Inits)
+        AddActors(Init);
+    }
+  }
+  for (size_t nLookups = SIZE_MAX; nLookups != Collector.Lookups.size();) {
+    nLookups = Collector.Lookups.size();
+    Collector.TraverseStmt(Body);
+    Collector.propagateLookups();
+  }
+  // What a lambda captures is looked up before it runs.
+  if (const auto *Method = dyn_cast<CXXMethodDecl>(Function);
+      Method && Method->getParent()->isLambda()) {
+    for (const LambdaCapture &Capture : Method->getParent()->captures()) {
+      if (!Capture.capturesVariable())
+        continue;
+      auto *Variable = dyn_cast<VarDecl>(Capture.getCapturedVar());
+      // A name of a structured binding is of what it decomposes, `[&Value]`
+      // of `auto &[Value, Other] = ...`.
+      if (const auto *Binding = dyn_cast<BindingDecl>(Capture.getCapturedVar()))
+        Variable = dyn_cast_or_null<VarDecl>(Binding->getDecomposedDecl());
+      if (!Variable)
+        continue;
+      Collector.VisitVarDecl(Variable);
+      // A pointer of the enclosing function that is assigned a lookup after
+      // its declaration may hold it when it is captured.
+      if (!Variable->isInitCapture() && Variable->getType()->isPointerType() &&
+          !Collector.LookupSet.contains(Variable)) {
+        const auto *Outer = dyn_cast_or_null<FunctionDecl>(
+            Variable->getParentFunctionOrMethod());
+        bool AssignedLookup = false;
+        if (Outer && Outer->getBody()) {
+          const auto LookupAssignments = matchEach<BinaryOperator>(
+              binaryOperator(hasOperatorName("="),
+                             hasLHS(ignoringParenImpCasts(
+                                 declRefExpr(to(equalsNode(Variable))))))
+                  .bind("assignment"),
+              *Outer->getBody(), Context);
+          for (const auto &Nodes : LookupAssignments) {
+            const auto *Assignment =
+                Nodes.getNodeAs<BinaryOperator>("assignment");
+            AssignedLookup = AssignedLookup ||
+                             Collector.isLookupIntoActor(Assignment->getRHS());
+          }
+        }
+        if (AssignedLookup)
+          Collector.addLookup(Variable);
+      }
+    }
+  }
+  // A lookup used as it is by a call whose arguments suspend,
+  // `mp_Items[0].f_Read(co_await fg_Suspend())`, in code that can run: not
+  // in a branch that can't be taken, `if (false)`, nor after a `co_return`.
+  // What can run is told when there is one, which is rare.
+  std::optional<llvm::DenseSet<const Stmt *>> ReachableStatements;
+  bool UnknownReachable = false;
+  auto CanRun = [&](const Stmt *S) {
+    if (!ReachableStatements && !UnknownReachable) {
+      CFG::BuildOptions Options;
+      Options.setAllAlwaysAdd();
+      const std::unique_ptr<CFG> Graph =
+          buildGraph(Function, Body, Context, Options);
+      // Also what only a handler reaches (addExceptionEdges).
+      if (Graph)
+        addExceptionEdges(*Graph, Context);
+      if (!Graph)
+        UnknownReachable = true;
+      else {
+        ReachableStatements.emplace();
+        const llvm::BitVector Reachable = reachableBlocks(*Graph);
+        for (const CFGBlock *Block : *Graph)
+          if (Block && Reachable.test(Block->getBlockID()))
+            for (const CFGElement &Element : *Block)
+              if (const std::optional<CFGStmt> Statement =
+                      Element.getAs<CFGStmt>())
+                ReachableStatements->insert(Statement->getStmt());
+      }
+    }
+    return UnknownReachable || ReachableStatements->contains(S);
+  };
+  llvm::SmallPtrSet<const CXXBindTemporaryExpr *, 4> ReportedTemporaries;
+  TCRecursive<void(const Stmt *)> FindLateLookups = [&](const Stmt *S) {
+    if (!S || isa<LambdaExpr>(S))
+      return;
+    // Not a variable, also through its members, or either of a conditional,
+    // `(bChoose ? pFirst : pSecond)`, whose uses are followed by themselves,
+    // also of an array a pointer is at that a subscript indexes,
+    // `pEntry->m_Values[...]`.
+    TCRecursive<bool(const Expr *, bool, int)> OfVariable =
+        [&](const Expr *E, bool ThroughArrow, int Depth) {
+          for (E = E->IgnoreParenImpCasts(); const auto *Member =
+                                                 dyn_cast<MemberExpr>(E);
+               E = Member->getBase()->IgnoreParenImpCasts())
+            if (Member->isArrow() && !ThroughArrow)
+              break;
+          if (const auto *Conditional = dyn_cast<ConditionalOperator>(E))
+            return Depth < 8 &&
+                   llvm::all_of(keptArms(Conditional), [&](const Expr *Arm) {
+                     return OfVariable(Arm, ThroughArrow, Depth + 1);
+                   });
+          return isa<DeclRefExpr>(E);
+        };
+    // The phases the guards around it guard, declared before it in a scope
+    // it is in, `auto Guard = co_await fp_CheckStoppedOrDestroyedOnResume();`,
+    // which end the coroutine when it resumes in them, for as long as they
+    // are in scope, but not those that a callback registered after a guard,
+    // which runs after it on resume, can start.
+    auto GuardedAround = [&] {
+      const SourceManager &SM = Context.getSourceManager();
+      auto InScope = [&](const VarDecl *Holder) {
+        const auto Parents = instantiatedParents(*Holder, Context);
+        const auto *Declaration =
+            Parents.empty() ? nullptr : Parents[0].get<DeclStmt>();
+        if (!Declaration)
+          return false;
+        const auto ScopeParents = instantiatedParents(*Declaration, Context);
+        const Stmt *Scope =
+            ScopeParents.empty() ? nullptr : ScopeParents[0].get<Stmt>();
+        return Scope &&
+               SM.isBeforeInTranslationUnit(Declaration->getEndLoc(),
+                                            S->getBeginLoc()) &&
+               !SM.isBeforeInTranslationUnit(Scope->getEndLoc(),
+                                             S->getEndLoc());
+      };
+      unsigned Phases = 0;
+      for (const auto &[Holder, Guarded] : Collector.HolderPhases) {
+        if (!InScope(Holder))
+          continue;
+        unsigned Kept = Guarded;
+        for (const auto &[Later, Started] : Collector.HolderStarted)
+          if (Started && Later != Holder &&
+              SM.isBeforeInTranslationUnit(Holder->getLocation(),
+                                           Later->getLocation()) &&
+              InScope(Later))
+            Kept &= ~Started;
+        Phases |= Kept;
+      }
+      return Phases;
+    };
+    // Not into a collection of the own actor that is declared to lose no
+    // entries, `DMibActorEntries() TCMap<...>`, or only in the phases the
+    // guards around it guard, of a type whose entries stay where they are
+    // when others are added, like for a local reference.
+    // Not the phases the call starts in its arguments, after the lookup,
+    // `mp_Items[1].f_Read(f_ApplyStopResult(co_await fg_Work()))`, which the
+    // guards checked before.
+    auto NeverLosesEntries = [&](const Expr *Early, unsigned StartedInCall) {
+      const Expr *Key = nullptr;
+      const Expr *Owner = nullptr;
+      const FieldDecl *Field = lookupCollection(Early, Key, Owner);
+      const std::optional<unsigned> Phases =
+          Field ? annotatedPhases(Field, AnnotationActorEntries) : std::nullopt;
+      return Phases && !(*Phases & ActorPhase_Owner) &&
+             (*Phases == 0 ||
+              (*Phases & ~(GuardedAround() & ~StartedInCall)) == 0) &&
+             isOwnActorObject(Owner) &&
+             matchesTypeName(Field->getType(), NodeStableContainerList,
+                             Context);
+    };
+    bool Reported = false;
+    for (const Expr *Early : earlyCallOperands(S, Context))
+      if (!OfVariable(Early, isa<ArraySubscriptExpr>(S), 0) &&
+          Collector.isLookupIntoActor(Early) &&
+          !NeverLosesEntries(Early, startedPhases(S, Context)) && CanRun(S)) {
+        const SourceLocation Loc =
+            reportLocation(S->getBeginLoc(), Context.getSourceManager());
+        if (Loc.isValid())
+          diag(Loc, "the data of the actor that this call uses is looked up "
+                    "before its arguments suspend, during which other calls "
+                    "of the actor can change or erase the data; look it up "
+                    "after the suspension");
+        Reported = true;
+        break;
+      }
+    // Also what a pointer it looks up points to, accessed after a suspension
+    // in the same expression, `*(mp_Values.f_GetArray() + co_await
+    // fg_Index())`, like through a local pointer: looked up before the
+    // suspension, not after it, `(co_await fg_Suspend(), 0)[&mp_Items[0]]`.
+    auto LookedUpBefore = [&](const Expr *Root) {
+      bool Before = false;
+      TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *Inner) {
+        if (!Inner || Before || isa<LambdaExpr>(Inner))
+          return;
+        // An assignment evaluates what it assigns before what it assigns to,
+        // `*mp_Items.f_FindEqual(1) = co_await fg_Work()`, also an overloaded
+        // one: of one whose target has it, only what is in the target.
+        const Expr *Target = nullptr;
+        if (const auto *Assign = dyn_cast<BinaryOperator>(Inner);
+            Assign && Assign->isAssignmentOp())
+          Target = Assign->getLHS();
+        else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Inner);
+                 Operator && Operator->isAssignmentOp() &&
+                 Operator->getNumArgs() == 2)
+          Target = Operator->getArg(0);
+        if (Target &&
+            Target->getSourceRange().fullyContains(Root->getSourceRange())) {
+          Visit(Target);
+          return;
+        }
+        if (isa<CoroutineSuspendExpr>(Inner) &&
+            Context.getSourceManager().isBeforeInTranslationUnit(
+                Root->getEndLoc(), Inner->getBeginLoc()))
+          Before = true;
+        for (const Stmt *Child : keptChildren(Inner))
+          Visit(Child);
+      };
+      Visit(S);
+      return Before;
+    };
+    if (const Expr *Pointer =
+            Reported ? nullptr : accessedAfterSuspension(S, Context))
+      for (const Expr *Root : pointerRoots(Pointer))
+        // Not a variable, followed by itself.
+        if (!isa<DeclRefExpr>(Root) && Collector.isLookupIntoActor(Root) &&
+            LookedUpBefore(Root) &&
+            !NeverLosesEntries(Root, startedPhases(S, Context)) && CanRun(S)) {
+          const SourceLocation Loc =
+              reportLocation(S->getBeginLoc(), Context.getSourceManager());
+          if (Loc.isValid())
+            diag(Loc, "the data of the actor that this expression uses is "
+                      "looked up before it suspends, during which other calls "
+                      "of the actor can change or erase the data; look it up "
+                      "after the suspension");
+          break;
+        }
+    // Not in a branch an `if constexpr` discards.
+    for (const Stmt *Child : evaluatedChildren(S))
+      FindLateLookups(Child);
+  };
+  FindLateLookups(Body);
+  llvm::DenseMap<const ValueDecl *, unsigned> Tracked;
+  llvm::SmallVector<const VarDecl *, 8> Variables;
+  for (const VarDecl *Variable : Collector.Lookups) {
+    Tracked[Variable] = Variables.size();
+    Variables.push_back(Variable);
+  }
+  if (Variables.empty())
+    return;
+
+  // A lambda that copies a tracked pointer has its own copy, which looking the
+  // pointer up again afterwards doesn't refresh. Each copy is tracked as a
+  // variable of its own, from where the lambda is made; none for a copy that
+  // isn't tracked, which is of its own storage.
+  llvm::DenseMap<std::pair<const LambdaExpr *, const ValueDecl *>,
+                 std::optional<unsigned>>
+      LambdaCopies;
+  for (const auto &Nodes :
+       matchEach<LambdaExpr>(lambdaExpr().bind("lambda"), *Body, Context)) {
+    const auto *Lambda = Nodes.getNodeAs<LambdaExpr>("lambda");
+    const auto CaptureInits = captureInitsOf(Lambda);
+    auto Init = CaptureInits.begin();
+    for (const LambdaCapture &Capture : Lambda->captures()) {
+      const Expr *CaptureInit = *Init++;
+      if (!Capture.capturesVariable())
+        continue;
+      // An init capture is its own variable, initialized where the lambda is
+      // made.
+      if (const auto *Variable = dyn_cast<VarDecl>(Capture.getCapturedVar());
+          Variable && Variable->isInitCapture()) {
+        if (Tracked.count(Variable))
+          LambdaCopies[{Lambda, Variable}] = Tracked.lookup(Variable);
+        continue;
+      }
+      if (Capture.getCaptureKind() != LCK_ByCopy)
+        continue;
+      const DeclRefExpr *Captured = capturedVariableRef(CaptureInit);
+      if (!Captured)
+        continue;
+      const ValueDecl *Source = resolveReferenceCapture(Captured->getDecl());
+      if (auto It = Tracked.find(Source); It != Tracked.end()) {
+        // A copy, made where the lambda is, that is independent, or at its
+        // own level, like a shared owner, `[rpChildren]` of `auto &rpChildren
+        // = mp_Items[0].m_pChildren`, that the lambda uses only of its own
+        // storage, isn't what is tracked: what is looked up through it, or
+        // reached through its borrowed parts, is (throughBorrowedPart).
+        if (const QualType Copied = Source->getType().getNonReferenceType();
+            isIndependentType(Copied, Context) ||
+            (isCopyAtOwnLevel(Copied, Context) &&
+             !usesThroughBorrowedPart(Lambda, Captured->getDecl(),
+                                      const_cast<ASTContext &>(Context)))) {
+          LambdaCopies[{Lambda, Source}] = std::nullopt;
+          continue;
+        }
+        LambdaCopies[{Lambda, Source}] = Variables.size();
+        Variables.push_back(Variables[It->second]);
+      }
+    }
+  }
+
+  CFG::BuildOptions Options;
+  Options.setAllAlwaysAdd();
+  // Exceptions can reach handlers after a suspension (addExceptionEdges).
+  // The end of the scope of an `fg_OnResume` registration ends it. A holder
+  // of a dependent type has no destructor in the CFG, but its lifetime ends.
+  Options.AddImplicitDtors = true;
+  // So do destructors of temporaries, `(void)CStopper{this}`.
+  Options.AddTemporaryDtors = true;
+  // Past the limit of the uses of a shared default argument, leave out the
+  // destructors of the rest, which only end their temporaries.
+  Options.OmitRepeatedSharedTemporaryDtors = true;
+  Options.AddLifetime = true;
+  const std::unique_ptr<CFG> Graph =
+      buildGraph(Function, Body, Context, Options);
+  if (Graph)
+    addExceptionEdges(*Graph, Context);
+  // Not accepted when its control flow can't be built, like through a long
+  // chain of conditionals in default arguments that destroy temporaries.
+  if (!Graph) {
+    const SourceLocation Loc =
+        reportLocation(Function->getLocation(), Context.getSourceManager());
+    if (Loc.isValid())
+      diag(Loc, "the control flow of %select{%1|the lambda}0 is too complex to "
+                "analyze, so whether it uses what refers into the data of the "
+                "actor after a suspension can't be told; split up what makes "
+                "it complex")
+          << isLambdaCallOperator(Function) << Function;
+    return;
+  }
+  // Blocks that can't run, like `if (false)` branches, don't change the state.
+  const llvm::BitVector Reachable = reachableBlocks(*Graph);
+  const auto SuspendPoints = suspendPoints(Body);
+  // What is written where it isn't evaluated, `__builtin_constant_p(*pEntry)`
+  // or `noexcept(pEntry->f_Read())` (hasUnevaluatedOperands), neither uses
+  // nor changes anything, also where the control flow lists it.
+  llvm::DenseSet<const Stmt *> Unevaluated;
+  {
+    llvm::DenseSet<std::pair<const Stmt *, int>> Marked;
+    TCRecursive<void(const Stmt *, bool)> Mark = [&](const Stmt *S,
+                                                       bool Inside) {
+      if (!S || !Marked.insert({S, Inside ? 1 : 0}).second)
+        return;
+      if (Inside)
+        Unevaluated.insert(S);
+      const bool Operands = Inside || hasUnevaluatedOperands(S);
+      for (const Stmt *Child : childrenOnce(S))
+        Mark(Child, Operands);
+    };
+    Mark(Body, false);
+  }
+
+  // What a lookup into a collection declared with `DMibActorEntries` needs to
+  // stay valid across a suspension: guards of the phases its entries are
+  // removed in. One that needs none, like an entry of an insert-only
+  // collection, or the entry this call added by its fresh key, is protected.
+  llvm::SmallVector<std::optional<unsigned>, 8> Required;
+  llvm::SmallVector<const FieldDecl *, 8> RequiredFields;
+  llvm::BitVector Protected(Variables.size());
+  for (unsigned iVariable = 0; iVariable < Variables.size(); ++iVariable) {
+    const FieldDecl *Field = nullptr;
+    Required.push_back(
+        requiredPhases(Variables[iVariable],
+                       Collector.RangeIterators.contains(Variables[iVariable]),
+                       Function, Context, &Field));
+    RequiredFields.push_back(Field);
+    if (Required.back() && *Required.back() == 0)
+      Protected.set(iVariable);
+  }
+
+  // The `fg_OnResume` registrations, and the tracked variables each
+  // re-validates.
+  llvm::DenseMap<const VarDecl *, unsigned> HolderIndices;
+  llvm::SmallVector<llvm::BitVector, 4> HolderVariables;
+  /// Of those, what each re-validates only by a comparison.
+  llvm::SmallVector<llvm::BitVector, 4> HolderComparedVariables;
+  llvm::SmallVector<llvm::BitVector, 4> HolderRemovedVariables;
+  llvm::SmallVector<const VarDecl *, 4> HolderDecls;
+  llvm::SmallVector<unsigned, 4> HolderPhaseMasks;
+  llvm::SmallVector<unsigned, 4> HolderStartedMasks;
+  for (const auto &[Holder, Revalidated] : Collector.Revalidations) {
+    llvm::BitVector Bits(Variables.size());
+    for (const ValueDecl *Variable : Revalidated) {
+      if (auto Index = Tracked.find(Variable); Index != Tracked.end())
+        Bits.set(Index->second);
+    }
+    // References made from what the callback keeps pointing to the same data,
+    // like `auto &Distribution = *pDistribution` and `auto &Settings =
+    // Distribution.m_Settings`, through what it points to and its members.
+    llvm::SmallPtrSet<const ValueDecl *, 8> Same;
+    if (auto It = Collector.SameData.find(Holder); It != Collector.SameData.end())
+      Same.insert(It->second.begin(), It->second.end());
+    for (bool bChanged = true; bChanged;) {
+      bChanged = false;
+      for (const auto &[Decl, Index] : Tracked) {
+        const auto *Derived = dyn_cast<VarDecl>(Decl);
+        if (!Derived || Same.contains(Derived) || !Derived->getInit() ||
+            !Derived->getType()->isReferenceType() || isChangedVariable(Derived))
+          continue;
+        const Expr *Inner = skipWrappers(Derived->getInit())->IgnoreParenImpCasts();
+        for (int Depth = 0; Depth < 8; ++Depth) {
+          if (const auto *Unary = dyn_cast<UnaryOperator>(Inner);
+              Unary && Unary->getOpcode() == UO_Deref)
+            Inner = Unary->getSubExpr()->IgnoreParenImpCasts();
+          else if (const auto *Member = dyn_cast<MemberExpr>(Inner);
+                   Member && !isa<CXXMethodDecl>(Member->getMemberDecl()))
+            Inner = Member->getBase()->IgnoreParenImpCasts();
+          else
+            break;
+        }
+        // Of a variable that the function doesn't assign another, `int
+        // &Value = *pEntry; pEntry = ...`, outside the callbacks that look it
+        // up again, which re-validates only what it holds then.
+        const auto *Base = dyn_cast<DeclRefExpr>(Inner);
+        const auto *BaseVariable =
+            Base ? dyn_cast<VarDecl>(resolveReferenceCapture(Base->getDecl()))
+                 : nullptr;
+        auto ChangedOutsideLambdas = [&](const VarDecl *Variable) {
+          const auto *Function = dyn_cast_or_null<FunctionDecl>(
+              Variable->getParentFunctionOrMethod());
+          bool Changed = false;
+          TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+            if (!S || Changed || isa<LambdaExpr>(S))
+              return;
+            const Expr *Target = nullptr;
+            if (const auto *Assign = dyn_cast<BinaryOperator>(S);
+                Assign && Assign->isAssignmentOp())
+              Target = Assign->getLHS();
+            else if (const auto *Unary = dyn_cast<UnaryOperator>(S);
+                     Unary && (Unary->isIncrementDecrementOp() ||
+                               Unary->getOpcode() == UO_AddrOf))
+              Target = Unary->getSubExpr();
+            if (Target)
+              for (const DeclRefExpr *Ref : assignedVariables(Target))
+                Changed |= Ref->getDecl() == Variable;
+            for (const Stmt *Child : keptChildren(S))
+              Visit(Child);
+          };
+          Visit(Function ? Function->getBody() : nullptr);
+          return Changed;
+        };
+        if (!Base || !Same.contains(resolveReferenceCapture(Base->getDecl())) ||
+            (BaseVariable && !BaseVariable->getType()->isReferenceType() &&
+             BaseVariable->hasLocalStorage() &&
+             ChangedOutsideLambdas(BaseVariable)))
+          continue;
+        Same.insert(Derived);
+        Bits.set(Index);
+        bChanged = true;
+      }
+    }
+    HolderIndices[Holder] = HolderVariables.size();
+    HolderDecls.push_back(Holder);
+    HolderVariables.push_back(std::move(Bits));
+    llvm::BitVector ComparedBits(Variables.size());
+    if (auto It = Collector.ComparedRevalidations.find(Holder);
+        It != Collector.ComparedRevalidations.end())
+      for (const ValueDecl *Variable : It->second)
+        if (auto Index = Tracked.find(Variable); Index != Tracked.end())
+          ComparedBits.set(Index->second);
+    HolderComparedVariables.push_back(std::move(ComparedBits));
+    // What its callback can remove entries of, which the callbacks
+    // registered before it looked up again.
+    llvm::BitVector Removed(Variables.size());
+    if (auto It = Collector.HolderRemovals.find(Holder);
+        It != Collector.HolderRemovals.end())
+      for (const auto &[Variable, Index] : Tracked)
+        if (Collector.mayRemove(It->second, Variable))
+          Removed.set(Index);
+    HolderRemovedVariables.push_back(std::move(Removed));
+    HolderPhaseMasks.push_back(Collector.HolderPhases.lookup(Holder));
+    HolderStartedMasks.push_back(Collector.HolderStarted.lookup(Holder));
+  }
+
+  // Which of the variables may have been suspended over since they were
+  // looked up, and which registrations may not be alive. A variable is
+  // re-validated on resume while any registration for it is alive on every
+  // path.
+  // Which variables may point into the data of the actor: a pointer
+  // assigned other storage, like `pValue = new CValue`, doesn't go stale.
+  struct CState {
+    llvm::BitVector Stale;
+    llvm::BitVector MaybeDead;
+    llvm::BitVector Into;
+    /// The variables that may have been assigned since they were made, and
+    /// may not hold what the guards their lookup needs protect.
+    llvm::BitVector Reassigned;
+    /// The registrations whose phases may have started since their callback
+    /// last ran, when they were registered or on the last resume.
+    llvm::BitVector Unchecked;
+    /// The variables a test of a removal flag of their entry found there,
+    /// which a call that can change the data of the actor after it can
+    /// remove again, `if (*pDeleted) co_return 0; mp_Items.f_Clear();`.
+    llvm::BitVector FlagValidated;
+    /// The scope exits and guards of `fg_AsyncDestroy` whose cleanup may
+    /// still run, not cancelled or run early on every path.
+    llvm::SmallPtrSet<const VarDecl *, 2> ArmedCleanups;
+
+    bool operator!=(const CState &Other) const {
+      return Stale != Other.Stale || MaybeDead != Other.MaybeDead ||
+             Into != Other.Into || Reassigned != Other.Reassigned ||
+             Unchecked != Other.Unchecked ||
+             FlagValidated != Other.FlagValidated ||
+             ArmedCleanups != Other.ArmedCleanups;
+    }
+    void merge(const CState &Other) {
+      Stale |= Other.Stale;
+      MaybeDead |= Other.MaybeDead;
+      Into |= Other.Into;
+      Reassigned |= Other.Reassigned;
+      Unchecked |= Other.Unchecked;
+      FlagValidated |= Other.FlagValidated;
+      ArmedCleanups.insert(Other.ArmedCleanups.begin(),
+                           Other.ArmedCleanups.end());
+    }
+  };
+  const unsigned nVariables = Variables.size();
+  const unsigned nHolders = HolderVariables.size();
+  auto EmptyState = [&] {
+    return CState{llvm::BitVector(nVariables),
+                  llvm::BitVector(nHolders),
+                  llvm::BitVector(nVariables),
+                  llvm::BitVector(nVariables),
+                  llvm::BitVector(nHolders),
+                  llvm::BitVector(nVariables),
+                  {}};
+  };
+  // The guards the lookup of a variable needs, while it holds what it was
+  // made from.
+  auto RequiredAt = [&](const CState &State,
+                        unsigned iVariable) -> std::optional<unsigned> {
+    if (State.Reassigned.test(iVariable))
+      return std::nullopt;
+    return Required[iVariable];
+  };
+  // The phases in \p Started may begin here: what loses entries in them is
+  // stale, and the registrations that check them haven't since.
+  auto StartPhases = [&](CState &State, unsigned Started) {
+    for (unsigned iVariable = 0; iVariable < nVariables; ++iVariable)
+      if (const std::optional<unsigned> Needed = RequiredAt(State, iVariable);
+          Needed && (*Needed & Started) && State.Into.test(iVariable))
+        State.Stale.set(iVariable);
+    for (unsigned iHolder = 0; iHolder < nHolders; ++iHolder)
+      if (HolderPhaseMasks[iHolder] & Started)
+        State.Unchecked.set(iHolder);
+  };
+  // With \p Revalidations, also not what the callbacks alive re-validate,
+  // which their own early uses aren't protected by.
+  // With \p Before, only of the guards registered before it, which run
+  // before its callback on resume.
+  // With \p Compared instead, only what they re-validate by a comparison,
+  // which protects early uses too.
+  auto Unguarded = [&](const CState &State, bool Revalidations = true,
+                       const VarDecl *Before = nullptr, bool Compared = false) {
+    llvm::BitVector Bits(nVariables, true);
+    // The guards alive together cover the phases of each of them, but not
+    // those that a callback registered after a guard starts, after the guard
+    // ran.
+    const SourceManager &SM = Context.getSourceManager();
+    unsigned LivePhases = 0;
+    for (unsigned iHolder = 0; iHolder < nHolders; ++iHolder) {
+      if (State.MaybeDead.test(iHolder))
+        continue;
+      if (Before && !SM.isBeforeInTranslationUnit(
+                        HolderDecls[iHolder]->getLocation(),
+                        Before->getLocation()))
+        continue;
+      // Not what a callback registered after it and alive, which runs after
+      // it on resume, can remove again.
+      if (Revalidations || Compared) {
+        llvm::BitVector Revalidated = Revalidations
+                                          ? HolderVariables[iHolder]
+                                          : HolderComparedVariables[iHolder];
+        for (unsigned iLater = 0; iLater < nHolders; ++iLater)
+          if (iLater != iHolder && !State.MaybeDead.test(iLater) &&
+              SM.isBeforeInTranslationUnit(
+                  HolderDecls[iHolder]->getLocation(),
+                  HolderDecls[iLater]->getLocation()))
+            Revalidated.reset(HolderRemovedVariables[iLater]);
+        Bits.reset(Revalidated);
+      }
+      unsigned Guarded = HolderPhaseMasks[iHolder];
+      if (!Guarded)
+        continue;
+      for (unsigned iLater = 0; iLater < nHolders; ++iLater)
+        if (!State.MaybeDead.test(iLater) &&
+            SM.isBeforeInTranslationUnit(HolderDecls[iHolder]->getLocation(),
+                                         HolderDecls[iLater]->getLocation()))
+          Guarded &= ~HolderStartedMasks[iLater];
+      LivePhases |= Guarded;
+      // Each guard covers what loses entries only in its phases.
+      for (unsigned iVariable = 0; iVariable < nVariables; ++iVariable)
+        if (const std::optional<unsigned> Needed = RequiredAt(State, iVariable);
+            Needed && !(*Needed & ~Guarded))
+          Bits.reset(iVariable);
+    }
+    for (unsigned iVariable = 0; iVariable < nVariables; ++iVariable) {
+      if (const std::optional<unsigned> Needed = RequiredAt(State, iVariable);
+          Needed && *Needed && !(*Needed & ~LivePhases))
+        Bits.reset(iVariable);
+    }
+    return Bits;
+  };
+  auto isRangeIterator = [&](const Expr *E) {
+    const auto *Ref = dyn_cast<DeclRefExpr>(E->IgnoreParenImpCasts());
+    const auto *Variable = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    return Variable && Collector.RangeIterators.contains(Variable);
+  };
+  TCRecursive<void(unsigned, const Expr *, CState &)> CopyFrom =
+      [&](unsigned Index, const Expr *E, CState &State) {
+    const Expr *Inner = E->IgnoreParenImpCasts();
+    if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(Inner))
+      Inner = Cleanups->getSubExpr()->IgnoreParenImpCasts();
+    // Either value of a conditional, `bFirst ? pValue : pOther`, or the one a
+    // constant condition chooses, `false ? pEntry : &g_Value`.
+    if (const auto *Conditional = dyn_cast<ConditionalOperator>(Inner)) {
+      if (bool Chosen = false;
+          !Conditional->getCond()->isValueDependent() &&
+          foldsCondition(Conditional->getCond(), Chosen, Context))
+        return CopyFrom(Index,
+                        Chosen ? Conditional->getTrueExpr()
+                               : Conditional->getFalseExpr(),
+                        State);
+      CopyFrom(Index, Conditional->getTrueExpr(), State);
+      const bool Into = State.Into.test(Index);
+      const bool Stale = State.Stale.test(Index);
+      CopyFrom(Index, Conditional->getFalseExpr(), State);
+      State.Into[Index] = State.Into.test(Index) || Into;
+      State.Stale[Index] = State.Stale.test(Index) || Stale;
+      return;
+    }
+    // Through what a tracked pointer points to, like `CValue &Alias =
+    // *pValue` or `&pValue->m_Sub`.
+    for (int Depth = 0; Depth < 8; ++Depth) {
+      // What a local pointer to a tracked local points to, `*ppValue` of
+      // `int **ppValue = &pValue` (addressedExpr), is that local.
+      if (const auto *Unary = dyn_cast<UnaryOperator>(Inner);
+          Unary && Unary->getOpcode() == UO_Deref)
+        if (const auto *Pointer = dyn_cast<DeclRefExpr>(
+                Unary->getSubExpr()->IgnoreParenImpCasts());
+            Pointer && !Tracked.contains(Pointer->getDecl()))
+          if (const Expr *Pointed = addressedExpr(Unary->getSubExpr());
+              Pointed && isa<DeclRefExpr>(Pointed->IgnoreParenImpCasts())) {
+            Inner = Pointed->IgnoreParenImpCasts();
+            continue;
+          }
+      if (const auto *Unary = dyn_cast<UnaryOperator>(Inner);
+          Unary && (Unary->getOpcode() == UO_Deref ||
+                    Unary->getOpcode() == UO_AddrOf))
+        Inner = Unary->getSubExpr()->IgnoreParenImpCasts();
+      else if (const auto *Member = dyn_cast<MemberExpr>(Inner))
+        Inner = Member->getBase()->IgnoreParenImpCasts();
+      // An element of a local array, `Views[0]`, which is part of it.
+      else if (const auto *Element = dyn_cast<ArraySubscriptExpr>(Inner);
+               Element && Element->getBase()
+                              ->IgnoreParenImpCasts()
+                              ->getType()
+                              ->isArrayType())
+        Inner = Element->getBase()->IgnoreParenImpCasts();
+      // What an assignment assigns, `q = (p = ...)`.
+      else if (const auto *Assign = dyn_cast<BinaryOperator>(Inner);
+               Assign && Assign->getOpcode() == BO_Assign)
+        Inner = Assign->getRHS()->IgnoreParenImpCasts();
+      // The last of a comma, `(fg_Log(), pValue)`, and the value of a
+      // statement expression, `({ pValue; })`.
+      else if (const auto *Comma = dyn_cast<BinaryOperator>(Inner);
+               Comma && Comma->getOpcode() == BO_Comma)
+        Inner = Comma->getRHS()->IgnoreParenImpCasts();
+      else if (const auto *Statement = dyn_cast<StmtExpr>(Inner);
+               Statement && !Statement->getSubStmt()->body_empty() &&
+               isa<Expr>(Statement->getSubStmt()->body_back()))
+        Inner = cast<Expr>(Statement->getSubStmt()->body_back())
+                    ->IgnoreParenImpCasts();
+      // Moved, `fg_Move(pValue)`, it is what is moved.
+      else if (const auto *Move = dyn_cast<CallExpr>(Inner);
+               Move && Move->getNumArgs() == 1 &&
+               (isMoveFunction(calleeName(Move)) ||
+                isForwardFunction(calleeName(Move))))
+        Inner = Move->getArg(0)->IgnoreParenImpCasts();
+      // Given back by a function that returns it, `fg_Identity(pValue)`.
+      else if (const Expr *Returned =
+                   returnedArgument(dyn_cast<CallExpr>(Inner)))
+        Inner = Returned->IgnoreParenImpCasts();
+      // A cast or an offset of a pointer, `static_cast<int *>(pValue)` or
+      // `pValue + 1`, points where it does.
+      else if (const auto *Cast = dyn_cast<ExplicitCastExpr>(Inner);
+               Cast && (Cast->getType()->isPointerType() || Cast->isGLValue()))
+        Inner = Cast->getSubExpr()->IgnoreParenImpCasts();
+      else if (const auto *Binary = dyn_cast<BinaryOperator>(Inner);
+               Binary && Binary->isAdditiveOp() &&
+               Binary->getType()->isPointerType())
+        Inner = (Binary->getLHS()->getType()->isPointerType()
+                     ? Binary->getLHS()
+                     : Binary->getRHS())
+                    ->IgnoreParenImpCasts();
+      // What a handle refers to, like `*Mapping`, or a copy of the handle.
+      else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Inner);
+               Operator && Operator->getNumArgs() == 1 &&
+               (Operator->getOperator() == OO_Star ||
+                Operator->getOperator() == OO_Arrow) &&
+               (isReferenceHandle(Operator->getArg(0)->getType()) ||
+                isRangeIterator(Operator->getArg(0))))
+        Inner = Operator->getArg(0)->IgnoreParenImpCasts();
+      else if (const CMemberCall Call = memberCallOf(Inner);
+               Call && isReferenceHandle(Call->getImplicitObjectArgument()
+                                             ->IgnoreParenImpCasts()
+                                             ->getType()))
+        Inner = Call->getImplicitObjectArgument()->IgnoreParenImpCasts();
+      else if (const auto *Construct = dyn_cast<CXXConstructExpr>(Inner);
+               Construct && Construct->getNumArgs() == 1 &&
+               isReferenceHandle(Construct->getType()))
+        Inner = Construct->getArg(0)->IgnoreParenImpCasts();
+      else
+        break;
+    }
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner)) {
+      if (auto It = Tracked.find(resolveReferenceCapture(Ref->getDecl()));
+          It != Tracked.end()) {
+        State.Into[Index] = State.Into.test(It->second);
+        // The entry of a loop is reported where the loop goes on with its
+        // iterator.
+        State.Stale[Index] =
+            State.Stale.test(It->second) &&
+            !Collector.RangeIterators.contains(Variables[It->second]);
+        return;
+      }
+    }
+    State.Into[Index] = Collector.isLookupIntoActor(E);
+    State.Stale.reset(Index);
+  };
+  llvm::BitVector EntryInto(Variables.size(), true);
+  // A parameter points where the caller gave it, not into the data, until it
+  // is assigned a lookup.
+  for (const auto &[Variable, Index] : Tracked)
+    if (isa<ParmVarDecl>(Variable))
+      EntryInto.reset(Index);
+  if (Lambda) {
+    for (const LambdaCapture &Capture : Lambda->captures()) {
+      const auto *Variable = capturedVariableOf(Capture);
+      if (!Variable || Variable->isInitCapture() ||
+          Capture.getCaptureKind() != LCK_ByCopy ||
+          !Variable->getType()->isPointerType())
+        continue;
+      if (auto It = Tracked.find(Variable); It != Tracked.end())
+        EntryInto[It->second] = intoActorAtCapture(Variable, Lambda, Context);
+        }
+  }
+  // A flag copied from the data before a suspension that its destructor sets,
+  // like `auto pDeleted = Entry.m_pDeleted`, tested after it by an `if` that
+  // leaves, like `if (*pDeleted) co_return …;`, re-validates the data, and
+  // the pointers made from it, where the `if` doesn't leave.
+  auto BaseOf = [&](const Expr *E) -> const ValueDecl * {
+    const Expr *Inner = skipWrappers(E)->IgnoreParenImpCasts();
+    for (int Depth = 0; Depth < 8; ++Depth) {
+      if (const auto *Unary = dyn_cast<UnaryOperator>(Inner);
+          Unary && (Unary->getOpcode() == UO_Deref ||
+                    Unary->getOpcode() == UO_AddrOf))
+        Inner = Unary->getSubExpr()->IgnoreParenImpCasts();
+      else if (const auto *Member = dyn_cast<MemberExpr>(Inner);
+               Member && !isa<CXXMethodDecl>(Member->getMemberDecl()))
+        Inner = Member->getBase()->IgnoreParenImpCasts();
+      // What a handle refers to, `*Mapping` or `Mapping.f_GetResult()`.
+      else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Inner);
+               Operator && Operator->getNumArgs() == 1 &&
+               (Operator->getOperator() == OO_Star ||
+                Operator->getOperator() == OO_Arrow) &&
+               isReferenceHandle(Operator->getArg(0)->getType()))
+        Inner = Operator->getArg(0)->IgnoreParenImpCasts();
+      else if (const CMemberCall Call = memberCallOf(Inner);
+               Call && isReferenceHandle(Call->getImplicitObjectArgument()
+                                             ->IgnoreParenImpCasts()
+                                             ->getType()))
+        Inner = Call->getImplicitObjectArgument()->IgnoreParenImpCasts();
+      else
+        break;
+    }
+    const auto *Ref = dyn_cast<DeclRefExpr>(Inner);
+    return Ref ? resolveReferenceCapture(Ref->getDecl()) : nullptr;
+  };
+  // Whether \p E reads a pointer of a member of the data, `Entry.m_pValue`,
+  // or goes through one, `*Entry.m_pValue` or `Entry.m_pValue->m_Value`: what
+  // it points to is elsewhere, which the flag of the data doesn't tell about.
+  auto ThroughMemberPointer = [](const Expr *E) {
+    auto IsMemberPointer = [](const Expr *Inner) {
+      const auto *Member = dyn_cast<MemberExpr>(Inner->IgnoreParenImpCasts());
+      return Member && !isa<CXXMethodDecl>(Member->getMemberDecl()) &&
+             Member->getType()->isPointerType();
+    };
+    const Expr *Inner = skipWrappers(E)->IgnoreParenImpCasts();
+    if (IsMemberPointer(Inner))
+      return true;
+    for (int Depth = 0; Depth < 8; ++Depth) {
+      if (const auto *Unary = dyn_cast<UnaryOperator>(Inner);
+          Unary && (Unary->getOpcode() == UO_Deref ||
+                    Unary->getOpcode() == UO_AddrOf)) {
+        if (Unary->getOpcode() == UO_Deref &&
+            IsMemberPointer(Unary->getSubExpr()))
+          return true;
+        Inner = Unary->getSubExpr()->IgnoreParenImpCasts();
+      } else if (const auto *Member = dyn_cast<MemberExpr>(Inner);
+                 Member && !isa<CXXMethodDecl>(Member->getMemberDecl())) {
+        if (Member->isArrow() && IsMemberPointer(Member->getBase()))
+          return true;
+        Inner = Member->getBase()->IgnoreParenImpCasts();
+      } else
+        break;
+    }
+    return false;
+  };
+  // Also out of a loop or to its next round, `if (*pRemoved) break;`, which
+  // the false edge still goes past.
+  auto Leaves = [](const Stmt *S) {
+    if (const auto *Compound = dyn_cast_or_null<CompoundStmt>(S))
+      S = Compound->body_empty() ? nullptr : Compound->body_back();
+    return isa_and_nonnull<ReturnStmt, CoreturnStmt, BreakStmt, ContinueStmt>(
+               S) ||
+           (isa_and_nonnull<Expr>(S) &&
+            isa<CXXThrowExpr>(cast<Expr>(S)->IgnoreImplicit()));
+  };
+  // Each check of flags, what it covers, and whether it is negated, `if
+  // (!*pDeleted)`, whose true edge is where they are not set.
+  llvm::DenseMap<const Stmt *, std::pair<llvm::BitVector, bool>> FlagChecks;
+  for (const auto &Nodes :
+       matchEach<IfStmt>(ifStmt().bind("if"), *Body, Context)) {
+    const auto *If = Nodes.getNodeAs<IfStmt>("if");
+    if (!If->getCond())
+      continue;
+    const auto *Not =
+        dyn_cast<UnaryOperator>(If->getCond()->IgnoreParenImpCasts());
+    const bool Negated = Not && Not->getOpcode() == UO_LNot;
+    const Expr *Tested = Negated ? Not->getSubExpr() : If->getCond();
+    // Also flags read into a local that can't change just before, `bool const
+    // bRemoved = *pRemoved; if (bRemoved)`, as read in the condition.
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(Tested->IgnoreParenImpCasts()))
+      if (const auto *Saved = dyn_cast<VarDecl>(Ref->getDecl());
+          Saved && Saved->hasLocalStorage() && !isa<ParmVarDecl>(Saved) &&
+          Saved->getType()->isBooleanType() && Saved->getInit() &&
+          !isChangedVariable(Saved) && onlyReadsFlags(Saved->getInit())) {
+        const auto Parents = instantiatedParents(*If, Context);
+        const auto *Block =
+            Parents.empty() ? nullptr : Parents[0].get<CompoundStmt>();
+        const Stmt *Before = nullptr;
+        if (Block)
+          for (const Stmt *Statement : Block->body()) {
+            if (Statement == If)
+              break;
+            Before = Statement;
+          }
+        if (const auto *Declaration = dyn_cast_or_null<DeclStmt>(Before);
+            Declaration && Declaration->isSingleDecl() &&
+            Declaration->getSingleDecl() == Saved)
+          Tested = Saved->getInit();
+      }
+    if ((!Negated && !Leaves(If->getThen())) || !onlyReadsFlags(Tested))
+      continue;
+    llvm::BitVector Covered(Variables.size());
+    // The flags the condition dereferences, `*pDeleted`.
+    // Only a flag the condition tests as such, alone or in a disjunction, like
+    // `*pDeleted || bOther`: the branch is then taken when it is set, and the
+    // false edge is where it is not. A negated flag is the other way around.
+    struct CFlags {
+      llvm::SmallVector<const VarDecl *, 2> Flags;
+      void collect(const Expr *E) {
+        E = E->IgnoreParenImpCasts();
+        if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
+          return collect(Cleanups->getSubExpr());
+        if (const auto *Binary = dyn_cast<BinaryOperator>(E)) {
+          if (Binary->getOpcode() == BO_LOr) {
+            collect(Binary->getLHS());
+            collect(Binary->getRHS());
+          }
+          // Compared to be set, like `*pDeleted == true`.
+          if (const Expr *Flag = comparedToBeSet(Binary))
+            collect(Flag);
+          return;
+        }
+        const Expr *Operand = nullptr;
+        if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+            Unary && Unary->getOpcode() == UO_Deref)
+          Operand = Unary->getSubExpr();
+        else if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
+                 Call && Call->getOperator() == OO_Star &&
+                 Call->getNumArgs() == 1)
+          Operand = Call->getArg(0);
+        // Also an atomic flag loaded, `pDeleted->f_Load()`.
+        else if (const CMemberCall Load = memberCallOf(E);
+                 Load && Load->getMethodDecl() &&
+                 Load->getMethodDecl()->getIdentifier() &&
+                 (identifierTextOf(Load->getMethodDecl()) == "f_Load" ||
+                  identifierTextOf(Load->getMethodDecl()) == "load")) {
+          Operand = Load->getImplicitObjectArgument()->IgnoreParenImpCasts();
+          if (const auto *Arrow = dyn_cast<CXXOperatorCallExpr>(Operand);
+              Arrow && Arrow->getOperator() == OO_Arrow &&
+              Arrow->getNumArgs() == 1)
+            Operand = Arrow->getArg(0);
+          else if (const auto *Deref = dyn_cast<UnaryOperator>(Operand);
+                   Deref && Deref->getOpcode() == UO_Deref)
+            Operand = Deref->getSubExpr();
+        }
+        if (!Operand)
+          return;
+        if (const auto *Ref =
+                dyn_cast<DeclRefExpr>(Operand->IgnoreParenImpCasts()))
+          if (const auto *Variable = dyn_cast<VarDecl>(Ref->getDecl()))
+            Flags.push_back(Variable);
+      }
+    };
+    CFlags FlagFinder;
+    FlagFinder.collect(Tested);
+    for (const VarDecl *Variable : FlagFinder.Flags) {
+      // A flag assigned something else may not be the entry's any more.
+      if (!Variable->hasLocalStorage() || !Variable->getInit() ||
+          isChangedVariable(Variable))
+        continue;
+      // A copy of a member of the data that tells it was removed, like
+      // `m_pDestroyed`.
+      const auto *Member = dyn_cast<MemberExpr>(
+          skipWrappers(Variable->getInit())->IgnoreParenImpCasts());
+      if (Member && !isRemovalFlagName(Member->getMemberDecl()))
+        continue;
+      const ValueDecl *Data = Member ? BaseOf(Member->getBase()) : nullptr;
+      if (!Data)
+        continue;
+      // The data and what is made from it, or what it is made from.
+      for (const auto &[Decl, Index] : Tracked) {
+        const auto *Tracked = dyn_cast<VarDecl>(Decl);
+        // What the flag was copied from must still be that entry.
+        const auto *DataVariable = dyn_cast<VarDecl>(Data);
+        if (DataVariable && isChangedVariable(DataVariable) &&
+            !DataVariable->getType()->isReferenceType())
+          continue;
+        if (Tracked == Data ||
+            (Tracked && Tracked->getInit() &&
+             BaseOf(Tracked->getInit()) == Data &&
+             !ThroughMemberPointer(Tracked->getInit()) &&
+             !isChangedVariable(Tracked)))
+          Covered.set(Index);
+      }
+    }
+    if (Covered.any())
+      FlagChecks[If] = {std::move(Covered), Negated};
+  }
+
+  // Testing whether a pointer is null, or comparing it, doesn't use the data.
+  // Neither does asking a handle something else than what it refers to, like
+  // `Mapping.f_WasCreated()`, nor naming a static member through it,
+  // `Entry.ms_Count` or `pEntry->f_Count()` of a static function.
+  auto isPointerTest = [&](const DeclRefExpr *Ref) {
+    {
+      auto Parents = instantiatedParents(*Ref, Context);
+      while (!Parents.empty() && (Parents[0].get<ImplicitCastExpr>() ||
+                                  Parents[0].get<ParenExpr>()))
+        Parents = instantiatedParents(Parents[0], Context);
+      if (const auto *Member =
+              Parents.empty() ? nullptr : Parents[0].get<MemberExpr>()) {
+        const ValueDecl *Named = Member->getMemberDecl();
+        const auto *Method = dyn_cast<CXXMethodDecl>(Named);
+        if (isa<VarDecl>(Named) || (Method && Method->isStatic()))
+          return true;
+      }
+    }
+    if (isReferenceHandle(Ref->getType())) {
+      auto Parents = instantiatedParents(*Ref, Context);
+      while (!Parents.empty() && (Parents[0].get<ImplicitCastExpr>() ||
+                                  Parents[0].get<ParenExpr>()))
+        Parents = instantiatedParents(Parents[0], Context);
+      if (Parents.empty())
+        return false;
+      // What the handle knows itself, like whether the lookup added the
+      // entry; another member function may read the entry.
+      if (const auto *Member = Parents[0].get<MemberExpr>()) {
+        const auto *Method = dyn_cast<CXXMethodDecl>(Member->getMemberDecl());
+        return Method && Method->getIdentifier() &&
+               identifierTextOf(Method) == "f_WasCreated";
+      }
+      return false;
+    }
+    const bool Pointer = Ref->getType()->isPointerType();
+    // Not through a reference to a pointer in the data, `auto const &pEntry =
+    // mp_Items[0]`, whose value is read from the entry, unlike one bound to a
+    // local pointer.
+    if (Pointer && isUnresolvedReference(Ref->getDecl()))
+      return false;
+    // Nothing done to the entry (storageUsesOf), of a pointer what it points
+    // to, also explicitly, `bool(pEntry)`, or kept, `bool bFound = pEntry;`,
+    // of a reference what it refers to, its address compared, `&Job ==
+    // mp_Jobs.f_FindEqual(_Key)`.
+    return storageUsesOf(Ref, Pointer ? 1 : 0, Context).none();
+  };
+
+  llvm::DenseMap<const CFGBlock *, CState> StateAtEnd;
+  // Whether \p Flag is a flag of the entry \p Captured points to that tells
+  // it was removed, copied before, like `pDeleted = pEntry->m_pDeleted`.
+  auto IsRemovalFlagOf = [&](const ValueDecl *Flag, const ValueDecl *Captured) {
+    const auto *Copy = dyn_cast_or_null<VarDecl>(Flag);
+    // A copy of the flag that is replaced, `pDeleted = pOther`, is another
+    // flag.
+    if (!Copy || !Copy->getInit() || isChangedVariable(Copy))
+      return false;
+    const auto *Member =
+        dyn_cast<MemberExpr>(skipWrappers(Copy->getInit())->IgnoreParenImpCasts());
+    if (!Member || !Member->getMemberDecl()->getIdentifier())
+      return false;
+    const StringRef Name = identifierTextOf(Member->getMemberDecl());
+    const auto *Base =
+        dyn_cast<DeclRefExpr>(Member->getBase()->IgnoreParenImpCasts());
+    // Of the entry it still points to: one pointed at another entry after
+    // the flag was copied, `pEntry = mp_Items.f_FindEqual(2)`, isn't told by
+    // the flag of the first, but one pointed before, `pEntry = &Entry;`
+    // after `CEntry *pEntry;`, is.
+    auto AssignedAfterCopy = [&](const VarDecl *Pointer) {
+      if (!isChangedVariable(Pointer))
+        return false;
+      const auto *Function =
+          dyn_cast_or_null<FunctionDecl>(Pointer->getParentFunctionOrMethod());
+      if (!Function || !Function->getBody())
+        return true;
+      const SourceManager &SM = Context.getSourceManager();
+      bool After = false;
+      bool Other = false;
+      for (const auto &Nodes : matchEach<DeclRefExpr>(
+               declRefExpr(to(varDecl(equalsNode(Pointer)))).bind("ref"),
+               *Function->getBody(), Context)) {
+        const auto *Ref = Nodes.getNodeAs<DeclRefExpr>("ref");
+        DynTypedNode Node = DynTypedNode::create(*Ref);
+        auto Parents = instantiatedParents(Node, Context);
+        while (!Parents.empty() && (Parents[0].get<ParenExpr>() ||
+                                    (Parents[0].get<ImplicitCastExpr>() &&
+                                     Parents[0].get<ImplicitCastExpr>()
+                                             ->getCastKind() != CK_LValueToRValue))) {
+          Node = Parents[0];
+          Parents = instantiatedParents(Node, Context);
+        }
+        if (Parents.empty())
+          continue;
+        // Assigned, before or after the copy of the flag; read, which
+        // changes nothing; or changed otherwise, by its address, a step or
+        // what gets it by reference.
+        if (const auto *Assign = Parents[0].get<BinaryOperator>();
+            Assign && Assign->isAssignmentOp() &&
+            Assign->getLHS()->IgnoreParenImpCasts() == Ref) {
+          if (Assign->getOpcode() == BO_Assign)
+            After |= !SM.isBeforeInTranslationUnit(Assign->getEndLoc(),
+                                                   Base->getBeginLoc());
+          else
+            Other = true;
+        } else if (const auto *Unary = Parents[0].get<UnaryOperator>();
+                   Unary && (Unary->getOpcode() == UO_AddrOf ||
+                             Unary->isIncrementDecrementOp()))
+          Other = true;
+        else if (Parents[0].get<CallExpr>() || Parents[0].get<CXXConstructExpr>())
+          Other = true;
+      }
+      return After || Other;
+    };
+    const auto *Pointer = dyn_cast<VarDecl>(Captured);
+    return Base && Base->getDecl() == Captured &&
+           (!Pointer || Pointer->getType()->isReferenceType() ||
+            !AssignedAfterCopy(Pointer)) &&
+           (Name.contains("Destroyed") || Name.contains("Deleted") ||
+            Name.contains("Removed"));
+  };
+  // Whether \p Condition, when \p Set, tells that a removal flag of
+  // \p Captured is set: `*pDeleted`, `pDeleted->f_Load()` or `*pDeleted ==
+  // true`, or, unless Set, `!*pDeleted`.
+  TCRecursive<bool(const Expr *, const ValueDecl *, bool)> TestsRemoval =
+      [&](const Expr *Condition, const ValueDecl *Captured, bool Set) {
+        Condition = skipWrappers(Condition)->IgnoreParenImpCasts();
+        if (const auto *Not = dyn_cast<UnaryOperator>(Condition);
+            Not && Not->getOpcode() == UO_LNot)
+          return TestsRemoval(Not->getSubExpr(), Captured, !Set);
+        // Either side of `*pDeleted || bSkip` is true when the flag is set,
+        // and each side of `!*pDeleted && bGo` when it isn't; the other way
+        // around, both sides must tell.
+        if (const auto *Logical = dyn_cast<BinaryOperator>(Condition);
+            Logical && Logical->isLogicalOp()) {
+          const bool Left = TestsRemoval(Logical->getLHS(), Captured, Set);
+          const bool Right = TestsRemoval(Logical->getRHS(), Captured, Set);
+          return (Logical->getOpcode() == BO_LOr) == Set ? Left || Right
+                                                         : Left && Right;
+        }
+        if (!Set)
+          return false;
+        if (const auto *Binary = dyn_cast<BinaryOperator>(Condition)) {
+          if (const Expr *Flag = comparedToBeSet(Binary))
+            return TestsRemoval(Flag, Captured, true);
+          return false;
+        }
+        const Expr *Operand = nullptr;
+        if (const auto *Deref = dyn_cast<UnaryOperator>(Condition);
+            Deref && Deref->getOpcode() == UO_Deref)
+          Operand = Deref->getSubExpr();
+        else if (const auto *Star = dyn_cast<CXXOperatorCallExpr>(Condition);
+                 Star && Star->getOperator() == OO_Star &&
+                 Star->getNumArgs() == 1)
+          Operand = Star->getArg(0);
+        else if (const CMemberCall Load = memberCallOf(Condition);
+                 Load && Load->getMethodDecl() &&
+                 Load->getMethodDecl()->getIdentifier() &&
+                 (identifierTextOf(Load->getMethodDecl()) == "f_Load" ||
+                  identifierTextOf(Load->getMethodDecl()) == "load")) {
+          Operand = Load->getImplicitObjectArgument()->IgnoreParenImpCasts();
+          if (const auto *Arrow = dyn_cast<CXXOperatorCallExpr>(Operand);
+              Arrow && Arrow->getOperator() == OO_Arrow &&
+              Arrow->getNumArgs() == 1)
+            Operand = Arrow->getArg(0);
+          else if (const auto *Deref = dyn_cast<UnaryOperator>(Operand);
+                   Deref && Deref->getOpcode() == UO_Deref)
+            Operand = Deref->getSubExpr();
+        }
+        const auto *Ref =
+            Operand ? dyn_cast<DeclRefExpr>(Operand->IgnoreParenImpCasts())
+                    : nullptr;
+        return Ref && IsRemovalFlagOf(Ref->getDecl(), Captured);
+      };
+  // Whether \p Ref, in the body of \p Invoked, only runs when the entry of
+  // \p Captured is still there: in the branch of `if (!*pDeleted)`, or after
+  // `if (*pDeleted) return;` in the body.
+  auto IsGuardedByFlag = [&](const DeclRefExpr *Ref, const LambdaExpr *Invoked,
+                             const ValueDecl *Captured) {
+    // A jump can pass the test, `goto Use;`.
+    if (hasJumps(Invoked->getBody()))
+      return false;
+    const SourceManager &SM = Context.getSourceManager();
+    // Nor can what runs between the test and the use call what can remove
+    // the entry, `if (*pDeleted) return 0; mp_Items.f_Clear();`: a call that
+    // uses the actor, other than a const member function of it, or one the use
+    // is in, `mp_Items.f_Remove(*pEntry)`, which runs after it.
+    auto ChangesBetween = [&](SourceLocation Tested) {
+      bool Changes = false;
+      TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *S) {
+        if (!S || Changes || isa<LambdaExpr>(S))
+          return;
+        if (const auto *Call = dyn_cast<CallExpr>(S);
+            Call && SM.isBeforeInTranslationUnit(Tested, Call->getBeginLoc()) &&
+            SM.isBeforeInTranslationUnit(Call->getBeginLoc(),
+                                         Ref->getBeginLoc()) &&
+            SM.isBeforeInTranslationUnit(Call->getEndLoc(),
+                                         Ref->getBeginLoc())) {
+          // A const one, unless its class has mutable members or its body
+          // can be seen to free, like the calls of the body do.
+          const CMemberCall Member = memberCallOf(Call);
+          const CXXMethodDecl *Method =
+              Member ? Member->getMethodDecl() : nullptr;
+          const bool Const = Method && hasConstObject(Method) &&
+                             !Method->getParent()->hasMutableFields() &&
+                             !(Method->getDefinition() && mayFree(Method));
+          // Also through what refers into the data, `Items.f_Clear()` of a
+          // captured `auto &Items = mp_Items`.
+          auto Uses = [&](const Expr *E) {
+            return usesThis(E) || Collector.isRooted(E);
+          };
+          if (Const ? llvm::any_of(Call->arguments(), Uses)
+                    : Uses(Call) ||
+                          (Member && Member->getImplicitObjectArgument() &&
+                           Uses(Member->getImplicitObjectArgument())) ||
+                          llvm::any_of(Call->arguments(), Uses)) {
+            Changes = true;
+            return;
+          }
+        }
+        for (const Stmt *Child : evaluatedChildren(S, Context))
+          Visit(Child);
+      };
+      Visit(Invoked->getBody());
+      return Changes;
+    };
+    if (const auto *Body = dyn_cast<CompoundStmt>(Invoked->getBody()))
+      for (const Stmt *Statement : Body->body()) {
+        if (!SM.isBeforeInTranslationUnit(Statement->getEndLoc(),
+                                          Ref->getBeginLoc()))
+          break;
+        const auto *If = dyn_cast<IfStmt>(Statement);
+        const Stmt *Then = If ? If->getThen() : nullptr;
+        if (const auto *Block = dyn_cast_or_null<CompoundStmt>(Then);
+            Block && Block->size() == 1)
+          Then = Block->body_front();
+        if (If && !If->getInit() && !If->getElse() &&
+            isa_and_nonnull<ReturnStmt>(Then) &&
+            TestsRemoval(If->getCond(), Captured, true) &&
+            onlyReadsFlags(If->getCond()) &&
+            !ChangesBetween(If->getCond()->getBeginLoc()))
+          return true;
+      }
+    DynTypedNode Node = DynTypedNode::create(*Ref);
+    for (int Depth = 0; Depth < 64; ++Depth) {
+      const auto Parents = instantiatedParents(Node, Context);
+      if (Parents.empty() || Parents[0].get<LambdaExpr>())
+        return false;
+      // In the branch of `if (!*pDeleted)`, or the other branch of `if
+      // (*pDeleted)`.
+      if (const auto *If = Parents[0].get<IfStmt>();
+          If && !If->getInit() && !If->getConditionVariable() &&
+          ((Node.get<Stmt>() == If->getThen() &&
+            TestsRemoval(If->getCond(), Captured, false)) ||
+           (Node.get<Stmt>() == If->getElse() &&
+            TestsRemoval(If->getCond(), Captured, true))) &&
+          onlyReadsFlags(If->getCond()) &&
+          !ChangesBetween(If->getCond()->getBeginLoc()))
+        return true;
+      Node = Parents[0];
+    }
+    return false;
+  };
+  // Whether \p Ref is what an assignment assigns, `pEntry = nullptr`.
+  auto isAssignedAt = [&](const DeclRefExpr *Ref) {
+    DynTypedNode Node = DynTypedNode::create(*Ref);
+    for (int Depth = 0; Depth < 4; ++Depth) {
+      const auto Parents = instantiatedParents(Node, Context);
+      if (Parents.empty())
+        return false;
+      if (const auto *Assign = Parents[0].get<BinaryOperator>())
+        return Assign->getOpcode() == BO_Assign &&
+               Assign->getLHS()->IgnoreParens() == Node.get<Expr>();
+      if (!Parents[0].get<ParenExpr>())
+        return false;
+      Node = Parents[0];
+    }
+    return false;
+  };
+  auto UsesCaptured = [&](const LambdaExpr *Invoked,
+                          const ValueDecl *Captured) {
+    bool Uses = false;
+    TCRecursive<void(const Stmt *)> Visit = [&](const Stmt *Inner) {
+      if (!Inner || Uses)
+        return;
+      // Not what isn't evaluated, `sizeof(*pEntry)`, nor a branch of an `if
+      // constexpr` that is discarded.
+      if (hasUnevaluatedOperands(Inner))
+        return;
+      if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(Inner);
+          Typeid && !Typeid->isPotentiallyEvaluated())
+        return;
+      // Making a lambda inside runs only what initializes its copies; what
+      // its body does is of the lambdas that are run, which are told by
+      // themselves.
+      if (const auto *Nested = dyn_cast<LambdaExpr>(Inner)) {
+        const auto CaptureInits = captureInitsOf(Nested);
+        auto Init = CaptureInits.begin();
+        for (const LambdaCapture &Capture : Nested->captures()) {
+          const Expr *CaptureInit = *Init++;
+          if (Capture.getCaptureKind() == LCK_ByCopy)
+            Visit(CaptureInit);
+        }
+        return;
+      }
+      // Nor assigning it, `pEntry = nullptr`, which changes the variable,
+      // not the data, but a reference, `Entry = 1` of `int &Entry`, writes
+      // what it refers to.
+      // Nor one the lambda looks up again first, `[this, pEntry]() mutable {
+      // pEntry = mp_Items.f_FindEqual(1); return pEntry->m_Value; }`, a
+      // value of its own, not a copy of another variable.
+      const bool Reference = Captured->getType()->isReferenceType();
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner);
+          Ref && Ref->getDecl() == Captured && !isPointerTest(Ref) &&
+          (Reference || !isAssignedAt(Ref)) &&
+          !IsGuardedByFlag(Ref, Invoked, Captured) &&
+          (Reference ||
+           !reassignedBefore(Invoked->getBody(), Captured, Ref,
+                             Context.getSourceManager(), [](const Expr *Value) {
+                               return !isa<DeclRefExpr>(
+                                   Value->IgnoreParenImpCasts());
+                             })))
+        Uses = true;
+      for (const Stmt *Child : evaluatedChildren(Inner, Context))
+        Visit(Child);
+    };
+    Visit(Invoked->getBody());
+    return Uses;
+  };
+  // The lambdas that running \p Invoked runs: itself and the ones it calls
+  // in turn, like `fRead()` in `[&fRead] { return fRead(); }`, however many
+  // there are, in the order they run: what each reads where it starts, the
+  // ones it calls in the order it calls them, each with what it calls, and
+  // what it assigns where it ends, so that what it assigns isn't taken to be
+  // before what those it calls read.
+  // Each with whether it runs for sure when \p Invoked does: called in a
+  // statement of the body of the one that calls it that runs each time it
+  // does, not in a branch, a loop or a condition, `if (bRefresh) fRefresh()`.
+  // Each once, or twice when it is reached first where it may not run and
+  // then where it runs for sure, `if (bRefresh) fRefresh(); fRefresh();`.
+  struct CRun {
+    const LambdaExpr *Lambda;
+    bool Sure;
+    bool Assigns;
+    // Of what it assigns, those written from and before these, when valid,
+    // which run between the lambdas it calls.
+    SourceLocation From;
+    SourceLocation To;
+  };
+  auto RunLambdas = [&](const LambdaExpr *Invoked, bool Sure) {
+    const SourceManager &SM = Context.getSourceManager();
+    llvm::SmallVector<CRun, 8> Run;
+    // Each time it is called, `fRefresh(); p = &Local; fRefresh();`, but not
+    // one in itself, nor more times than code can have.
+    // Past as many as code can have, each that is left once, as one that
+    // may run, so what it reads is still looked at.
+    llvm::SmallPtrSet<const LambdaExpr *, 4> InProgress;
+    llvm::SmallPtrSet<const LambdaExpr *, 4> Overflowed;
+    unsigned nAdded = 0;
+    TCRecursive<void(const LambdaExpr *, bool, int)> Add =
+        [&](const LambdaExpr *Runner, bool RunnerSure, int Depth) {
+          const bool Over = Depth > 64 || ++nAdded > 1024;
+          if (Over ? !Overflowed.insert(Runner).second
+                   : !InProgress.insert(Runner).second)
+            return;
+          if (Over)
+            RunnerSure = false;
+          const llvm::scope_exit Done([&] {
+            if (!Over)
+              InProgress.erase(Runner);
+          });
+          Run.push_back({Runner, RunnerSure, false, {}, {}});
+          const llvm::SmallPtrSet<const Stmt *, 8> Always =
+              statementsBeforeLeaving(Runner->getBody());
+          // What it assigns, when that is all in statements of its body that
+          // run each time, before a lambda it calls, `p = mp_Items.f_FindEqual(
+          // 1); return fRead();`, is assigned before that one runs, and what
+          // it assigns after, `p = nullptr;`, after.
+          llvm::SmallVector<SourceLocation, 4> Assignments;
+          bool AssignsInBranch = false;
+          // Of a coroutine, the statements of its body.
+          const Stmt *RunnerBody = Runner->getBody();
+          if (const auto *Coroutine =
+                  dyn_cast_or_null<CoroutineBodyStmt>(RunnerBody))
+            RunnerBody = Coroutine->getBody();
+          if (const auto *Body = dyn_cast_or_null<CompoundStmt>(RunnerBody))
+            for (const Stmt *Statement : Body->body()) {
+              TCRecursive<void(const Stmt *)> Find = [&](const Stmt *Inner) {
+                if (!Inner || isa<LambdaExpr>(Inner))
+                  return;
+                if (const auto *Assign = dyn_cast<BinaryOperator>(Inner);
+                    Assign && Assign->isAssignmentOp()) {
+                  Assignments.push_back(Assign->getBeginLoc());
+                  if (!Always.contains(Statement))
+                    AssignsInBranch = true;
+                }
+                for (const Stmt *Child : keptChildren(Inner))
+                  Find(Child);
+              };
+              Find(Statement);
+            }
+          // Where the assignments not yet applied start.
+          SourceLocation AssignedUntil;
+          auto AssignsBefore = [&](SourceLocation To) {
+            return llvm::any_of(Assignments, [&](SourceLocation Loc) {
+              return (AssignedUntil.isInvalid() ||
+                      !SM.isBeforeInTranslationUnit(Loc, AssignedUntil)) &&
+                     (To.isInvalid() || SM.isBeforeInTranslationUnit(Loc, To));
+            });
+          };
+          TCRecursive<void(const Stmt *, bool)> Visit =
+              [&](const Stmt *Inner, bool Sure) {
+                if (!Inner || isa<LambdaExpr>(Inner))
+                  return;
+                if (isa<IfStmt, ForStmt, WhileStmt, DoStmt, CXXForRangeStmt,
+                        SwitchStmt, AbstractConditionalOperator, CXXTryStmt>(
+                        Inner))
+                  Sure = false;
+                if (const auto *Logical = dyn_cast<BinaryOperator>(Inner);
+                    Logical && Logical->isLogicalOp())
+                  Sure = false;
+                // What it is given runs before it.
+                for (const Stmt *Child : keptChildren(Inner))
+                  Visit(Child, Sure);
+                const LambdaExpr *Nested = nullptr;
+                if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Inner);
+                    Operator && Operator->getOperator() == OO_Call &&
+                    Operator->getNumArgs() >= 1)
+                  Nested = asLambda(Operator->getArg(0));
+                else if (const CMemberCall Member = memberCallOf(Inner);
+                         Member && Member->getMethodDecl() &&
+                         Member->getMethodDecl()->getOverloadedOperator() ==
+                             OO_Call)
+                  Nested = asLambda(Member->getImplicitObjectArgument());
+                else if (const auto *Call = dyn_cast<CallExpr>(Inner);
+                         Call && Call->getNumArgs() >= 1 &&
+                         (calleeName(Call) == "fg_CallSafe" ||
+                          isStdInvoke(Call)))
+                  Nested = asLambda(Call->getArg(0));
+                if (Nested) {
+                  if (!AssignsInBranch && AssignsBefore(Inner->getBeginLoc())) {
+                    Run.push_back({Runner, RunnerSure, true, AssignedUntil,
+                                   Inner->getBeginLoc()});
+                    AssignedUntil = Inner->getBeginLoc();
+                  }
+                  Add(Nested, Sure, Depth + 1);
+                }
+              };
+          if (const auto *Body = dyn_cast_or_null<CompoundStmt>(RunnerBody))
+            for (const Stmt *Statement : Body->body())
+              Visit(Statement, RunnerSure && Always.contains(Statement));
+          else
+            Visit(Runner->getBody(), false);
+          if (AssignsInBranch)
+            Run.push_back({Runner, RunnerSure, true, {}, {}});
+          else if (AssignsBefore({}))
+            Run.push_back({Runner, RunnerSure, true, AssignedUntil, {}});
+        };
+    Add(Invoked, Sure, 0);
+    return Run;
+  };
+  // With \p Sure, when it runs for sure, and with \p CallsLeave, where what
+  // its calls throw can be caught, `try { fRefresh(); } catch (...) {}`.
+  // What \p Invoked reads, or with \p AssignsPart, what it assigns.
+  auto InvokeOne = [&](const LambdaExpr *Invoked, bool Sure, bool CallsLeave,
+                       bool AssignsPart, SourceLocation From, SourceLocation To,
+                       auto &State, auto &&OnUse, const Stmt *CallSite) {
+    if (!AssignsPart)
+      for (const LambdaCapture &Capture : Invoked->captures()) {
+        const auto *Variable = capturedVariableOf(Capture);
+        if (!Variable || !Variable->isInitCapture())
+          continue;
+        if (auto Copy = LambdaCopies.find({Invoked, Variable});
+            Copy != LambdaCopies.end() && Copy->second &&
+            State.Stale.test(*Copy->second) && UsesCaptured(Invoked, Variable))
+          OnUse(Capture.getLocation(), Variable);
+      }
+    if (!AssignsPart)
+      for (const Expr *Init : Invoked->capture_inits()) {
+        const DeclRefExpr *Captured = capturedVariableRef(Init);
+        if (!Captured)
+          continue;
+        const ValueDecl *Source = resolveReferenceCapture(Captured->getDecl());
+        auto It = Tracked.find(Source);
+        if (It == Tracked.end())
+          continue;
+        std::optional<unsigned> Copied = It->second;
+        if (auto Copy = LambdaCopies.find({Invoked, Source});
+            Copy != LambdaCopies.end())
+          Copied = Copy->second;
+        if (!Copied)
+          continue;
+        const unsigned Index = *Copied;
+        if (State.Stale.test(Index) &&
+            UsesCaptured(Invoked, Captured->getDecl()))
+          OnUse(Captured->getBeginLoc(), Variables[Index]);
+      }
+    if (!AssignsPart)
+      return;
+    // What it assigns to what it captures by reference, `[&pEntry] { pEntry
+    // = mp_Items.f_FindEqual(0); }`, is what the variable holds after: for
+    // sure when a statement of its body before anything that can return
+    // does, or else maybe.
+    const llvm::SmallPtrSet<const Stmt *, 8> Always =
+        Sure ? statementsBeforeLeaving(Invoked->getBody(), CallsLeave)
+             : llvm::SmallPtrSet<const Stmt *, 8>();
+    TCRecursive<void(const Stmt *)> Assigns = [&](const Stmt *Inner) {
+      if (!Inner || isa<LambdaExpr>(Inner))
+        return;
+      const SourceManager &SM = Context.getSourceManager();
+      if (const auto *Assign = dyn_cast<BinaryOperator>(Inner);
+          Assign && Assign->getOpcode() == BO_Assign &&
+          (From.isInvalid() ||
+           !SM.isBeforeInTranslationUnit(Assign->getBeginLoc(), From)) &&
+          (To.isInvalid() ||
+           SM.isBeforeInTranslationUnit(Assign->getBeginLoc(), To))) {
+        const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+            assignedVariables(Assign->getLHS());
+        for (const DeclRefExpr *Ref : Targets) {
+          // Not a copy that a lambda around it captures, `[p] { [&p] { p =
+          // nullptr; }(); }`.
+          const bool ByReference =
+              capturedByReferenceThroughout(Invoked, Ref->getDecl(), Context);
+          auto It = Tracked.find(resolveReferenceCapture(Ref->getDecl()));
+          if (!ByReference || It == Tracked.end())
+            continue;
+          const bool Stale = State.Stale.test(It->second);
+          const bool Into = State.Into.test(It->second);
+          // A parameter of it is what the call gives it, `fSet(&Value)`.
+          const Expr *Value = Assign->getRHS();
+          if (const auto *Given =
+                  dyn_cast<DeclRefExpr>(Value->IgnoreParenImpCasts()))
+            if (const auto *Parameter = dyn_cast<ParmVarDecl>(Given->getDecl());
+                Parameter &&
+                Parameter->getDeclContext() == Invoked->getCallOperator())
+              if (const auto *Call = dyn_cast_or_null<CallExpr>(CallSite))
+                // Not shifted again for an explicit object parameter
+                // (argumentOf).
+                if (const Expr *Argument =
+                        argumentOf(Call, Invoked->getCallOperator(),
+                                   Parameter->getFunctionScopeIndex()))
+                  Value = Argument;
+          CopyFrom(It->second, Value, State);
+          State.Reassigned.set(It->second);
+          if (Targets.size() != 1 || !Always.contains(Assign)) {
+            if (Stale)
+              State.Stale.set(It->second);
+            if (Into)
+              State.Into.set(It->second);
+          }
+        }
+      }
+      for (const Stmt *Child : evaluatedChildren(Inner, Context))
+        Assigns(Child);
+    };
+    Assigns(Invoked->getBody());
+  };
+  // Where \p CallSite runs it, in a `try` that can catch what it throws.
+  // With \p Later, it only runs later, `g_Dispatch / [&pEntry] { pEntry =
+  // ...; }`, with what it captures now, so what it assigns isn't what the
+  // variables hold after.
+  // One that runs later, like a dispatched one, `g_Dispatch / [pValue] {
+  // ... }`, runs after other calls of the actor, which can remove what it
+  // reads, as after a suspension, and changes nothing here.
+  // With \p MayNotRun, it may not run, like one given to a function that
+  // calls it, `fg_Read([pEntry] { ... })`, so what it assigns may stay.
+  auto Invoke = [&](const LambdaExpr *Invoked, auto &State, auto &&OnUse,
+                    const Stmt *CallSite = nullptr, bool Later = false,
+                    bool MayNotRun = false) {
+    const bool CallsLeave = CallSite && insideTryBlock(CallSite, Context);
+    std::optional<CState> LaterState;
+    if (Later) {
+      LaterState = State;
+      llvm::BitVector Suspended = Unguarded(*LaterState);
+      Suspended &= LaterState->Into;
+      llvm::BitVector Kept = Protected;
+      Kept.reset(LaterState->Reassigned);
+      Suspended.reset(Kept);
+      LaterState->Stale |= Suspended;
+    }
+    for (const CRun &Run : RunLambdas(Invoked, !MayNotRun))
+      if (!Later || !Run.Assigns)
+        InvokeOne(Run.Lambda, Run.Sure, CallsLeave, Run.Assigns, Run.From,
+                  Run.To, LaterState ? *LaterState : State, OnUse,
+                  Run.Lambda == Invoked ? CallSite : nullptr);
+  };
+
+  // Whether the function each call calls calls an argument, by its index,
+  // looked into once.
+  llvm::DenseMap<std::pair<const CallExpr *, unsigned>, bool> CallsArgument;
+  auto CachedCallsArgument = [&](const CallExpr *Call, unsigned Index) {
+    auto [It, Inserted] = CallsArgument.try_emplace({Call, Index}, false);
+    if (Inserted)
+      It->second = callsArgument(Call, Index);
+    return It->second;
+  };
+
+  // The phases that the cleanups of each variable, and its destructor,
+  // start where it goes.
+  llvm::DenseMap<const VarDecl *, std::pair<unsigned, unsigned>>
+      DestroyedPhases;
+  llvm::DenseMap<const CXXDestructorDecl *, unsigned> TemporaryPhases;
+  // The scope exits that are discarded temporaries, `(void)(g_OnScopeExit /
+  // [pEntry] { ... })`, by the end of the full expression they are made in,
+  // where they run their lambdas, also after what it awaits after them.
+  llvm::DenseMap<const Stmt *, llvm::SmallVector<const LambdaExpr *, 1>>
+      ExitsAtEnd;
+  for (const CFGBlock *Block : *Graph)
+    if (Reachable.test(Block->getBlockID()))
+      for (const CFGElement &Element : *Block)
+        if (const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>())
+          if (const auto *Cleanup =
+                  dyn_cast<LambdaExpr>(Statement->getStmt());
+              Cleanup && isTemporaryScopeExitLambda(Cleanup, Context))
+            ExitsAtEnd[fullExpressionOf(Cleanup, Context)].push_back(Cleanup);
+  llvm::DenseMap<const VarDecl *, bool> HolderDestroysData;
+  // Whether the local \p Holder is in scope where \p Throw is, after it is
+  // declared, and is left by it: in the `try` around it that can catch it,
+  // or in the function.
+  // The locals destroyed where their scopes end, which an exception thrown
+  // where they are in scope destroys too, of the `try` around it that can
+  // catch it, or of the function (UnwoundBy).
+  llvm::SmallVector<const VarDecl *, 8> Destroyed;
+  {
+    llvm::SmallPtrSet<const VarDecl *, 8> Seen;
+    for (const CFGBlock *Block : *Graph)
+      for (const CFGElement &Element : *Block)
+        if (const std::optional<CFGAutomaticObjDtor> Destructor =
+                Element.getAs<CFGAutomaticObjDtor>())
+          if (Seen.insert(Destructor->getVarDecl()).second)
+            Destroyed.push_back(Destructor->getVarDecl());
+  }
+  // Of each local, the scope it is declared in and where; of each statement
+  // asked of, the block of the innermost `try` around it.
+  llvm::DenseMap<const VarDecl *, std::pair<const Stmt *, SourceLocation>>
+      Scopes;
+  llvm::DenseMap<const Stmt *, const Stmt *> TryBlocks;
+  auto UnwoundBy = [&](const VarDecl *Holder, const Stmt *Throwing) {
+    if (!Holder->hasLocalStorage() || isa<ParmVarDecl>(Holder))
+      return false;
+    const SourceManager &SM = Context.getSourceManager();
+    auto [Scope, ScopeInserted] =
+        Scopes.try_emplace(Holder, nullptr, SourceLocation());
+    if (ScopeInserted) {
+      const auto Parents = instantiatedParents(*Holder, Context);
+      if (const auto *Declaration =
+              Parents.empty() ? nullptr : Parents[0].get<DeclStmt>()) {
+        const auto ScopeParents = instantiatedParents(*Declaration, Context);
+        Scope->second = {ScopeParents.empty() ? nullptr
+                                              : ScopeParents[0].get<Stmt>(),
+                         Declaration->getEndLoc()};
+      }
+    }
+    const auto [Around, Declared] = Scope->second;
+    if (!Around ||
+        !Around->getSourceRange().fullyContains(Throwing->getSourceRange()) ||
+        !SM.isBeforeInTranslationUnit(Declared, Throwing->getBeginLoc()))
+      return false;
+    auto [Try, TryInserted] = TryBlocks.try_emplace(Throwing, nullptr);
+    if (TryInserted) {
+      DynTypedNode Node = DynTypedNode::create(*Throwing);
+      for (int Depth = 0; Depth < 256; ++Depth) {
+        const auto Above = instantiatedParents(Node, Context);
+        if (Above.empty() || Above[0].get<LambdaExpr>())
+          break;
+        if (const auto *Statement = Above[0].get<CXXTryStmt>();
+            Statement && Statement->getTryBlock() &&
+            Statement->getTryBlock()->getSourceRange().fullyContains(
+                Throwing->getSourceRange())) {
+          Try->second = Statement->getTryBlock();
+          break;
+        }
+        Node = Above[0];
+      }
+    }
+    return !Try->second || Try->second->getSourceRange().fullyContains(
+                               Holder->getSourceRange());
+  };
+  // Also, in \p Thrown, each state an exception thrown in the block carries
+  // to each handler dispatch it reaches: before and after each element in the
+  // block of that dispatch's own `try` (inDispatchTry), of nested ones that
+  // share the block apart, with the locals it leaves destroyed.
+  using CThrown = llvm::SmallDenseMap<const CFGBlock *, CState, 2>;
+  auto Transfer = [&](const CFGBlock *Block, CState State, auto &&OnUse,
+                      CThrown *Thrown = nullptr) {
+    // Given by a reference that isn't to const, which it can change
+    // through, like `void fg_Erase(CMap &_Items) { _Items.f_Remove(0); }`,
+    // whatever it assigns.
+    // \p Given, the type of the parameter, is none where it can't be told, of
+    // an argument given to a C ellipsis, `fg_Log("%d", Entry.m_Value)`.
+    auto GivesToChange = [&](const Expr *Argument,
+                             std::optional<QualType> Given,
+                             llvm::function_ref<bool()> MayAssign) {
+      const std::optional<QualType> Parameter =
+          Given ? std::optional<QualType>(Given->getNonReferenceType())
+                : std::nullopt;
+      const bool Changeable =
+          (!Given ? MayAssign()
+                  : (*Given)->isReferenceType() &&
+                        !Parameter->isConstQualified()) ||
+          (Argument->getType()->isPointerType() &&
+           !pointsToConst(Argument->getType()) &&
+           (!Parameter || !(*Parameter)->isPointerType() ||
+            !(*Parameter)->getPointeeType().isConstQualified()));
+      return Changeable && (usesThis(Argument) || Collector.isRooted(Argument));
+    };
+    // A local made with the data to change, `CErase Erase{mp_Items}` or
+    // `CReset Reset(mp_Items)`, whose destructor can free, `~CErase() {
+    // m_Items.f_Clear(); }`, where it is destroyed. Not a copy or a move.
+    auto DestroysData = [&](const VarDecl *Holder) {
+      auto [It, Inserted] = HolderDestroysData.try_emplace(Holder, false);
+      if (!Inserted)
+        return It->second;
+      const CXXRecordDecl *Record = Holder->getType()->getAsCXXRecordDecl();
+      const CXXDestructorDecl *Destructor =
+          Record && Record->hasDefinition() ? Record->getDestructor() : nullptr;
+      if (!Destructor || Destructor->isTrivial() || !Holder->getInit() ||
+          scopeExitLambda(Holder))
+        return false;
+      const Expr *Init = Holder->getInit()->IgnoreImplicit();
+      bool Gives = false;
+      if (const auto *Construct = dyn_cast<CXXConstructExpr>(Init);
+          Construct &&
+          !Construct->getConstructor()->isCopyOrMoveConstructor()) {
+        const CXXConstructorDecl *Constructor = Construct->getConstructor();
+        for (unsigned iArgument = 0;
+             iArgument < Construct->getNumArgs() && !Gives; ++iArgument)
+          Gives = GivesToChange(
+              Construct->getArg(iArgument),
+              iArgument < Constructor->getNumParams()
+                  ? std::optional<QualType>(
+                        Constructor->getParamDecl(iArgument)->getType())
+                  : std::nullopt,
+              [] { return true; });
+      } else {
+        // Also an aggregate, of the members it initializes, after its bases.
+        llvm::ArrayRef<Expr *> Inits;
+        if (const auto *List = dyn_cast<InitListExpr>(Init))
+          Inits = List->inits();
+        else if (const auto *Parens = dyn_cast<CXXParenListInitExpr>(Init))
+          Inits = Parens->getInitExprs();
+        const unsigned nBases = Record->getNumBases();
+        unsigned iInit = 0;
+        for (const FieldDecl *Field : Record->fields()) {
+          if (Gives || nBases + iInit >= Inits.size())
+            break;
+          Gives = GivesToChange(Inits[nBases + iInit++], Field->getType(),
+                                [] { return true; });
+        }
+      }
+      return HolderDestroysData[Holder] = Gives && mayFree(Destructor);
+    };
+    // Where a local is destroyed, at \p At, its scope ending or an
+    // exception thrown there: the registration ends with the scope of its
+    // holder, and a scope exit, like `g_OnScopeExit / [pEntry] { ... }`, runs
+    // its lambda there, unless cancelled or run early, and so does the guard
+    // of `fg_AsyncDestroy` start its cleanup, unless moved away.
+    auto Destroy = [&](const VarDecl *Holder, SourceLocation At,
+                       CState &State) {
+      if (auto It = HolderIndices.find(Holder); It != HolderIndices.end())
+        State.MaybeDead.set(It->second);
+      // What runs here can start a phase, `g_OnScopeExit / [this] {
+      // f_StopApp(); }` or a destructor that does, which no guard alive
+      // keeps the entries of.
+      // Each once, the flow is told again until it settles.
+      auto [Phases, Inserted] =
+          DestroyedPhases.try_emplace(Holder, std::pair<unsigned, unsigned>());
+      if (Inserted) {
+        if (const LambdaExpr *Cleanup = scopeExitLambda(Holder))
+          Phases->second.first |= startedPhases(Cleanup->getBody(), Context);
+        for (const LambdaExpr *Cleanup : asyncDestroyLambdas(Holder))
+          Phases->second.first |= startedPhases(Cleanup->getBody(), Context);
+        // Also of its members and bases, `struct CWrapper { CStop m_Stop;
+        // };`.
+        if (!scopeExitLambda(Holder))
+          Phases->second.second = destructionStartedPhases(
+              Holder->getType()->getAsCXXRecordDecl(), Context);
+      }
+      if (State.FlagValidated.any() && DestroysData(Holder)) {
+        State.Stale |= State.FlagValidated;
+        State.FlagValidated.reset();
+      }
+      unsigned Started = Phases->second.second;
+      if (State.ArmedCleanups.contains(Holder)) {
+        // A cleanup that can free, `g_OnScopeExit / [this] {
+        // mp_Items.f_Clear(); }`, can remove what a test of a removal flag
+        // found.
+        if (const LambdaExpr *Cleanup = scopeExitLambda(Holder)) {
+          Invoke(Cleanup, State, OnUse);
+          if (State.FlagValidated.any() &&
+              mayFree(Cleanup->getCallOperator())) {
+            State.Stale |= State.FlagValidated;
+            State.FlagValidated.reset();
+          }
+        }
+        for (const LambdaExpr *Cleanup : asyncDestroyLambdas(Holder))
+          Invoke(Cleanup, State, OnUse);
+        Started |= Phases->second.first;
+      }
+      if (Started)
+        StartPhases(State, Started);
+    };
+    // What throws destroys the locals it leaves, which the control flow
+    // doesn't list, as their scopes end, where they end, anything that is
+    // evaluated, what can throw not told; to a handler, with the state
+    // before and after each element in the block of its `try`
+    // (inDispatchTry).
+    llvm::SmallVector<const CFGBlock *, 2> Dispatches;
+    if (Thrown)
+      for (const CFGBlock::AdjacentBlock &Successor : Block->succs())
+        if (const CFGBlock *To = Successor.getReachableBlock();
+            To && isHandlerDispatch(To))
+          Dispatches.push_back(To);
+    auto Unwind = [&](const CFGElement &At, const CState &Before) {
+      llvm::SmallVector<const CFGBlock *, 2> Into;
+      for (const CFGBlock *Dispatch : Dispatches)
+        if (inDispatchTry(Dispatch, At, Context))
+          Into.push_back(Dispatch);
+      if (Into.empty())
+        return;
+      CState Unwound = Before;
+      if (const std::optional<CFGStmt> Statement = At.getAs<CFGStmt>())
+        for (const VarDecl *Holder : Destroyed)
+          if (UnwoundBy(Holder, Statement->getStmt()))
+            Destroy(Holder, Scopes.lookup(Holder).first->getEndLoc(), Unwound);
+      for (const CFGBlock *Dispatch : Into)
+        Thrown->try_emplace(Dispatch, EmptyState()).first->second.merge(Unwound);
+    };
+    const CFGElement *Previous = nullptr;
+    for (const CFGElement &Element : *Block) {
+      if (Previous)
+        Unwind(*Previous, State);
+      Previous = &Element;
+      Unwind(Element, State);
+      // A call that can change the data of the actor, a member function
+      // that isn't const of it, `mp_Items.f_Clear()`, can remove what a test
+      // of a removal flag found there.
+      if (const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>();
+          Statement && State.FlagValidated.any()) {
+        const CXXMethodDecl *Method = nullptr;
+        const Expr *Object = nullptr;
+        if (const CMemberCall Member =
+                memberCallOf(Statement->getStmt())) {
+          Method = Member->getMethodDecl();
+          Object = Member->getImplicitObjectArgument();
+        } else if (const auto *Operator =
+                       dyn_cast<CXXOperatorCallExpr>(Statement->getStmt());
+                   Operator && Operator->getNumArgs() >= 1) {
+          Method = dyn_cast_or_null<CXXMethodDecl>(Operator->getDirectCallee());
+          Object = Operator->getArg(0);
+        }
+        // Also through a reference to the data, `auto &Items = mp_Items;
+        // Items.f_Clear()`, or an actor object parameter, also a const one of
+        // a class with mutable members, which it can change, or whose body
+        // can be seen to free, like through a pointer member,
+        // `mp_pItems->f_Clear()`, or that an override can replace, which can
+        // free through one too.
+        bool Removes =
+            Method &&
+            (!hasConstObject(Method) || Method->getParent()->hasMutableFields() ||
+             Method->getDefinition() ||
+             (Method->isVirtual() && !Method->hasAttr<FinalAttr>() &&
+              !Method->getParent()->hasAttr<FinalAttr>())) &&
+            !Method->isStatic() && Object &&
+            (usesThis(Object) || Collector.isRooted(Object)) && mayFree(Method);
+        // Also a lambda called, `fClear()` with `auto fClear = [this] {
+        // mp_Items.f_Clear(); }`, which does what its body does.
+        if (!Removes && Object && Method && Method->getParent()->isLambda())
+          if (const LambdaExpr *Called = calledLambda(Object))
+            Removes = mayFree(Called->getCallOperator());
+        // Also one run here, `fg_CallSafe(fClear)` or `std::invoke(fClear)`,
+        // also a coroutine, which runs until it first suspends.
+        if (const auto *Call = dyn_cast<CallExpr>(Statement->getStmt());
+            !Removes && Call && Call->getNumArgs() >= 1 &&
+            (calleeName(Call) == "fg_CallSafe" || isStdInvoke(Call)))
+          if (const LambdaExpr *Called = asLambda(Call->getArg(0)))
+            Removes = mayFree(Called->getCallOperator());
+        // Also a call given the data to change, `fg_Clear(mp_Items)` or
+        // `fg_Stop(this)`, by a reference or pointer that isn't to const, and
+        // a constructor, `CReset Reset(mp_Items)`.
+        if (const auto *Call = dyn_cast<CallExpr>(Statement->getStmt());
+            Call && !Removes) {
+          const unsigned iFirst =
+              isa<CXXOperatorCallExpr>(Call) && Method ? 1 : 0;
+          for (unsigned iArgument = iFirst;
+               iArgument < Call->getNumArgs() && !Removes; ++iArgument)
+            Removes = GivesToChange(
+                          Call->getArg(iArgument),
+                          argumentParameterType(Call, iArgument),
+                          [&] { return mayAssignArgument(Call, iArgument); }) &&
+                      mayFree(Call->getDirectCallee());
+        }
+        // Not a copy or a move, `auto fDestroy = fg_Move(pEntry->m_fDestroy)`,
+        // which takes what it is given but removes no entry.
+        if (const auto *Construct =
+                dyn_cast<CXXConstructExpr>(Statement->getStmt());
+            Construct && !Removes &&
+            !Construct->getConstructor()->isCopyOrMoveConstructor()) {
+          const CXXConstructorDecl *Constructor = Construct->getConstructor();
+          for (unsigned iArgument = 0;
+               iArgument < Construct->getNumArgs() && !Removes; ++iArgument)
+            Removes =
+                GivesToChange(
+                    Construct->getArg(iArgument),
+                    iArgument < Constructor->getNumParams()
+                        ? std::optional<QualType>(
+                              Constructor->getParamDecl(iArgument)->getType())
+                        : std::nullopt,
+                    [] { return true; }) &&
+                mayFree(Constructor);
+        }
+        if (Removes) {
+          State.Stale |= State.FlagValidated;
+          State.FlagValidated.reset();
+        }
+      }
+      if (const std::optional<CFGAutomaticObjDtor> Destructor =
+              Element.getAs<CFGAutomaticObjDtor>()) {
+        const VarDecl *Holder = Destructor->getVarDecl();
+        const Stmt *Trigger = Destructor->getTriggerStmt();
+        Destroy(Holder, Trigger ? Trigger->getEndLoc() : Holder->getLocation(),
+                State);
+        continue;
+      }
+      // The destructor of a temporary, `(void)CStopper{this}`, can start a
+      // phase where the full expression ends.
+      if (const std::optional<CFGTemporaryDtor> Destructor =
+              Element.getAs<CFGTemporaryDtor>()) {
+        const CXXDestructorDecl *Ending =
+            Destructor->getBindTemporaryExpr()->getTemporary()->getDestructor();
+        auto [Phases, Inserted] = TemporaryPhases.try_emplace(Ending, 0u);
+        if (Inserted && Ending)
+          Phases->second =
+              destructionStartedPhases(Ending->getParent(), Context);
+        if (const unsigned Started = Phases->second)
+          StartPhases(State, Started);
+        continue;
+      }
+      if (const std::optional<CFGLifetimeEnds> End =
+              Element.getAs<CFGLifetimeEnds>()) {
+        if (auto It = HolderIndices.find(End->getVarDecl());
+            It != HolderIndices.end())
+          State.MaybeDead.set(It->second);
+        continue;
+      }
+      const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>();
+      if (!Statement || Unevaluated.contains(Statement->getStmt()) ||
+          hasUnevaluatedOperands(Statement->getStmt()))
+        continue;
+      const Stmt *S = Statement->getStmt();
+      // A scope exit called, `Cleanup()`, or the cleanup of
+      // `fg_AsyncDestroy` awaited early, `co_await fg_Move(Cleanup)`, runs
+      // here.
+      // Also the phases it starts.
+      // A cleanup that can free, `[this] { mp_Items.f_Clear(); }`, can
+      // remove what a test of a removal flag found, like where its holder
+      // runs it.
+      auto Removed = [&](const LambdaExpr *Cleanup) {
+        if (State.FlagValidated.any() && mayFree(Cleanup->getCallOperator())) {
+          State.Stale |= State.FlagValidated;
+          State.FlagValidated.reset();
+        }
+      };
+      updateArmedCleanups(S, State.ArmedCleanups,
+                          [&](const LambdaExpr *Cleanup, const VarDecl *) {
+                            Invoke(Cleanup, State, OnUse);
+                            Removed(Cleanup);
+                            if (const unsigned Started =
+                                    startedPhases(Cleanup->getBody(), Context))
+                              StartPhases(State, Started);
+                          });
+      // A scope exit that is a discarded temporary, `(void)(g_OnScopeExit /
+      // [pEntry] { ... })`, runs its lambda at the end of the full expression
+      // it is made in, and the phases it starts, which is taken to be where
+      // it is made too.
+      auto RunExit = [&](const LambdaExpr *Cleanup) {
+        Invoke(Cleanup, State, OnUse);
+        Removed(Cleanup);
+        if (const unsigned Started =
+                startedPhases(Cleanup->getBody(), Context))
+          StartPhases(State, Started);
+      };
+      if (const auto *Cleanup = dyn_cast<LambdaExpr>(S);
+          Cleanup && isTemporaryScopeExitLambda(Cleanup, Context))
+        RunExit(Cleanup);
+      if (const auto *Declaration = dyn_cast<DeclStmt>(S)) {
+        for (const Decl *D : Declaration->decls()) {
+          const auto *Declared = dyn_cast<VarDecl>(D);
+          if (auto It = Tracked.find(Declared);
+              Declared && It != Tracked.end()) {
+            const VarDecl *Variable = Declared;
+            // The iterator of a loop over the data, also from a free
+            // `begin(Container)`, is into the data.
+            State.Reassigned.reset(It->second);
+            if (Collector.RangeIterators.contains(Variable)) {
+              State.Into.set(It->second);
+              State.Stale.reset(It->second);
+            } else if (Variable->getInit()) {
+              CopyFrom(It->second, Variable->getInit(), State);
+              // A static local is made once, by the first call, and later
+              // calls find what that looked up, which other calls of the
+              // actor, or another object, can have changed.
+              if (Variable->isStaticLocal() && State.Into.test(It->second))
+                State.Stale.set(It->second);
+            } else {
+              State.Stale.reset(It->second);
+              State.Into.reset(It->second);
+            }
+          }
+          // A registration runs its re-validation right away, and on every
+          // resume while its holder lives.
+          if (auto It = HolderIndices.find(Declared);
+              Declared && It != HolderIndices.end()) {
+            // Right away it uses what it uses before it re-validates it as it
+            // is here, which can be stale already, after an earlier
+            // suspension.
+            for (const auto &[Validated, Use] :
+                 Collector.CallbackEarlyUses.lookup(Declared))
+              if (auto Early = Tracked.find(Validated);
+                  Early != Tracked.end() && State.Stale.test(Early->second))
+                OnUse(Use, Variables[Early->second]);
+            State.MaybeDead.reset(It->second);
+            State.Unchecked.reset(It->second);
+            State.Stale.reset(HolderVariables[It->second]);
+            // A guard ends the coroutine right away when its phases began,
+            // which then can't have removed what loses entries only in them,
+            // together with the other guards alive, which checked theirs on
+            // the last resume or when they were registered after it, unless
+            // their phases may have started since, like by a call, which
+            // they don't check until the next resume.
+            unsigned Guarded = 0;
+            for (unsigned iHolder = 0; iHolder < nHolders; ++iHolder)
+              if (!State.MaybeDead.test(iHolder) &&
+                  !State.Unchecked.test(iHolder))
+                Guarded |= HolderPhaseMasks[iHolder];
+            if (Guarded)
+              for (unsigned iVariable = 0; iVariable < nVariables; ++iVariable)
+                if (const std::optional<unsigned> Needed =
+                        RequiredAt(State, iVariable);
+                    Needed && !(*Needed & ~Guarded))
+                  State.Stale.reset(iVariable);
+            // What the callback assigns says where it may point: into the
+            // data of the actor when any path assigns a lookup, or keeps
+            // where it pointed when a path doesn't assign it.
+            llvm::SmallDenseMap<const ValueDecl *, std::pair<bool, bool>, 4>
+                MayLookUp;
+            for (const auto &Assignment :
+                 Collector.CallbackAssignments.lookup(Declared)) {
+              auto &[bLookup, bAlways] = MayLookUp[Assignment.Assigned];
+              bLookup |= Assignment.bLookup;
+              bAlways |= Assignment.bUnconditional;
+            }
+            for (const auto &[Assigned, Result] : MayLookUp) {
+              if (auto Index = Tracked.find(Assigned); Index != Tracked.end())
+                State.Into[Index->second] =
+                    Result.first ||
+                    (!Result.second && State.Into.test(Index->second));
+            }
+          }
+        }
+      } else if (const Expr *Pointer = accessedAfterSuspension(S, Context)) {
+        // What a pointer points to accessed after a suspension in the same
+        // expression, `pEntry[(co_await fg_Suspend(), 0)]`, is used there.
+        for (const Expr *Root : pointerRoots(Pointer))
+          if (const auto *Ref = dyn_cast<DeclRefExpr>(Root))
+            if (auto It = Tracked.find(resolveReferenceCapture(Ref->getDecl()));
+                It != Tracked.end() && State.Stale.test(It->second))
+              OnUse(Ref->getBeginLoc(), Variables[It->second]);
+      } else if (const auto *Ref = dyn_cast<DeclRefExpr>(S)) {
+        // A name of a structured binding that refers into what a lookup
+        // found, `auto &[Value] = mp_Items[Key]`, is a use of the lookup.
+        const ValueDecl *Used = Ref->getDecl();
+        if (const auto *Binding = dyn_cast<BindingDecl>(Used))
+          if (const auto *Decomposed =
+                  dyn_cast_or_null<VarDecl>(Binding->getDecomposedDecl());
+              Decomposed && Decomposed->getType()->isReferenceType())
+            Used = Decomposed;
+        if (auto Through = Collector.AssignedThrough.find(Ref);
+            Through != Collector.AssignedThrough.end())
+          for (const auto &Assignment : Through->second)
+            if (auto Target =
+                    Tracked.find(resolveReferenceCapture(Assignment.Assigned));
+                Target != Tracked.end()) {
+              const bool Into = State.Into.test(Target->second);
+              const bool Stale = State.Stale.test(Target->second);
+              CopyFrom(Target->second, Assignment.Value, State);
+              State.Reassigned.set(Target->second);
+              // One that may not be assigned keeps what it held too.
+              if (Assignment.Maybe) {
+                if (Into)
+                  State.Into.set(Target->second);
+                if (Stale)
+                  State.Stale.set(Target->second);
+              }
+            }
+        auto It = Tracked.find(resolveReferenceCapture(Used));
+        // What `fg_Exchange` gives back of it, `*fg_Exchange(pEntry,
+        // mp_Items.f_FindEqual(0))`, is what it held before, also where it is
+        // assigned: a use of that, unless it is discarded.
+        auto UsesExchanged = [&] {
+          DynTypedNode Node = DynTypedNode::create(*Ref);
+          for (int Depth = 0; Depth < 8; ++Depth) {
+            const auto Parents = instantiatedParents(Node, Context);
+            if (Parents.empty())
+              return false;
+            if (const auto *Exchange = Parents[0].get<CallExpr>()) {
+              if (Exchange->getNumArgs() != 2 ||
+                  Exchange->getArg(0)->IgnoreParenImpCasts() != Ref ||
+                  (!isExchangeFunction(calleeName(Exchange))))
+                return false;
+              const auto Above = instantiatedParents(*Exchange, Context);
+              if (Above.empty() || Above[0].get<CompoundStmt>())
+                return false;
+              if (const auto *Cast = Above[0].get<ExplicitCastExpr>();
+                  Cast && Cast->getType()->isVoidType())
+                return false;
+              return true;
+            }
+            if (!Parents[0].get<ImplicitCastExpr>() &&
+                !Parents[0].get<ParenExpr>())
+              return false;
+            Node = Parents[0];
+          }
+          return false;
+        };
+        if (It != Tracked.end()) {
+          if (Collector.AssignedRefs.contains(Ref) &&
+              State.Stale.test(It->second) && UsesExchanged())
+            OnUse(Ref->getBeginLoc(), Variables[It->second]);
+          // Assigning looks the data up again.
+          if (auto Assigned = Collector.AssignedRefs.find(Ref);
+              Assigned != Collector.AssignedRefs.end()) {
+            // One that may not be assigned keeps what it held too.
+            const bool Into = State.Into.test(It->second);
+            const bool Stale = State.Stale.test(It->second);
+            CopyFrom(It->second, Assigned->second, State);
+            State.Reassigned.set(It->second);
+            if (Collector.MaybeAssignedRefs.contains(Ref)) {
+              if (Into)
+                State.Into.set(It->second);
+              if (Stale)
+                State.Stale.set(It->second);
+            }
+          } else if (State.Stale.test(It->second) &&
+                     (!Collector.CaptureRefs.contains(Ref) ||
+                      Collector.CoroutineCaptureRefs.contains(Ref)) &&
+                     !isPointerTest(Ref) && !namesOnlyStorage(Ref, Context))
+            OnUse(Ref->getBeginLoc(), Variables[It->second]);
+        } else if (const auto *Pointer = dyn_cast<VarDecl>(Used);
+                   Pointer && Pointer->hasLocalStorage() &&
+                   !isa<ParmVarDecl>(Pointer) && Pointer->getInit() &&
+                   Pointer->getType()->isPointerType() &&
+                   !isChangedVariable(Pointer)) {
+          // Through an unchanged local pointer to a variable, `**ppEntry`
+          // of `int **ppEntry = &pEntry`, what that variable holds is used
+          // where it is read through both.
+          // Also through more of them, `***pppEntry`, and through unchanged
+          // copies of them, `int **ppCopy = ppEntry`, each once.
+          const DeclRefExpr *Target = nullptr;
+          int nLevels = 0;
+          llvm::SmallPtrSet<const VarDecl *, 4> Copies;
+          for (const VarDecl *Level = Pointer; Level && nLevels < 8;) {
+            if (const auto *Copied = dyn_cast<DeclRefExpr>(
+                    Level->getInit()->IgnoreParenImpCasts())) {
+              const auto *Source = dyn_cast<VarDecl>(Copied->getDecl());
+              if (!Source || !Source->hasLocalStorage() ||
+                  isa<ParmVarDecl>(Source) || !Source->getInit() ||
+                  !Source->getType()->isPointerType() ||
+                  isChangedVariable(Source) || !Copies.insert(Source).second) {
+                Target = nullptr;
+                break;
+              }
+              Level = Source;
+              continue;
+            }
+            const auto *Address = dyn_cast<UnaryOperator>(
+                Level->getInit()->IgnoreParenImpCasts());
+            Target = Address && Address->getOpcode() == UO_AddrOf
+                         ? dyn_cast<DeclRefExpr>(
+                               Address->getSubExpr()->IgnoreParenImpCasts())
+                         : nullptr;
+            ++nLevels;
+            const auto *Next =
+                Target ? dyn_cast<VarDecl>(Target->getDecl()) : nullptr;
+            // Unchanged other than by its address being taken for the
+            // level before.
+            if (!Next ||
+                Tracked.contains(resolveReferenceCapture(Target->getDecl())) ||
+                !Next->hasLocalStorage() || isa<ParmVarDecl>(Next) ||
+                !Next->getInit() || !Next->getType()->isPointerType() ||
+                isChangedOtherThanBy(Target))
+              break;
+            Level = Next;
+          }
+          auto Through = [&] {
+            const Expr *Read = Ref;
+            int nDerefs = 0;
+            for (int Depth = 0; Depth < 16 && nDerefs < nLevels + 1; ++Depth) {
+              const auto Parents = instantiatedParents(*Read, Context);
+              const auto *Parent =
+                  Parents.empty() ? nullptr : Parents[0].get<Expr>();
+              if (!Parent)
+                return false;
+              if (const auto *Deref = dyn_cast<UnaryOperator>(Parent);
+                  Deref && Deref->getOpcode() == UO_Deref)
+                ++nDerefs;
+              else if (const auto *Member = dyn_cast<MemberExpr>(Parent);
+                       Member && Member->isArrow() && nDerefs == nLevels)
+                ++nDerefs;
+              else if (const auto *Subscript =
+                           dyn_cast<ArraySubscriptExpr>(Parent);
+                       Subscript && Subscript->getBase() == Read)
+                ++nDerefs;
+              // Also what an iterator it points to gives, `(*piEntry)->
+              // m_Value` or `**piEntry`.
+              else if (const auto *Operator =
+                           dyn_cast<CXXOperatorCallExpr>(Parent);
+                       Operator && nDerefs == nLevels &&
+                       Operator->getNumArgs() == 1 &&
+                       (Operator->getOperator() == OO_Arrow ||
+                        Operator->getOperator() == OO_Star) &&
+                       Operator->getArg(0)->IgnoreParenImpCasts() ==
+                           Read->IgnoreParenImpCasts())
+                ++nDerefs;
+              // What the pointer it points to points to, moved along,
+              // `*(*ppEntry + 1)`.
+              else if (const auto *Offset = dyn_cast<BinaryOperator>(Parent);
+                       !(Offset && Offset->isAdditiveOp() &&
+                         nDerefs == nLevels &&
+                         Offset->getType()->isPointerType()) &&
+                       !isa<ImplicitCastExpr, ParenExpr>(Parent))
+                return false;
+              Read = Parent;
+            }
+            return nDerefs == nLevels + 1;
+          };
+          if (Target)
+            if (auto Aliased =
+                    Tracked.find(resolveReferenceCapture(Target->getDecl()));
+                Aliased != Tracked.end() &&
+                State.Stale.test(Aliased->second) && Through())
+              OnUse(Ref->getBeginLoc(), Variables[Aliased->second]);
+        }
+      }
+      // A member function of what a variable refers to, called after an
+      // await in its arguments, `Entry.f_Update(co_await fg_Suspend())`, uses
+      // it where the await resumed.
+      // Also of a member of it, `Entry.m_Value.f_Read(...)`, of an operator,
+      // `Entry(co_await fg_Suspend())`, and what is given by reference or
+      // pointer to a call whose other arguments suspend, `fg_Read(Entry,
+      // co_await fg_Suspend())`.
+      for (const Expr *Early : earlyCallOperands(S, Context)) {
+        while (Early) {
+          Early = Early->IgnoreParenImpCasts();
+          const auto *Member = dyn_cast<MemberExpr>(Early);
+          if (!Member || Member->isArrow())
+            break;
+          Early = Member->getBase();
+        }
+        // What a callback looks up again on resume, `pEntry =
+        // mp_Items.f_FindEqual(Key)`, isn't what was read before, which only
+        // a guard protects, or a callback that compares it with a fresh
+        // lookup and leaves it as it is, `if (pEntry !=
+        // mp_Items.f_FindEqual(Key)) return fg_MakeError(...)`.
+        auto StaleBefore = [&](unsigned iVariable) {
+          return State.Stale.test(iVariable) ||
+                 (State.Into.test(iVariable) &&
+                  !(Protected.test(iVariable) &&
+                    !State.Reassigned.test(iVariable)) &&
+                  Unguarded(State, /*Revalidations=*/false, nullptr,
+                            /*Compared=*/true)
+                      .test(iVariable));
+        };
+        if (const auto *Object = dyn_cast_or_null<DeclRefExpr>(Early))
+          if (auto It =
+                  Tracked.find(resolveReferenceCapture(Object->getDecl()));
+              It != Tracked.end() && StaleBefore(It->second))
+            OnUse(S->getBeginLoc(), Variables[It->second]);
+      }
+      // A swap of two tracked locals, `fg_Swap(pEntry, pOther)`, exchanges
+      // what they hold.
+      if (const auto *Swap = dyn_cast<CallExpr>(S);
+          Swap && swappedArguments(Swap).first) {
+        auto IndexOf = [&](const Expr *E) -> std::optional<unsigned> {
+          const llvm::SmallVector<const DeclRefExpr *, 2> Targets =
+              assignedVariables(E);
+          const DeclRefExpr *Ref = Targets.size() == 1 ? Targets[0] : nullptr;
+          auto It = Ref ? Tracked.find(resolveReferenceCapture(Ref->getDecl()))
+                        : Tracked.end();
+          if (It == Tracked.end())
+            return std::nullopt;
+          return It->second;
+        };
+        const std::optional<unsigned> First =
+            IndexOf(swappedArguments(Swap).first);
+        const std::optional<unsigned> Second =
+            IndexOf(swappedArguments(Swap).second);
+        if (First && Second) {
+          const bool FirstStale = State.Stale.test(*First);
+          const bool FirstInto = State.Into.test(*First);
+          State.Stale[*First] = State.Stale.test(*Second);
+          State.Into[*First] = State.Into.test(*Second);
+          State.Stale[*Second] = FirstStale;
+          State.Into[*Second] = FirstInto;
+          State.Reassigned.set(*First);
+          State.Reassigned.set(*Second);
+        }
+      }
+      // A lambda copies the pointers it captures when it is made.
+      if (const auto *Lambda = dyn_cast<LambdaExpr>(S)) {
+        for (const auto &[Key, Copied] : LambdaCopies) {
+          if (Key.first != Lambda || !Copied)
+            continue;
+          const unsigned Index = *Copied;
+          if (const auto *Variable = dyn_cast<VarDecl>(Key.second);
+              Variable && Variable->isInitCapture() && Variable->getInit()) {
+            CopyFrom(Index, Variable->getInit(), State);
+            continue;
+          }
+          const unsigned Source = Tracked.lookup(Key.second);
+          State.Stale[Index] = State.Stale.test(Source);
+          State.Reassigned[Index] = State.Reassigned.test(Source);
+          State.Into[Index] = State.Into.test(Source);
+        }
+      }
+      // A lambda called, like `[pValue] { ... }()` or `fRead()`, uses what it
+      // captures: its copy, or what it refers to.
+      if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(S);
+          Call && Call->getOperator() == OO_Call && Call->getNumArgs() >= 1) {
+        if (const LambdaExpr *Invoked = asLambda(Call->getArg(0)))
+          Invoke(Invoked, State, OnUse, Call);
+      }
+      // Also through its call operator by name, `fRead.operator()()`.
+      if (const CMemberCall Call = memberCallOf(S);
+          Call && Call->getMethodDecl() &&
+          Call->getMethodDecl()->getOverloadedOperator() == OO_Call) {
+        if (const LambdaExpr *Invoked =
+                asLambda(Call->getImplicitObjectArgument()))
+          Invoke(Invoked, State, OnUse, Call);
+      }
+      // Also dispatched, `g_Dispatch / [pEntry] { ... }`, which runs it
+      // later, with what it captured now. `fg_DirectDispatch` runs it here,
+      // until it suspends.
+      auto InvokeDispatched = [&](const LambdaExpr *Dispatched,
+                                  const Expr *Dispatch) {
+        const auto *DispatchCall = dyn_cast<CallExpr>(Dispatch);
+        if (DispatchCall && calleeName(DispatchCall) == "fg_DirectDispatch")
+          Invoke(Dispatched, State, OnUse, DispatchCall);
+        else
+          Invoke(Dispatched, State, OnUse, nullptr, true);
+      };
+      if (const auto *Lambda = dyn_cast<LambdaExpr>(S))
+        if (const Expr *Dispatch = closureDispatch(
+                Lambda, Lambda->getLambdaClass(), Context, nullptr))
+          InvokeDispatched(Lambda, Dispatch);
+      // Also one held in a local, dispatched where it is given, `g_Dispatch
+      // / fRead`.
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(S))
+        if (const LambdaExpr *Stored = asLambda(Ref))
+          if (const Expr *Dispatch = closureDispatch(
+                  Ref, Stored->getLambdaClass(), Context, nullptr))
+            InvokeDispatched(Stored, Dispatch);
+      // Also run by `fg_CallSafe(fRead)` or `std::invoke(fRead)`, which call
+      // it here.
+      if (const auto *Call = dyn_cast<CallExpr>(S);
+          Call && Call->getNumArgs() >= 1 &&
+          (calleeName(Call) == "fg_CallSafe" || isStdInvoke(Call))) {
+        if (const LambdaExpr *Invoked = asLambda(Call->getArg(0)))
+          Invoke(Invoked, State, OnUse, Call);
+      }
+      // Also by a function that can be seen to call the callable it is given
+      // before it returns, `fg_Read([pEntry] { ... })` with `int
+      // fg_Read(auto &&_fRead) { return _fRead(); }`, which may not call it.
+      if (const auto *Call = dyn_cast<CallExpr>(S);
+          Call && calleeName(Call) != "fg_CallSafe" && !isStdInvoke(Call))
+        for (unsigned iArgument = 0; iArgument < Call->getNumArgs();
+             ++iArgument)
+          if (const LambdaExpr *Invoked = asLambda(Call->getArg(iArgument));
+              Invoked && CachedCallsArgument(Call, iArgument))
+            Invoke(Invoked, State, OnUse, Call, false, true);
+      // Calling a function of the own actor that starts or runs a phase, like
+      // `co_await f_StopApp()`, runs it here, where a guard of the phase
+      // can't keep the entries that it removes, also in a lambda called here,
+      // `fStop()` with `auto fStop = [this] { return f_StopApp(); }`.
+      llvm::SmallVector<const CallExpr *, 4> Calls;
+      if (const auto *Call = dyn_cast<CallExpr>(S)) {
+        Calls.push_back(Call);
+        // Also of the lambda it runs, and the lambdas that one calls in turn.
+        llvm::SmallPtrSet<const LambdaExpr *, 4> Followed;
+        // Not what doesn't run: what isn't evaluated, `noexcept(f_StopApp())`,
+        // or a branch of an `if constexpr` that is discarded.
+        TCRecursive<void(const Stmt *)> CollectCalls = [&](const Stmt *Inner) {
+          if (!Inner || isa<LambdaExpr, UnaryExprOrTypeTraitExpr,
+                            CXXNoexceptExpr>(Inner))
+            return;
+          if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(Inner);
+              Typeid && !Typeid->isPotentiallyEvaluated())
+            return;
+          if (const auto *InnerCall = dyn_cast<CallExpr>(Inner)) {
+            Calls.push_back(InnerCall);
+            if (const LambdaExpr *Nested = invokedLambda(InnerCall);
+                Nested && Followed.insert(Nested).second)
+              CollectCalls(Nested->getBody());
+          }
+          for (const Stmt *Child : evaluatedChildren(Inner, Context))
+            CollectCalls(Child);
+        };
+        if (const LambdaExpr *Invoked = invokedLambda(Call);
+            Invoked && Followed.insert(Invoked).second)
+          CollectCalls(Invoked->getBody());
+      }
+      // Also what a constructor given the object calls, `CStop Stop(this)`
+      // with `CStop(CApp *_pThis) { _pThis->f_StopApp(); }`, also in its
+      // initializers and the default initializers of the members, and what
+      // a helper calls, also a constructor it gives the object.
+      llvm::SmallPtrSet<const FunctionDecl *, 8> Helpers;
+      llvm::SmallPtrSet<const LambdaExpr *, 4> HelperLambdas;
+      auto GivesObject = [](llvm::iterator_range<
+                             CXXConstructExpr::const_arg_iterator> Arguments) {
+        return llvm::any_of(Arguments, [](const Expr *Argument) {
+          const QualType Type = Argument->getType();
+          return (Type->isPointerType() || Argument->isGLValue()) &&
+                 Type->getPointeeOrArrayElementType()->getAsCXXRecordDecl() &&
+                 isOwnActorObject(Argument);
+        });
+      };
+      TCRecursive<void(const FunctionDecl *)> CollectHelper =
+          [&](const FunctionDecl *Definition) {
+            if (!Definition || !Definition->getBody() ||
+                !Helpers.insert(Definition).second)
+              return;
+            // The expression of each default argument once, which its uses
+            // share, also those in other default arguments, `int f1(int =
+            // f0() + f0());`.
+            llvm::SmallPtrSet<const Expr *, 8> Defaults;
+            TCRecursive<void(const Stmt *)> Collect =
+                [&](const Stmt *Inner) {
+                  if (!Inner || isa<LambdaExpr, UnaryExprOrTypeTraitExpr,
+                                    CXXNoexceptExpr>(Inner))
+                    return;
+                  if (const auto *Default = dyn_cast<CXXDefaultInitExpr>(Inner))
+                    return Defaults.insert(Default->getExpr()).second
+                               ? Collect(Default->getExpr())
+                               : void();
+                  if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(Inner))
+                    return Defaults.insert(Default->getExpr()).second
+                               ? Collect(Default->getExpr())
+                               : void();
+                  // Also what a lambda it calls calls, `[this] {
+                  // f_StopApp(); }()`.
+                  if (const auto *InnerCall = dyn_cast<CallExpr>(Inner)) {
+                    Calls.push_back(InnerCall);
+                    if (const LambdaExpr *Nested = invokedLambda(InnerCall);
+                        Nested && HelperLambdas.insert(Nested).second)
+                      Collect(Nested->getBody());
+                  }
+                  if (const auto *Construct = dyn_cast<CXXConstructExpr>(Inner);
+                      Construct && GivesObject(Construct->arguments()))
+                    CollectHelper(Construct->getConstructor()->getDefinition());
+                  for (const Stmt *Child :
+                       evaluatedChildren(Inner, Definition->getASTContext()))
+                    Collect(Child);
+                };
+            Collect(Definition->getBody());
+            if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(Definition))
+              for (const CXXCtorInitializer *Initializer : Constructor->inits())
+                Collect(Initializer->getInit());
+          };
+      if (const auto *Construct = dyn_cast<CXXConstructExpr>(S);
+          Construct && GivesObject(Construct->arguments()))
+        CollectHelper(Construct->getConstructor()->getDefinition());
+      // Also what a helper of the own actor that is called calls in turn,
+      // like `f_StopWrapper()` that calls `f_StopApp()`, each followed once
+      // however many there are.
+      for (size_t iCall = 0; iCall < Calls.size(); ++iCall) {
+        const CallExpr *Call = Calls[iCall];
+        const FunctionDecl *Callee = Call->getDirectCallee();
+        // Also through an unchanged local pointer to it, `(this->*fStop)()`
+        // with `auto fStop = &CDistributedAppActor::f_StopApp`, also through
+        // copies of it, `auto fCopy = fStop`.
+        if (const CMemberCall Member = memberCallOf(Call);
+            !Callee && Member)
+          if (const auto *Pointer = dyn_cast<BinaryOperator>(
+                  Member->getCallee()->IgnoreParens());
+              Pointer && Pointer->isPtrMemOp()) {
+            const Expr *Value = Pointer->getRHS()->IgnoreParenImpCasts();
+            for (int Depth = 0; Depth < 4 && Value && !Callee; ++Depth) {
+              const auto *Ref = dyn_cast<DeclRefExpr>(Value);
+              const auto *Local =
+                  Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+              if (!Local || !Local->hasLocalStorage() || !Local->getInit() ||
+                  isChangedVariable(Local))
+                break;
+              Value = Local->getInit()->IgnoreParenImpCasts();
+              if (const auto *Address = dyn_cast<UnaryOperator>(Value);
+                  Address && Address->getOpcode() == UO_AddrOf)
+                if (const auto *Function = dyn_cast<DeclRefExpr>(
+                        Address->getSubExpr()->IgnoreParenImpCasts()))
+                  Callee = dyn_cast<FunctionDecl>(Function->getDecl());
+            }
+          }
+        // Also through a pointer to a function, `fStop(this)` with `auto
+        // fStop = &fg_Stop`, or any, when it is given the object.
+        const CMemberCall Member = memberCallOf(Call);
+        bool bUnknownGivenObject = false;
+        // A pointer to a member function of the object that can't be
+        // resolved, `(this->*fChange)()`, can be any of them.
+        if (!Callee && Member &&
+            isOwnActorObject(Member->getImplicitObjectArgument()))
+          bUnknownGivenObject = true;
+        if (!Callee && !Member && !isa<CXXOperatorCallExpr>(Call)) {
+          Callee = calleeThroughPointer(Call);
+          bUnknownGivenObject =
+              !Callee && llvm::any_of(Call->arguments(), [](const Expr *Argument) {
+                const QualType Type = Argument->getType();
+                return (Type->isPointerType() || Argument->isGLValue()) &&
+                       Type->getPointeeOrArrayElementType()->getAsCXXRecordDecl() &&
+                       isOwnActorObject(Argument);
+              });
+        }
+        // A virtual one can run any of its overrides, `f_Tick()` of a
+        // `CDerived` that stops the app.
+        llvm::SmallVector<const FunctionDecl *, 4> Callees;
+        if (Member && Callee && Member->getMethodDecl())
+          for (const CXXMethodDecl *Method : dispatchedMethods(Member))
+            Callees.push_back(Method);
+        else if (Callee)
+          Callees.push_back(Callee);
+        std::optional<unsigned> Started;
+        llvm::SmallVector<const FunctionDecl *, 4> Unannotated;
+        for (const FunctionDecl *Candidate : Callees) {
+          std::optional<unsigned> Phases =
+              annotatedPhases(Candidate, AnnotationActorPhaseEntry);
+          if (!Phases)
+            Phases = annotatedPhases(Candidate, AnnotationActorPhase);
+          if (Phases)
+            Started = Started.value_or(0) | *Phases;
+          else
+            Unannotated.push_back(Candidate);
+        }
+        if (bUnknownGivenObject)
+          Started = ~0u;
+        // A helper of the object: a member function called on it, or another
+        // function given it, `fg_Stop(this)`.
+        auto GivenObject = [&] {
+          return llvm::any_of(Call->arguments(), [](const Expr *Argument) {
+            const QualType Type = Argument->getType();
+            return (Type->isPointerType() || Argument->isGLValue()) &&
+                   Type->getPointeeOrArrayElementType()->getAsCXXRecordDecl() &&
+                   isOwnActorObject(Argument);
+          });
+        };
+        for (const FunctionDecl *Candidate : Unannotated)
+          if (const FunctionDecl *Definition = Candidate->getDefinition();
+              Definition &&
+              ((isa<CXXMethodDecl>(Definition) && Member &&
+                isOwnActorObject(Member->getImplicitObjectArgument())) ||
+               (!Member && GivenObject())))
+            CollectHelper(Definition);
+        // A free or static one given another actor, `fs_Stop(Other)` with a
+        // `TCActor<CApp> Other`, starts the phase of that one.
+        if (Started && *Started &&
+            (Member ? isOwnActorObject(Member->getImplicitObjectArgument())
+                    : !givenAnotherActor(Call, Context) || GivenObject()))
+          StartPhases(State, *Started);
+      }
+      if (isSuspension(S) || SuspendPoints.contains(S)) {
+        // The callbacks of the registrations alive run on resume, and use
+        // stale what they use before they re-validate it, unless a guard of
+        // a phase alive protects it, which runs before them.
+        for (unsigned iHolder = 0; iHolder < nHolders; ++iHolder) {
+          if (State.MaybeDead.test(iHolder))
+            continue;
+          // Only a guard registered before the callback runs before it.
+          const llvm::BitVector Unphased =
+              Unguarded(State, false, HolderDecls[iHolder]);
+          for (const auto &[Validated, Use] :
+               Collector.CallbackEarlyUses.lookup(HolderDecls[iHolder]))
+            if (auto It = Tracked.find(Validated);
+                It != Tracked.end() && State.Into.test(It->second) &&
+                !(Protected.test(It->second) &&
+                  !State.Reassigned.test(It->second)) &&
+                Unphased.test(It->second))
+              OnUse(Use, Variables[It->second]);
+        }
+        llvm::BitVector Suspended = Unguarded(State);
+        Suspended &= State.Into;
+        llvm::BitVector Kept = Protected;
+        Kept.reset(State.Reassigned);
+        Suspended.reset(Kept);
+        State.Stale |= Suspended;
+        // Each registration alive checks its phases on resume.
+        State.Unchecked.reset();
+      }
+      // The temporary scope exits made in it run at its end, after what it
+      // awaits.
+      if (auto It = ExitsAtEnd.find(S); It != ExitsAtEnd.end())
+        for (const LambdaExpr *Cleanup : It->second)
+          RunExit(Cleanup);
+    }
+    if (Previous)
+      Unwind(*Previous, State);
+    return State;
+  };
+  // Of the blocks with a handler after them, the states that exceptions
+  // thrown in them carry to each dispatch.
+  llvm::DenseMap<std::pair<const CFGBlock *, const CFGBlock *>, CState>
+      StateThrown;
+  auto Entry = [&](const CFGBlock *Block) {
+    CState State = EmptyState();
+    // What a lambda captures was looked up before it runs, unless it points
+    // elsewhere where the lambda captures it.
+    if (Block == &Graph->getEntry()) {
+      State.MaybeDead.set();
+      State.Into = EntryInto;
+    }
+    const bool Dispatch = isHandlerDispatch(Block);
+    for (const CFGBlock::AdjacentBlock &Predecessor : Block->preds()) {
+      if (const CFGBlock *Pred = Predecessor.getReachableBlock()) {
+        const auto It = Dispatch ? StateThrown.find({Pred, Block})
+                                 : StateThrown.end();
+        const auto AtEndIt =
+            Dispatch ? StateAtEnd.end() : StateAtEnd.find(Pred);
+        if (const CState *Found = Dispatch
+                                      ? (It != StateThrown.end() ? &It->second
+                                                                 : nullptr)
+                                      : (AtEndIt != StateAtEnd.end()
+                                             ? &AtEndIt->second
+                                             : nullptr)) {
+          CState From = *Found;
+          // Past a flag check that leaves otherwise, its false edge, or of
+          // a negated one, its true edge, also in a `try`, whose handlers
+          // come after them (addExceptionEdges).
+          if (auto Check = FlagChecks.find(Pred->getTerminatorStmt());
+              Check != FlagChecks.end() && !Dispatch &&
+              Pred->succ_size() -
+                      llvm::count_if(Pred->succs(),
+                                     [](const CFGBlock::AdjacentBlock &Next) {
+                                       return isHandlerDispatch(
+                                           Next.getReachableBlock());
+                                     }) ==
+                  2 &&
+              *(Pred->succ_begin() + (Check->second.second ? 0 : 1)) == Block) {
+            llvm::BitVector Keep = Check->second.first;
+            Keep.flip();
+            llvm::BitVector Validated = From.Stale;
+            Validated &= Check->second.first;
+            From.Stale &= Keep;
+            From.FlagValidated |= Validated;
+          }
+          State.merge(From);
+        }
+      }
+    }
+    return State;
+  };
+
+  // Propagate until nothing changes, looking again only at the successors of
+  // a block whose state changed, from the entry on, so that a long function
+  // is gone through about once, not once per block. Bits are only ever added
+  // at the ends of blocks, so this ends.
+  {
+    std::deque<const CFGBlock *> Work;
+    llvm::BitVector Queued(Graph->getNumBlockIDs());
+    auto Enqueue = [&](const CFGBlock *Block) {
+      if (Block && Reachable.test(Block->getBlockID()) &&
+          !Queued.test(Block->getBlockID())) {
+        Queued.set(Block->getBlockID());
+        Work.push_back(Block);
+      }
+    };
+    Enqueue(&Graph->getEntry());
+    for (const CFGBlock *Block : llvm::reverse(*Graph))
+      Enqueue(Block);
+    while (!Work.empty()) {
+      const CFGBlock *Block = Work.front();
+      Work.pop_front();
+      Queued.reset(Block->getBlockID());
+      const bool Throws = llvm::any_of(
+          Block->succs(), [](const CFGBlock::AdjacentBlock &Successor) {
+            return isHandlerDispatch(Successor.getReachableBlock());
+          });
+      CThrown Thrown;
+      const CState End = Transfer(
+          Block, Entry(Block), [](SourceLocation, const VarDecl *) {},
+          Throws ? &Thrown : nullptr);
+      bool Changed = false;
+      for (const auto &[Dispatch, Value] : Thrown) {
+        auto [It, Inserted] =
+            StateThrown.try_emplace({Block, Dispatch}, EmptyState());
+        CState Merged = It->second;
+        Merged.merge(Value);
+        if (Inserted || Merged != It->second) {
+          It->second = std::move(Merged);
+          Changed = true;
+        }
+      }
+      auto [It, Inserted] = StateAtEnd.try_emplace(Block, EmptyState());
+      CState Merged = It->second;
+      Merged.merge(End);
+      if (Inserted || Merged != It->second) {
+        It->second = std::move(Merged);
+        Changed = true;
+      }
+      if (Changed)
+        for (const CFGBlock::AdjacentBlock &Successor : Block->succs())
+          Enqueue(Successor.getReachableBlock());
+    }
+  }
+
+  const SourceManager &SM = Context.getSourceManager();
+  // The first use of each variable after a suspension, in the order of the
+  // source, which is where it is to be looked up again.
+  llvm::MapVector<const VarDecl *, SourceLocation> FirstUses;
+  for (const CFGBlock *Block : *Graph) {
+    if (!Reachable.test(Block->getBlockID()))
+      continue;
+    Transfer(Block, Entry(Block),
+             [&](SourceLocation UseLoc, const VarDecl *Variable) {
+               const SourceLocation Loc = reportLocation(UseLoc, SM);
+               if (Loc.isInvalid())
+                 return;
+               auto [It, Inserted] = FirstUses.try_emplace(Variable, Loc);
+               if (!Inserted && SM.isBeforeInTranslationUnit(Loc, It->second))
+                 It->second = Loc;
+             });
+  }
+  for (const auto &[Variable, Loc] : FirstUses) {
+    if (const CXXForRangeStmt *For = Collector.RangeIterators.lookup(Variable)) {
+      const SourceLocation RangeLoc =
+          reportLocation(For->getRangeInit()->getBeginLoc(), SM);
+      diag(RangeLoc.isValid() ? RangeLoc : Loc,
+           "the loop goes on over the data of the actor after a suspension, "
+           "during which other calls of the actor can change or erase the "
+           "data; loop over a copy, or look the entry up again after the "
+           "suspension")
+          << For->getRangeInit()->getSourceRange();
+      continue;
+    }
+    // Not where the borrow lands in what an owner owns past the entry, which
+    // erasing the entry only releases, and the context of the use keeps that
+    // (EUsed::Landed), `CJob &Job = *mp_Jobs[Key]; auto pKeep =
+    // mp_Jobs[Key];`.
+    const auto Names = Function->getBody()
+                           ? referencesIn(Function->getBody(), Variable, Context)
+                           : llvm::SmallVector<const DeclRefExpr *, 2>();
+    const SourceLocation UseLoc = Loc;
+    if (const auto *Name = llvm::find_if(
+            Names,
+            [&](const DeclRefExpr *Each) {
+              return reportLocation(Each->getBeginLoc(), SM) == UseLoc;
+            });
+        Name != Names.end()) {
+      CLifetimeUse Landed;
+      Landed.Use = *Name;
+      Landed.Used = EUsed::Landed;
+      if (aliveWhereUsed(Landed, Context))
+        continue;
+    }
+    const unsigned Index = Tracked.lookup(Variable);
+    if (Required[Index]) {
+      diag(Loc, "%0 refers into the data of the actor and is used after a "
+                "suspension; %1 loses entries only in %2, so a guard of "
+                "%select{that phase|those phases}3 that is alive at the use, "
+                "like %select{f_CheckDestroyedOnResume|"
+                "fp_CheckStoppedOrDestroyedOnResume}4, makes it safe")
+          << nameOf(Variable) << RequiredFields[Index]
+          << phaseNames(*Required[Index])
+          << (llvm::popcount(*Required[Index]) > 1)
+          << ((*Required[Index] & ActorPhase_StopApp) != 0);
+      continue;
+    }
+    diag(Loc, "%0 refers into the data of the actor and is used after a "
+              "suspension, during which other calls of the actor can change "
+              "or erase the data; look it up again, or re-validate it with "
+              "fg_OnResume")
+        << nameOf(Variable);
+  }
+}
+
+} // namespace clang::tidy::malterlib

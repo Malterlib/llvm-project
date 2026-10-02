@@ -24,6 +24,10 @@ ForwardFunctions:
 # The functions that set a value and give the one it had.
 ExchangeFunctions:
   - fg_Exchange
+# The function objects that call what they are made of where they are called,
+# before the call returns.
+SynchronousFunctionTypes:
+  - TCFunction
 # The functions that swap two values.
 SwapFunctions:
   - fg_Swap
@@ -128,6 +132,11 @@ NodeStableContainers:
   - TCMapWithPool
   - TCSetWithPool
   - TCLinkedList
+# The futures, whose destruction doesn't end what makes their results.
+FutureTypes:
+  - TCFuture
+  - TCFutureWithFlags
+  - TCUnsafeFuture
 
 # The smart pointers, function objects and iterators, which the conceptual
 # prefixes p, f and i are for.
@@ -351,3 +360,126 @@ malterlib-no-zero-bit-scan.CheckMacros:
   - DMibRequire
 malterlib-no-zero-bit-scan.AssumeMacros:
   - DMibAnalyzerAssume
+
+# The owners, `Type=kind`, by what keeps what they own alive: `shared`, a
+# copy and a move, counting references; `weak`, nothing; `unique`, a move;
+# `buffer`, the data held in a buffer on the heap, which a move gives to the
+# one moved to at the same address, and a copy, also one made of anything
+# else, copies; `sharedbuffer`, a buffer that copies share, counting
+# references, and copy before they change it, a copy and a move, which one
+# made of anything else copies. A type of the `buffer` or `sharedbuffer`
+# kind whose layout has an array member, like TCVector with an inline
+# allocator, isn't one. An entry names a class or a
+# template by its own name: one that names an alias, CAliasEntryPointer,
+# registers nothing.
+OwnerTypes:
+  - TCSharedPointer=shared
+  - CAliasEntryPointer=shared
+  - TCWeakPointer=weak
+  - TCUniquePointer=unique
+  - TCVector=buffer
+  - 'TCStr<CStrTraits_CStr*>=sharedbuffer'
+  # The hand-written owners of the actor-phase tests.
+  - TCRound57Unique=unique
+  - TCRound62Owner=unique
+  - TCRound70Owner=unique
+  - CRound81DerivedOwner=unique
+  # Hand-written owners whose bodies the checks can't tell owners by: the
+  # unique owner of the actor-phase and reference-capture tests.
+  - CRound149Owner=unique
+  - TCFlatPointer=unique
+
+# The member functions whose calls on a member of the object look up again
+# each time an fg_OnResume callback runs.
+CallbackLookupFunctions:
+  - f_FindEqual
+
+# The functions that give the thread-local data of the thread that calls them,
+# also a part of it, by name, also after the names of the classes and
+# namespaces they are in, and of an operator or a conversion of a class.
+ThreadLocalFunctions:
+  - fg_ConcurrencyThreadLocal
+  - fg_SystemThreadLocal
+  - fg_DistributedAppThreadLocal
+  - CPromiseThreadLocal::f_ConcurrencyThreadLocal
+  - TCThreadLocal::f_Get
+  - TCThreadLocal::f_TryGet
+  - TCThreadLocal::f_GetForThread
+  - TCThreadLocal::operator->
+  - TCThreadLocal::operator&
+  - TCThreadLocal::operator t_CData *
+  - TCThreadLocalDynamic::f_Get
+  - TCThreadLocalDynamic::f_TryGet
+  - TCThreadLocalDynamic::f_GetForThread
+  - TCThreadLocalDynamic::operator->
+  - TCThreadLocalDynamic::operator&
+  - TCThreadLocalDynamic::operator t_CData *
+  - fg_NoResultException
+  - CAsyncResult::fs_ResultWasNotSetException
+  - CAsyncResult::fs_ActorCalledDeletedException
+  - CAsyncResult::fs_ActorAlreadyDestroyedException
+  - fg_RandomThreadLocal
+  - fg_SecureRandomThreadLocal
+  - fg_Random
+  - CActorDistributionManager::fs_GetCallingHostInfo
+  - fg_GetCallingHostInfo
+
+# The classes of thread-local data, every class a TCThreadLocal or
+# TCThreadLocalDynamic holds, by name, or qualified by the namespaces and
+# classes they are in, anonymous and inline namespaces aside, up to a function
+# a class is local to. Only these are thread-local types.
+ThreadLocalTypes:
+  - NMib::CSystemThreadLocal
+  - NMib::CPromiseThreadLocal
+  - NMib::NConcurrency::CConcurrencyThreadLocal
+  - NMib::NConcurrency::CDistributedAppThreadLocal
+  - NMib::NConcurrency::NPrivate::CSubSystem_Concurrency_DistributedActor::CThreadLocal
+  - NMib::NBuildSystem::NNinja::CGeneratorThreadLocal
+  - NMib::NDatabase::CDatabaseThreadLocal
+  - NMib::NContainer::CThreadLocal
+  - NMib::NContract::CContractLoggerThreadLocal
+  - NMib::NContract::CSafeCheckThrowsExcetionThreadLocal
+  - NMib::NException::CEnableExceptionTraceThreadLocal
+  - NMib::NFile::CSubSystem_File::CThreadLocal
+  - NMib::NLog::CLogger::CDetails::CThreadInfo
+  - NMib::NMisc::CRandomThreadLocal
+  - NMib::NSys::CSubSystem_Core_Signal::CThreadLocal
+  - NMib::NMemory::CLocalNumaNode
+  - NMib::NMemory::CMemoryReportThreadInfo
+  - NMib::NMemory::NPrivate::CThreadLocal
+  - NMib::NMemory::CCategoriesMemoryReporter::CThreadLocal
+  - NMib::NMemory::CStatsMemoryReporter::CThreadLocal
+  - NMib::NTime::CSubSystem_Time::CThreadLocal
+  - NMib::NTest::NPrivate::CTestManager::CThreadLocal
+  - CInvalidRegionCacheThreadLocal
+  # Tests
+  - CThread_Tests::CTemp
+  - CThread_Tests::CTemp35
+  - CTestThread::CThreadLocal
+  - CThreadLocalTest
+
+# The class templates that hold a value for each thread, whose first argument,
+# a class that isn't a template's, must be one of ThreadLocalTypes.
+ThreadLocalTemplates:
+  - TCThreadLocal
+  - TCThreadLocalDynamic
+
+# The scopes that keep a reference to thread-local data and that the coroutine
+# runtime doesn't move with the coroutine.
+ThreadLocalScopeTypes:
+  - CCurrentActorScope
+  - CCurrentlyProcessingActorScope
+
+# The bases of the scopes that the coroutine runtime suspends and resumes with
+# the coroutine, on the thread it resumes on.
+ThreadLocalHandlerTypes:
+  - CCoroutineThreadLocalHandler
+
+# The variables whose operator /, and the functions whose call, makes a guard
+# that runs the closure it is given where the guard ends, by name.
+ScopeExitHelpers:
+  - g_OnScopeExit
+  - g_OnScopeExitWithException
+  - g_OnScopeExitCatch
+  - fg_OnScopeExit
+  - fg_OnScopeExitCatch
