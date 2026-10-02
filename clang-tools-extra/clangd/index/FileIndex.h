@@ -80,10 +80,17 @@ public:
 
   /// Returns the keys that have slabs.
   std::vector<std::string> keys() const;
+  /// The FileURI passed to update() for \p Key, if any.
+  std::string fileURI(llvm::StringRef Key) const;
 
+  /// \p FileURI is the URI that symbols in the file have, if it differs from
+  /// \p Key, e.g. if it was opened through a symlinked directory. The index
+  /// also has the file by it then, so that it takes precedence over other
+  /// indexes for it, see SymbolIndex::indexedFiles().
   void update(llvm::StringRef Key, std::unique_ptr<SymbolSlab> Symbols,
               std::unique_ptr<RefSlab> Refs,
-              std::unique_ptr<RelationSlab> Relations, bool CountReferences);
+              std::unique_ptr<RelationSlab> Relations, bool CountReferences,
+              llvm::StringRef FileURI = {});
 
   /// The index keeps the slabs alive.
   /// Will count Symbol::References based on number of references in the main
@@ -110,6 +117,8 @@ private:
   llvm::StringMap<std::shared_ptr<SymbolSlab>> SymbolsSnapshot;
   llvm::StringMap<RefSlabAndCountReferences> RefsSnapshot;
   llvm::StringMap<std::shared_ptr<RelationSlab>> RelationsSnapshot;
+  // FileURI passed to update() by its key.
+  llvm::StringMap<std::string> FileURIs;
 };
 
 /// This manages symbols from files and an in-memory index on all symbols.
@@ -133,7 +142,12 @@ public:
   /// headers, e.g. because they changed on disk while not open. Queries see
   /// the removal after the next rebuild, e.g. rebuildAfterRemovals(), which is
   /// slower and can run on another thread. Updates in between are kept.
-  void removeFiles(llvm::ArrayRef<std::string> Paths);
+  /// Files are also removed by the paths their symbols have, see
+  /// FileSymbols::update(), unless \p KeepFile returns true for the path they
+  /// were updated by, e.g. if they're open by that path.
+  void removeFiles(
+      llvm::ArrayRef<std::string> Paths,
+      llvm::function_ref<bool(llvm::StringRef Path)> KeepFile = nullptr);
   /// Like removeFiles(), but only as main files, for the main files that
   /// \p ShouldRemove returns true for.
   void
@@ -196,7 +210,14 @@ SlabTuple indexHeaderSymbols(llvm::StringRef Version, ASTContext &AST,
 struct FileShardedIndex {
   /// \p HintPath is used to convert file URIs stored in symbols into absolute
   /// paths.
-  explicit FileShardedIndex(IndexFileIn Input);
+  /// Symbols are stored with URIs of canonical paths, which resolve symlinked
+  /// directories, while the include graph has files as they were found.
+  /// \p SymbolURI maps the latter to the former, so that a file's shard has
+  /// its symbols, also when it was found through a symlink. Shards are looked
+  /// up by include graph URIs then.
+  explicit FileShardedIndex(
+      IndexFileIn Input,
+      std::function<std::string(llvm::StringRef)> SymbolURI = nullptr);
 
   /// Returns uris for all files that has a shard.
   std::vector<llvm::StringRef> getAllSources() const;
@@ -222,6 +243,7 @@ private:
 
   // Keeps all the information alive.
   const IndexFileIn Index;
+  std::function<std::string(llvm::StringRef)> SymbolURI;
   // Mapping from URIs to slab information.
   llvm::StringMap<FileShard> Shards;
   // Used to build RefSlabs.

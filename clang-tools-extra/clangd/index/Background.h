@@ -260,6 +260,20 @@ private:
   std::mutex FileEventsMu;
   // Case-folded keys of ShardVersions.
   llvm::StringSet<> IndexedFiles;
+  // Files can be indexed by several paths, e.g. through symlinked directories,
+  // so that changes to a file apply to all its paths.
+  // Canonical paths of keys of ShardVersions, as of when they were recorded.
+  llvm::StringMap<std::string> CanonicalPaths;
+  // Keys of ShardVersions by their case-folded canonical paths.
+  llvm::StringMap<llvm::SmallVector<std::string, 1>> PathsByCanonicalPath;
+  // The paths that symbols in the shards of keys of ShardVersions have, see
+  // IndexFileIn::FileURI, if they differ.
+  llvm::StringMap<std::string> SymbolPaths;
+  // Records \p Path as indexed, with ShardVersionsMu held, and \p FileURI as
+  // the URI its symbols have, if known.
+  void recordIndexedPathLocked(PathRef Path, llvm::StringRef FileURI);
+  // Paths that \p File was indexed by, including its canonical path.
+  std::vector<std::string> indexedPaths(PathRef File);
   // The commands main files were last indexed with in this session, keyed by
   // commandChangedKey(). Shards store them too, but storage may be missing.
   llvm::StringMap<tooling::CompileCommand> IndexedCommands;

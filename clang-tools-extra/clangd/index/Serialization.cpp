@@ -547,6 +547,9 @@ llvm::Expected<IndexFileIn> readRIFF(llvm::StringRef Data,
     for (llvm::StringRef C : Cmd.CommandLine)
       Result.Cmd->CommandLine.emplace_back(C);
   }
+  // Readers that don't know about it ignore it, so it needs no new Version.
+  if (Chunks.count("furi"))
+    Result.FileURI = Chunks.lookup("furi").str();
   return std::move(Result);
 }
 
@@ -668,6 +671,9 @@ void writeRIFF(const IndexFileOut &Data, llvm::raw_ostream &OS) {
     }
     RIFF.Chunks.push_back({riff::fourCC("cmdl"), CmdlSection});
   }
+
+  if (Data.FileURI)
+    RIFF.Chunks.push_back({riff::fourCC("furi"), *Data.FileURI});
 
   OS << RIFF;
 }
