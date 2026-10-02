@@ -927,6 +927,10 @@ llvm::StringRef getStdHeader(const Symbol *S, const LangOptions &LangOpts) {
   return "";
 }
 
+std::string SymbolCollector::fileURI(FileEntryRef FE) {
+  return HeaderFileURIs ? HeaderFileURIs->toURI(FE) : std::string();
+}
+
 void SymbolCollector::finish() {
   // At the end of the TU, add 1 to the refcount of all referenced symbols.
   for (const auto &ID : ReferencedSymbols) {

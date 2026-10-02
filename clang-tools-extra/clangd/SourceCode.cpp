@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 #include "SourceCode.h"
 
+#include "FS.h"
 #include "FuzzyMatch.h"
 #include "Preamble.h"
 #include "Protocol.h"
@@ -551,6 +552,16 @@ std::optional<std::string> getCanonicalPath(const FileEntryRef F,
   }
 
   return FilePath.str().str();
+}
+
+bool isMainFile(PathRef File, PathRef MainFile, const SourceManager &SM) {
+  if (pathEqual(File, MainFile))
+    return true;
+  auto Main = SM.getFileEntryRefForID(SM.getMainFileID());
+  if (!Main)
+    return false;
+  auto Canonical = getCanonicalPath(*Main, SM.getFileManager());
+  return Canonical && pathEqual(File, removeDots(*Canonical));
 }
 
 TextEdit toTextEdit(const FixItHint &FixIt, const SourceManager &M,

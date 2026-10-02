@@ -240,6 +240,9 @@ void remapIndexData(IndexFileIn &Data, const PathMappings &Mappings,
       remapStdStr(Arg, Mappings);
     remapStdStr(Data.Cmd->Filename, Mappings);
   }
+
+  if (Data.FileURI)
+    remapStdStr(*Data.FileURI, Mappings);
 }
 
 } // namespace

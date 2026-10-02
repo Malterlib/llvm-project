@@ -10,6 +10,7 @@
 #include "CollectMacros.h"
 #include "FS.h"
 #include "ParsedAST.h"
+#include "SourceCode.h"
 #include "clang-include-cleaner/Record.h"
 #include "index/Index.h"
 #include "index/MemIndex.h"
@@ -126,8 +127,9 @@ IncludeGraph getSubGraph(llvm::StringRef URI, const IncludeGraph &FullGraph) {
 }
 } // namespace
 
-FileShardedIndex::FileShardedIndex(IndexFileIn Input)
-    : Index(std::move(Input)) {
+FileShardedIndex::FileShardedIndex(
+    IndexFileIn Input, std::function<std::string(llvm::StringRef)> SymbolURI)
+    : Index(std::move(Input)), SymbolURI(std::move(SymbolURI)) {
   // Used to build RelationSlabs.
   llvm::DenseMap<SymbolID, FileShard *> SymbolIDToFile;
 
@@ -176,7 +178,8 @@ FileShardedIndex::FileShardedIndex(IndexFileIn Input)
   if (Index.Sources) {
     const auto &FullGraph = *Index.Sources;
     for (const auto &It : FullGraph) {
-      auto ShardIt = Shards.try_emplace(It.first());
+      auto ShardIt = Shards.try_emplace(
+          this->SymbolURI ? this->SymbolURI(It.first()) : It.first().str());
       ShardIt.first->getValue().IG = getSubGraph(It.first(), FullGraph);
     }
   }
@@ -193,7 +196,7 @@ std::vector<llvm::StringRef> FileShardedIndex::getAllSources() const {
 
 std::optional<IndexFileIn>
 FileShardedIndex::getShard(llvm::StringRef Uri) const {
-  auto It = Shards.find(Uri);
+  auto It = Shards.find(SymbolURI ? SymbolURI(Uri) : Uri.str());
   if (It == Shards.end())
     return std::nullopt;
 
@@ -251,9 +254,15 @@ bool FileSymbols::remove(llvm::StringRef Key) {
   bool Removed = SymbolsSnapshot.erase(Key);
   Removed |= RefsSnapshot.erase(Key);
   Removed |= RelationsSnapshot.erase(Key);
+  FileURIs.erase(Key);
   if (Removed)
     ++Version;
   return Removed;
+}
+
+std::string FileSymbols::fileURI(llvm::StringRef Key) const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  return FileURIs.lookup(Key);
 }
 
 std::vector<std::string> FileSymbols::keys() const {
@@ -275,9 +284,13 @@ void FileSymbols::update(llvm::StringRef Key,
                          std::unique_ptr<SymbolSlab> Symbols,
                          std::unique_ptr<RefSlab> Refs,
                          std::unique_ptr<RelationSlab> Relations,
-                         bool CountReferences) {
+                         bool CountReferences, llvm::StringRef FileURI) {
   std::lock_guard<std::mutex> Lock(Mutex);
   ++Version;
+  if (FileURI.empty() || FileURI == Key)
+    FileURIs.erase(Key);
+  else
+    FileURIs[Key] = FileURI.str();
   if (!Symbols)
     SymbolsSnapshot.erase(Key);
   else
@@ -303,7 +316,9 @@ FileSymbols::buildIndex(IndexType Type, DuplicateHandling DuplicateHandle,
   std::vector<std::shared_ptr<RefSlab>> RefSlabs;
   std::vector<std::shared_ptr<RelationSlab>> RelationSlabs;
   llvm::StringSet<> Files;
-  std::vector<RefSlab *> MainFileRefs;
+  // Grouped by file: a file can have slabs by several keys, e.g. by several
+  // paths, whose identical references are only counted once.
+  llvm::StringMap<llvm::SmallVector<RefSlab *, 1>> MainFileRefs;
   {
     std::lock_guard<std::mutex> Lock(Mutex);
     for (const auto &FileAndSymbols : SymbolsSnapshot) {
@@ -313,13 +328,19 @@ FileSymbols::buildIndex(IndexType Type, DuplicateHandling DuplicateHandle,
     for (const auto &FileAndRefs : RefsSnapshot) {
       RefSlabs.push_back(FileAndRefs.second.Slab);
       Files.insert(FileAndRefs.first());
-      if (FileAndRefs.second.CountReferences)
-        MainFileRefs.push_back(RefSlabs.back().get());
+      if (!FileAndRefs.second.CountReferences)
+        continue;
+      std::string File = FileURIs.lookup(FileAndRefs.first());
+      MainFileRefs[File.empty() ? FileAndRefs.first() : File].push_back(
+          RefSlabs.back().get());
     }
     for (const auto &FileAndRelations : RelationsSnapshot) {
       Files.insert(FileAndRelations.first());
       RelationSlabs.push_back(FileAndRelations.second);
     }
+    for (const auto &KeyAndURI : FileURIs)
+      if (Files.contains(KeyAndURI.first()))
+        Files.insert(KeyAndURI.second);
 
     if (Version)
       *Version = this->Version;
@@ -338,14 +359,30 @@ FileSymbols::buildIndex(IndexType Type, DuplicateHandling DuplicateHandle,
           I.first->second = mergeSymbol(I.first->second, Sym);
       }
     }
-    for (const RefSlab *Refs : MainFileRefs)
-      for (const auto &Sym : *Refs) {
-        auto It = Merged.find(Sym.first);
-        // This might happen while background-index is still running.
-        if (It == Merged.end())
-          continue;
-        It->getSecond().References += Sym.second.size();
+    for (const auto &FileRefs : MainFileRefs) {
+      if (FileRefs.second.size() == 1) {
+        for (const auto &Sym : *FileRefs.second.front()) {
+          auto It = Merged.find(Sym.first);
+          // This might happen while background-index is still running.
+          if (It == Merged.end())
+            continue;
+          It->getSecond().References += Sym.second.size();
+        }
+        continue;
       }
+      // The slabs can differ, e.g. if the file was indexed with different
+      // flags by each path.
+      llvm::DenseMap<SymbolID, std::vector<Ref>> FileSymRefs;
+      for (const RefSlab *Refs : FileRefs.second)
+        for (const auto &Sym : *Refs)
+          if (Merged.count(Sym.first))
+            llvm::append_range(FileSymRefs[Sym.first], Sym.second);
+      for (auto &SymRefs : FileSymRefs) {
+        llvm::sort(SymRefs.second);
+        Merged[SymRefs.first].References +=
+            std::distance(SymRefs.second.begin(), llvm::unique(SymRefs.second));
+      }
+    }
     SymsStorage.reserve(Merged.size());
     for (auto &Sym : Merged) {
       SymsStorage.push_back(std::move(Sym.second));
@@ -382,6 +419,9 @@ FileSymbols::buildIndex(IndexType Type, DuplicateHandling DuplicateHandle,
       auto &SymRefs = Sym.second;
       // Sorting isn't required, but yields more stable results over rebuilds.
       llvm::sort(SymRefs);
+      // Files can have slabs by several paths, e.g. a header in the background
+      // index that is found through a symlinked directory and its real path.
+      SymRefs.erase(llvm::unique(SymRefs), SymRefs.end());
       llvm::copy(SymRefs, back_inserter(RefsStorage));
       AllRefs.try_emplace(
           Sym.first,
@@ -501,34 +541,58 @@ void FileIndex::updatePreamble(PathRef Path, llvm::StringRef Version,
 
 void FileIndex::updateMain(PathRef Path, ParsedAST &AST) {
   auto Contents = indexMainDecls(AST);
+  // Symbols have the file by its canonical path, like SymbolCollector, which
+  // differs from Path e.g. if it was opened through a symlinked directory.
+  std::string FileURI;
+  const SourceManager &SM = AST.getSourceManager();
+  if (auto File = SM.getFileEntryRefForID(SM.getMainFileID()))
+    if (auto Canonical = getCanonicalPath(*File, SM.getFileManager()))
+      FileURI = URI::create(removeDots(*Canonical)).toString();
   MainFileSymbols.update(
       URI::create(Path).toString(),
       std::make_unique<SymbolSlab>(std::move(std::get<0>(Contents))),
       std::make_unique<RefSlab>(std::move(std::get<1>(Contents))),
       std::make_unique<RelationSlab>(std::move(std::get<2>(Contents))),
-      /*CountReferences=*/true);
+      /*CountReferences=*/true, FileURI);
   rebuildMainIndex();
 }
 
-// Removes the slabs of the files that \p ShouldRemove returns true for.
+// Removes the slabs of the files that \p ShouldRemove returns true for, or
+// \p ShouldRemoveByFileURI for the paths their symbols have.
 // Returns whether any were removed.
-static bool
-removeFilesIf(FileSymbols &Symbols,
-              llvm::function_ref<bool(llvm::StringRef Path)> ShouldRemove) {
-  bool Removed = false;
-  for (const std::string &Uri : Symbols.keys()) {
+static bool removeFilesIf(
+    FileSymbols &Symbols,
+    llvm::function_ref<bool(llvm::StringRef Path)> ShouldRemove,
+    llvm::function_ref<bool(llvm::StringRef Path, llvm::StringRef KeyPath)>
+        ShouldRemoveByFileURI = nullptr) {
+  auto ToPath = [](llvm::StringRef Uri) -> std::optional<std::string> {
+    if (Uri.empty())
+      return std::nullopt;
     auto Path = URI::resolve(Uri);
     if (!Path) {
       llvm::consumeError(Path.takeError());
-      continue;
+      return std::nullopt;
     }
-    if (ShouldRemove(*Path))
+    return *Path;
+  };
+  bool Removed = false;
+  for (const std::string &Uri : Symbols.keys()) {
+    auto Path = ToPath(Uri);
+    if (!Path)
+      continue;
+    bool Remove = ShouldRemove(*Path);
+    if (!Remove && ShouldRemoveByFileURI)
+      if (auto FilePath = ToPath(Symbols.fileURI(Uri)))
+        Remove = ShouldRemoveByFileURI(*FilePath, *Path);
+    if (Remove)
       Removed |= Symbols.remove(Uri);
   }
   return Removed;
 }
 
-void FileIndex::removeFiles(llvm::ArrayRef<std::string> Paths) {
+void FileIndex::removeFiles(
+    llvm::ArrayRef<std::string> Paths,
+    llvm::function_ref<bool(llvm::StringRef Path)> KeepFile) {
   if (Paths.empty())
     return;
   // Paths may be spelled differently than when indexed, e.g. in case.
@@ -538,9 +602,13 @@ void FileIndex::removeFiles(llvm::ArrayRef<std::string> Paths) {
   auto ShouldRemove = [&](llvm::StringRef Path) {
     return Keys.contains(maybeCaseFoldPath(removeDots(Path)));
   };
-  if (removeFilesIf(PreambleSymbols, ShouldRemove))
+  auto ShouldRemoveByFileURI = [&](llvm::StringRef Path,
+                                   llvm::StringRef KeyPath) {
+    return ShouldRemove(Path) && !(KeepFile && KeepFile(KeyPath));
+  };
+  if (removeFilesIf(PreambleSymbols, ShouldRemove, ShouldRemoveByFileURI))
     PreambleRemovalPending = true;
-  if (removeFilesIf(MainFileSymbols, ShouldRemove))
+  if (removeFilesIf(MainFileSymbols, ShouldRemove, ShouldRemoveByFileURI))
     MainRemovalPending = true;
 }
 

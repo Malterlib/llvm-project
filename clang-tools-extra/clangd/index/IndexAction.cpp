@@ -45,8 +45,9 @@ std::optional<std::string> toURI(OptionalFileEntryRef File) {
 // self edges.
 struct IncludeGraphCollector : public PPCallbacks {
 public:
-  IncludeGraphCollector(const SourceManager &SM, IncludeGraph &IG)
-      : SM(SM), IG(IG) {}
+  IncludeGraphCollector(const SourceManager &SM, IncludeGraph &IG,
+                        llvm::StringMap<OptionalFileEntryRef> &Files)
+      : SM(SM), IG(IG), Files(Files) {}
 
   // Populates everything except direct includes for a node, which represents
   // edges in the include graph and populated in inclusion directive.
@@ -65,6 +66,8 @@ public:
     auto URI = toURI(File);
     if (!URI)
       return;
+    // The file is found by the first name it was entered by, like its URI.
+    Files.try_emplace(*URI, *File);
     auto I = IG.try_emplace(*URI).first;
 
     auto &Node = I->getValue();
@@ -123,6 +126,7 @@ public:
 private:
   const SourceManager &SM;
   IncludeGraph &IG;
+  llvm::StringMap<OptionalFileEntryRef> &Files;
 };
 
 // Wraps the index action and reports index data after each translation unit.
@@ -157,8 +161,8 @@ public:
   std::unique_ptr<ASTConsumer>
   CreateASTConsumer(CompilerInstance &CI, llvm::StringRef InFile) override {
     PI->record(CI.getPreprocessor());
-    CI.getPreprocessor().addPPCallbacks(
-        std::make_unique<IncludeGraphCollector>(CI.getSourceManager(), IG));
+    CI.getPreprocessor().addPPCallbacks(std::make_unique<IncludeGraphCollector>(
+        CI.getSourceManager(), IG, Files));
 
     return index::createIndexingASTConsumer(Collector, Opts,
                                             CI.getPreprocessorPtr());
@@ -190,6 +194,13 @@ public:
         assert(Node.getKeyData() == Node.getValue().URI.data());
 #endif
       Result.Sources = std::move(IG);
+      // Symbols have files by the URIs SymbolCollector made for them, which
+      // canonicalize their paths, e.g. if they're in symlinked directories.
+      for (const auto &[URI, File] : Files) {
+        std::string SymbolURI = Collector->fileURI(*File);
+        if (!SymbolURI.empty() && SymbolURI != URI)
+          Result.SymbolURIs[URI] = std::move(SymbolURI);
+      }
       IndexContentsCallback(std::move(Result));
   }
 
@@ -199,6 +210,8 @@ private:
   std::unique_ptr<include_cleaner::PragmaIncludes> PI;
   index::IndexingOptions Opts;
   IncludeGraph IG;
+  // The files in IG by their URIs.
+  llvm::StringMap<OptionalFileEntryRef> Files;
 };
 
 } // namespace
