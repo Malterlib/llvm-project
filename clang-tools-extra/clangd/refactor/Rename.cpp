@@ -890,7 +890,8 @@ findOccurrencesOutsideFile(const NamedDecl &RenameDecl,
     if ((R.Kind & RefKind::Spelled) == RefKind::Unknown)
       return;
     if (auto RefFilePath = filePath(R.Location, /*HintFilePath=*/MainFile)) {
-      if (!pathEqual(*RefFilePath, MainFile))
+      if (!isMainFile(*RefFilePath, MainFile,
+                      RenameDecl.getASTContext().getSourceManager()))
         AffectedFiles[*RefFilePath].push_back(toRange(R.Location));
     }
   });

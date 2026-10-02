@@ -28,6 +28,7 @@
 #include "index/Index.h"
 #include "index/Symbol.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include <optional>
 
@@ -48,6 +49,13 @@ struct IndexFileIn {
   std::optional<IncludeGraph> Sources;
   // This contains only the Directory and CommandLine.
   std::optional<tooling::CompileCommand> Cmd;
+  // URIs of files in Sources that symbols have other URIs for, which they have
+  // by canonical paths, e.g. for files found through a symlinked directory.
+  // Keys are URIs in Sources. Not stored in index files.
+  llvm::StringMap<std::string> SymbolURIs;
+  // For the index of a single file, e.g. a background index shard, the URI
+  // that its symbols have for the file.
+  std::optional<std::string> FileURI;
 };
 // Parse an index file. The input must be a RIFF or YAML file.
 llvm::Expected<IndexFileIn> readIndexFile(llvm::StringRef, SymbolOrigin);
@@ -62,6 +70,7 @@ struct IndexFileOut {
   // TODO: Support serializing Dex posting lists.
   IndexFileFormat Format = IndexFileFormat::RIFF;
   const tooling::CompileCommand *Cmd = nullptr;
+  const std::string *FileURI = nullptr;
 
   IndexFileOut() = default;
   IndexFileOut(const IndexFileIn &I)
@@ -69,7 +78,8 @@ struct IndexFileOut {
         Refs(I.Refs ? &*I.Refs : nullptr),
         Relations(I.Relations ? &*I.Relations : nullptr),
         Sources(I.Sources ? &*I.Sources : nullptr),
-        Cmd(I.Cmd ? &*I.Cmd : nullptr) {}
+        Cmd(I.Cmd ? &*I.Cmd : nullptr),
+        FileURI(I.FileURI ? &*I.FileURI : nullptr) {}
 };
 // Serializes an index file.
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, const IndexFileOut &O);

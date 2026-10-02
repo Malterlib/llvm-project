@@ -1692,8 +1692,8 @@ ReferencesResult findReferences(ParsedAST &AST, Position Pos, uint32_t Limit,
     Results.HasMore |= Index->refs(Req, [&](const Ref &R) {
       auto LSPLoc = toLSPLocation(R.Location, MainFilePath);
       // Avoid indexed results for the main file - the AST is authoritative.
-      if (!LSPLoc ||
-          (!AllowMainFileSymbols && LSPLoc->uri.file() == MainFilePath))
+      if (!LSPLoc || (!AllowMainFileSymbols &&
+                      isMainFile(LSPLoc->uri.file(), MainFilePath, SM)))
         return;
       ReferencesResult::Reference Result;
       Result.Loc = {std::move(*LSPLoc), std::nullopt};

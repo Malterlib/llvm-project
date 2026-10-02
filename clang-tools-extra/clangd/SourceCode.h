@@ -166,6 +166,11 @@ TextEdit toTextEdit(const FixItHint &FixIt, const SourceManager &M,
 std::optional<std::string> getCanonicalPath(const FileEntryRef F,
                                             FileManager &FileMgr);
 
+/// Whether \p File is the main file of \p SM, at \p MainFile, also when the
+/// index has it by its canonical path, see getCanonicalPath(), e.g. if it was
+/// opened through a symlinked directory.
+bool isMainFile(PathRef File, PathRef MainFile, const SourceManager &SM);
+
 /// Choose the clang-format style we should apply to a certain file.
 /// This will usually use FS to look for .clang-format directories.
 /// FIXME: should we be caching the .clang-format file search?

@@ -346,7 +346,8 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
         for (const std::string &File : Files)
           if (!isParsed(File) && BackgroundIdx->isIndexed(File))
             Closed.push_back(File);
-        DynamicIdx->removeFiles(Closed);
+        DynamicIdx->removeFiles(
+            Closed, [&](llvm::StringRef Path) { return isParsed(Path); });
       }
       // Synchronous workers run updates on the calling thread, which must be
       // the main thread. Watchers may be notified from other threads.
@@ -1137,7 +1138,8 @@ void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
           Closed.push_back(File);
       // Remove now, so this can't undo later updates, e.g. from reopening one
       // of the files. Rebuilding the dynamic index can be slow.
-      DynamicIdx->removeFiles(Closed);
+      DynamicIdx->removeFiles(
+          Closed, [&](llvm::StringRef Path) { return isParsed(Path); });
       // Closed files that include changed headers can be stale too. The
       // background index covers all closed files, so drop them. It's outdated
       // for files saved without a file event, e.g. if the client watches only

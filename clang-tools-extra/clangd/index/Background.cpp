@@ -9,6 +9,7 @@
 #include "index/Background.h"
 #include "Compiler.h"
 #include "Config.h"
+#include "FS.h"
 #include "Headers.h"
 #include "SourceCode.h"
 #include "URI.h"
@@ -245,144 +246,198 @@ void BackgroundIndex::reindexChangedFiles(
       if (ContextProvider)
         WithProvidedContext.emplace(ContextProvider(Reported));
       // Reported paths can be spelled differently, e.g. through a symlink,
-      // than the index records them. Compilation databases use their own
-      // spelling, which is looked up as reported.
-      std::string File = canonicalPath(Reported, *FS);
-      if (!FS->exists(File)) {
-        // Unreadable files aren't treated as deleted elsewhere, as files can
-        // exist only in a compile command's VFS overlay. Here the file is
-        // known to be gone.
-        {
-          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-          DeletedFiles.insert(maybeCaseFoldPath(File));
-        }
-        // Marked before looking for dependents, for TUs being indexed for the
-        // first time, see the other branch.
-        std::string Key = maybeCaseFoldPath(File);
-        {
-          std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-          PendingChangedHeaders.insert(Key);
-        }
-        // Deleting a header can change the files that included it, e.g.
-        // through __has_include, though their shards don't change.
-        std::string TU = indexedTUForHeader(File);
-        bool HasIncluder = !TU.empty();
-        if (!TU.empty()) {
+      // than the index records them, and files can be indexed by several
+      // paths. Compilation databases use their own spelling, which is looked
+      // up as reported.
+      std::vector<std::string> Paths = indexedPaths(Reported);
+      bool Exists = false, HasCommandOrIncluder = false;
+      for (const std::string &File : Paths) {
+        if (!FS->exists(File)) {
+          // Unreadable files aren't treated as deleted elsewhere, as files can
+          // exist only in a compile command's VFS overlay. Here the file is
+          // known to be gone.
+          {
+            std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+            DeletedFiles.insert(maybeCaseFoldPath(File));
+          }
+          // Marked before looking for dependents, for TUs being indexed for the
+          // first time, see the other branch.
+          std::string Key = maybeCaseFoldPath(File);
           {
             std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-            DeletedHeaderToIndexedTU[maybeCaseFoldPath(File)] = TU;
+            PendingChangedHeaders.insert(Key);
           }
+          // Deleting a header can change the files that included it, e.g.
+          // through __has_include, though their shards don't change.
+          std::string TU = indexedTUForHeader(File);
+          bool HasIncluder = !TU.empty();
+          if (!TU.empty()) {
+            {
+              std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+              DeletedHeaderToIndexedTU[maybeCaseFoldPath(File)] = TU;
+            }
+            std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+            ForcedTUs.insert(commandChangedKey(TU));
+          }
+          removeFromIndex(File);
+          if (!TU.empty() && SeenTUs.insert(TU).second)
+            TUs.push_back(std::move(TU));
+          // TUs that only probed for the file have unchanged shards.
+          std::vector<std::string> Probers;
+          {
+            std::lock_guard<std::mutex> Lock(MissingIncludesMu);
+            auto It = MissingIncludeToTUs.find(
+                llvm::StringRef(llvm::sys::path::filename(File)).lower());
+            if (It != MissingIncludeToTUs.end())
+              for (const auto &Prober : It->second)
+                Probers.push_back(Prober.getKey().str());
+          }
+          if (HasIncluder || !Probers.empty()) {
+            // They're reindexed now, which consumes the change.
+            std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+            PendingChangedHeaders.erase(Key);
+          }
+          for (std::string &Prober : Probers) {
+            {
+              std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+              ForcedTUs.insert(commandChangedKey(Prober));
+            }
+            if (SeenTUs.insert(Prober).second)
+              TUs.push_back(std::move(Prober));
+          }
+          continue;
+        }
+        {
+          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+          DeletedFiles.erase(maybeCaseFoldPath(File));
+        }
+        // A symlink in the path can point elsewhere since the file was indexed
+        // by it, while the contents are the same. Its shard isn't replaced
+        // when the contents match a version, so drop the version.
+        bool Recorded = false, Moved = false;
+        std::string SymbolPath;
+        {
+          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+          Recorded = CanonicalPaths.contains(File);
+          SymbolPath = SymbolPaths.lookup(File);
+        }
+        if (!SymbolPath.empty()) {
+          auto Current = FS->status(File);
+          auto Indexed = FS->status(SymbolPath);
+          Moved = Current && (!Indexed || !Indexed->equivalent(*Current));
+        }
+        if (Moved) {
+          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+          ShardVersions.erase(File);
+        }
+        // Files with a compile command of their own are translation units.
+        // Inferred commands don't count: those are used for headers. Each path
+        // of the file can have a command of its own. Only paths that are known
+        // are looked up: compilation databases are found by the directories of
+        // the paths, which would load the same one again for another spelling.
+        std::string TU;
+        std::optional<tooling::CompileCommand> Cmd;
+        if (Recorded || pathEqual(File, Reported))
+          Cmd = CDB.getCompileCommand(File);
+        if (Cmd && Cmd->Heuristic.empty()) {
+          // Looked up again by the path that has the command.
+          TU = File;
+        } else {
+          // A TU being indexed for the first time may be reading the file
+          // before it's known to include it, or failing to. Mark the change
+          // before looking for includers: such a TU checks the marks after
+          // recording its includes, so either it sees the mark or the lookup
+          // sees it.
+          std::string Key = maybeCaseFoldPath(File);
+          {
+            std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+            PendingChangedHeaders.insert(Key);
+          }
+          TU = indexedTUForHeader(File);
+          if (!TU.empty()) {
+            std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+            PendingChangedHeaders.erase(Key);
+          }
+        }
+        bool HasIncluder = !TU.empty();
+        Exists = true;
+        HasCommandOrIncluder |= HasIncluder;
+        if (Moved && HasIncluder) {
           std::lock_guard<std::mutex> Lock(ShardVersionsMu);
           ForcedTUs.insert(commandChangedKey(TU));
         }
-        removeFromIndex(File);
-        if (!TU.empty() && SeenTUs.insert(TU).second)
+        // A TU being indexed may be reading an older version of the file. Its
+        // shards can then match the disk again by the time this is checked,
+        // e.g. after a revert, so make sure it's indexed again after that.
+        if (HasIncluder &&
+            Queue.isActive(llvm::xxh3_64bits(commandChangedKey(TU)))) {
+          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+          ForcedTUs.insert(commandChangedKey(TU));
+        }
+        if (HasIncluder && SeenTUs.insert(TU).second)
           TUs.push_back(std::move(TU));
-        // TUs that only probed for the file have unchanged shards.
-        std::vector<std::string> Probers;
+        // A file that appears doesn't change the shards of TUs that tried to
+        // include it, so those have to be reindexed regardless: the TU that
+        // included a recreated header, or TUs that failed to include a file
+        // with its name.
+        std::vector<std::string> Includers;
+        {
+          std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+          auto It = DeletedHeaderToIndexedTU.find(maybeCaseFoldPath(File));
+          if (It != DeletedHeaderToIndexedTU.end()) {
+            Includers.push_back(std::move(It->second));
+            DeletedHeaderToIndexedTU.erase(It);
+          }
+        }
         {
           std::lock_guard<std::mutex> Lock(MissingIncludesMu);
           auto It = MissingIncludeToTUs.find(
               llvm::StringRef(llvm::sys::path::filename(File)).lower());
           if (It != MissingIncludeToTUs.end())
-            for (const auto &Prober : It->second)
-              Probers.push_back(Prober.getKey().str());
+            for (const auto &Includer : It->second)
+              Includers.push_back(Includer.getKey().str());
         }
-        if (HasIncluder || !Probers.empty()) {
+        if (!Includers.empty()) {
           // They're reindexed now, which consumes the change.
           std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-          PendingChangedHeaders.erase(Key);
+          PendingChangedHeaders.erase(maybeCaseFoldPath(File));
         }
-        for (std::string &Prober : Probers) {
+        for (std::string &Includer : Includers) {
           {
             std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-            ForcedTUs.insert(commandChangedKey(Prober));
+            ForcedTUs.insert(commandChangedKey(Includer));
           }
-          if (SeenTUs.insert(Prober).second)
-            TUs.push_back(std::move(Prober));
+          if (SeenTUs.insert(Includer).second)
+            TUs.push_back(std::move(Includer));
         }
-        continue;
       }
-      {
-        std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-        DeletedFiles.erase(maybeCaseFoldPath(File));
-      }
-      // Files with a compile command of their own are translation units.
-      // Inferred commands don't count: those are used for headers.
-      std::string TU;
-      auto Cmd = CDB.getCompileCommand(Reported);
-      if (Cmd && Cmd->Heuristic.empty()) {
-        TU = Reported;
-      } else {
-        // A TU being indexed for the first time may be reading the file before
-        // it's known to include it, or failing to. Mark the change before
-        // looking for includers: such a TU checks the marks after recording
-        // its includes, so either it sees the mark or the lookup sees it.
-        std::string Key = maybeCaseFoldPath(File);
+      // Missing includes aren't stored in shards. TUs loaded with errors may
+      // have failed to include a header that appears, so reindex them once to
+      // find out. Not for files with a known includer or command by any path,
+      // which are typically existing files that changed, to not reindex all
+      // those TUs whenever a file changes.
+      if (Exists && !HasCommandOrIncluder) {
+        std::vector<std::string> ErrorTUs;
         {
-          std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-          PendingChangedHeaders.insert(Key);
-        }
-        TU = indexedTUForHeader(File);
-        if (!TU.empty()) {
-          std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-          PendingChangedHeaders.erase(Key);
-        }
-      }
-      bool HasIncluder = !TU.empty();
-      // A TU being indexed may be reading an older version of the file. Its
-      // shards can then match the disk again by the time this is checked, e.g.
-      // after a revert, so make sure it's indexed again after that.
-      if (HasIncluder &&
-          Queue.isActive(llvm::xxh3_64bits(commandChangedKey(TU)))) {
-        std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-        ForcedTUs.insert(commandChangedKey(TU));
-      }
-      if (HasIncluder && SeenTUs.insert(TU).second)
-        TUs.push_back(std::move(TU));
-      // A file that appears doesn't change the shards of TUs that tried to
-      // include it, so those have to be reindexed regardless: the TU that
-      // included a recreated header, or TUs that failed to include a file with
-      // its name.
-      std::vector<std::string> Includers;
-      {
-        std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-        auto It = DeletedHeaderToIndexedTU.find(maybeCaseFoldPath(File));
-        if (It != DeletedHeaderToIndexedTU.end()) {
-          Includers.push_back(std::move(It->second));
-          DeletedHeaderToIndexedTU.erase(It);
-        }
-      }
-      {
-        std::lock_guard<std::mutex> Lock(MissingIncludesMu);
-        auto It = MissingIncludeToTUs.find(
-            llvm::StringRef(llvm::sys::path::filename(File)).lower());
-        if (It != MissingIncludeToTUs.end())
-          for (const auto &Includer : It->second)
-            Includers.push_back(Includer.getKey().str());
-        // Missing includes aren't stored in shards. TUs loaded with errors may
-        // have failed to include a header that appears, so reindex them once
-        // to find out. Not for files with a known includer or command, which
-        // are typically existing files that changed, to not reindex all those
-        // TUs whenever a file changes.
-        if (!HasIncluder) {
-          for (const auto &Includer : UntrackedErrorTUs)
-            Includers.push_back(Includer.getKey().str());
+          std::lock_guard<std::mutex> Lock(MissingIncludesMu);
+          for (const auto &TU : UntrackedErrorTUs)
+            ErrorTUs.push_back(TU.getKey().str());
           UntrackedErrorTUs.clear();
         }
-      }
-      if (!Includers.empty()) {
-        // They're reindexed now, which consumes the change.
-        std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
-        PendingChangedHeaders.erase(maybeCaseFoldPath(File));
-      }
-      for (std::string &Includer : Includers) {
-        {
-          std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-          ForcedTUs.insert(commandChangedKey(Includer));
+        if (!ErrorTUs.empty()) {
+          // They're reindexed now, which consumes the change.
+          std::lock_guard<std::mutex> Lock(HeaderToIndexedTUMu);
+          for (const std::string &File : Paths)
+            PendingChangedHeaders.erase(maybeCaseFoldPath(File));
         }
-        if (SeenTUs.insert(Includer).second)
-          TUs.push_back(std::move(Includer));
+        for (std::string &TU : ErrorTUs) {
+          {
+            std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+            ForcedTUs.insert(commandChangedKey(TU));
+          }
+          if (SeenTUs.insert(TU).second)
+            TUs.push_back(std::move(TU));
+        }
       }
     }
     EventsLock.unlock();
@@ -404,10 +459,22 @@ void BackgroundIndex::removeFromIndex(PathRef File) {
       It = llvm::find_if(ShardVersions, [&](const auto &Entry) {
         return pathEqual(Entry.first(), File);
       });
-    if (It == ShardVersions.end())
+    // Slabs can be published without a version until the file is indexed
+    // again, e.g. if its path points elsewhere than when it was.
+    std::string Indexed = File.str();
+    if (It != ShardVersions.end()) {
+      Indexed = It->first().str();
+      ShardVersions.erase(It);
+    } else if (IndexedFiles.contains(maybeCaseFoldPath(File))) {
+      // Slabs are keyed by the spelling the file was recorded by.
+      auto Recorded = llvm::find_if(CanonicalPaths, [&](const auto &Entry) {
+        return pathEqual(Entry.first(), File);
+      });
+      if (Recorded != CanonicalPaths.end())
+        Indexed = Recorded->first().str();
+    } else {
       return;
-    std::string Indexed = It->first().str();
-    ShardVersions.erase(It);
+    }
     IndexedFiles.erase(maybeCaseFoldPath(Indexed));
     IndexedSymbols.update(URI::create(Indexed).toString(), nullptr, nullptr,
                           nullptr, /*CountReferences=*/false);
@@ -483,8 +550,74 @@ void BackgroundIndex::reindexAgain(PathRef MainFile) {
 bool BackgroundIndex::isIndexed(PathRef File) const {
   std::string Canonical = canonicalPath(File, *TFS.view(/*CWD=*/std::nullopt));
   std::lock_guard<std::mutex> Lock(ShardVersionsMu);
-  return IndexedFiles.contains(maybeCaseFoldPath(File)) ||
-         IndexedFiles.contains(maybeCaseFoldPath(Canonical));
+  if (IndexedFiles.contains(maybeCaseFoldPath(File)) ||
+      IndexedFiles.contains(maybeCaseFoldPath(Canonical)))
+    return true;
+  auto It = PathsByCanonicalPath.find(maybeCaseFoldPath(Canonical));
+  return It != PathsByCanonicalPath.end() &&
+         llvm::any_of(It->second, [&](const std::string &Path) {
+           return IndexedFiles.contains(maybeCaseFoldPath(Path));
+         });
+}
+
+void BackgroundIndex::recordIndexedPathLocked(PathRef Path,
+                                              llvm::StringRef FileURI) {
+  IndexedFiles.insert(maybeCaseFoldPath(Path));
+  // As of when the file was parsed, unlike the canonical path below.
+  SymbolPaths.erase(Path);
+  if (!FileURI.empty()) {
+    if (auto SymbolPath = URI::resolve(FileURI, Path)) {
+      if (*SymbolPath != Path)
+        SymbolPaths[Path] = std::move(*SymbolPath);
+    } else {
+      llvm::consumeError(SymbolPath.takeError());
+    }
+  }
+  // Paths can point elsewhere since they were last recorded, e.g. if a
+  // symlinked directory was changed.
+  std::string Canonical = canonicalPath(Path, *TFS.view(/*CWD=*/std::nullopt));
+  auto [It, Inserted] = CanonicalPaths.try_emplace(Path);
+  if (!Inserted) {
+    if (It->second == Canonical)
+      return;
+    auto Old = PathsByCanonicalPath.find(maybeCaseFoldPath(It->second));
+    if (Old != PathsByCanonicalPath.end()) {
+      llvm::erase(Old->second, Path);
+      if (Old->second.empty())
+        PathsByCanonicalPath.erase(Old);
+    }
+  }
+  It->second = Canonical;
+  PathsByCanonicalPath[maybeCaseFoldPath(Canonical)].push_back(Path.str());
+}
+
+std::vector<std::string> BackgroundIndex::indexedPaths(PathRef File) {
+  std::string Canonical = canonicalPath(File, *TFS.view(/*CWD=*/std::nullopt));
+  std::vector<std::string> Paths = {Canonical};
+  // Spellings that differ only in case are kept: compile commands can be
+  // looked up by them case-sensitively.
+  auto Add = [&](llvm::StringRef Path) {
+    if (!llvm::is_contained(Paths, Path))
+      Paths.push_back(Path.str());
+  };
+  Add(File);
+  std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+  auto AddRecorded = [&](llvm::StringRef CanonicalPath) {
+    auto It = PathsByCanonicalPath.find(maybeCaseFoldPath(CanonicalPath));
+    if (It != PathsByCanonicalPath.end())
+      for (const std::string &Path : It->second)
+        Add(Path);
+  };
+  AddRecorded(Canonical);
+  // The canonical path can't be resolved anymore if e.g. the directory it was
+  // in is deleted.
+  auto Recorded = CanonicalPaths.find(File);
+  if (Recorded != CanonicalPaths.end() &&
+      !pathEqual(Recorded->second, Canonical)) {
+    Add(Recorded->second);
+    AddRecorded(Recorded->second);
+  }
+  return Paths;
 }
 
 void BackgroundIndex::boostRelated(llvm::StringRef Path) {
@@ -586,10 +719,17 @@ void BackgroundIndex::update(
     Path AbsPath;
     FileDigest Digest;
     bool IsTU;
+    bool Moved;
   };
   llvm::StringMap<FileToUpdate> FilesToUpdate;
   // Note that sources do not contain any information regarding missing headers,
   // since we don't even know what absolute path they should fall in.
+  // Paths whose symbols were indexed with other paths, e.g. through symlinks.
+  llvm::StringMap<std::string> IndexedSymbolPaths;
+  {
+    std::lock_guard<std::mutex> Lock(ShardVersionsMu);
+    IndexedSymbolPaths = SymbolPaths;
+  }
   for (const auto &IndexIt : *Index.Sources) {
     const auto &IGN = IndexIt.getValue();
     auto AbsPath = URI::resolve(IGN.URI, MainFile);
@@ -606,10 +746,26 @@ void BackgroundIndex::update(
     // main file's symbols can change without its contents changing, e.g. when
     // a header changes a macro that guards its declarations, so they're always
     // replaced.
-    if (IsTU || DigestIt == ShardVersionsSnapshot.end() ||
+    // Symbols also change if they have another path now, e.g. if a symlinked
+    // directory points elsewhere. Their symbols are collected then, as they're
+    // only skipped for unchanged versions of their paths.
+    std::string SymbolPath = *AbsPath;
+    if (std::string SymbolURI = Index.SymbolURIs.lookup(IGN.URI);
+        !SymbolURI.empty()) {
+      if (auto Resolved = URI::resolve(SymbolURI, MainFile))
+        SymbolPath = std::move(*Resolved);
+      else
+        llvm::consumeError(Resolved.takeError());
+    }
+    std::string IndexedSymbolPath = IndexedSymbolPaths.lookup(*AbsPath);
+    bool Moved =
+        DigestIt != ShardVersionsSnapshot.end() &&
+        !pathEqual(IndexedSymbolPath.empty() ? *AbsPath : IndexedSymbolPath,
+                   SymbolPath);
+    if (IsTU || Moved || DigestIt == ShardVersionsSnapshot.end() ||
         DigestIt->getValue().Digest != IGN.Digest ||
         (DigestIt->getValue().HadErrors && !HadErrors))
-      FilesToUpdate[IGN.URI] = {std::move(*AbsPath), IGN.Digest, IsTU};
+      FilesToUpdate[IGN.URI] = {std::move(*AbsPath), IGN.Digest, IsTU, Moved};
   }
   std::vector<std::string> ChangedHeaders =
       updateIndexedTUForHeaders(MainFile, IndexedHeaders);
@@ -628,8 +784,14 @@ void BackgroundIndex::update(
   if (!ChangedHeaders.empty() && OnIndexedHeaders)
     OnIndexedHeaders(std::move(ChangedHeaders));
 
-  // Shard slabs into files.
-  FileShardedIndex ShardedIndex(std::move(Index));
+  // Shard slabs into files. Symbols have files by their canonical paths, which
+  // the include graph doesn't have for files in symlinked directories, e.g. if
+  // the project is opened through a symlink.
+  llvm::StringMap<std::string> SymbolURIs = std::move(Index.SymbolURIs);
+  FileShardedIndex ShardedIndex(std::move(Index), [&](llvm::StringRef Uri) {
+    auto It = SymbolURIs.find(Uri);
+    return It == SymbolURIs.end() ? Uri.str() : It->second;
+  });
 
   // Build and store new slabs for each updated file.
   for (const auto &FileIt : FilesToUpdate) {
@@ -643,6 +805,10 @@ void BackgroundIndex::update(
     // current model keeps only one version of a header file.
     if (!IsTU)
       IF->Cmd.reset();
+    // Stored, as the include graph has the file by another path, e.g. if it's
+    // in a symlinked directory. Also tells shards written since apart.
+    std::string FileURI = SymbolURIs.lookup(Uri);
+    IF->FileURI = FileURI.empty() ? Uri.str() : FileURI;
 
     // We need to store shards before updating the index, since the latter
     // consumes slabs.
@@ -651,22 +817,32 @@ void BackgroundIndex::update(
       elog("Failed to write background-index shard for file {0}: {1}", Path,
            std::move(Error));
 
+    // Deletions can be reported by the path the symbols have, e.g. the real
+    // path of a file found through a symlinked directory.
+    std::string SymbolPath;
+    if (auto Resolved = URI::resolve(*IF->FileURI, Path))
+      SymbolPath = std::move(*Resolved);
+    else
+      llvm::consumeError(Resolved.takeError());
     {
       std::lock_guard<std::mutex> Lock(ShardVersionsMu);
       // The file may have been deleted while it was indexed. Deletions are
       // recorded under this lock, so checking under it can't undo a removal.
-      if (DeletedFiles.contains(maybeCaseFoldPath(Path)))
+      if (DeletedFiles.contains(maybeCaseFoldPath(Path)) ||
+          (!SymbolPath.empty() &&
+           DeletedFiles.contains(maybeCaseFoldPath(SymbolPath))))
         continue;
       const auto &Hash = FileIt.getValue().Digest;
       auto DigestIt = ShardVersions.try_emplace(Path);
-      IndexedFiles.insert(maybeCaseFoldPath(Path));
+      recordIndexedPathLocked(Path, *IF->FileURI);
       ShardVersion &SV = DigestIt.first->second;
       // Skip if another thread already stored this version of the file. The
       // main file and files left out of the snapshot are always replaced:
       // their symbols can change without their contents changing, e.g. with a
       // new compile command.
       if (!DigestIt.second && SV.Digest == Hash && SV.HadErrors == HadErrors &&
-          !IsTU && ShardVersionsSnapshot.count(Path))
+          !IsTU && !FileIt.getValue().Moved &&
+          ShardVersionsSnapshot.count(Path))
         continue;
       SV.Digest = Hash;
       SV.HadErrors = HadErrors;
@@ -676,10 +852,16 @@ void BackgroundIndex::update(
       // This can override a newer version that is added in another thread, if
       // this thread sees the older version but finishes later. This should be
       // rare in practice.
+      // A file indexed by several paths, e.g. as a TU and as a header of
+      // another TU through a symlinked directory, has slabs for each. Their
+      // identical references are deduplicated when building the index. Keying
+      // slabs by the file's canonical path instead would need versions,
+      // filtering and removal to use it too.
       IndexedSymbols.update(
           Uri, std::make_unique<SymbolSlab>(std::move(*IF->Symbols)),
           std::make_unique<RefSlab>(std::move(*IF->Refs)),
-          std::make_unique<RelationSlab>(std::move(*IF->Relations)), IsTU);
+          std::make_unique<RelationSlab>(std::move(*IF->Relations)), IsTU,
+          *IF->FileURI);
     }
   }
 }
@@ -848,6 +1030,9 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
 
   auto FS = TFS.view(/*CWD=*/std::nullopt);
   size_t LoadedShards = 0;
+  // TUs of shards whose files have other canonical paths than when they were
+  // indexed, or that were indexed by older versions in such paths.
+  std::vector<std::string> StaleIdentityTUs;
   {
     // Update in-memory state.
     std::lock_guard<std::mutex> Lock(ShardVersionsMu);
@@ -875,21 +1060,73 @@ BackgroundIndex::loadProject(std::vector<std::string> MainFiles) {
           LS.Shard->Relations
               ? std::make_unique<RelationSlab>(std::move(*LS.Shard->Relations))
               : nullptr;
+      // Symbols have the file by its canonical path, e.g. if it's in a
+      // symlinked directory, which shards written since store. Paths are
+      // compared by the files they're for: e.g. a subst drive on Windows isn't
+      // resolved in the stored path. A symlink retargeted to a hard link of
+      // the same file isn't noticed.
+      std::string PathURI = URI::create(LS.AbsolutePath).toString();
+      std::string FileURI;
+      bool StaleIdentity = false;
+      if (LS.Shard->FileURI) {
+        FileURI = *LS.Shard->FileURI;
+        // Deletions can be reported by the path the symbols have.
+        if (FileURI != PathURI) {
+          auto Stored = URI::resolve(FileURI, LS.AbsolutePath);
+          bool Deleted =
+              Stored && DeletedFiles.contains(maybeCaseFoldPath(*Stored));
+          if (!Stored)
+            llvm::consumeError(Stored.takeError());
+          if (Deleted)
+            continue;
+        }
+        // The symlink can point elsewhere now.
+        if (FileURI != PathURI) {
+          auto PathStatus = FS->status(LS.AbsolutePath);
+          if (auto Stored = URI::resolve(FileURI, LS.AbsolutePath)) {
+            auto StoredStatus = FS->status(*Stored);
+            StaleIdentity =
+                PathStatus &&
+                (!StoredStatus || !StoredStatus->equivalent(*PathStatus));
+          } else {
+            llvm::consumeError(Stored.takeError());
+          }
+        }
+      } else {
+        // Older versions stored no symbols for files whose paths aren't
+        // canonical, e.g. TUs in symlinked directories, and their shards stay
+        // valid until the files change.
+        llvm::StringRef Dir = llvm::sys::path::parent_path(LS.AbsolutePath);
+        llvm::SmallString<256> RealDir;
+        StaleIdentity =
+            !FS->getRealPath(Dir, RealDir) && !pathEqual(RealDir, Dir);
+      }
+      if (StaleIdentity) {
+        // Reindexing the TU replaces the shards that it has no versions of.
+        StaleIdentityTUs.push_back(LS.DependentTU);
+        recordIndexedPathLocked(LS.AbsolutePath, FileURI);
+        // Published until it's replaced, also if indexing fails.
+        ++LoadedShards;
+        IndexedSymbols.update(PathURI, std::move(SS), std::move(RS),
+                              std::move(RelS), LS.CountReferences);
+        continue;
+      }
       ShardVersion &SV = ShardVersions[LS.AbsolutePath];
-      IndexedFiles.insert(maybeCaseFoldPath(LS.AbsolutePath));
+      recordIndexedPathLocked(LS.AbsolutePath, FileURI);
       SV.Digest = LS.Digest;
       SV.HadErrors = LS.HadErrors;
       ++LoadedShards;
 
-      IndexedSymbols.update(URI::create(LS.AbsolutePath).toString(),
-                            std::move(SS), std::move(RS), std::move(RelS),
-                            LS.CountReferences);
+      IndexedSymbols.update(PathURI, std::move(SS), std::move(RS),
+                            std::move(RelS), LS.CountReferences, FileURI);
     }
   }
   Rebuilder.loadedShard(LoadedShards);
   Rebuilder.doneLoading();
 
   llvm::DenseSet<PathRef> TUsToIndex;
+  for (const std::string &TU : StaleIdentityTUs)
+    TUsToIndex.insert(TU);
   // We'll accept data from stale shards, but ensure the files get reindexed
   // soon.
   for (auto &LS : Result) {

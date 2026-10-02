@@ -146,6 +146,38 @@ TEST(FileSymbolsTest, MergeOverlap) {
             AllOf(qName("x"), declURI("file:///x1"), defURI("file:///x2"))));
 }
 
+// A file can have slabs by several keys, e.g. by several paths.
+TEST(FileSymbolsTest, DeduplicatesRefs) {
+  FileSymbols FS(IndexContents::All, true);
+  SymbolID ID("1");
+  FS.update("f1", numSlab(1, 3), refSlab(ID, "f.cc"), nullptr, false);
+  FS.update("f2", numSlab(1, 3), refSlab(ID, "f.cc"), nullptr, false);
+  for (auto Type : {IndexType::Light, IndexType::Heavy})
+    EXPECT_THAT(getRefs(*FS.buildIndex(Type), ID), refsAre({fileURI("f.cc")}));
+}
+
+// References of a file with slabs by several keys are counted once.
+TEST(FileSymbolsTest, CountsRefsOfFileOnce) {
+  FileSymbols FS(IndexContents::All, true);
+  SymbolID ID("1");
+  auto FileURI = URI::create(testPath("real/f.cc")).toString();
+  FS.update("f1", numSlab(1, 1), refSlab(ID, "f.cc"), nullptr,
+            /*CountReferences=*/true, FileURI);
+  FS.update(FileURI, nullptr, refSlab(ID, "f.cc"), nullptr,
+            /*CountReferences=*/true);
+  EXPECT_THAT(
+      runFuzzyFind(*FS.buildIndex(IndexType::Light, DuplicateHandling::Merge),
+                   ""),
+      UnorderedElementsAre(AllOf(qName("1"), numReferences(1u))));
+  // Unless they differ, e.g. if the file was indexed with other flags by each.
+  FS.update(FileURI, nullptr, refSlab(ID, "other.cc"), nullptr,
+            /*CountReferences=*/true);
+  EXPECT_THAT(
+      runFuzzyFind(*FS.buildIndex(IndexType::Light, DuplicateHandling::Merge),
+                   ""),
+      UnorderedElementsAre(AllOf(qName("1"), numReferences(2u))));
+}
+
 TEST(FileSymbolsTest, SnapshotAliveAfterRemove) {
   FileSymbols FS(IndexContents::All, true);
 
@@ -740,6 +772,33 @@ TEST(FileShardedIndexTest, Sharding) {
                 UnorderedElementsAre(BHeaderUri));
     EXPECT_TRUE(Shard->Cmd);
   }
+}
+
+// Symbols have files by their canonical paths, which differ from those in the
+// include graph for files found through a symlinked directory.
+TEST(FileShardedIndexTest, ShardingWithSymbolURIs) {
+  auto LinkUri = URI::create(testPath("link/a.h")).toString();
+  auto RealUri = URI::create(testPath("real/a.h")).toString();
+
+  auto Sym = symbol("1");
+  Sym.CanonicalDeclaration.FileURI = RealUri.c_str();
+  IndexFileIn IF;
+  {
+    SymbolSlab::Builder B;
+    B.insert(Sym);
+    IF.Symbols.emplace(std::move(B).build());
+  }
+  IF.Sources.emplace();
+  auto &Node = (*IF.Sources)[LinkUri];
+  Node.URI = LinkUri;
+
+  FileShardedIndex ShardedIndex(std::move(IF), [&](llvm::StringRef Uri) {
+    return Uri == LinkUri ? RealUri : Uri.str();
+  });
+  auto Shard = ShardedIndex.getShard(LinkUri);
+  ASSERT_TRUE(Shard);
+  EXPECT_THAT(*Shard->Symbols, UnorderedElementsAre(qName("1")));
+  EXPECT_THAT(Shard->Sources->keys(), UnorderedElementsAre(LinkUri));
 }
 
 TEST(FileIndexTest, Profile) {

@@ -158,6 +158,11 @@ public:
 
   void finish() override;
 
+  /// The URI that symbols and references in \p FE have, which can differ
+  /// from its path, e.g. if it was found through a symlinked directory. Empty
+  /// before indexing started.
+  std::string fileURI(FileEntryRef FE);
+
 private:
   // If D is an instantiation of a likely forwarding function, return the
   // constructors it invokes so that we can record indirect references
