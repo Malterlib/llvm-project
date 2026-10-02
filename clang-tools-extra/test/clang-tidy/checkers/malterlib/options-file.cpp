@@ -96,6 +96,14 @@
 // RUN: not clang-tidy --checks='-*,malterlib-function-naming' --config="{CheckOptions: {malterlib.OptionsFile: '%t/twice.yaml'}}" %t/root/Module/main.cpp -- 2>&1 | FileCheck --check-prefix=CHECK-TWICE %s
 // CHECK-TWICE: error: the option 'LowerCaseFreeFunctions' is given twice in '{{.*}}twice.yaml' [clang-tidy-config]
 
+// The option of all checks of a shared list edits that list, which the option
+// of a check of the same name is made of, not that option again: moving
+// nothing but fg_Move keeps the forwards of parameter-ownership.
+// RUN: printf "MoveFunctions: '-*;fg_Move'\nForwardFunctions: fg_Forward\n" > %t/reset.yaml
+// RUN: printf 'struct CStr\n{\n\tCStr();\n\tCStr(CStr const &);\n\tCStr(CStr &&);\n\t~CStr();\n};\ntemplate <typename t_CType> t_CType &&fg_Forward(t_CType &);\nvoid fg_Consume(CStr &&);\nvoid fg_Test(CStr _Value)\n{\n\tfg_Consume(fg_Forward<CStr>(_Value));\n}\n' > %t/forward.cpp
+// RUN: clang-tidy --checks='-*,malterlib-parameter-ownership' --config="{CheckOptions: {malterlib.OptionsFile: '%t/reset.yaml'}}" %t/forward.cpp -- 2>&1 | FileCheck --check-prefix=CHECK-RESET %s
+// CHECK-RESET: forward.cpp:10:19: warning: parameter '_Value' takes 'CStr' by value; take it by '&&', since the function consumes it [malterlib-parameter-ownership]
+
 // The option of a check of a shared list takes the edits of the file and then
 // of the configuration, each of all checks and then of the check: one of all
 // checks of the configuration comes after one of the check of the file.
@@ -180,6 +188,24 @@
 // RUN: not clang-tidy --checks='-*,malterlib-function-naming' --config="{CheckOptions: {malterlib.OptionsFile: '%t/missing.yaml'}}" --dump-config %t/root/Module/main.cpp -- 2>&1 | FileCheck --check-prefix=CHECK-DUMP-MISSING %s
 // CHECK-DUMP-MISSING: error: can't read the Malterlib options file '{{.*}}missing.yaml': {{.*}} [clang-tidy-config]
 // CHECK-DUMP-MISSING-NOT: CheckOptions
+
+// --verify-config knows the options the checks read, also those of all
+// checks, but not others.
+// RUN: clang-tidy --verify-config --config="{Checks: '-*,malterlib-*', CheckOptions: {malterlib.OptionsFile: '%t/root/Core/ClangTidyOptions.yaml', MoveFunctions: fg_Take, malterlib-no-zero-bit-scan.Functions: fg_Scan}}" 2>&1 | FileCheck --check-prefix=CHECK-VERIFY %s
+// CHECK-VERIFY: No config errors detected.
+// RUN: not clang-tidy --verify-config --config="{Checks: '-*,malterlib-*', CheckOptions: {malterlib.OptionsFile: '%t/root/Core/ClangTidyOptions.yaml', MoveFunction: fg_Take}}" 2>&1 | FileCheck --check-prefix=CHECK-UNKNOWN %s
+// CHECK-UNKNOWN: warning: unknown check option 'MoveFunction'; did you mean 'MoveFunctions' [-verify-config]
+// Also the options of the options file, which it can read.
+// RUN: printf 'MoveFunction: fg_Take\nmalterlib-async-destroy.MoveFunctions: fg_Take\nmalterlib-no-zero-bit-scan.Functions: fg_Scan\n' > %t/unknown.yaml
+// RUN: not clang-tidy --verify-config --config="{Checks: '-*,malterlib-*', CheckOptions: {malterlib.OptionsFile: '%t/unknown.yaml'}}" 2>&1 | FileCheck --check-prefix=CHECK-FILE-UNKNOWN --implicit-check-not=no-zero-bit-scan %s
+// CHECK-FILE-UNKNOWN-DAG: unknown.yaml: warning: unknown check option 'MoveFunction'; did you mean 'MoveFunctions' [-verify-config]
+// CHECK-FILE-UNKNOWN-DAG: unknown.yaml: warning: unknown check option 'malterlib-async-destroy.MoveFunctions' [-verify-config]
+// RUN: not clang-tidy --verify-config --config="{Checks: '-*,malterlib-*', CheckOptions: {malterlib.OptionsFile: '%t/missing.yaml'}}" 2>&1 | FileCheck --check-prefix=CHECK-FILE-MISSING %s
+// And a configuration that enables a Malterlib check without it.
+// RUN: not clang-tidy --verify-config --config="{Checks: '-*,malterlib-function-naming'}" 2>&1 | FileCheck --check-prefix=CHECK-VERIFY-UNSET %s
+// CHECK-VERIFY-UNSET: error: the Malterlib checks need the option 'malterlib.OptionsFile', the Malterlib options file [-verify-config]
+// CHECK-FILE-MISSING: error: can't read the Malterlib options file '{{.*}}missing.yaml': {{.*}} [-verify-config]
+// RUN: clang-tidy --verify-config --config="{Checks: '-*,malterlib-*', CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}" 2>&1 | FileCheck --check-prefix=CHECK-VERIFY %s
 
 // --verify-config reports the errors of an options file once, also one that a
 // configuration and one it inherits both name.

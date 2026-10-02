@@ -23,7 +23,9 @@
 #include "FunctionNamingCheck.h"
 #include "HeaderDeclarationsOnlyCheck.h"
 #include "MacroNamingCheck.h"
+#include "NoZeroBitScanCheck.h"
 #include "ParameterNamingCheck.h"
+#include "ParameterOwnershipCheck.h"
 #include "RunsToCompletionCheck.h"
 #include "StructNotClassCheck.h"
 #include "ThreadLocalStorageCheck.h"
@@ -66,8 +68,12 @@ public:
     CheckFactories.registerCheck<HeaderDeclarationsOnlyCheck>(
         "malterlib-header-declarations-only");
     CheckFactories.registerCheck<MacroNamingCheck>("malterlib-macro-naming");
+    CheckFactories.registerCheck<NoZeroBitScanCheck>(
+        "malterlib-no-zero-bit-scan");
     CheckFactories.registerCheck<ParameterNamingCheck>(
         "malterlib-parameter-naming");
+    CheckFactories.registerCheck<ParameterOwnershipCheck>(
+        "malterlib-parameter-ownership");
     CheckFactories.registerCheck<RunsToCompletionCheck>(
         "malterlib-runs-to-completion");
     CheckFactories.registerCheck<StructNotClassCheck>(
