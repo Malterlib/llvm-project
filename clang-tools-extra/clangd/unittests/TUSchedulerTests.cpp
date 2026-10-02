@@ -38,6 +38,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -45,6 +46,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace clang {
 namespace clangd {
@@ -837,6 +842,82 @@ TEST_F(TUSchedulerTests, LimitsLiveFilesOpenedAtOnce) {
   ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
   EXPECT_THAT(liveFiles(S), ElementsAre(Files.back()));
 }
+
+#if defined(__APPLE__) || defined(__linux__)
+// Only the most recently used files are parsed at normal priority.
+TEST_F(TUSchedulerTests, LowersPriorityOfUnusedFiles) {
+  if (!AdjustableThreadPriority::isSupported())
+    GTEST_SKIP() << "Threads can't raise their priority again";
+  auto IsLow = [] {
+#if defined(__APPLE__)
+    return qos_class_self() == QOS_CLASS_UTILITY;
+#else
+    return getpriority(PRIO_PROCESS, 0) > getpriority(PRIO_PROCESS, getpid());
+#endif
+  };
+  std::mutex Mu;
+  std::map<std::string, bool> Priorities;
+  auto Record = [&](llvm::StringRef Name, PathRef File) {
+    std::lock_guard<std::mutex> Lock(Mu);
+    Priorities[(Name + ":" + llvm::sys::path::filename(File)).str()] = IsLow();
+  };
+  struct RecordPriorities : public ParsingCallbacks {
+    using RecordFn = std::function<void(llvm::StringRef, PathRef)>;
+    RecordPriorities(RecordFn OnParsed) : OnParsed(std::move(OnParsed)) {}
+    void onPreambleAST(
+        PathRef Path, llvm::StringRef, CapturedASTCtx,
+        std::shared_ptr<const include_cleaner::PragmaIncludes>) override {
+      OnParsed("preamble", Path);
+    }
+    void onMainAST(PathRef Path, ParsedAST &, PublishFn) override {
+      OnParsed("ast", Path);
+    }
+    RecordFn OnParsed;
+  };
+  auto Opts = optsForTest();
+  Opts.NormalPriorityFiles = 1;
+  TUScheduler S(CDB, Opts, std::make_unique<RecordPriorities>(Record));
+
+  auto Header = testPath("foo.h");
+  FS.Files[Header] = "int before;";
+  FS.Timestamps[Header] = time_t(1);
+  auto Foo = testPath("foo.cpp"), Bar = testPath("bar.cpp");
+  for (const auto &File : {Foo, Bar}) {
+    S.update(File, getInputs(File, "#include \"foo.h\""), WantDiagnostics::Yes);
+    ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  }
+  {
+    std::lock_guard<std::mutex> Lock(Mu);
+    Priorities.clear();
+  }
+
+  // The header changes, e.g. in a build, which doesn't make the files used.
+  FS.Files[Header] = "int after; ";
+  auto Changed = std::make_shared<llvm::StringSet<>>();
+  Changed->insert(Header);
+  for (const auto &File : {Foo, Bar}) {
+    auto Inputs = getInputs(File, "#include \"foo.h\"");
+    Inputs.ChangedFiles = Changed;
+    S.update(File, std::move(Inputs), WantDiagnostics::Auto);
+  }
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  // Using a file parses it at normal priority.
+  S.runWithAST("Use", Foo, [&](llvm::Expected<InputsAndAST> AST) {
+    ASSERT_TRUE(bool(AST)) << AST.takeError();
+    Record("use", Foo);
+  });
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  EXPECT_EQ(Priorities,
+            (std::map<std::string, bool>{{"ast:bar.cpp", false},
+                                         {"ast:foo.cpp", true},
+                                         {"preamble:bar.cpp", false},
+                                         {"preamble:foo.cpp", true},
+                                         {"use:foo.cpp", false}}));
+}
+#endif
 
 TEST_F(TUSchedulerTests, NoopChangesDontThrashCache) {
   auto Opts = optsForTest();

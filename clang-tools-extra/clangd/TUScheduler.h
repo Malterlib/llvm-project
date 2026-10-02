@@ -244,6 +244,12 @@ public:
     /// Determines when to keep idle ASTs in memory for future use.
     ASTRetentionPolicy RetentionPolicy;
 
+    /// Number of most recently used open files that are parsed at normal
+    /// priority. The others are parsed at low priority, so that many files
+    /// reparsing at once, e.g. after a build changed headers they include,
+    /// don't slow down other processes. Zero parses all at normal priority.
+    unsigned NormalPriorityFiles = 0;
+
     /// This throttler controls which preambles may be built at a given time.
     clangd::PreambleThrottler *PreambleThrottler = nullptr;
 
@@ -397,6 +403,8 @@ public:
   class ASTCache;
   /// Tracks headers included by open files, to get known-good compile commands.
   class HeaderIncluderCache;
+  /// Limits how many workers run tasks at low priority at once.
+  class LowPrioritySlots;
 
   // The file being built/processed in the current thread. This is a hack in
   // order to get the file name into the index implementations. Do not depend on
@@ -443,8 +451,13 @@ private:
   /// Returns whether files that should be closed were busy, or closing them
   /// was suspended, unless \p IgnoreSuspension.
   bool closeIdleFiles(bool IgnoreSuspension);
+  /// Runs the workers of all but the most recently used files at low priority
+  /// (see Options::NormalPriorityFiles).
+  void updateWorkerPrioritiesLocked();
   std::unique_ptr<ASTCache> IdleASTs;
   std::unique_ptr<HeaderIncluderCache> HeaderIncluders;
+  /// Null unless workers of files that aren't used run at low priority.
+  std::unique_ptr<LowPrioritySlots> LowSlots;
   // std::nullopt when running tasks synchronously and non-std::nullopt when
   // running tasks asynchronously.
   std::optional<AsyncTaskRunner> PreambleTasks;

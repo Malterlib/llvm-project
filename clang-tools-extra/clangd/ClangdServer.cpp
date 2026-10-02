@@ -230,6 +230,7 @@ ClangdServer::Options::operator TUScheduler::Options() const {
   TUScheduler::Options Opts;
   Opts.AsyncThreadsCount = AsyncThreadsCount;
   Opts.RetentionPolicy = RetentionPolicy;
+  Opts.NormalPriorityFiles = NormalPriorityFiles;
   Opts.StorePreamblesInMemory = StorePreamblesInMemory;
   Opts.UpdateDebounce = UpdateDebounce;
   Opts.ContextProvider = ContextProvider;
