@@ -18,6 +18,8 @@
 // A value that isn't a boolean is reported and leaves fix-its off.
 // RUN: clang-tidy --config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml', malterlib.FixIts: maybe}}" --checks='-*,malterlib-struct-not-class,malterlib-unused-parameter-cast' --export-fixes=%t.bad.yaml %t.in.cpp -- -std=c++20 2>&1 | FileCheck --check-prefixes=CHECK-BAD,CHECK-MESSAGES --implicit-check-not='{{warning|error}}:' %s
 // RUN: FileCheck --check-prefix=CHECK-EXPORT --implicit-check-not=ReplacementText --input-file=%t.bad.yaml %s
+// The option is one the configuration may name.
+// RUN: clang-tidy --verify-config --config="{Checks: '-*,malterlib-struct-not-class', CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml', malterlib.FixIts: true}}" 2>&1 | FileCheck --check-prefix=CHECK-VERIFY --implicit-check-not='{{warning|error}}:' %s
 // The plugin offers no fixes, with the option on or off.
 // RUN: rm -rf %t.plugin && mkdir -p %t.plugin
 // RUN: %python %S/Inputs/fixit-inputs.py plugin-config-on %t.plugin/on.yaml
@@ -26,6 +28,7 @@
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -std=c++20 -fdiagnostics-parseable-fixits -fplugin-arg-malterlib-config-file=%t.plugin/on.yaml %t.in.cpp 2>&1 | FileCheck --check-prefix=CHECK-PLUGIN --implicit-check-not=fix-it: %s
 
 // CHECK-BAD: warning: invalid configuration value 'maybe' for option 'malterlib.FixIts'; expected a bool [clang-tidy-config]
+// CHECK-VERIFY: No config errors detected.
 // CHECK-EXPORT: DiagnosticName: malterlib-struct-not-class
 // CHECK-EXPORT: DiagnosticName: malterlib-unused-parameter-cast
 // CHECK-EXPORT-ON: DiagnosticName: malterlib-struct-not-class
