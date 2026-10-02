@@ -685,6 +685,44 @@ TidyProvider addClangArgs(std::vector<llvm::StringRef> ExtraArgs,
   };
 }
 
+TEST(DiagnosticTest, MalterlibConfigurationErrorOnEachParse) {
+  // Each parse of the file reports that the options file the Malterlib
+  // checks need isn't named, not only the first.
+  TestTU TU = TestTU::withCode("void fg_Test() {} // error-ok");
+  TU.ClangTidyProvider = addTidyChecks("malterlib-function-naming");
+  auto Missing = Field(&Diag::Message,
+                       ::testing::HasSubstr("the Malterlib checks need the "
+                                            "option 'malterlib.OptionsFile'"));
+  EXPECT_THAT(TU.build().getDiagnostics(), Contains(Missing));
+  EXPECT_THAT(TU.build().getDiagnostics(), Contains(Missing));
+}
+
+TEST(DiagnosticTest, MalterlibOptionsFileChanges) {
+  // A parse after the options file is made, or changes, reads it again, of
+  // the file system of the files.
+  const std::string Path = testPath("ClangTidyOptions.yaml");
+  TestTU TU = TestTU::withCode("void clear(); // error-ok");
+  TU.ClangTidyProvider = [Path](tidy::ClangTidyOptions &Options,
+                                llvm::StringRef) {
+    Options.Checks = "-*,malterlib-function-naming";
+    Options.CheckOptions["malterlib.OptionsFile"] =
+        tidy::ClangTidyOptions::ClangTidyValue(Path);
+  };
+  auto Unreadable = Field(&Diag::Message,
+                          ::testing::HasSubstr("can't read the Malterlib "
+                                               "options file"));
+  auto Prefix =
+      Field(&Diag::Message, ::testing::HasSubstr("should have the 'fg_' "
+                                                 "prefix"));
+  EXPECT_THAT(TU.build().getDiagnostics(), Contains(Unreadable));
+  TU.AdditionalFiles["ClangTidyOptions.yaml"] =
+      "LowerCaseFreeFunctions: clear\n";
+  EXPECT_THAT(TU.build().getDiagnostics(), IsEmpty());
+  TU.AdditionalFiles["ClangTidyOptions.yaml"] =
+      "LowerCaseFreeFunctions: '-clear'\n";
+  EXPECT_THAT(TU.build().getDiagnostics(), ElementsAre(Prefix));
+}
+
 TEST(DiagnosticTest, ClangTidyEnablesClangWarning) {
   Annotations Main(R"cpp( // error-ok
     static void [[foo]]() {}
@@ -708,8 +746,9 @@ TEST(DiagnosticTest, ClangTidyEnablesClangWarning) {
   // clang-diagnostic-* is acceptable
   TU.ClangTidyProvider = addClangArgs({"-Wunused"}, "clang-diagnostic-*");
   EXPECT_THAT(TU.build().getDiagnostics(), ElementsAre(UnusedFooWarning));
-  // And plain * (may turn on other checks too).
-  TU.ClangTidyProvider = addClangArgs({"-Wunused"}, "*");
+  // And plain * (may turn on other checks too), but not the Malterlib
+  // checks, which need their options file.
+  TU.ClangTidyProvider = addClangArgs({"-Wunused"}, "*,-malterlib-*");
   EXPECT_THAT(TU.build().getDiagnostics(), Contains(UnusedFooWarning));
   // And we can explicitly exclude a category too.
   TU.ClangTidyProvider = addClangArgs(

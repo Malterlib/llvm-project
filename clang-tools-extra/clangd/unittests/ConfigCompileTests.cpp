@@ -304,6 +304,28 @@ TEST_F(ConfigCompileTests, DiagnosticSuppression) {
   EXPECT_THAT(Conf.Diagnostics.Suppress, IsEmpty());
 }
 
+// An option a later fragment sets again takes the place of the earlier value,
+// which is kept for the options whose values edit those before.
+TEST_F(ConfigCompileTests, TidyReplacedOptions) {
+  Conf = Config();
+  for (const char *Value : {"first", "second", "third"}) {
+    Frag = {};
+    Frag.Diagnostics.ClangTidy.CheckOptions.emplace_back(std::make_pair(
+        std::string("LowerCaseFreeFunctions"), std::string(Value)));
+    EXPECT_TRUE(std::move(Frag).compile(Diags.callback())(Parm, Conf));
+  }
+  EXPECT_EQ(
+      Conf.Diagnostics.ClangTidy.CheckOptions.lookup("LowerCaseFreeFunctions"),
+      "third");
+  EXPECT_EQ(Conf.Diagnostics.ClangTidy.CheckOptionFragments.lookup(
+                "LowerCaseFreeFunctions"),
+            3U);
+  EXPECT_THAT(
+      Conf.Diagnostics.ClangTidy.ReplacedCheckOptions.lookup(
+          "LowerCaseFreeFunctions"),
+      ElementsAre(std::make_pair("first", 1U), std::make_pair("second", 2U)));
+}
+
 TEST_F(ConfigCompileTests, Tidy) {
   auto &Tidy = Frag.Diagnostics.ClangTidy;
   Tidy.Add.emplace_back("bugprone-use-after-move");
@@ -331,6 +353,37 @@ TEST_F(ConfigCompileTests, Tidy) {
               "clang-tidy check 'bugprone-use-after-move' was not found"),
           diagMessage("clang-tidy check 'llvm-include-order' was not found")));
 #endif
+}
+
+TEST_F(ConfigCompileTests, TidyPathOptions) {
+  // Relative to the directory of the fragment, like in a .clang-tidy.
+  auto &Tidy = Frag.Diagnostics.ClangTidy;
+  Tidy.CheckOptions.emplace_back(std::make_pair(
+      std::string("malterlib.OptionsFile"), std::string("Core/Options.yaml")));
+  Tidy.CheckOptions.emplace_back(std::make_pair(
+      std::string("example-check.Path"), std::string("Core/Options.yaml")));
+  Frag.Source.Directory = testRoot();
+  EXPECT_TRUE(compileAndApply());
+  EXPECT_THAT(Diags.Diagnostics, IsEmpty());
+  EXPECT_EQ(
+      Conf.Diagnostics.ClangTidy.CheckOptions.lookup("malterlib.OptionsFile"),
+      testPath("Core/Options.yaml"));
+  EXPECT_EQ(
+      Conf.Diagnostics.ClangTidy.CheckOptions.lookup("example-check.Path"),
+      "Core/Options.yaml");
+
+  // Which a fragment without one can't have.
+  Frag = {};
+  Frag.Diagnostics.ClangTidy.CheckOptions.emplace_back(std::make_pair(
+      std::string("malterlib.OptionsFile"), std::string("Core/Options.yaml")));
+  compileAndApply();
+  EXPECT_THAT(Diags.Diagnostics,
+              ElementsAre(diagMessage(
+                  "A path in CheckOptions must be an absolute path, because "
+                  "this fragment is not associated with any directory.")));
+  EXPECT_EQ(
+      Conf.Diagnostics.ClangTidy.CheckOptions.count("malterlib.OptionsFile"),
+      0U);
 }
 
 TEST_F(ConfigCompileTests, TidyBadChecks) {

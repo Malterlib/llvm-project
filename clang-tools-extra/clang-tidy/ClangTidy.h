@@ -72,11 +72,14 @@ ChecksAndOptions getAllChecksAndOptions(bool AllowEnablingAnalyzerAlphaCheckers,
 /// The method configures ClangTidy with the specified \p Options and collects
 /// effective options from all created checks. The returned set of options
 /// includes default check-specific options for all keys not overridden by \p
-/// Options.
+/// Options. What the checks report of the configuration as they are made, like
+/// an options file they can't read, goes to \p Errors.
 ClangTidyOptions::OptionMap
 getCheckOptions(const ClangTidyOptions &Options,
                 bool AllowEnablingAnalyzerAlphaCheckers,
-                bool ExperimentalCustomChecks);
+                bool ExperimentalCustomChecks,
+                std::vector<ClangTidyError> *Errors = nullptr,
+                llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS = nullptr);
 
 /// Filters CheckOptions in \p Options to only include options specified in
 /// the \p EnabledChecks which is a sorted vector.

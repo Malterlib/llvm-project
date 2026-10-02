@@ -861,6 +861,11 @@ static void InitializePredefinedMacros(const TargetInfo &TI,
   Builder.defineMacro("__clang_version__",
                       "\"" CLANG_VERSION_STRING " "
                       + getClangFullRepositoryVersion() + "\"");
+  // The version of the Malterlib clang-tidy checks this fork has, which the
+  // compiler, clang-tidy and clangd share, so code can tell what the checks
+  // understand, like a workaround that only an older version needs. It is
+  // raised when a check stops reporting what code worked around.
+  Builder.defineMacro("__malterlib_tidy_version__", "1");
 
   if (LangOpts.GNUCVersion != 0) {
     // Major, minor, patch, are given two decimal places each, so 4.2.1 becomes
