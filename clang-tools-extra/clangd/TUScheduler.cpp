@@ -100,6 +100,57 @@ namespace clang {
 namespace clangd {
 using std::chrono::steady_clock;
 
+/// Limits how many workers run tasks at low priority at once, so that they
+/// leave slots of the Barrier to the workers of the most recently used files,
+/// which would otherwise wait for workers slowed down by other processes.
+class TUScheduler::LowPrioritySlots {
+public:
+  LowPrioritySlots(unsigned Count) : Free(Count) {}
+
+  /// Waits until a slot is free, calling \p OnWait if it has to, or until
+  /// \p Priority is no longer low. Returns whether it took a slot.
+  bool acquire(const AdjustableThreadPriority &Priority,
+               llvm::function_ref<void()> OnWait) {
+    std::unique_lock<std::mutex> Lock(Mu);
+    bool Waited = false;
+    // The priority can change concurrently, so check it and the slots together.
+    while (Priority.wantsLow()) {
+      if (Free) {
+        --Free;
+        return true;
+      }
+      if (!Waited) {
+        Waited = true;
+        Lock.unlock();
+        OnWait();
+        Lock.lock();
+        continue;
+      }
+      CV.wait(Lock);
+    }
+    return false;
+  }
+
+  void release() {
+    {
+      std::lock_guard<std::mutex> Lock(Mu);
+      ++Free;
+    }
+    CV.notify_one();
+  }
+
+  /// Wakes up workers waiting for a slot whose priority was raised.
+  void priorityRaised() {
+    std::lock_guard<std::mutex> Lock(Mu);
+    CV.notify_all();
+  }
+
+private:
+  std::mutex Mu;
+  std::condition_variable CV;
+  unsigned Free; /* GUARDED_BY(Mu) */
+};
+
 namespace {
 // Tracks latency (in seconds) of FS operations done during a preamble build.
 // build_type allows to split by expected VFS cache state (cold on first
@@ -468,11 +519,11 @@ public:
                  bool StorePreambleInMemory, bool RunSync,
                  PreambleThrottler *Throttler, SynchronizedTUStatus &Status,
                  TUScheduler::HeaderIncluderCache &HeaderIncluders,
-                 ASTWorker &AW)
+                 ASTWorker &AW, bool AdjustsPriority)
       : FileName(FileName), Callbacks(Callbacks),
         StoreInMemory(StorePreambleInMemory), RunSync(RunSync),
-        Throttler(Throttler), Status(Status), ASTPeer(AW),
-        HeaderIncluders(HeaderIncluders) {}
+        AdjustsPriority(AdjustsPriority), Throttler(Throttler), Status(Status),
+        ASTPeer(AW), HeaderIncluders(HeaderIncluders) {}
 
   /// It isn't guaranteed that each requested version will be built. If there
   /// are multiple update requests while building a preamble, only the last one
@@ -518,6 +569,12 @@ public:
     // thread can notice the stack usage and prevent stack overflow with best
     // efforts. Same applies to other calls thoughout clangd.
     clang::noteBottomOfStack();
+    if (AdjustsPriority)
+      Priority.attach();
+    llvm::scope_exit DetachPriority([&] {
+      if (AdjustsPriority)
+        Priority.detach();
+    });
     while (true) {
       std::optional<PreambleThrottlerRequest> Throttle;
       {
@@ -556,6 +613,8 @@ public:
         // reuse the context/config that was created at that level.
 
         // Build the preamble and let the waiters know about it.
+        if (AdjustsPriority)
+          Priority.apply();
         build(std::move(*CurrentReq));
       }
       // Releasing the throttle before destroying the request assists testing.
@@ -601,6 +660,12 @@ public:
     return !NextReq && !CurrentReq;
   }
 
+  /// Builds preambles at low or normal priority.
+  void setLowPriority(bool Low) {
+    if (AdjustsPriority)
+      Priority.setLow(Low);
+  }
+
 private:
   /// Holds inputs required for building a preamble. CI is guaranteed to be
   /// non-null.
@@ -635,6 +700,8 @@ private:
   ParsingCallbacks &Callbacks;
   const bool StoreInMemory;
   const bool RunSync;
+  const bool AdjustsPriority;
+  AdjustableThreadPriority Priority;
   PreambleThrottler *Throttler;
 
   SynchronizedTUStatus &Status;
@@ -659,7 +726,8 @@ class ASTWorker {
   ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
             TUScheduler::ASTCache &LRUCache,
             TUScheduler::HeaderIncluderCache &HeaderIncluders,
-            Semaphore &Barrier, bool RunSync, const TUScheduler::Options &Opts,
+            Semaphore &Barrier, TUScheduler::LowPrioritySlots *LowSlots,
+            bool RunSync, const TUScheduler::Options &Opts,
             ParsingCallbacks &Callbacks);
 
 public:
@@ -668,11 +736,14 @@ public:
   /// is null, all requests will be processed on the calling thread
   /// synchronously instead. \p Barrier is acquired when processing each
   /// request, it is used to limit the number of actively running threads.
+  /// Unless \p LowSlots is null, the worker's threads run at the priority set
+  /// by setLowPriority(), acquiring one of \p LowSlots too while it's low.
   static ASTWorkerHandle
   create(PathRef FileName, const GlobalCompilationDatabase &CDB,
          TUScheduler::ASTCache &IdleASTs,
          TUScheduler::HeaderIncluderCache &HeaderIncluders,
          AsyncTaskRunner *Tasks, Semaphore &Barrier,
+         TUScheduler::LowPrioritySlots *LowSlots,
          const TUScheduler::Options &Opts, ParsingCallbacks &Callbacks);
   ~ASTWorker();
   ASTWorker(const ASTWorker &other) = delete;
@@ -693,6 +764,17 @@ public:
   /// scheduled outside TUScheduler's lock, until unpin().
   void pin() { ++Pins; }
   void unpin() { --Pins; }
+  /// Runs the worker's threads at low or normal priority. Raising it also
+  /// raises tasks they're running, where possible. Can be called from any
+  /// thread.
+  void setLowPriority(bool Low) {
+    if (!LowSlots)
+      return;
+    Priority.setLow(Low);
+    PreamblePeer.setLowPriority(Low);
+    if (!Low)
+      LowSlots->priorityRaised();
+  }
   /// The inputs of the latest update.
   ParseInputs latestInputs();
   /// The headers the latest AST included, also outside the preamble.
@@ -813,6 +895,9 @@ private:
   ParsingCallbacks &Callbacks;
 
   Semaphore &Barrier;
+  TUScheduler::LowPrioritySlots *const LowSlots;
+  /// The priority of the worker's thread.
+  AdjustableThreadPriority Priority;
   /// Whether the 'onMainAST' callback ran for the current FileInputs.
   bool RanASTCallback = false;
   /// Requests being scheduled outside TUScheduler's lock.
@@ -919,16 +1004,15 @@ private:
   std::shared_ptr<ASTWorker> Worker;
 };
 
-ASTWorkerHandle
-ASTWorker::create(PathRef FileName, const GlobalCompilationDatabase &CDB,
-                  TUScheduler::ASTCache &IdleASTs,
-                  TUScheduler::HeaderIncluderCache &HeaderIncluders,
-                  AsyncTaskRunner *Tasks, Semaphore &Barrier,
-                  const TUScheduler::Options &Opts,
-                  ParsingCallbacks &Callbacks) {
-  std::shared_ptr<ASTWorker> Worker(
-      new ASTWorker(FileName, CDB, IdleASTs, HeaderIncluders, Barrier,
-                    /*RunSync=*/!Tasks, Opts, Callbacks));
+ASTWorkerHandle ASTWorker::create(
+    PathRef FileName, const GlobalCompilationDatabase &CDB,
+    TUScheduler::ASTCache &IdleASTs,
+    TUScheduler::HeaderIncluderCache &HeaderIncluders, AsyncTaskRunner *Tasks,
+    Semaphore &Barrier, TUScheduler::LowPrioritySlots *LowSlots,
+    const TUScheduler::Options &Opts, ParsingCallbacks &Callbacks) {
+  std::shared_ptr<ASTWorker> Worker(new ASTWorker(
+      FileName, CDB, IdleASTs, HeaderIncluders, Barrier,
+      Tasks ? LowSlots : nullptr, /*RunSync=*/!Tasks, Opts, Callbacks));
   if (Tasks) {
     Tasks->runAsync("ASTWorker:" + llvm::sys::path::filename(FileName),
                     [Worker]() { Worker->run(); });
@@ -942,16 +1026,19 @@ ASTWorker::create(PathRef FileName, const GlobalCompilationDatabase &CDB,
 ASTWorker::ASTWorker(PathRef FileName, const GlobalCompilationDatabase &CDB,
                      TUScheduler::ASTCache &LRUCache,
                      TUScheduler::HeaderIncluderCache &HeaderIncluders,
-                     Semaphore &Barrier, bool RunSync,
+                     Semaphore &Barrier,
+                     TUScheduler::LowPrioritySlots *LowSlots, bool RunSync,
                      const TUScheduler::Options &Opts,
                      ParsingCallbacks &Callbacks)
     : IdleASTs(LRUCache), HeaderIncluders(HeaderIncluders),
       IndexedHeaderIncluder(Opts.IndexedHeaderIncluder), RunSync(RunSync),
       UpdateDebounce(Opts.UpdateDebounce), FileName(FileName),
       ContextProvider(Opts.ContextProvider), CDB(CDB), Callbacks(Callbacks),
-      Barrier(Barrier), Done(false), Status(FileName, Callbacks),
+      Barrier(Barrier), LowSlots(LowSlots), Done(false),
+      Status(FileName, Callbacks),
       PreamblePeer(FileName, Callbacks, Opts.StorePreamblesInMemory, RunSync,
-                   Opts.PreambleThrottler, Status, HeaderIncluders, *this) {
+                   Opts.PreambleThrottler, Status, HeaderIncluders, *this,
+                   /*AdjustsPriority=*/LowSlots != nullptr) {
   // Set a fallback command because compile command can be accessed before
   // `Inputs` is initialized. Other fields are only used after initialization
   // from client inputs.
@@ -1654,6 +1741,12 @@ void ASTWorker::startTask(llvm::StringRef Name,
 
 void ASTWorker::run() {
   clang::noteBottomOfStack();
+  if (LowSlots)
+    Priority.attach();
+  llvm::scope_exit DetachPriority([&] {
+    if (LowSlots)
+      Priority.detach();
+  });
   while (true) {
     {
       std::unique_lock<std::mutex> Lock(Mutex);
@@ -1707,6 +1800,22 @@ void ASTWorker::run() {
     // It is safe to perform reads to CurrentRequest without holding the lock as
     // only writer is also this thread.
     {
+      // Tasks at low priority also wait for one of LowSlots, so that they leave
+      // slots of the Barrier to the most recently used files.
+      bool TookLowSlot = false;
+      // Without a slot, the priority was raised while waiting, but it can have
+      // been lowered again since.
+      while (!TookLowSlot && LowSlots && Priority.apply())
+        TookLowSlot = LowSlots->acquire(Priority, [&] {
+          Status.update([&](TUStatus &Status) {
+            Status.ASTActivity.K = ASTAction::Queued;
+            Status.ASTActivity.Name = CurrentRequest->Name;
+          });
+        });
+      llvm::scope_exit ReleaseLowSlot([&] {
+        if (TookLowSlot)
+          LowSlots->release();
+      });
       std::unique_lock<Semaphore> Lock(Barrier, std::try_to_lock);
       if (!Lock.owns_lock()) {
         Status.update([&](TUStatus &Status) {
@@ -1934,6 +2043,16 @@ TUScheduler::TUScheduler(const GlobalCompilationDatabase &CDB,
   if (0 < Opts.AsyncThreadsCount) {
     PreambleTasks.emplace();
     WorkerThreads.emplace();
+    if (Opts.NormalPriorityFiles) {
+      if (AdjustableThreadPriority::isSupported())
+        LowSlots = std::make_unique<LowPrioritySlots>(
+            Opts.AsyncThreadsCount > Opts.NormalPriorityFiles
+                ? Opts.AsyncThreadsCount - Opts.NormalPriorityFiles
+                : 1);
+      else
+        log("Parsing all open files at normal priority, as threads can't "
+            "raise their priority again after lowering it");
+    }
     // Synchronous workers would run the reparses within the preamble build of
     // another file.
     HeaderIncluders->OnNewIncluders =
@@ -1995,9 +2114,10 @@ bool TUScheduler::update(PathRef File, ParseInputs Inputs,
     NewFile = FD == nullptr;
     if (!FD) {
       // Create a new worker to process the AST-related tasks.
-      ASTWorkerHandle NewWorker = ASTWorker::create(
-          File, CDB, *IdleASTs, *HeaderIncluders,
-          WorkerThreads ? &*WorkerThreads : nullptr, Barrier, Opts, *Callbacks);
+      ASTWorkerHandle NewWorker =
+          ASTWorker::create(File, CDB, *IdleASTs, *HeaderIncluders,
+                            WorkerThreads ? &*WorkerThreads : nullptr, Barrier,
+                            LowSlots.get(), Opts, *Callbacks);
       Worker = NewWorker.lockMutable();
       FD = std::unique_ptr<FileData>(
           new FileData{Inputs.Contents, std::move(NewWorker),
@@ -2024,6 +2144,7 @@ bool TUScheduler::update(PathRef File, ParseInputs Inputs,
     if (ContentChanged || WantDiags == WantDiagnostics::Yes ||
         Inputs.ForceRebuild)
       FD->LastUsed = std::chrono::steady_clock::now();
+    updateWorkerPrioritiesLocked();
     // There might be synthetic update requests, don't change the LastActiveFile
     // in such cases.
     if (ContentChanged)
@@ -2043,10 +2164,12 @@ void TUScheduler::reopenClosedFileLocked(PathRef File, FileData &FD,
   log("Reopening {0}, which was closed to free its resources", File);
   FD.Worker = ASTWorker::create(File, CDB, *IdleASTs, *HeaderIncluders,
                                 WorkerThreads ? &*WorkerThreads : nullptr,
-                                Barrier, Opts, *Callbacks);
+                                Barrier, LowSlots.get(), Opts, *Callbacks);
   FD.Worker->setCompileCommand(std::move(FD.ClosedCommand));
   ParseInputs Inputs = std::move(*FD.ClosedInputs);
   FD.ClosedInputs.reset();
+  // Callers that use the file updated LastUsed before reopening it.
+  updateWorkerPrioritiesLocked();
   // Update the worker before releasing the lock, so that requests scheduled
   // by other threads see it parsed. Closing idle files needs worker threads,
   // so this doesn't parse the file on this thread.
@@ -2276,7 +2399,25 @@ bool TUScheduler::closeIdleFiles(bool IgnoreSuspension) {
     Callbacks->onFailedAST(C->File, Version, {},
                            [](llvm::function_ref<void()> Publish) { Publish(); });
   }
+  updateWorkerPrioritiesLocked();
   return Busy;
+}
+
+void TUScheduler::updateWorkerPrioritiesLocked() {
+  if (!LowSlots)
+    return;
+  std::vector<std::pair<std::chrono::steady_clock::time_point, ASTWorker *>>
+      Live;
+  for (auto &PathAndFile : Files)
+    if (!PathAndFile.second->isClosed())
+      Live.emplace_back(PathAndFile.second->LastUsed,
+                        &*PathAndFile.second->Worker);
+  size_t Normal = std::min<size_t>(Opts.NormalPriorityFiles, Live.size());
+  std::nth_element(
+      Live.begin(), Live.begin() + Normal, Live.end(),
+      [](const auto &L, const auto &R) { return L.first > R.first; });
+  for (size_t I = 0; I < Live.size(); ++I)
+    Live[I].second->setLowPriority(I >= Normal);
 }
 
 bool TUScheduler::isClosed(PathRef File) const {
@@ -2290,6 +2431,8 @@ void TUScheduler::remove(PathRef File) {
   {
     std::lock_guard<std::mutex> Lock(FilesMu);
     Removed = Files.erase(File);
+    if (Removed)
+      updateWorkerPrioritiesLocked();
   }
   if (!Removed)
     elog("Trying to remove file from TUScheduler that is not tracked: {0}",
@@ -2349,9 +2492,12 @@ void TUScheduler::runWithAST(
     auto It = Files.find(File);
     if (It != Files.end()) {
       LastActiveFile = File.str();
-      reopenClosedFileLocked(File, *It->second,
-                             /*UpdateWithClosedInputs=*/true);
       It->second->LastUsed = std::chrono::steady_clock::now();
+      if (It->second->isClosed())
+        reopenClosedFileLocked(File, *It->second,
+                               /*UpdateWithClosedInputs=*/true);
+      else
+        updateWorkerPrioritiesLocked();
       Worker = It->second->Worker.lockMutable();
       Worker->pin();
     }
@@ -2377,9 +2523,12 @@ void TUScheduler::runWithPreamble(llvm::StringRef Name, PathRef File,
     auto It = Files.find(File);
     if (It != Files.end()) {
       LastActiveFile = File.str();
-      reopenClosedFileLocked(File, *It->second,
-                             /*UpdateWithClosedInputs=*/true);
       It->second->LastUsed = std::chrono::steady_clock::now();
+      if (It->second->isClosed())
+        reopenClosedFileLocked(File, *It->second,
+                               /*UpdateWithClosedInputs=*/true);
+      else
+        updateWorkerPrioritiesLocked();
       Contents = It->second->Contents;
       Worker = It->second->Worker.lockMutable();
       // Until the action ran, as closing the file would stop it waiting for

@@ -15,12 +15,17 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <pthread/qos.h>
+#endif
 
 namespace clang {
 namespace clangd {
@@ -38,6 +43,51 @@ private:
   std::mutex Mutex;
   std::condition_variable SlotsChanged;
   std::size_t FreeSlots;
+};
+
+/// The priority of a thread that runs tasks, which is lowered while its tasks
+/// are less important, e.g. those of files that aren't being used. The thread
+/// applies the requested priority itself before each task, and other threads
+/// can raise it while it runs a task, where the platform allows it.
+class AdjustableThreadPriority {
+public:
+  /// Whether threads can raise their priority again after lowering it. Linux
+  /// only allows lowering the nice value again with CAP_SYS_NICE or a
+  /// sufficient RLIMIT_NICE, which by default there isn't.
+  static bool isSupported();
+
+  ~AdjustableThreadPriority() { assert(!Attached && "Thread still running?"); }
+
+  /// Requests the thread to run at low or normal priority. Raising it also
+  /// raises the task it's running, where possible. Can be called from any
+  /// thread.
+  void setLow(bool Low);
+  /// Whether low priority is requested.
+  bool wantsLow() const { return WantLow; }
+
+  /// Called by the thread when it starts, before applying the priority.
+  void attach();
+  /// Called by the thread before each task, returning whether it now runs at
+  /// low priority.
+  bool apply();
+  /// Called by the thread before it exits.
+  void detach();
+
+private:
+  std::mutex Mu;
+  std::atomic<bool> WantLow = {false};
+  /// The priority the thread set itself, if it set one.
+  std::optional<bool> IsLow; /* GUARDED_BY(Mu) */
+  bool Attached = false;     /* GUARDED_BY(Mu) */
+#if defined(__APPLE__)
+  pthread_t Thread; /* GUARDED_BY(Mu) */
+#elif defined(__linux__)
+  uint64_t ThreadID; /* GUARDED_BY(Mu) */
+#endif
+#if defined(__APPLE__)
+  /// Raises the thread while it runs a task at low priority.
+  pthread_override_t Override = nullptr; /* GUARDED_BY(Mu) */
+#endif
 };
 
 /// A point in time we can wait for.

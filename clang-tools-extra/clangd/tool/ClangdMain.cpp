@@ -435,6 +435,18 @@ opt<unsigned> MinLiveFiles{
     init(3),
 };
 
+opt<unsigned> NormalPriorityFiles{
+    "normal-priority-files",
+    cat(Misc),
+    desc("Number of most recently used open files that are parsed at normal "
+         "priority. The others are parsed at low priority, so that many files "
+         "reparsing at once, e.g. after a build changed headers they include, "
+         "don't slow down other processes. 0 parses all at normal priority. "
+         "Ignored where threads can't raise their priority again, e.g. on "
+         "Linux without CAP_SYS_NICE or a sufficient RLIMIT_NICE"),
+    init(3),
+};
+
 opt<bool> Sync{
     "sync",
     cat(Misc),
@@ -1014,6 +1026,7 @@ clangd accepts flags on the commandline, and in the CLANGD_FLAGS environment var
       std::chrono::minutes(CloseIdleFilesAfter);
   Opts.RetentionPolicy.MaxLiveFiles = MaxLiveFiles;
   Opts.RetentionPolicy.MinLiveFiles = MinLiveFiles;
+  Opts.NormalPriorityFiles = NormalPriorityFiles;
   if (!ResourceDir.empty())
     Opts.ResourceDir = ResourceDir;
   Opts.StrongWorkspaceMode = StrongWorkspaceMode;

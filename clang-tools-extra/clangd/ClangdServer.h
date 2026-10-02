@@ -109,6 +109,9 @@ public:
     /// AST caching policy. The default is to keep up to 3 ASTs in memory.
     ASTRetentionPolicy RetentionPolicy;
 
+    /// See TUScheduler::Options::NormalPriorityFiles.
+    unsigned NormalPriorityFiles = 0;
+
     /// Cached preambles are potentially large. If false, store them on disk.
     bool StorePreamblesInMemory = true;
 
