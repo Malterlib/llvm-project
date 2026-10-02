@@ -7,7 +7,9 @@ set(LLVM_LINK_COMPONENTS
 add_clang_library(clangTidyMalterlibModule STATIC
   CheckedAccess.cpp
   ConceptualPrefixCheck.cpp
+  FixIts.cpp
   FunctionNamingCheck.cpp
+  HeaderDeclarationsOnlyCheck.cpp
   MacroNamingCheck.cpp
   LibraryFunctions.cpp
   MalterlibCheck.cpp
@@ -16,7 +18,9 @@ add_clang_library(clangTidyMalterlibModule STATIC
   NamingUtils.cpp
   ParameterNamingCheck.cpp
   StackSegments.cpp
+  StructNotClassCheck.cpp
   TypeNamingCheck.cpp
+  UnusedParameterCastCheck.cpp
   VariableNamingCheck.cpp
   WorkBudget.cpp
 
