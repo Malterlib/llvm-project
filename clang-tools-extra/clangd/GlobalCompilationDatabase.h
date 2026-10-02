@@ -64,6 +64,12 @@ public:
   /// For use in tests.
   virtual bool blockUntilIdle(Deadline D) const { return true; }
 
+  /// Notifies the CDB that compilation database files, such as
+  /// compile_commands.json, may have changed on disk. Changed databases are
+  /// reloaded immediately rather than when they are next found to be stale,
+  /// and watchers are notified of the files they cover. This may be slow.
+  virtual void checkForChanges(llvm::ArrayRef<std::string> CDBFiles) const {}
+
   using CommandChanged = Event<std::vector<std::string>>;
   /// The callback is notified when files may have new compile commands.
   /// The argument is a list of full file paths.
@@ -97,6 +103,8 @@ public:
   tooling::CompileCommand getFallbackCommand(PathRef File) const override;
 
   bool blockUntilIdle(Deadline D) const override;
+
+  void checkForChanges(llvm::ArrayRef<std::string> CDBFiles) const override;
 
 private:
   const GlobalCompilationDatabase *Base;
@@ -150,6 +158,10 @@ public:
   getProjectModules(PathRef File) const override;
 
   bool blockUntilIdle(Deadline Timeout) const override;
+
+  /// Reloads the compilation databases in the directories containing
+  /// \p CDBFiles, if clangd has looked for one there before.
+  void checkForChanges(llvm::ArrayRef<std::string> CDBFiles) const override;
 
 private:
   Options Opts;

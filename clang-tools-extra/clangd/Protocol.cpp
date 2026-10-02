@@ -499,6 +499,12 @@ bool fromJSON(const llvm::json::Value &Params, ClientCapabilities &R,
       if (auto RefreshSupport = SemanticTokens->getBoolean("refreshSupport"))
         R.SemanticTokenRefreshSupport = *RefreshSupport;
     }
+    if (auto *DidChangeWatchedFiles =
+            Workspace->getObject("didChangeWatchedFiles")) {
+      if (auto DynamicRegistration =
+              DidChangeWatchedFiles->getBoolean("dynamicRegistration"))
+        R.DidChangeWatchedFilesDynamicRegistration = *DynamicRegistration;
+    }
     if (auto *WorkspaceEdit = Workspace->getObject("workspaceEdit")) {
       if (auto DocumentChanges = WorkspaceEdit->getBoolean("documentChanges"))
         R.DocumentChanges = *DocumentChanges;
@@ -692,6 +698,24 @@ bool fromJSON(const llvm::json::Value &Params, DidChangeWatchedFilesParams &R,
               llvm::json::Path P) {
   llvm::json::ObjectMapper O(Params, P);
   return O && O.map("changes", R.changes);
+}
+
+llvm::json::Value toJSON(const FileSystemWatcher &W) {
+  return llvm::json::Object{{"globPattern", W.globPattern}};
+}
+
+llvm::json::Value toJSON(const DidChangeWatchedFilesRegistrationOptions &O) {
+  return llvm::json::Object{{"watchers", O.watchers}};
+}
+
+llvm::json::Value toJSON(const Registration &R) {
+  return llvm::json::Object{{"id", R.id},
+                            {"method", R.method},
+                            {"registerOptions", R.registerOptions}};
+}
+
+llvm::json::Value toJSON(const RegistrationParams &P) {
+  return llvm::json::Object{{"registrations", P.registrations}};
 }
 
 bool fromJSON(const llvm::json::Value &Params,

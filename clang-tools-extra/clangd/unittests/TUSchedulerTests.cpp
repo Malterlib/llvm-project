@@ -56,6 +56,7 @@ using ::testing::Each;
 using ::testing::ElementsAre;
 using ::testing::Eq;
 using ::testing::Field;
+using ::testing::HasSubstr;
 using ::testing::IsEmpty;
 using ::testing::Not;
 using ::testing::Pair;
@@ -836,9 +837,9 @@ TEST_F(TUSchedulerTests, NoopOnEmptyChanges) {
   CDB.ExtraClangFlags.push_back("-DSOMETHING");
   ASSERT_TRUE(DoUpdate(SourceContents));
   ASSERT_FALSE(DoUpdate(SourceContents));
-  // This causes 2 AST builds always. We first build an AST with the stale
-  // preamble, and build a second AST once the fresh preamble is ready.
-  ASSERT_EQ(S.fileStats().lookup(Source).ASTBuilds, 5u);
+  // The stale preamble was built with the old command, so no AST is built with
+  // it: its diagnostics are cleared until the fresh preamble is ready.
+  ASSERT_EQ(S.fileStats().lookup(Source).ASTBuilds, 4u);
   ASSERT_EQ(S.fileStats().lookup(Source).PreambleBuilds, 3u);
 }
 
@@ -912,7 +913,135 @@ TEST_F(TUSchedulerTests, MissingHeader) {
       });
 
   ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
-  EXPECT_EQ(DiagCount, 3U);
+  // Adding b/foo.h published twice: the stale preamble's diagnostics were
+  // cleared, then the rebuilt preamble's were published.
+  EXPECT_EQ(DiagCount, 4U);
+}
+
+// A header that __has_include didn't find invalidates the preamble when it
+// appears, like a missing include.
+TEST_F(TUSchedulerTests, HasIncludeHeaderAppears) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  ParseInputs Inputs = getInputs(Source, R"cpp(
+    #if __has_include("gen.h")
+    #include "gen.h"
+    #endif
+    int x = gen();
+  )cpp");
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  FS.Files[testPath("gen.h")] = "int gen();";
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  ASSERT_THAT(Published, Not(IsEmpty()));
+  EXPECT_THAT(Published.front(),
+              ElementsAre("use of undeclared identifier 'gen'"));
+  EXPECT_THAT(Published.back(), IsEmpty());
+}
+
+// __has_include_next only searches later include directories, so files with
+// the same name in earlier ones must not make the preamble look stale.
+TEST_F(TUSchedulerTests, HasIncludeNextKeepsPreamble) {
+  CDB.ExtraClangFlags = {"-I" + testPath("a"), "-I" + testPath("b")};
+  FS.Files["b/__unused__"] = "";
+  FS.Files[testPath("a/foo.h")] = R"cpp(
+    #if __has_include_next(<foo.h>)
+    #include_next <foo.h>
+    #endif
+    int fromA;
+  )cpp";
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  updateWithDiags(S, Source, "#include <foo.h>\nint x = fromA;",
+                  WantDiagnostics::Yes, [](std::vector<Diag>) {});
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  updateWithDiags(S, Source, "#include <foo.h>\nint y = fromA;",
+                  WantDiagnostics::Yes, [](std::vector<Diag>) {});
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_EQ(S.fileStats().lookup(Source).PreambleBuilds, 1u);
+}
+
+TEST_F(TUSchedulerTests, HasIncludeInMacroHeaderAppears) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  ParseInputs Inputs = getInputs(Source, R"cpp(
+    #define HAS(x) __has_include(x)
+    #if HAS("gen.h")
+    #include "gen.h"
+    #endif
+    int x = gen();
+  )cpp");
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  FS.Files[testPath("gen.h")] = "int gen();";
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  ASSERT_THAT(Published, Not(IsEmpty()));
+  EXPECT_THAT(Published.back(), IsEmpty());
+}
+
+// Modification times have a resolution of seconds, so a header can change
+// without its size or timestamp changing. Files reported changed are rebuilt.
+TEST_F(TUSchedulerTests, ChangedFilesInvalidatePreamble) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  auto Header = testPath("foo.h");
+  FS.Files[Header] = "int before;";
+  FS.Timestamps[Header] = time_t(1);
+  ParseInputs Inputs = getInputs(Source, "#include \"foo.h\"\nint x = after;");
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  // Same size and timestamp.
+  FS.Files[Header] = "int after; ";
+  auto Changed = std::make_shared<llvm::StringSet<>>();
+  Changed->insert(Header);
+  Inputs.ChangedFiles = std::move(Changed);
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  ASSERT_THAT(Published, Not(IsEmpty()));
+  EXPECT_THAT(Published.front(),
+              ElementsAre("use of undeclared identifier 'after'"));
+  EXPECT_THAT(Published.back(), IsEmpty());
 }
 
 TEST_F(TUSchedulerTests, NoChangeDiags) {
@@ -1317,6 +1446,252 @@ TEST_F(TUSchedulerTests, PublishWithStalePreamble) {
   S.update(File, PI, WantDiagnostics::No);
   ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
   EXPECT_THAT(Collector.diagVersions().back(), Pair("3", "3"));
+}
+
+// When a header changed on disk, diagnostics computed with the stale preamble
+// would report errors that the rebuilt preamble resolves, so they are cleared.
+TEST_F(TUSchedulerTests, ClearsStalePreambleDiagsWhenDependenciesChange) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  auto Header = testPath("foo.h");
+  FS.Files[Header] = "";
+  FS.Timestamps[Header] = time_t(1);
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+
+  updateWithDiags(S, Source, "#include \"foo.h\"\nint x = f();",
+                  WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  // Another tool declares f() in the header and edits the source file.
+  FS.Files[Header] = "int f();";
+  FS.Timestamps[Header] = time_t(2);
+  updateWithDiags(S, Source, "#include \"foo.h\"\nint y = f();",
+                  WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  EXPECT_THAT(Published,
+              ElementsAre(ElementsAre("use of undeclared identifier 'f'"),
+                          IsEmpty(), IsEmpty()));
+}
+
+// Includes outside the preamble aren't checked for changes, so callers that
+// know files changed on disk can request a new AST.
+TEST_F(TUSchedulerTests, RebuildASTForChangedNonPreambleIncludes) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  auto Header = testPath("foo.h");
+  FS.Files[Header] = "";
+  FS.Timestamps[Header] = time_t(1);
+  // The include follows a declaration, so it isn't part of the preamble.
+  ParseInputs Inputs =
+      getInputs(Source, "int a;\n#include \"foo.h\"\nint x = f();");
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  FS.Files[Header] = "int f();";
+  FS.Timestamps[Header] = time_t(2);
+  Inputs.RebuildAST = true;
+  updateWithDiags(S, Source, Inputs, WantDiagnostics::Yes, Record);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  EXPECT_THAT(
+      Published,
+      ElementsAre(ElementsAre("use of undeclared identifier 'f'"), IsEmpty()));
+}
+
+// Headers parsed in the context of an including file use a preamble built from
+// that file. Changes to the headers it includes before this one invalidate it.
+TEST_F(TUSchedulerTests, HeaderInContextPreambleTracksDependencies) {
+  // Headers are compiled in the context of a file that includes them.
+  Config Cfg;
+  Cfg.CompileFlags.CompileHeadersInContext = true;
+  WithContextValue WithCfg(Config::Key, std::move(Cfg));
+  static std::string Main = testPath("main.cpp"), A = testPath("a.h"),
+                     B = testPath("b.h");
+  struct NoHeadersCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+  TUScheduler S(CDB, optsForTest());
+
+  const char *MainContents = "#include \"a.h\"\n#include \"b.h\"\n";
+  FS.Files[Main] = MainContents;
+  FS.Files[A] = "";
+  FS.Timestamps[A] = time_t(1);
+  FS.Files[B] = "int y = a();";
+  S.update(Main, getInputs(Main, MainContents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  auto Update = [&] {
+    S.update(B, getInputs(B, "int y = a();"), WantDiagnostics::Yes);
+    EXPECT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+    return S.fileStats().lookup(B).PreambleBuilds;
+  };
+  EXPECT_EQ(Update(), 1u);
+  EXPECT_EQ(Update(), 1u);
+  // A header included before it invalidates the preamble.
+  FS.Files[A] = "int a();";
+  FS.Timestamps[A] = time_t(2);
+  EXPECT_EQ(Update(), 2u);
+  EXPECT_EQ(Update(), 2u);
+}
+
+// A header opened before the file that includes it is parsed in context once
+// that file's preamble is built, without publishing diagnostics from parsing it
+// without the context in between.
+TEST_F(TUSchedulerTests, HeaderInContextOpenedBeforeIncluder) {
+  // Headers are compiled in the context of a file that includes them.
+  Config Cfg;
+  Cfg.CompileFlags.CompileHeadersInContext = true;
+  WithContextValue WithCfg(Config::Key, std::move(Cfg));
+  static std::string Main = testPath("main.cpp"), A = testPath("a.h"),
+                     B = testPath("b.h");
+  struct NoHeadersCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+
+  const char *MainContents = "#include \"a.h\"\n#include \"b.h\"\n";
+  FS.Files[Main] = MainContents;
+  FS.Files[A] = "int a();";
+  FS.Files[B] = "int y = a();";
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  bool PublishedMain = false;
+  WithContextValue Ctx(DiagsCallbackKey,
+                       [&](PathRef File, std::vector<Diag> Diags) {
+                         if (File != B) {
+                           std::lock_guard<std::mutex> Lock(Mu);
+                           PublishedMain = true;
+                           return;
+                         }
+                         std::vector<std::string> Messages;
+                         for (const Diag &D : Diags)
+                           Messages.push_back(D.Message);
+                         std::lock_guard<std::mutex> Lock(Mu);
+                         Published.push_back(std::move(Messages));
+                       });
+  S.update(B, getInputs(B, "int y = a();"), WantDiagnostics::Yes);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  S.update(Main, getInputs(Main, MainContents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::lock_guard<std::mutex> Lock(Mu);
+  ASSERT_THAT(Published, Not(IsEmpty()));
+  EXPECT_THAT(Published.front(),
+              ElementsAre(HasSubstr("cannot reliably parse")));
+  EXPECT_THAT(Published,
+              Each(Not(Contains(HasSubstr("use of undeclared identifier")))));
+  EXPECT_THAT(Published.back(), IsEmpty());
+  // The including file isn't reparsed for its own includes.
+  EXPECT_FALSE(PublishedMain);
+}
+
+// The preamble of a header parsed in context stops at the header itself, not at
+// another header with the same name, and diagnostics of the including file
+// aren't reported for the header.
+TEST_F(TUSchedulerTests, HeaderInContextStopsAtTheHeader) {
+  // Headers are compiled in the context of a file that includes them.
+  Config Cfg;
+  Cfg.CompileFlags.CompileHeadersInContext = true;
+  WithContextValue WithCfg(Config::Key, std::move(Cfg));
+  static std::string Main = testPath("main.cpp"),
+                     OtherB = testPath("other/b.h"), B = testPath("b.h");
+  struct NoHeadersCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+
+  const char *MainContents = "#warning in main\n"
+                             "#include \"other/b.h\"\n"
+                             "#include \"b.h\"\n";
+  FS.Files[Main] = MainContents;
+  FS.Files[OtherB] = "int other();";
+  FS.Files[B] = "int y = other();";
+  S.update(Main, getInputs(Main, MainContents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::vector<std::string> Messages;
+  updateWithDiags(S, B, "int y = other();", WantDiagnostics::Yes,
+                  [&](std::vector<Diag> Diags) {
+                    for (const Diag &D : Diags)
+                      Messages.push_back(D.Message);
+                  });
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_THAT(Messages, IsEmpty());
+}
+
+// A reparse requested from another thread must not use older contents than an
+// update that is still queued.
+TEST_F(TUSchedulerTests, ReparseAllFilesUsesLatestContents) {
+  TUScheduler S(CDB, optsForTest(), captureDiags());
+  auto Source = testPath("foo.cpp");
+  updateWithDiags(S, Source, "int x = undeclared;", WantDiagnostics::Yes,
+                  [](std::vector<Diag>) {});
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  std::mutex Mu;
+  std::vector<std::vector<std::string>> Published;
+  auto Record = [&](std::vector<Diag> Diags) {
+    std::vector<std::string> Messages;
+    for (const Diag &D : Diags)
+      Messages.push_back(D.Message);
+    std::lock_guard<std::mutex> Lock(Mu);
+    Published.push_back(std::move(Messages));
+  };
+  updateWithDiags(S, Source, "int x = 1;", WantDiagnostics::Auto, Record);
+  {
+    WithContextValue Ctx(
+        DiagsCallbackKey,
+        [&](PathRef, std::vector<Diag> Diags) { Record(std::move(Diags)); });
+    S.reparseAllFiles();
+  }
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  std::lock_guard<std::mutex> Lock(Mu);
+  ASSERT_THAT(Published, Not(IsEmpty()));
+  for (const auto &Messages : Published)
+    EXPECT_THAT(Messages, IsEmpty());
 }
 
 #ifdef CLANGD_PATH_CASE_INSENSITIVE

@@ -34,6 +34,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FunctionExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -238,7 +239,8 @@ public:
   void addDocument(PathRef File, StringRef Contents,
                    llvm::StringRef Version = "null",
                    WantDiagnostics WD = WantDiagnostics::Auto,
-                   bool ForceRebuild = false);
+                   bool ForceRebuild = false, bool RebuildAST = false,
+                   std::shared_ptr<const llvm::StringSet<>> ChangedFiles = {});
 
   /// Remove \p File from list of tracked files, schedule a request to free
   /// resources associated with it. Pending diagnostics for closed files may not
@@ -249,9 +251,13 @@ public:
   /// Requests a reparse of currently opened files using their latest source.
   /// This will typically only rebuild if something other than the source has
   /// changed (e.g. the CDB yields different flags, or files included in the
-  /// preamble have been modified).
+  /// preamble have been modified). With \p RebuildASTs, ASTs are rebuilt even
+  /// if their inputs didn't change, as files included outside the preamble may
+  /// have been modified. Preambles built from \p ChangedFiles are rebuilt.
   void reparseOpenFilesIfNeeded(
-      llvm::function_ref<bool(llvm::StringRef File)> Filter);
+      llvm::function_ref<bool(llvm::StringRef File)> Filter,
+      bool RebuildASTs = false,
+      std::shared_ptr<const llvm::StringSet<>> ChangedFiles = {});
 
   /// Run code completion for \p File at \p Pos.
   ///
@@ -497,7 +503,8 @@ private:
   const SymbolIndex *Index = nullptr;
   // If present, an index of symbols in open files. Read via *Index.
   std::unique_ptr<FileIndex> DynamicIdx;
-  // Guards background-index callbacks that can schedule reparses.
+  // Guards background-index and compilation database callbacks that can
+  // schedule reparses.
   mutable std::mutex BackgroundIndexReparseMu;
   // If present, the new "auto-index" maintained in background threads.
   std::unique_ptr<BackgroundIndex> BackgroundIdx;
@@ -539,6 +546,9 @@ private:
 
   std::unique_ptr<ThreadsafeFS> DirtyFS;
   std::function<Context(PathRef)> ContextProvider;
+
+  // Declared last so it is destroyed first: the callback uses other members.
+  GlobalCompilationDatabase::CommandChanged::Subscription CommandsChanged;
 };
 
 } // namespace clangd

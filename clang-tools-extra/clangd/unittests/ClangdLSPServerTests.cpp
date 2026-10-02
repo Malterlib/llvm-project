@@ -16,6 +16,7 @@
 #include "LSPBinder.h"
 #include "LSPClient.h"
 #include "TestFS.h"
+#include "TidyProvider.h"
 #include "support/Function.h"
 #include "support/Logger.h"
 #include "support/TestTracer.h"
@@ -65,11 +66,11 @@ protected:
     Base.FeatureModules = &FeatureModules;
   }
 
-  LSPClient &start() {
+  LSPClient &start(llvm::json::Object InitializeParams = {}) {
     EXPECT_FALSE(Server) << "Already initialized";
     Server.emplace(Client.transport(), FS, Opts);
     ServerThread.emplace([&] { EXPECT_TRUE(Server->run()); });
-    Client.call("initialize", llvm::json::Object{});
+    InitializeResult = &Client.call("initialize", std::move(InitializeParams));
     return Client;
   }
 
@@ -91,6 +92,7 @@ protected:
   MockFS FS;
   ClangdLSPServer::Options Opts;
   FeatureModuleSet FeatureModules;
+  LSPClient::CallResult *InitializeResult = nullptr;
 
 private:
   class Logger : public clang::clangd::Logger {
@@ -184,6 +186,117 @@ TEST_F(LSPTest, DiagnosticsHeaderSaved) {
   EXPECT_THAT(Client.diagnostics("foo.cpp"),
               llvm::ValueIs(testing::ElementsAre(
                   diagMessage("Use of undeclared identifier 'changed'"))));
+}
+
+TEST_F(LSPTest, WatchesFiles) {
+  auto &Client = start(llvm::json::Object{
+      {"capabilities",
+       llvm::json::Object{
+           {"workspace",
+            llvm::json::Object{
+                {"didChangeWatchedFiles",
+                 llvm::json::Object{{"dynamicRegistration", true}}}}}}}});
+  auto Capabilities = InitializeResult->takeValue();
+  EXPECT_EQ(*Capabilities.getAsObject()
+                 ->getObject("capabilities")
+                 ->getObject("fileWatching")
+                 ->getBoolean("reparseOpenFiles"),
+            true);
+
+  Client.expectServerCall("client/registerCapability");
+  Client.notify("initialized", llvm::json::Object{});
+  Client.sync();
+  auto Registrations = Client.takeCallParams("client/registerCapability");
+  ASSERT_THAT(Registrations, testing::SizeIs(1));
+  EXPECT_EQ(
+      *(*Registrations.front().getAsObject()->getArray("registrations"))[0]
+           .getAsObject()
+           ->getString("method"),
+      "workspace/didChangeWatchedFiles");
+
+  FS.Files["compile_flags.txt"] = "-xc++";
+  FS.Files["foo.h"] = "";
+  Client.didOpen("foo.cpp", R"cpp(
+    #include "foo.h"
+    int x = VAR;
+  )cpp");
+  EXPECT_THAT(Client.diagnostics("foo.cpp"),
+              llvm::ValueIs(testing::ElementsAre(
+                  diagMessage("Use of undeclared identifier 'VAR'"))));
+
+  // Another tool defines VAR in the header.
+  FS.Files["foo.h"] = "int VAR;";
+  Client.notify(
+      "workspace/didChangeWatchedFiles",
+      llvm::json::Object{
+          {"changes", llvm::json::Array{llvm::json::Object{
+                          {"uri", Client.uri("foo.h")}, {"type", 2}}}}});
+  EXPECT_THAT(Client.diagnostics("foo.cpp"), llvm::ValueIs(testing::IsEmpty()));
+}
+
+TEST_F(LSPTest, ReparsesOnCompileFlagsChange) {
+  auto &Client = start(llvm::json::Object{
+      {"capabilities",
+       llvm::json::Object{
+           {"workspace",
+            llvm::json::Object{
+                {"didChangeWatchedFiles",
+                 llvm::json::Object{{"dynamicRegistration", true}}}}}}}});
+  Client.expectServerCall("client/registerCapability");
+  Client.notify("initialized", llvm::json::Object{});
+
+  FS.Files["compile_flags.txt"] = "-DFOO=1";
+  Client.didOpen("foo.cpp", "int x = FOO;");
+  EXPECT_THAT(Client.diagnostics("foo.cpp"), llvm::ValueIs(testing::IsEmpty()));
+
+  // compile_flags.txt lists no files, so its watchers aren't notified.
+  FS.Files["compile_flags.txt"] = "-DBAR";
+  Client.notify("workspace/didChangeWatchedFiles",
+                llvm::json::Object{
+                    {"changes", llvm::json::Array{llvm::json::Object{
+                                    {"uri", Client.uri("compile_flags.txt")},
+                                    {"type", 2}}}}});
+  // The database is reloaded asynchronously, and then reparses open files.
+  Client.sync();
+  EXPECT_THAT(Client.diagnostics("foo.cpp"),
+              llvm::ValueIs(testing::ElementsAre(
+                  diagMessage("Use of undeclared identifier 'FOO'"))));
+}
+
+TEST_F(LSPTest, ReparsesOnClangTidyChange) {
+  // This test requires clang-tidy checks to be linked in.
+  if (!CLANGD_TIDY_CHECKS)
+    return;
+  FS.Files["compile_flags.txt"] = "-xc++";
+  FS.Files[".clang-tidy"] = "Checks: '-*'";
+  TidyProvider Provider = provideClangTidyFiles(FS);
+  Opts.ClangTidyProvider = Provider;
+  auto &Client = start(llvm::json::Object{
+      {"capabilities",
+       llvm::json::Object{
+           {"workspace",
+            llvm::json::Object{
+                {"didChangeWatchedFiles",
+                 llvm::json::Object{{"dynamicRegistration", true}}}}}}}});
+  Client.expectServerCall("client/registerCapability");
+  Client.notify("initialized", llvm::json::Object{});
+
+  Client.didOpen("foo.cpp", "void foo() {}");
+  EXPECT_THAT(Client.diagnostics("foo.cpp"), llvm::ValueIs(testing::IsEmpty()));
+
+  // The checks change within the seconds a read of the file is reused.
+  FS.Files[".clang-tidy"] =
+      "Checks: '-*,readability-identifier-naming'\n"
+      "CheckOptions:\n"
+      "  readability-identifier-naming.FunctionCase: CamelCase\n";
+  Client.notify(
+      "workspace/didChangeWatchedFiles",
+      llvm::json::Object{
+          {"changes", llvm::json::Array{llvm::json::Object{
+                          {"uri", Client.uri(".clang-tidy")}, {"type", 2}}}}});
+  EXPECT_THAT(Client.diagnostics("foo.cpp"),
+              llvm::ValueIs(testing::ElementsAre(diagMessage(
+                  "Invalid case style for function 'foo' (fix available)"))));
 }
 
 TEST_F(LSPTest, RecordsLatencies) {

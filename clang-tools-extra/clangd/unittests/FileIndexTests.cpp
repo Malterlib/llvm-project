@@ -397,6 +397,35 @@ TEST(FileIndexTest, Refs) {
                              fileURI("unittest:///test2.cc"))}));
 }
 
+TEST(FileIndexTest, RemoveFiles) {
+  const char *HeaderCode = "class Foo {};";
+  auto Foo =
+      findSymbol(TestTU::withHeaderCode(HeaderCode).headerSymbols(), "Foo");
+
+  FileIndex Index(true);
+  TestTU Test;
+  Test.HeaderCode = HeaderCode;
+  Test.Code = "void f() { Foo foo; }";
+  Test.Filename = "test.cc";
+  auto AST = Test.build();
+  Index.updateMain(testPath(Test.Filename), AST);
+  ASSERT_THAT(getRefs(Index, Foo.ID).numRefs(), 1u);
+
+  Index.removeFiles({testPath(Test.Filename)});
+  Index.rebuildAfterRemovals();
+  EXPECT_THAT(getRefs(Index, Foo.ID).numRefs(), 0u);
+
+  Index.updateMain(testPath(Test.Filename), AST);
+  ASSERT_THAT(getRefs(Index, Foo.ID).numRefs(), 1u);
+  Index.removeMainFiles([](llvm::StringRef) { return false; });
+  Index.rebuildAfterRemovals();
+  EXPECT_THAT(getRefs(Index, Foo.ID).numRefs(), 1u);
+  Index.removeMainFiles(
+      [&](llvm::StringRef Path) { return Path == testPath(Test.Filename); });
+  Index.rebuildAfterRemovals();
+  EXPECT_THAT(getRefs(Index, Foo.ID).numRefs(), 0u);
+}
+
 TEST(FileIndexTest, MacroRefs) {
   Annotations HeaderCode(R"cpp(
     #define $def1[[HEADER_MACRO]](X) (X+1)

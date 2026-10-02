@@ -102,12 +102,34 @@ public:
                           SrcMgr::CharacteristicKind FileType) override {
     // File is std::nullopt if it wasn't found.
     // (We have some false negatives if PP recovered e.g. <foo> -> "foo")
-    if (File)
-      return;
+    if (!File)
+      missing(IncludeTok.getLocation(), FileName, IsAngled);
+  }
 
+  // A file that __has_include didn't find affects the preamble if it appears,
+  // just like a missing include. This is also called for __has_include_next,
+  // which only searches the directories after the current one, so a file with
+  // the same name can exist in an earlier one. Such files are left out, as
+  // they would make the preamble look stale forever.
+  void HasInclude(SourceLocation Loc, StringRef FileName, bool IsAngled,
+                  OptionalFileEntryRef File,
+                  SrcMgr::CharacteristicKind FileType) override {
+    if (!File)
+      missing(Loc, FileName, IsAngled, /*SkipExisting=*/true);
+  }
+
+private:
+  void missing(SourceLocation Loc, StringRef FileName, bool IsAngled,
+               bool SkipExisting = false) {
+    auto Exists = [&](StringRef Path) {
+      return SkipExisting &&
+             SM.getFileManager().getOptionalFileRef(Path, /*OpenFile=*/false,
+                                                    /*CacheFailure=*/false);
+    };
     // If it's a rare absolute include, we know the full path already.
     if (llvm::sys::path::is_absolute(FileName)) {
-      Out.insert(FileName);
+      if (!Exists(FileName))
+        Out.insert(FileName);
       return;
     }
 
@@ -117,12 +139,14 @@ public:
       Buf = DE.getName();
       llvm::sys::path::append(Buf, FileName);
       llvm::sys::path::remove_dots(Buf, /*remove_dot_dot=*/true);
+      if (Exists(Buf))
+        return;
       Out.insert(Buf);
     };
     // ...relative to the including file.
     if (!IsAngled) {
       if (OptionalFileEntryRef IncludingFile =
-              SM.getFileEntryRefForID(SM.getFileID(IncludeTok.getLocation())))
+              SM.getFileEntryRefForID(SM.getFileID(SM.getExpansionLoc(Loc))))
         if (IncludingFile->getDir())
           NotFoundRelativeTo(IncludingFile->getDir());
     }
@@ -603,10 +627,6 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
       Bounds.Size <= MainFileBuffer.getBufferSize() &&
       "Buffer is too large. Bounds were calculated from a different buffer?");
 
-  auto PreambleInvocation = std::make_shared<CompilerInvocation>(Invocation);
-  PreprocessorOptions &PreprocessorOpts =
-      PreambleInvocation->getPreprocessorOpts();
-
   // We've previously computed a preamble. Check whether we have the same
   // preamble now that we did before, and that there's enough space in
   // the main-file buffer within the precompiled preamble to fit the
@@ -618,6 +638,15 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
     return false;
   // The preamble has not changed. We may be able to re-use the precompiled
   // preamble.
+  return DependenciesUnchanged(Invocation, VFS);
+}
+
+bool PrecompiledPreamble::DependenciesUnchanged(
+    const CompilerInvocation &Invocation, llvm::vfs::FileSystem &VFS,
+    llvm::function_ref<bool(llvm::StringRef)> Ignore) const {
+  auto PreambleInvocation = std::make_shared<CompilerInvocation>(Invocation);
+  PreprocessorOptions &PreprocessorOpts =
+      PreambleInvocation->getPreprocessorOpts();
 
   // Check that none of the files used by the preamble have changed.
   // First, make a record of those files that have been overridden via
@@ -658,6 +687,8 @@ bool PrecompiledPreamble::CanReuse(const CompilerInvocation &Invocation,
 
   // Check whether anything has changed.
   for (const auto &F : FilesInPreamble) {
+    if (Ignore && Ignore(F.first()))
+      continue;
     auto OverridenFileBuffer = OverridenFileBuffers.find(F.first());
     if (OverridenFileBuffer != OverridenFileBuffers.end()) {
       // The file's buffer was remapped and the file was not found in VFS.
