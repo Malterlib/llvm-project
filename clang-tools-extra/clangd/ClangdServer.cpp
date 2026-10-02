@@ -31,6 +31,7 @@
 #include "refactor/Tweak.h"
 #include "support/Cancellation.h"
 #include "support/Context.h"
+#include "support/FileCache.h"
 #include "support/Logger.h"
 #include "support/MemoryTree.h"
 #include "support/ThreadsafeFS.h"
@@ -266,7 +267,12 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
     };
     BGOpts.ContextProvider = Opts.ContextProvider;
     BGOpts.SupportContainedRefs = Opts.EnableOutgoingCalls;
-    BGOpts.OnIndexedHeaders = [this](std::vector<std::string> Headers) {
+    BGOpts.OnIndexedHeaders = [this, Sync(Opts.AsyncThreadsCount == 0)](
+                                  std::vector<std::string> Headers) {
+      // Synchronous workers run updates on the calling thread, which must be
+      // the main thread.
+      if (Sync)
+        return;
       std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
       if (WorkScheduler)
         WorkScheduler->reparseFilesWithNewContext(Headers);
@@ -280,6 +286,36 @@ ClangdServer::ClangdServer(const GlobalCompilationDatabase &CDB,
   }
   if (DynamicIdx)
     AddIndex(DynamicIdx.get());
+
+  // Compile commands of open files may have changed. Reparse them so that
+  // their diagnostics use the new commands instead of waiting for an edit.
+  CommandsChanged = CDB.watch([this, Sync(Opts.AsyncThreadsCount == 0)](
+                                  const std::vector<std::string> &Files) {
+    // Closed files keep their symbols in the dynamic index, which takes
+    // precedence over the background index that reindexes them with the new
+    // commands.
+    // This runs off the main thread, so a file opened concurrently may lose
+    // its first symbols until it's parsed again, e.g. on its next edit.
+    // Symbols of headers from the preambles of closed files stay: the dynamic
+    // index doesn't track which file they came from, and dropping all of them
+    // would also drop those of open files' headers until their preambles are
+    // rebuilt. They're replaced when a file including them is parsed again.
+    if (DynamicIdx && BackgroundIdx) {
+      std::vector<std::string> Closed;
+      for (const std::string &File : Files)
+        if (!DraftMgr.getDraft(File) && BackgroundIdx->isIndexed(File))
+          Closed.push_back(File);
+      DynamicIdx->removeFiles(Closed);
+      DynamicIdx->rebuildAfterRemovals();
+    }
+    // Synchronous workers run updates on the calling thread, which must be the
+    // main thread. Watchers may be notified from other threads.
+    if (Sync)
+      return;
+    std::lock_guard<std::mutex> Lock(BackgroundIndexReparseMu);
+    if (WorkScheduler)
+      WorkScheduler->reparseAllFiles();
+  });
 
   if (Opts.FeatureModules) {
     FeatureModule::Facilities F{
@@ -309,9 +345,10 @@ ClangdServer::~ClangdServer() {
   }
 }
 
-void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
-                               llvm::StringRef Version,
-                               WantDiagnostics WantDiags, bool ForceRebuild) {
+void ClangdServer::addDocument(
+    PathRef File, llvm::StringRef Contents, llvm::StringRef Version,
+    WantDiagnostics WantDiags, bool ForceRebuild, bool RebuildAST,
+    std::shared_ptr<const llvm::StringSet<>> ChangedFiles) {
   std::string ActualVersion = DraftMgr.addDraft(File, Version, Contents);
   ParseOptions Opts;
   Opts.PreambleParseForwardingFunctions = PreambleParseForwardingFunctions;
@@ -323,6 +360,8 @@ void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
   Inputs.Contents = std::string(Contents);
   Inputs.Version = std::move(ActualVersion);
   Inputs.ForceRebuild = ForceRebuild;
+  Inputs.RebuildAST = RebuildAST;
+  Inputs.ChangedFiles = std::move(ChangedFiles);
   Inputs.Opts = std::move(Opts);
   Inputs.Index = Index;
   Inputs.ClangTidyProvider = ClangTidyProvider;
@@ -336,13 +375,15 @@ void ClangdServer::addDocument(PathRef File, llvm::StringRef Contents,
 }
 
 void ClangdServer::reparseOpenFilesIfNeeded(
-    llvm::function_ref<bool(llvm::StringRef File)> Filter) {
+    llvm::function_ref<bool(llvm::StringRef File)> Filter, bool RebuildASTs,
+    std::shared_ptr<const llvm::StringSet<>> ChangedFiles) {
   // Reparse only opened files that were modified.
   for (const Path &FilePath : DraftMgr.getActiveFiles())
     if (Filter(FilePath))
       if (auto Draft = DraftMgr.getDraft(FilePath)) // else disappeared in race?
         addDocument(FilePath, *Draft->Contents, Draft->Version,
-                    WantDiagnostics::Auto);
+                    WantDiagnostics::Auto, /*ForceRebuild=*/false, RebuildASTs,
+                    ChangedFiles);
 }
 
 std::shared_ptr<const std::string> ClangdServer::getDraft(PathRef File) const {
@@ -961,8 +1002,98 @@ void ClangdServer::outgoingCalls(
 }
 
 void ClangdServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
-  // FIXME: Do nothing for now. This will be used for indexing and potentially
-  // invalidating other caches.
+  std::vector<std::string> CDBFiles;
+  std::vector<std::string> SourceFiles;
+  bool ConfigChanged = false;
+  for (const FileEvent &Change : Params.changes) {
+    std::string File = Change.uri.file().str();
+    llvm::StringRef Name = llvm::sys::path::filename(File);
+    if (Name == "compile_commands.json" || Name == "compile_flags.txt")
+      CDBFiles.push_back(std::move(File));
+    else if (Name == ".clang-tidy" || Name == ".clangd")
+      ConfigChanged = true;
+    else
+      SourceFiles.push_back(std::move(File));
+  }
+  // Configuration, like the checks of .clang-tidy files or the flags of
+  // .clangd files, is read again now, instead of within seconds. Open files
+  // are reparsed with it, rebuilding their ASTs, which clang-tidy checks, and
+  // their preambles when their compile commands change. Closed files read it
+  // when they're opened again.
+  if (ConfigChanged) {
+    noteCachedFilesChanged();
+    if (SourceFiles.empty() && CDBFiles.empty()) {
+      reparseOpenFilesIfNeeded([](llvm::StringRef) { return true; },
+                               /*RebuildASTs=*/true);
+      return;
+    }
+  }
+
+  // Reloading a compilation database can be slow, so do it off the main
+  // thread. Its watchers then reindex the files whose commands changed. Open
+  // files are reparsed here, as not every change notifies watchers: e.g.
+  // compile_flags.txt lists no files, and a deleted database has none. Such
+  // databases aren't background-indexed either, beyond files that change on
+  // disk, which are reindexed with the current flags when they next change.
+  // Source files changed in the same batch are reindexed after the reload, so
+  // with their new commands.
+  bool ReindexAfterReload = !CDBFiles.empty() && BackgroundIdx;
+  if (!CDBFiles.empty())
+    WorkScheduler->run(
+        "Reload compilation database", /*Path=*/"",
+        [this, Scheduler(&*WorkScheduler), CDBFiles(std::move(CDBFiles)),
+         Reindex(ReindexAfterReload ? SourceFiles
+                                    : std::vector<std::string>())]() mutable {
+          CDB.checkForChanges(CDBFiles);
+          // The scheduler waits for its tasks when destroyed.
+          Scheduler->reparseAllFiles();
+          if (!Reindex.empty())
+            BackgroundIdx->reindexChangedFiles(std::move(Reindex));
+        });
+
+  if (SourceFiles.empty())
+    return;
+
+  // Passed along to reparses, as modification times have a resolution of
+  // seconds.
+  auto Changed = std::make_shared<llvm::StringSet<>>();
+  for (const std::string &File : SourceFiles)
+    Changed->insert(File);
+  if (BackgroundIdx) {
+    // Files that were open keep their symbols in the dynamic index, which takes
+    // precedence over the background index. Drop them for files that changed
+    // since, so the background index's new results become visible. Headers of
+    // open files are added back when their preambles are rebuilt. Only files
+    // in the background index are dropped: e.g. with compile_flags.txt or
+    // background indexing disabled for them, the dynamic index is all there
+    // is. Files that are being reindexed for the first time are kept.
+    if (DynamicIdx) {
+      std::vector<std::string> Closed;
+      for (const std::string &File : SourceFiles)
+        if (!DraftMgr.getDraft(File) && BackgroundIdx->isIndexed(File))
+          Closed.push_back(File);
+      // Remove now, so this can't undo later updates, e.g. from reopening one
+      // of the files. Rebuilding the dynamic index can be slow.
+      DynamicIdx->removeFiles(Closed);
+      // Closed files that include changed headers can be stale too. The
+      // background index covers all closed files, so drop them.
+      DynamicIdx->removeMainFiles([&](llvm::StringRef Path) {
+        return !DraftMgr.getDraft(Path) && BackgroundIdx->isIndexed(Path);
+      });
+      WorkScheduler->run("Rebuild dynamic index", /*Path=*/"",
+                         [this] { DynamicIdx->rebuildAfterRemovals(); });
+    }
+    if (!ReindexAfterReload)
+      BackgroundIdx->reindexChangedFiles(SourceFiles);
+  }
+  // Headers that open files include may have changed. Reparsing a file whose
+  // preamble's dependencies didn't change only checks them on disk, and
+  // reparses that arrive in quick succession are coalesced. Their ASTs are
+  // rebuilt, as files included outside the preamble aren't checked. In
+  // particular, for headers parsed in the context of an including file, that's
+  // everything the header itself includes.
+  reparseOpenFilesIfNeeded([](llvm::StringRef) { return true; },
+                           /*RebuildASTs=*/true, std::move(Changed));
 }
 
 void ClangdServer::workspaceSymbols(
@@ -1171,8 +1302,9 @@ ClangdServer::blockUntilIdleForTest(std::optional<double> TimeoutSeconds) {
     (*TimeoutSeconds) *= 10;
 #endif
 
-  // Nothing else can schedule work on TUScheduler, because it's not threadsafe
-  // and we're blocking the main thread.
+  // The main thread is blocked, but TUScheduler's own tasks, CDB broadcasts and
+  // background indexing can schedule more work on it, e.g. reparses after a
+  // compilation database changed. The loop below waits for it again.
   if (!WorkScheduler->blockUntilIdle(timeoutSeconds(TimeoutSeconds)))
     return false;
   // TUScheduler is the only thing that starts background indexing work.
@@ -1197,6 +1329,11 @@ ClangdServer::blockUntilIdleForTest(std::optional<double> TimeoutSeconds) {
     if (FeatureModules && llvm::any_of(*FeatureModules, [&](FeatureModule &M) {
           return !M.blockUntilIdle(timeoutSeconds(Timeout));
         }))
+      return false;
+    if (!WorkScheduler->blockUntilIdle(timeoutSeconds(Timeout)))
+      return false;
+    // Reparses scheduled above can start dynamic indexing.
+    if (IndexTasks && !IndexTasks->wait(timeoutSeconds(Timeout)))
       return false;
   }
 

@@ -18,6 +18,7 @@
 
 using ::testing::_;
 using ::testing::AllOf;
+using ::testing::AnyOf;
 using ::testing::Contains;
 using ::testing::ElementsAre;
 using ::testing::Not;
@@ -824,10 +825,298 @@ TEST_F(BackgroundIndexTest, Reindex) {
   CDB.setCompileCommand(testPath("A.cc"), Cmd);
   ASSERT_TRUE(Idx.blockUntilIdleForTest());
 
-  // Currently, we will never index the same main file again.
-  EXPECT_EQ(1u, runFuzzyFind(Idx, "theOldFunction").size());
-  EXPECT_EQ(0u, runFuzzyFind(Idx, "theNewFunction").size());
-  EXPECT_EQ(OldShard, Storage.lookup(testPath("A.cc")));
+  // The file is stale, so it is indexed again.
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "theOldFunction").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "theNewFunction").size());
+  EXPECT_NE(OldShard, Storage.lookup(testPath("A.cc")));
+}
+
+TEST_F(BackgroundIndexTest, ReindexOnCommandChange) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("A.cc")] = R"cpp(
+    #include "A.h"
+    #ifdef FOO
+    int mainWithFoo();
+    #endif
+  )cpp";
+  FS.Files[testPath("A.h")] = R"cpp(
+    #ifdef FOO
+    int headerWithFoo();
+    #endif
+  )cpp";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "mainWithFoo").size());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "headerWithFoo").size());
+
+  // Only the command changes, which affects the symbols of both files.
+  Cmd.CommandLine.push_back("-DFOO");
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "mainWithFoo").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "headerWithFoo").size());
+  // The new command is stored, so the file isn't considered stale again.
+  EXPECT_EQ(MSS.loadShard(testPath("A.cc"))->Cmd->CommandLine, Cmd.CommandLine);
+}
+
+TEST_F(BackgroundIndexTest, ReindexChangedFiles) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("A.cc")] = R"cpp(
+    #include "A.h"
+    int inMain();
+    #if FEATURE
+    int featureInMain();
+    #endif
+  )cpp";
+  FS.Files[testPath("A.h")] = "#define FEATURE 0\nint oldHeaderFunction();";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "oldHeaderFunction").size());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "featureInMain").size());
+
+  // A changed header is reindexed through a file that includes it, which
+  // also updates that file's symbols that depend on the header.
+  FS.Files[testPath("A.h")] = "#define FEATURE 1\nint newHeaderFunction();";
+  Idx.reindexChangedFiles({testPath("A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "oldHeaderFunction").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "newHeaderFunction").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "featureInMain").size());
+
+  // A deleted header is removed from the index, and isn't restored from its
+  // stored shard when a file that included it is reindexed.
+  FS.Files.erase(testPath("A.h"));
+  Idx.reindexChangedFiles({testPath("A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "newHeaderFunction").size());
+  FS.Files[testPath("A.cc")] = "int inMain();";
+  Idx.reindexChangedFiles({testPath("A.cc")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "newHeaderFunction").size());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "inMain").size());
+
+  // A deleted source file is removed from the index.
+  FS.Files.erase(testPath("A.cc"));
+  Idx.reindexChangedFiles({testPath("A.cc")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "inMain").size());
+}
+
+TEST_F(BackgroundIndexTest, ReindexRecreatedHeader) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("A.cc")] = "#include \"A.h\"";
+  FS.Files[testPath("A.h")] = "int original();";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "original").size());
+
+  FS.Files.erase(testPath("A.h"));
+  Idx.reindexChangedFiles({testPath("A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "original").size());
+
+  // A.cc didn't change, but includes the header again.
+  FS.Files[testPath("A.h")] = "int recreated();";
+  Idx.reindexChangedFiles({testPath("A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "recreated").size());
+}
+
+TEST_F(BackgroundIndexTest, ReindexWhenMissingHeaderAppears) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  // E.g. a generated header that doesn't exist yet.
+  FS.Files[testPath("A.cc")] = R"cpp(
+    #include "gen/A.h"
+    #ifdef GENERATED
+    int enabledByGenerated();
+    #endif
+  )cpp";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  FS.Files[testPath("gen/A.h")] = "#define GENERATED\nint headerSymbol();";
+  Idx.reindexChangedFiles({testPath("gen/A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "headerSymbol").size());
+  // The unchanged main file's symbols are updated too.
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "enabledByGenerated").size());
+}
+
+TEST_F(BackgroundIndexTest, ReindexWhenMissingHeaderAppearsAfterRestart) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  FS.Files[testPath("A.cc")] = "#include \"gen.h\"";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  {
+    BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                        /*Opts=*/{});
+    CDB.setCompileCommand(testPath("A.cc"), Cmd);
+    ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  }
+
+  // After a restart, the shard is loaded rather than indexed again, so which
+  // includes were missing isn't known.
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+  Idx.enqueue({testPath("A.cc")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+
+  FS.Files[testPath("gen.h")] = "int generated();";
+  Idx.reindexChangedFiles({testPath("gen.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "generated").size());
+}
+
+TEST_F(BackgroundIndexTest, ReindexWhenProbedFileWithCommandAppears) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("A.cc")] = R"cpp(
+    #if __has_include("gen.h")
+    int withGen();
+    #endif
+  )cpp";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = "../A.cc";
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", "../A.cc", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "withGen").size());
+
+  // The new file has a compile command of its own.
+  FS.Files[testPath("gen.h")] = "";
+  tooling::CompileCommand GenCmd = Cmd;
+  GenCmd.Filename = "../gen.h";
+  GenCmd.CommandLine = {"clang++", "-xc++", "../gen.h", "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("gen.h"), GenCmd);
+  Idx.reindexChangedFiles({testPath("gen.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "withGen").size());
+}
+
+TEST_F(BackgroundIndexTest, HeaderContextMovesToSurvivingIncluder) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("H.h")] = "int oldHeaderFunction();";
+  for (llvm::StringRef Name : {"A.cc", "B.cc"}) {
+    FS.Files[testPath(Name)] = "#include \"H.h\"";
+    tooling::CompileCommand Cmd;
+    Cmd.Filename = ("../" + Name).str();
+    Cmd.Directory = testPath("build");
+    Cmd.CommandLine = {"clang++", Cmd.Filename, "-fsyntax-only"};
+    CDB.setCompileCommand(testPath(Name), Cmd);
+  }
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  std::string Context = Idx.indexedTUForHeader(testPath("H.h"));
+  ASSERT_THAT(Context, AnyOf(testPath("A.cc"), testPath("B.cc")));
+  std::string Other =
+      Context == testPath("A.cc") ? testPath("B.cc") : testPath("A.cc");
+
+  FS.Files.erase(Context);
+  Idx.reindexChangedFiles({Context});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(Other, Idx.indexedTUForHeader(testPath("H.h")));
+
+  // Changes to the header are still reindexed, through the other includer.
+  FS.Files[testPath("H.h")] = "int newHeaderFunction();";
+  Idx.reindexChangedFiles({testPath("H.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "newHeaderFunction").size());
+}
+
+TEST_F(BackgroundIndexTest, ReindexMainFileSpelledWithDots) {
+  MockFS FS;
+  llvm::StringMap<std::string> Storage;
+  size_t CacheHits = 0;
+  MemoryShardStorage MSS(Storage, CacheHits);
+  OverlayCDB CDB(/*Base=*/nullptr);
+  BackgroundIndex Idx(FS, CDB, [&](llvm::StringRef) { return &MSS; },
+                      /*Opts=*/{});
+
+  FS.Files[testPath("A.cc")] = R"cpp(
+    #include "A.h"
+    #if FEATURE
+    int featureOn();
+    #else
+    int featureOff();
+    #endif
+  )cpp";
+  FS.Files[testPath("A.h")] = "#define FEATURE 0";
+  tooling::CompileCommand Cmd;
+  Cmd.Filename = testPath("build/../A.cc");
+  Cmd.Directory = testPath("build");
+  Cmd.CommandLine = {"clang++", Cmd.Filename, "-fsyntax-only"};
+  CDB.setCompileCommand(testPath("A.cc"), Cmd);
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "featureOff").size());
+
+  FS.Files[testPath("A.h")] = "#define FEATURE 1";
+  Idx.reindexChangedFiles({testPath("A.h")});
+  ASSERT_TRUE(Idx.blockUntilIdleForTest());
+  EXPECT_EQ(1u, runFuzzyFind(Idx, "featureOn").size());
+  EXPECT_EQ(0u, runFuzzyFind(Idx, "featureOff").size());
 }
 
 class BackgroundIndexRebuilderTest : public testing::Test {
@@ -988,14 +1277,14 @@ TEST(BackgroundQueueTest, Duplicates) {
     // The first time we go idle, we enqueue the same task again.
     if (!llvm::is_contained(Sequence, ' ')) {
       Sequence.push_back(' ');
-      Q.append({A, B, A, B}); // Both As are dropped.
+      // A completed task can run again, but only once while queued.
+      Q.append({A, B, A, B});
     } else {
       Q.stop();
     }
   });
 
-  // This could reasonably be "ABB BBA", if we had good *re*indexing support.
-  EXPECT_EQ("ABB BB", Sequence);
+  EXPECT_EQ("ABB ABB", Sequence);
 }
 
 TEST(BackgroundQueueTest, Progress) {

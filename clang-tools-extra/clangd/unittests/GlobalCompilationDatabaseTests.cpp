@@ -418,6 +418,42 @@ TEST(GlobalCompilationDatabaseTest, Config) {
   EXPECT_THAT(CDB.getCompileCommand(testPath("x/y/z/foo.cc")), hasArg("-DZ"));
 }
 
+TEST(GlobalCompilationDatabaseTest, CheckForChanges) {
+  MockFS FS;
+  auto Database = [](llvm::StringRef Flag) {
+    return llvm::formatv(R"json([{
+      "file": "{0}/a.cc",
+      "command": "clang {1} a.cc",
+      "directory": "{0}",
+    }])json",
+                         llvm::sys::path::convert_to_slash(testRoot()), Flag)
+        .str();
+  };
+  FS.Files["compile_commands.json"] = Database("-DOLD");
+  DirectoryBasedGlobalCompilationDatabase GDB(FS);
+  EXPECT_THAT(GDB.getCompileCommand(testPath("a.cc"))->CommandLine,
+              Contains("-DOLD"));
+  ASSERT_TRUE(GDB.blockUntilIdle(timeoutSeconds(10)));
+
+  std::mutex Mu;
+  std::vector<std::string> Changed;
+  auto Sub = GDB.watch([&](const std::vector<std::string> &Files) {
+    std::lock_guard<std::mutex> Lock(Mu);
+    llvm::append_range(Changed, Files);
+  });
+
+  FS.Files["compile_commands.json"] = Database("-DNEWER");
+  // Until it revalidates, the database uses its cached commands.
+  EXPECT_THAT(GDB.getCompileCommand(testPath("a.cc"))->CommandLine,
+              Contains("-DOLD"));
+  GDB.checkForChanges({testPath("compile_commands.json")});
+  EXPECT_THAT(GDB.getCompileCommand(testPath("a.cc"))->CommandLine,
+              Contains("-DNEWER"));
+  ASSERT_TRUE(GDB.blockUntilIdle(timeoutSeconds(10)));
+  std::lock_guard<std::mutex> Lock(Mu);
+  EXPECT_THAT(Changed, ElementsAre(testPath("a.cc")));
+}
+
 TEST(GlobalCompilationDatabaseTest, NonCanonicalFilenames) {
   OverlayCDB DB(nullptr);
   std::vector<std::string> DiscoveredFiles;

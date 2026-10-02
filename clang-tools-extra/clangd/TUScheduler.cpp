@@ -497,6 +497,15 @@ public:
       ReqCV.wait(Lock, [this] {
         return !NextReq || NextReq->WantDiags != WantDiagnostics::Yes;
       });
+      // Files reported changed by the replaced request still need checking.
+      if (NextReq && NextReq->Inputs.ChangedFiles) {
+        auto Changed =
+            std::make_shared<llvm::StringSet<>>(*NextReq->Inputs.ChangedFiles);
+        if (Req.Inputs.ChangedFiles)
+          for (const auto &File : *Req.Inputs.ChangedFiles)
+            Changed->insert(File.getKey());
+        Req.Inputs.ChangedFiles = std::move(Changed);
+      }
       NextReq = std::move(Req);
     }
     // Let the worker thread know there's a request, notify_one is safe as there
@@ -664,6 +673,9 @@ public:
   ASTWorker(const ASTWorker &other) = delete;
   ASTWorker &operator=(const ASTWorker &other) = delete;
   void update(ParseInputs Inputs, WantDiagnostics, bool ContentChanged);
+  /// Schedules a rebuild with the current contents, e.g. because files the
+  /// main file depends on may have changed. Can be called from any thread.
+  void reparse(WantDiagnostics);
   void
   runWithAST(llvm::StringRef Name,
              llvm::unique_function<void(llvm::Expected<InputsAndAST>)> Action,
@@ -683,8 +695,6 @@ public:
 
   /// Returns compile command from the current file inputs.
   tooling::CompileCommand getCurrentCompileCommand() const;
-  /// Returns the current file inputs.
-  ParseInputs getCurrentInputs() const;
 
   /// Wait for the first build of preamble to finish. Preamble itself can be
   /// accessed via getPossiblyStalePreamble(). Note that this function will
@@ -708,6 +718,8 @@ private:
     bool ContentChanged;
   };
 
+  /// Queues an update. Requires LatestInputsMu to be held.
+  void scheduleUpdate(ParseInputs Inputs, WantDiagnostics, bool ContentChanged);
   /// Publishes diagnostics for \p Inputs. It will build an AST or reuse the
   /// cached one if applicable. Assumes LatestPreamble is compatible for \p
   /// Inputs.
@@ -773,6 +785,21 @@ private:
   /// Writes and reads from unknown threads are locked. Reads from the worker
   /// thread are not locked, as it's the only writer.
   ParseInputs FileInputs; /* GUARDED_BY(Mutex) */
+  /// Guards LatestInputs. Held while scheduling updates, so that updates are
+  /// queued in the same order as LatestInputs is written.
+  /// Lock order: LatestInputsMu, then Mutex.
+  std::mutex LatestInputsMu;
+  /// Inputs of the most recently scheduled update, which may still be queued.
+  ParseInputs LatestInputs; /* GUARDED_BY(LatestInputsMu) */
+  /// Whether a scheduled update requested a new AST. Kept until an update runs,
+  /// as the update that requested it may be skipped in favor of a later one.
+  bool RebuildASTRequested = false; /* GUARDED_BY(Mutex) */
+  /// Files reported changed by scheduled updates, kept until an update runs
+  /// for the same reason.
+  llvm::StringSet<> PendingChangedFiles; /* GUARDED_BY(Mutex) */
+  /// Whether reparse() may schedule updates: only after the first update, so
+  /// LatestInputs is set, and before stop(), after which no tasks may start.
+  bool AcceptsReparses = false; /* GUARDED_BY(LatestInputsMu) */
   /// Times of recent AST rebuilds, used for UpdateDebounce computation.
   llvm::SmallVector<DebouncePolicy::clock::duration>
       RebuildTimes; /* GUARDED_BY(Mutex) */
@@ -904,6 +931,34 @@ ASTWorker::~ASTWorker() {
 
 void ASTWorker::update(ParseInputs Inputs, WantDiagnostics WantDiags,
                        bool ContentChanged) {
+  std::lock_guard<std::mutex> Lock(LatestInputsMu);
+  LatestInputs = Inputs;
+  // These are one-off requests, which scheduleUpdate() keeps pending.
+  LatestInputs.RebuildAST = false;
+  LatestInputs.ChangedFiles = nullptr;
+  AcceptsReparses = true;
+  scheduleUpdate(std::move(Inputs), WantDiags, ContentChanged);
+}
+
+void ASTWorker::reparse(WantDiagnostics WantDiags) {
+  // Use the inputs of the latest update rather than FileInputs: an update with
+  // newer contents may still be queued, and is skipped if this one follows it.
+  std::lock_guard<std::mutex> Lock(LatestInputsMu);
+  // Before the first update, that update parses the file anyway.
+  if (!AcceptsReparses)
+    return;
+  scheduleUpdate(LatestInputs, WantDiags, /*ContentChanged=*/false);
+}
+
+void ASTWorker::scheduleUpdate(ParseInputs Inputs, WantDiagnostics WantDiags,
+                               bool ContentChanged) {
+  if (Inputs.RebuildAST || Inputs.ChangedFiles) {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    RebuildASTRequested |= Inputs.RebuildAST;
+    if (Inputs.ChangedFiles)
+      for (const auto &File : *Inputs.ChangedFiles)
+        PendingChangedFiles.insert(File.getKey());
+  }
   llvm::StringLiteral TaskName = "Update";
   auto Task = [=]() mutable {
     // Get the actual command as `Inputs` does not have a command.
@@ -1000,8 +1055,19 @@ void ASTWorker::update(ParseInputs Inputs, WantDiagnostics WantDiags,
     bool InputsAreTheSame =
         std::tie(FileInputs.CompileCommand, FileInputs.Contents) ==
         std::tie(Inputs.CompileCommand, Inputs.Contents);
+    bool RebuildAST;
+    {
+      std::lock_guard<std::mutex> Lock(Mutex);
+      RebuildAST = RebuildASTRequested;
+      RebuildASTRequested = false;
+      Inputs.ChangedFiles = nullptr;
+      if (!PendingChangedFiles.empty())
+        Inputs.ChangedFiles = std::make_shared<const llvm::StringSet<>>(
+            std::move(PendingChangedFiles));
+      PendingChangedFiles.clear();
+    }
     // Cached AST is invalidated.
-    if (!InputsAreTheSame) {
+    if (!InputsAreTheSame || RebuildAST) {
       IdleASTs.take(this);
       RanASTCallback = false;
     }
@@ -1060,9 +1126,36 @@ void ASTWorker::update(ParseInputs Inputs, WantDiagnostics WantDiags,
     // rebuild. Newly built preamble cannot emit diagnostics before this call
     // finishes (ast callbacks are called from astpeer thread), hence we
     // guarantee eventual consistency.
-    if (LatestPreamble && WantDiags != WantDiagnostics::No)
-      generateDiagnostics(std::move(Invocation), std::move(Inputs),
-                          std::move(CompilerInvocationDiags));
+    if (LatestPreamble && WantDiags != WantDiagnostics::No) {
+      // With RunSync, the preamble was already rebuilt above.
+      if (!RunSync &&
+          (*LatestPreamble ? preambleDependenciesChanged(
+                                 **LatestPreamble, Inputs, FileName,
+                                 *Invocation)
+                           // Without the preamble built from the including
+                           // file, a header parsed in context has none of it.
+                           : Inputs.ProxyCompileCommand.has_value())) {
+        // The preamble is stale because e.g. a header changed on disk or the
+        // compile command changed, which unlike edits to this file can't be
+        // patched. Its diagnostics would report problems that the rebuild
+        // resolves, such as uses of declarations just added to a header, so
+        // clear them until the new preamble publishes fresh ones.
+        Callbacks.onFailedAST(FileName, Inputs.Version,
+                              std::move(CompilerInvocationDiags),
+                              [&](llvm::function_ref<void()> Publish) {
+                                std::lock_guard<std::mutex> Lock(PublishMu);
+                                if (CanPublishResults)
+                                  Publish();
+                              });
+      } else {
+        generateDiagnostics(std::move(Invocation), std::move(Inputs),
+                            std::move(CompilerInvocationDiags));
+      }
+    }
+    // Semantics are otherwise only refreshed when the preamble changes, which
+    // a rebuild for changes outside the preamble doesn't.
+    if (RebuildAST)
+      Callbacks.onPreamblePublished(FileName);
 
     std::unique_lock<std::mutex> Lock(Mutex);
     PreambleCV.wait(Lock, [this] {
@@ -1402,11 +1495,6 @@ tooling::CompileCommand ASTWorker::getCurrentCompileCommand() const {
   return FileInputs.CompileCommand;
 }
 
-ParseInputs ASTWorker::getCurrentInputs() const {
-  std::unique_lock<std::mutex> Lock(Mutex);
-  return FileInputs;
-}
-
 TUScheduler::FileStats ASTWorker::stats() const {
   TUScheduler::FileStats Result;
   Result.ASTBuilds = ASTBuildCount;
@@ -1428,6 +1516,9 @@ void ASTWorker::stop() {
     CanPublishResults = false;
   }
   {
+    // Reparses can be requested from other threads until the worker stops.
+    std::lock_guard<std::mutex> ReparseLock(LatestInputsMu);
+    AcceptsReparses = false;
     std::lock_guard<std::mutex> Lock(Mutex);
     assert(!Done && "stop() called twice");
     Done = true;
@@ -1687,10 +1778,9 @@ bool ASTWorker::blockUntilIdle(Deadline Timeout) const {
   // ASTWorker.
   if (!PreamblePeer.blockUntilIdle(Timeout))
     return false;
-  assert(Requests.empty() &&
-         "No new normal tasks can be scheduled concurrently with "
-         "blockUntilIdle(): ASTWorker isn't threadsafe");
-  // Finally make sure ASTWorker has processed all of the preamble updates.
+  // Finally make sure ASTWorker has processed all of the preamble updates, and
+  // of reparses that other threads may have scheduled meanwhile, e.g. after
+  // compile commands changed.
   return WaitUntilASTWorkerIsIdle();
 }
 
@@ -2009,8 +2099,19 @@ void TUScheduler::reparseFilesWithNewContext(
     }
   }
   for (const auto &Worker : Workers)
-    Worker->update(Worker->getCurrentInputs(), WantDiagnostics::Auto,
-                   /*ContentChanged=*/false);
+    Worker->reparse(WantDiagnostics::Auto);
+}
+
+void TUScheduler::reparseAllFiles() {
+  std::vector<std::shared_ptr<ASTWorker>> Workers;
+  {
+    std::lock_guard<std::mutex> Lock(FilesMu);
+    Workers.reserve(Files.size());
+    for (const auto &PathAndFile : Files)
+      Workers.push_back(PathAndFile.second->Worker.lockMutable());
+  }
+  for (const auto &Worker : Workers)
+    Worker->reparse(WantDiagnostics::Auto);
 }
 
 llvm::StringMap<TUScheduler::FileStats> TUScheduler::fileStats() const {

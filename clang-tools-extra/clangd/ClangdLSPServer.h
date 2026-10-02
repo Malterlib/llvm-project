@@ -204,6 +204,8 @@ private:
   LSPBinder::OutgoingNotification<ProgressParams<WorkDoneProgressEnd>>
       EndWorkDoneProgress;
   LSPBinder::OutgoingMethod<NoParams, std::nullptr_t> SemanticTokensRefresh;
+  LSPBinder::OutgoingMethod<RegistrationParams, std::nullptr_t>
+      RegisterCapability;
 
   void applyEdit(WorkspaceEdit WE, llvm::json::Value Success,
                  Callback<llvm::json::Value> Reply);
@@ -297,6 +299,9 @@ private:
   bool SupportsHierarchicalDocumentSymbol = false;
   /// Whether the client supports showing file status.
   bool SupportFileStatus = false;
+  /// Whether to ask the client to report changes to source files and
+  /// compilation databases on disk (workspace/didChangeWatchedFiles).
+  bool WatchFiles = false;
   /// Whether the client supports attaching a container string to references.
   bool SupportsReferenceContainer = false;
   /// Which kind of markup should we use in textDocument/hover responses.

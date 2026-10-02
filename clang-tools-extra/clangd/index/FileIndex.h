@@ -29,6 +29,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -74,6 +75,12 @@ public:
   /// If either is nullptr, corresponding data for \p Key will be removed.
   /// If CountReferences is true, \p Refs will be used for counting references
   /// during merging.
+  /// Removes the slabs for \p Key. Returns whether there were any.
+  bool remove(llvm::StringRef Key);
+
+  /// Returns the keys that have slabs.
+  std::vector<std::string> keys() const;
+
   void update(llvm::StringRef Key, std::unique_ptr<SymbolSlab> Symbols,
               std::unique_ptr<RefSlab> Refs,
               std::unique_ptr<RelationSlab> Relations, bool CountReferences);
@@ -122,6 +129,18 @@ public:
   /// `indexMainDecls`.
   void updateMain(PathRef Path, ParsedAST &AST);
 
+  /// Removes what was indexed from \p Paths, both as main files and as
+  /// headers, e.g. because they changed on disk while not open. Queries see
+  /// the removal after the next rebuild, e.g. rebuildAfterRemovals(), which is
+  /// slower and can run on another thread. Updates in between are kept.
+  void removeFiles(llvm::ArrayRef<std::string> Paths);
+  /// Like removeFiles(), but only as main files, for the main files that
+  /// \p ShouldRemove returns true for.
+  void
+  removeMainFiles(llvm::function_ref<bool(llvm::StringRef Path)> ShouldRemove);
+  /// Rebuilds the indexes that removeFiles() removed something from.
+  void rebuildAfterRemovals();
+
   void profile(MemoryTree &MT) const;
 
 private:
@@ -145,6 +164,11 @@ private:
   // (Note that symbols *only* in the main file are not indexed).
   FileSymbols MainFileSymbols;
   SwapIndex MainFileIndex;
+
+  void rebuildPreambleIndex();
+  void rebuildMainIndex();
+  std::atomic<bool> PreambleRemovalPending = {false};
+  std::atomic<bool> MainRemovalPending = {false};
 
   // While both the FileIndex and SwapIndex are threadsafe, we need to track
   // versions to ensure that we don't overwrite newer indexes with older ones.

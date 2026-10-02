@@ -8,6 +8,7 @@
 
 #include "FileIndex.h"
 #include "CollectMacros.h"
+#include "FS.h"
 #include "ParsedAST.h"
 #include "clang-include-cleaner/Record.h"
 #include "index/Index.h"
@@ -32,6 +33,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include <algorithm>
 #include <memory>
 #include <optional>
@@ -244,6 +246,31 @@ SlabTuple indexHeaderSymbols(llvm::StringRef Version, ASTContext &AST,
 FileSymbols::FileSymbols(IndexContents IdxContents, bool SupportContainedRefs)
     : IdxContents(IdxContents), SupportContainedRefs(SupportContainedRefs) {}
 
+bool FileSymbols::remove(llvm::StringRef Key) {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  bool Removed = SymbolsSnapshot.erase(Key);
+  Removed |= RefsSnapshot.erase(Key);
+  Removed |= RelationsSnapshot.erase(Key);
+  if (Removed)
+    ++Version;
+  return Removed;
+}
+
+std::vector<std::string> FileSymbols::keys() const {
+  std::lock_guard<std::mutex> Lock(Mutex);
+  llvm::StringSet<> Keys;
+  for (const auto &Entry : SymbolsSnapshot)
+    Keys.insert(Entry.getKey());
+  for (const auto &Entry : RefsSnapshot)
+    Keys.insert(Entry.getKey());
+  for (const auto &Entry : RelationsSnapshot)
+    Keys.insert(Entry.getKey());
+  std::vector<std::string> Result;
+  for (const auto &Key : Keys)
+    Result.push_back(Key.getKey().str());
+  return Result;
+}
+
 void FileSymbols::update(llvm::StringRef Key,
                          std::unique_ptr<SymbolSlab> Symbols,
                          std::unique_ptr<RefSlab> Refs,
@@ -441,6 +468,10 @@ void FileIndex::updatePreamble(IndexFileIn IF) {
         std::make_unique<RelationSlab>(std::move(*IF->Relations)),
         /*CountReferences=*/false);
   }
+  rebuildPreambleIndex();
+}
+
+void FileIndex::rebuildPreambleIndex() {
   size_t IndexVersion = 0;
   auto NewIndex = PreambleSymbols.buildIndex(
       IndexType::Heavy, DuplicateHandling::PickOne, &IndexVersion);
@@ -476,6 +507,57 @@ void FileIndex::updateMain(PathRef Path, ParsedAST &AST) {
       std::make_unique<RefSlab>(std::move(std::get<1>(Contents))),
       std::make_unique<RelationSlab>(std::move(std::get<2>(Contents))),
       /*CountReferences=*/true);
+  rebuildMainIndex();
+}
+
+// Removes the slabs of the files that \p ShouldRemove returns true for.
+// Returns whether any were removed.
+static bool
+removeFilesIf(FileSymbols &Symbols,
+              llvm::function_ref<bool(llvm::StringRef Path)> ShouldRemove) {
+  bool Removed = false;
+  for (const std::string &Uri : Symbols.keys()) {
+    auto Path = URI::resolve(Uri);
+    if (!Path) {
+      llvm::consumeError(Path.takeError());
+      continue;
+    }
+    if (ShouldRemove(*Path))
+      Removed |= Symbols.remove(Uri);
+  }
+  return Removed;
+}
+
+void FileIndex::removeFiles(llvm::ArrayRef<std::string> Paths) {
+  if (Paths.empty())
+    return;
+  // Paths may be spelled differently than when indexed, e.g. in case.
+  llvm::StringSet<> Keys;
+  for (const std::string &Path : Paths)
+    Keys.insert(maybeCaseFoldPath(removeDots(Path)));
+  auto ShouldRemove = [&](llvm::StringRef Path) {
+    return Keys.contains(maybeCaseFoldPath(removeDots(Path)));
+  };
+  if (removeFilesIf(PreambleSymbols, ShouldRemove))
+    PreambleRemovalPending = true;
+  if (removeFilesIf(MainFileSymbols, ShouldRemove))
+    MainRemovalPending = true;
+}
+
+void FileIndex::removeMainFiles(
+    llvm::function_ref<bool(llvm::StringRef Path)> ShouldRemove) {
+  if (removeFilesIf(MainFileSymbols, ShouldRemove))
+    MainRemovalPending = true;
+}
+
+void FileIndex::rebuildAfterRemovals() {
+  if (PreambleRemovalPending.exchange(false))
+    rebuildPreambleIndex();
+  if (MainRemovalPending.exchange(false))
+    rebuildMainIndex();
+}
+
+void FileIndex::rebuildMainIndex() {
   size_t IndexVersion = 0;
   auto NewIndex = MainFileSymbols.buildIndex(
       IndexType::Light, DuplicateHandling::Merge, &IndexVersion);

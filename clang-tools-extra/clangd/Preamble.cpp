@@ -786,6 +786,8 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
     if (InProxyMode) {
       Result->Preamble.clearPreambleBytes();
       Result->Preamble.setIsProxyPreamble();
+      Result->ProxyFile = Inputs.ProxyCompileCommand->Filename;
+      Result->ProxyFileDigest = digest(ProxyBuffer->getBuffer());
     }
 
     Result->Version = Inputs.Version;
@@ -842,15 +844,63 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
   return nullptr;
 }
 
+// Identifies a dependency of the preamble, which is spelled as found, e.g.
+// relative to the working directory it was built in.
+static std::string dependencyKey(llvm::StringRef Dependency,
+                                 const ParseInputs &Inputs) {
+  llvm::SmallString<256> Absolute(Dependency);
+  if (llvm::sys::path::is_relative(Absolute))
+    llvm::sys::path::make_absolute(Inputs.ProxyCompileCommand
+                                       ? Inputs.ProxyCompileCommand->Directory
+                                       : Inputs.CompileCommand.Directory,
+                                   Absolute);
+  return maybeCaseFoldPath(removeDots(Absolute));
+}
+
+// Whether the preamble depends on files reported changed, which can be missed
+// by comparing their size and modification time. A directory can be reported
+// instead of the files in it, such as one that was moved or replaced.
+static bool dependsOnChangedFiles(const PreambleData &Preamble,
+                                  const ParseInputs &Inputs, PathRef FileName) {
+  if (!Inputs.ChangedFiles || Inputs.ChangedFiles->empty())
+    return false;
+  llvm::StringSet<> Changed;
+  for (const auto &File : *Inputs.ChangedFiles)
+    // In proxy mode, the preamble stops at FileName.
+    if (!Inputs.ProxyCompileCommand || !pathEqual(File.getKey(), FileName))
+      Changed.insert(maybeCaseFoldPath(removeDots(File.getKey())));
+  bool Depends = false;
+  Preamble.Preamble.ForEachDependency([&](llvm::StringRef Dependency) {
+    if (Depends)
+      return;
+    const std::string Key = dependencyKey(Dependency, Inputs);
+    for (llvm::StringRef Path = Key; !Path.empty() && !Depends;
+         Path = llvm::sys::path::parent_path(Path))
+      Depends = Changed.contains(Path);
+  });
+  return Depends;
+}
+
+// Whether the preamble was built from the including file that the inputs
+// borrow their command from, or like the inputs from the file itself.
+static bool preambleContextMatches(const PreambleData &Preamble,
+                                   const ParseInputs &Inputs) {
+  if (!Inputs.ProxyCompileCommand)
+    return Preamble.ProxyFile.empty();
+  return Preamble.ProxyFile == Inputs.ProxyCompileCommand->Filename;
+}
+
 bool isPreambleCompatible(const PreambleData &Preamble,
                           const ParseInputs &Inputs, PathRef FileName,
                           const CompilerInvocation &CI) {
+  // In proxy mode the preamble holds none of the main file, so only changes to
+  // its dependencies invalidate it.
+  if (Inputs.ProxyCompileCommand.has_value())
+    return !preambleDependenciesChanged(Preamble, Inputs, FileName, CI);
+  if (!preambleContextMatches(Preamble, Inputs))
+    return false;
+
   auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
-  if (Inputs.ProxyCompileCommand.has_value()) // When in proxy mode the preamble is always empty
-    return compileCommandsAreEqual(Inputs.CompileCommand,
-                                 Preamble.CompileCommand) &&
-         (!Preamble.RequiredModules ||
-          Preamble.RequiredModules->canReuse(CI, VFS));
 
   auto ContentsBuffer =
       llvm::MemoryBuffer::getMemBuffer(Inputs.Contents, FileName);
@@ -872,10 +922,44 @@ bool isPreambleCompatible(const PreambleData &Preamble,
 
   return compileCommandsAreEqual(Inputs.CompileCommand,
                                  Preamble.CompileCommand) &&
+         !dependsOnChangedFiles(Preamble, Inputs, FileName) &&
          Preamble.Preamble.CanReuse(CI, *ContentsBuffer, Bounds, *VFS) &&
          (!Preamble.RequiredModules ||
           Preamble.RequiredModules->canReuse(CI, VFS)) &&
          RequiredModulesMatch();
+}
+
+bool preambleDependenciesChanged(const PreambleData &Preamble,
+                                 const ParseInputs &Inputs, PathRef FileName,
+                                 const CompilerInvocation &CI) {
+  // Headers parsed in context borrow the including file's command, which can
+  // be the same for different including files.
+  if (!preambleContextMatches(Preamble, Inputs))
+    return true;
+  if (!compileCommandsAreEqual(Inputs.CompileCommand, Preamble.CompileCommand))
+    return true;
+  if (dependsOnChangedFiles(Preamble, Inputs, FileName))
+    return true;
+  auto VFS = Inputs.TFS->view(Inputs.CompileCommand.Directory);
+  if (Preamble.RequiredModules && !Preamble.RequiredModules->canReuse(CI, VFS))
+    return true;
+  if (!Inputs.ProxyCompileCommand)
+    return !Preamble.Preamble.DependenciesUnchanged(CI, *VFS);
+
+  // The preamble stops where the including file includes FileName, so changes
+  // to FileName itself don't affect it.
+  std::string FileKey = maybeCaseFoldPath(removeDots(FileName));
+  if (!Preamble.Preamble.DependenciesUnchanged(
+          CI, *VFS, [&](llvm::StringRef Dependency) {
+            return dependencyKey(Dependency, Inputs) == FileKey;
+          }))
+    return true;
+  // The including file is the preamble's main file, which isn't one of its
+  // tracked dependencies.
+  auto ProxyVFS = Inputs.TFS->view(Inputs.ProxyCompileCommand->Directory);
+  auto Buffer =
+      ProxyVFS->getBufferForFile(Inputs.ProxyCompileCommand->Filename);
+  return !Buffer || digest((*Buffer)->getBuffer()) != Preamble.ProxyFileDigest;
 }
 
 void escapeBackslashAndQuotes(llvm::StringRef Text, llvm::raw_ostream &OS) {

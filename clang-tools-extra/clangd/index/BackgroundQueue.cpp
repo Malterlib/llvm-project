@@ -27,6 +27,8 @@ void BackgroundQueue::work(std::function<void()> OnIdle) {
       CV.wait(Lock, [&] { return ShouldStop || !Queue.empty(); });
       if (ShouldStop) {
         Queue.clear();
+        QueuedKeys.clear();
+        Deferred.clear();
         CV.notify_all();
         return;
       }
@@ -34,6 +36,10 @@ void BackgroundQueue::work(std::function<void()> OnIdle) {
       std::pop_heap(Queue.begin(), Queue.end());
       Task = std::move(Queue.back());
       Queue.pop_back();
+      if (Task->Key) {
+        QueuedKeys.erase(Task->Key);
+        ActiveKeys.insert(Task->Key);
+      }
       notifyProgress();
     }
 
@@ -47,6 +53,19 @@ void BackgroundQueue::work(std::function<void()> OnIdle) {
     {
       std::unique_lock<std::mutex> Lock(Mu);
       ++Stat.Completed;
+      if (Task->Key) {
+        ActiveKeys.erase(Task->Key);
+        auto It = Deferred.find(Task->Key);
+        if (It != Deferred.end()) {
+          BackgroundQueue::Task Next = std::move(It->second);
+          Deferred.erase(It);
+          if (adjust(Next)) {
+            Queue.push_back(std::move(Next));
+            std::push_heap(Queue.begin(), Queue.end());
+            ++Stat.Enqueued;
+          }
+        }
+      }
       if (Stat.Active == 1 && Queue.empty()) {
         // We just finished the last item, the queue is going idle.
         assert(ShouldStop || Stat.Completed == Stat.Enqueued);
@@ -75,13 +94,19 @@ void BackgroundQueue::stop() {
 
 // Tweaks the priority of a newly-enqueued task, or returns false to cancel it.
 bool BackgroundQueue::adjust(Task &T) {
-  // It is tempting to drop duplicates of queued tasks, and merely deprioritize
-  // duplicates of completed tasks (i.e. reindexing on CDB changes). But:
-  //  - the background indexer doesn't support reindexing well, e.g. staleness
-  //    is checked at *enqueue* time only, and doesn't account for compile flags
-  //  - reindexing on compile flags is often a poor use of CPU in practice
-  if (T.Key && !SeenKeys.insert(T.Key).second)
-    return false;
+  // Drop duplicates of queued tasks, e.g. a file whose dependencies changed
+  // several times before it got indexed. Duplicates of completed tasks run
+  // again: the indexer only enqueues files that are stale compared to their
+  // stored shards, including their compile flags. Tasks with the key of a
+  // running task wait for it to finish, as both would store their results.
+  if (T.Key) {
+    if (ActiveKeys.contains(T.Key)) {
+      Deferred.insert_or_assign(T.Key, std::move(T));
+      return false;
+    }
+    if (!QueuedKeys.insert(T.Key).second)
+      return false;
+  }
   T.QueuePri = std::max(T.QueuePri, Boosts.lookup(T.Tag));
   return true;
 }
@@ -112,6 +137,11 @@ void BackgroundQueue::append(std::vector<Task> Tasks) {
     notifyProgress();
   }
   CV.notify_all();
+}
+
+bool BackgroundQueue::isActive(uint64_t Key) {
+  std::lock_guard<std::mutex> Lock(Mu);
+  return ActiveKeys.contains(Key);
 }
 
 void BackgroundQueue::boost(llvm::StringRef Tag, unsigned NewPriority) {
