@@ -4,16 +4,31 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_clang_library(clangTidyMalterlibModule STATIC
+  ActorAnnotations.cpp
+  ActorDispatchThisCheck.cpp
+  ActorPhaseCheck.cpp
+  AsyncDestroyCheck.cpp
+  CoawaitPrecedenceCheck.cpp
   ConceptualPrefixCheck.cpp
+  ContinueRunningOnActorCheck.cpp
+  CoroutineActorReferenceCheck.cpp
+  CoroutineLambdaCallCheck.cpp
+  CoroutineReferenceCaptureCheck.cpp
+  CoroutineReferenceParameterCheck.cpp
+  CoroutineUnsafeThisCheck.cpp
+  CoroutineUtils.cpp
   FunctionNamingCheck.cpp
   HeaderDeclarationsOnlyCheck.cpp
   MacroNamingCheck.cpp
   MalterlibCheck.cpp
+  MalterlibOptions.cpp
   MalterlibTidyModule.cpp
   NamingUtils.cpp
   NoZeroBitScanCheck.cpp
   ParameterNamingCheck.cpp
   ParameterOwnershipCheck.cpp
+  RunsToCompletion.cpp
+  RunsToCompletionCheck.cpp
   StructNotClassCheck.cpp
   TypeNamingCheck.cpp
   UnusedParameterCastCheck.cpp

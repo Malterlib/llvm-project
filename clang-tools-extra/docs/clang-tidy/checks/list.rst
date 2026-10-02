@@ -261,13 +261,24 @@ Clang-Tidy Checks
    :doc:`llvmlibc-implementation-in-namespace <llvmlibc/implementation-in-namespace>`,
    :doc:`llvmlibc-inline-function-decl <llvmlibc/inline-function-decl>`, "Yes"
    :doc:`llvmlibc-restrict-system-libc-headers <llvmlibc/restrict-system-libc-headers>`, "Yes"
+   :doc:`malterlib-actor-dispatch-this <malterlib/actor-dispatch-this>`,
+   :doc:`malterlib-actor-phase <malterlib/actor-phase>`,
+   :doc:`malterlib-async-destroy <malterlib/async-destroy>`,
+   :doc:`malterlib-coawait-precedence <malterlib/coawait-precedence>`, "Yes"
    :doc:`malterlib-conceptual-prefix <malterlib/conceptual-prefix>`,
+   :doc:`malterlib-continue-running-on-actor <malterlib/continue-running-on-actor>`,
+   :doc:`malterlib-coroutine-actor-reference <malterlib/coroutine-actor-reference>`,
+   :doc:`malterlib-coroutine-lambda-call <malterlib/coroutine-lambda-call>`,
+   :doc:`malterlib-coroutine-reference-capture <malterlib/coroutine-reference-capture>`,
+   :doc:`malterlib-coroutine-reference-parameter <malterlib/coroutine-reference-parameter>`,
+   :doc:`malterlib-coroutine-unsafe-this <malterlib/coroutine-unsafe-this>`,
    :doc:`malterlib-function-naming <malterlib/function-naming>`,
    :doc:`malterlib-header-declarations-only <malterlib/header-declarations-only>`,
    :doc:`malterlib-macro-naming <malterlib/macro-naming>`,
    :doc:`malterlib-no-zero-bit-scan <malterlib/no-zero-bit-scan>`,
    :doc:`malterlib-parameter-naming <malterlib/parameter-naming>`,
    :doc:`malterlib-parameter-ownership <malterlib/parameter-ownership>`,
+   :doc:`malterlib-runs-to-completion <malterlib/runs-to-completion>`,
    :doc:`malterlib-struct-not-class <malterlib/struct-not-class>`, "Yes"
    :doc:`malterlib-type-naming <malterlib/type-naming>`,
    :doc:`malterlib-unused-parameter-cast <malterlib/unused-parameter-cast>`, "Yes"
