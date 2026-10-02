@@ -622,14 +622,34 @@ struct FragmentCompiler {
           });
     if (!F.CheckOptions.empty()) {
       std::vector<std::pair<std::string, std::string>> CheckOptions;
-      for (auto &Opt : F.CheckOptions)
+      for (auto &Opt : F.CheckOptions) {
+        // A path relative to the directory of the fragment, like one in a
+        // .clang-tidy is relative to its directory.
+        if (tidy::isPathOption(*Opt.first) && !Opt.second->empty()) {
+          if (std::optional<std::string> Path =
+                  makeAbsolute(std::move(Opt.second), "A path in CheckOptions",
+                               llvm::sys::path::Style::native))
+            CheckOptions.emplace_back(std::move(*Opt.first), std::move(*Path));
+          continue;
+        }
         CheckOptions.emplace_back(std::move(*Opt.first),
                                   std::move(*Opt.second));
+      }
       Out.Apply.push_back(
           [CheckOptions = std::move(CheckOptions)](const Params &, Config &C) {
-            for (auto &StringPair : CheckOptions)
-              C.Diagnostics.ClangTidy.CheckOptions.insert_or_assign(
+            auto &ClangTidy = C.Diagnostics.ClangTidy;
+            const unsigned Fragment = ++ClangTidy.CheckOptionsFragmentCount;
+            for (auto &StringPair : CheckOptions) {
+              auto [It, Inserted] = ClangTidy.CheckOptions.try_emplace(
                   StringPair.first, StringPair.second);
+              unsigned &Set = ClangTidy.CheckOptionFragments[StringPair.first];
+              if (!Inserted) {
+                ClangTidy.ReplacedCheckOptions[StringPair.first].emplace_back(
+                    std::move(It->second), Set);
+                It->second = StringPair.second;
+              }
+              Set = Fragment;
+            }
           });
     }
     if (F.FastCheckFilter.has_value())

@@ -53,6 +53,9 @@ config.test_exec_root = os.path.join(config.clang_tools_binary_dir, "test")
 # Set up clang for use in tests. Makes %clang substitution available.
 llvm_config.use_clang()
 
+# Whether LLVM is built with assertions, for tests of what clang asserts on.
+llvm_config.feature_config([("--assertion-mode", {"ON": "asserts"})])
+
 if config.clang_tidy_staticanalyzer:
     config.available_features.add("static-analyzer")
 if config.clang_tidy_custom_check:
@@ -85,6 +88,10 @@ config.substitutions.append(("%clang_tidy_headers", clang_tidy_headers))
 # Plugins (loadable modules)
 if config.has_plugins and config.llvm_plugin_ext:
     config.available_features.add("plugins")
+
+# The plugin that runs the Malterlib checks in clang
+if config.has_malterlib_plugin:
+    config.available_features.add("malterlib-plugin")
 
 # It is not realistically possible to account for all options that could
 # possibly be present in system and user configuration files, so disable

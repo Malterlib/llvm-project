@@ -90,6 +90,11 @@ extern volatile int LLVMLibcModuleAnchorSource;
 [[maybe_unused]] static int LLVMLibcModuleAnchorDestination =
     LLVMLibcModuleAnchorSource;
 
+// This anchor is used to force the linker to link the MalterlibModule.
+extern volatile int MalterlibModuleAnchorSource;
+[[maybe_unused]] static int MalterlibModuleAnchorDestination =
+    MalterlibModuleAnchorSource;
+
 // This anchor is used to force the linker to link the MiscModule.
 extern volatile int MiscModuleAnchorSource;
 [[maybe_unused]] static int MiscModuleAnchorDestination =

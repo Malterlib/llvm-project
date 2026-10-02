@@ -535,19 +535,29 @@ void filterCheckOptions(ClangTidyOptions &Options,
   ClangTidyOptions::OptionMap FilteredOptions;
   for (const auto &[OptionName, Value] : Options.CheckOptions) {
     const size_t CheckNameEndPos = OptionName.find('.');
-    if (CheckNameEndPos == StringRef::npos)
+    // An option of all checks, which an enabled check keeps, like the lists
+    // that the Malterlib checks share.
+    if (CheckNameEndPos == StringRef::npos) {
+      FilteredOptions[OptionName] = Value;
       continue;
+    }
     const StringRef CheckName = OptionName.substr(0, CheckNameEndPos);
-    if (llvm::binary_search(EnabledChecks, CheckName))
+    // Or of the checks of a module with an enabled check, like
+    // `malterlib.OptionsFile`.
+    const std::string ModulePrefix = (CheckName + "-").str();
+    if (llvm::binary_search(EnabledChecks, CheckName) ||
+        llvm::any_of(EnabledChecks, [&](const std::string &Check) {
+          return StringRef(Check).starts_with(ModulePrefix);
+        }))
       FilteredOptions[OptionName] = Value;
   }
   Options.CheckOptions = std::move(FilteredOptions);
 }
 
-ClangTidyOptions::OptionMap
-getCheckOptions(const ClangTidyOptions &Options,
-                bool AllowEnablingAnalyzerAlphaCheckers,
-                bool ExperimentalCustomChecks) {
+ClangTidyOptions::OptionMap getCheckOptions(
+    const ClangTidyOptions &Options, bool AllowEnablingAnalyzerAlphaCheckers,
+    bool ExperimentalCustomChecks, std::vector<ClangTidyError> *Errors,
+    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS) {
   ClangTidyContext Context(std::make_unique<DefaultOptionsProvider>(
                                ClangTidyGlobalOptions(), Options),
                            AllowEnablingAnalyzerAlphaCheckers, false,
@@ -557,8 +567,12 @@ getCheckOptions(const ClangTidyOptions &Options,
   DiagnosticsEngine DE(llvm::makeIntrusiveRefCnt<DiagnosticIDs>(), *DiagOpts,
                        &DiagConsumer, /*ShouldOwnClient=*/false);
   Context.setDiagnosticsEngine(std::move(DiagOpts), &DE);
+  Context.setFileSystem(std::move(FS));
   ClangTidyASTConsumerFactory Factory(Context);
-  return Factory.getCheckOptions();
+  ClangTidyOptions::OptionMap CheckOptions = Factory.getCheckOptions();
+  if (Errors)
+    *Errors = DiagConsumer.take();
+  return CheckOptions;
 }
 
 std::vector<ClangTidyError>

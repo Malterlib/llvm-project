@@ -14,6 +14,7 @@ See also:
    Clang-tidy IDE/Editor Integrations <Integrations>
    Getting Involved <Contributing>
    External Clang-Tidy Examples <ExternalClang-TidyExamples>
+   The Malterlib Options File <MalterlibOptionsFile>
 
 :program:`clang-tidy` is a clang-based C++ "linter" tool. Its purpose is to
 provide an extensible framework for diagnosing and fixing typical programming
@@ -83,6 +84,7 @@ Name prefix            Description
 ``linuxkernel-``       Checks related to the Linux Kernel coding conventions.
 ``llvm-``              Checks related to the LLVM coding conventions.
 ``llvmlibc-``          Checks related to the LLVM-libc coding standards.
+``malterlib-``         Checks related to the Malterlib coding standard.
 ``misc-``              Checks that we didn't have a better category for.
 ``modernize-``         Checks that advocate usage of modern (currently
                        "modern" means "C++11") language constructs.

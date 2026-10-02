@@ -14,6 +14,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBufferRef.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -309,12 +310,24 @@ ClangTidyOptions &ClangTidyOptions::mergeWith(const ClangTidyOptions &Other,
   // FIXME: how to handle duplicate names check?
   mergeVectors(CustomChecks, Other.CustomChecks);
   for (const auto &KeyValue : Other.CheckOptions) {
-    CheckOptions.insert_or_assign(
-        KeyValue.getKey(),
-        ClangTidyValue(KeyValue.getValue().Value,
-                       KeyValue.getValue().Priority + Order));
+    ClangTidyValue Value(KeyValue.getValue().Value,
+                         KeyValue.getValue().Priority + Order);
+    for (const auto &[Replaced, Priority] : KeyValue.getValue().Replaced)
+      Value.Replaced.emplace_back(Replaced, Priority + Order);
+    replaceCheckOption(KeyValue.getKey(), std::move(Value));
   }
   return *this;
+}
+
+void ClangTidyOptions::replaceCheckOption(StringRef Key, ClangTidyValue Value) {
+  if (auto It = CheckOptions.find(Key); It != CheckOptions.end()) {
+    std::vector<std::pair<std::string, unsigned>> Replaced =
+        std::move(It->second.Replaced);
+    Replaced.emplace_back(std::move(It->second.Value), It->second.Priority);
+    llvm::append_range(Replaced, std::move(Value.Replaced));
+    Value.Replaced = std::move(Replaced);
+  }
+  CheckOptions.insert_or_assign(Key, std::move(Value));
 }
 
 ClangTidyOptions ClangTidyOptions::merge(const ClangTidyOptions &Other,
@@ -479,6 +492,12 @@ FileOptionsProvider::getRawOptions(StringRef FileName) {
   return RawOptions;
 }
 
+void FileOptionsBaseProvider::configFileUnreadable(StringRef ConfigFile,
+                                                   std::error_code Error) {
+  llvm::errs() << "Can't read " << ConfigFile << ": " << Error.message()
+               << "\n";
+}
+
 std::optional<OptionsSource>
 FileOptionsBaseProvider::tryReadConfigFile(StringRef Directory) {
   assert(!Directory.empty());
@@ -498,14 +517,28 @@ FileOptionsBaseProvider::tryReadConfigFile(StringRef Directory) {
 
     llvm::ErrorOr<llvm::vfs::Status> FileStatus = FS->status(ConfigFile);
 
-    if (!FileStatus || !FileStatus->isRegularFile())
+    // One that exists and can't be read as a file, also through a symbolic
+    // link into a directory that can't be searched, is reported like one
+    // whose read fails; "no such file", also of a dangling link, is none.
+    if (!FileStatus) {
+      if (FileStatus.getError() != std::errc::no_such_file_or_directory)
+        configFileUnreadable(ConfigFile, FileStatus.getError());
       continue;
+    }
+    // Nor is one that isn't a regular file, a directory or a pipe.
+    if (!FileStatus->isRegularFile()) {
+      configFileUnreadable(ConfigFile,
+                           std::make_error_code(
+                               FileStatus->isDirectory()
+                                   ? std::errc::is_a_directory
+                                   : std::errc::not_supported));
+      continue;
+    }
 
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Text =
         FS->getBufferForFile(ConfigFile);
     if (const std::error_code EC = Text.getError()) {
-      llvm::errs() << "Can't read " << ConfigFile << ": " << EC.message()
-                   << "\n";
+      configFileUnreadable(ConfigFile, EC);
       continue;
     }
 
@@ -539,6 +572,44 @@ std::error_code parseLineFilter(StringRef LineFilter,
   return {};
 }
 
+/// The options whose values are paths, which a configuration file gives
+/// relative to the directory it is in.
+static constexpr llvm::StringLiteral PathOptions[] = {"malterlib.OptionsFile"};
+
+bool isPathOption(StringRef Name) {
+  return llvm::is_contained(PathOptions, Name);
+}
+
+/// Makes the relative paths of \p Options absolute, relative to the directory
+/// of the configuration file \p Config is read from, or to the current
+/// directory for one given on the command line, which has no file. Like
+/// `malterlib.OptionsFile: ../Core/ClangTidyOptions.yaml` in a module's
+/// `.clang-tidy`, which refers to the same file from wherever a source is.
+static void resolvePathOptions(ClangTidyOptions &Options,
+                               llvm::MemoryBufferRef Config) {
+  for (StringRef Name : PathOptions) {
+    auto It = Options.CheckOptions.find(Name);
+    if (It == Options.CheckOptions.end() || It->second.Value.empty() ||
+        llvm::sys::path::is_absolute(It->second.Value))
+      continue;
+    const StringRef Identifier = Config.getBufferIdentifier();
+    SmallString<256> Path;
+    // Of a file, also one whose name starts with `<`, `<module>/tidy.yaml`.
+    if (!Identifier.empty() && Identifier != CommandLineConfigName)
+      Path = llvm::sys::path::parent_path(Identifier);
+    llvm::sys::path::append(Path, It->second.Value);
+    // Of a file named absolutely, which the plugin reads its configuration
+    // by, already absolute, without asking for the current directory outside
+    // the file system of the compilation.
+    if (!llvm::sys::path::is_absolute(Path))
+      llvm::sys::fs::make_absolute(Path);
+    // Not `..`, which after a symbolic link is in another directory than the
+    // one before it.
+    llvm::sys::path::remove_dots(Path);
+    It->second.Value = std::string(Path);
+  }
+}
+
 llvm::ErrorOr<ClangTidyOptions>
 parseConfiguration(llvm::MemoryBufferRef Config) {
   llvm::yaml::Input Input(Config);
@@ -546,6 +617,7 @@ parseConfiguration(llvm::MemoryBufferRef Config) {
   Input >> Options;
   if (Input.error())
     return Input.error();
+  resolvePathOptions(Options, Config);
   return Options;
 }
 
@@ -562,6 +634,7 @@ parseConfigurationWithDiags(llvm::MemoryBufferRef Config,
   Input >> Options;
   if (Input.error())
     return Input.error();
+  resolvePathOptions(Options, Config);
   return Options;
 }
 

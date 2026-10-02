@@ -1,0 +1,361 @@
+.. title:: clang-tidy - malterlib-conceptual-prefix
+
+malterlib-conceptual-prefix
+===========================
+
+Checks the concept prefix that follows the storage prefix of a variable,
+member, parameter or non-type template parameter, where the declared type
+tells the concept. The placeholder ``_`` of what is ignored, C++26 ``bool _``
+or ``auto [Ticket, _] = ...``, is no name and isn't checked.
+
+========= ==================================================================
+Prefix    Type
+========= ==================================================================
+``b``     ``bool``
+``p``     Pointers, ``nullptr_t`` and smart pointers
+``f``     Function pointers, lambdas and function objects
+``i``     Iterators
+========= ==================================================================
+
+Of a class whose bases can't be told from what clang instantiated, not
+defined in the translation unit, like a forward declared one or a
+specialization nothing completes, also only named by a declaration, or of a
+template only declared, without partial specializations,
+``void fg_Use(TCAutoClearPtr<int> _Object);``, or with a base that depends on
+parameters, ``b``, ``i`` and ``p`` can't be told to be wrong, and what its
+bases decide, like being a handle, isn't known, so its generic name is
+allowed too. What its name tells still applies. A name doesn't have a concept prefix its
+type, which doesn't depend on template parameters, can't be: ``b`` on what isn't an integer, a ``bool``, an
+enumeration or a wrapper of one, ValueWrapperTypes, like ``TCAtomic<bool>``,
+which is a set of flags, or a class that is a flag, FlagTypes, like
+``CAtomicFlag m_bReplied``, which may have ``b`` but needn't, ``i`` on what isn't one of IteratorTypes or an
+integer, an index, ``p`` on what isn't a pointer or one of SmartPointerTypes,
+and ``f`` on a number or a class without a call operator (``double
+g_fRatio``). ``n`` and ``r``, the number of something and a range, can be on
+anything but an array, which takes only ``r``. Malterlib's built-in types that are classes, like ``fp64``, are numbers,
+of BuiltinTypes. ``b`` on an integer is allowed, as a set of
+flags. In a template, that is of what it is in any instantiation, also of a
+structured binding, ``auto [fValue] = _Entry`` of an ``int`` member, and of a
+partial specialization of a member variable template: a prefix wrong in one of
+them is wrong, as a prefix claims a concept of every use, while no prefix fits
+any. A member that takes no space where it is empty, ``[[no_unique_address]]``,
+can be an empty stand-in in an instantiation, ``TCConditional<t_bStore, CStore
+*, CStoreEmpty> m_pStore``, which then excludes no prefix.
+
+When a name models several concepts, only the outer one is used, so a pointer
+to a function is ``f`` and a pointer to a ``bool`` is ``p``, not ``pb``, and a
+pointer to a pointer is ``p``, not ``pp``. A raw pointer is always ``p``, also
+one that walks over elements, like ``for (int *pValue = pBegin; ...)``, also
+through an alias named as an iterator, like ``using CIntIterator = int *``:
+that it is a pointer matters more than that it is an iterator. An iterator that is
+a range, which knows its end, may use ``r``, like ``for (auto rByte =
+_rBytes; rByte; ++rByte)``.
+
+.. example-before
+   struct CNode;
+
+.. code-block:: c++
+
+  void fg_Find(bool _bExact, CNode *_pRoot, TCFunction<void ()> const &_fOnFound); // fine
+
+.. example-check
+
+  using umint = unsigned long;
+  struct CNode;
+  void fg_Pointer(CNode *_Root); // warning: a raw pointer is always 'p'
+  void fg_WrongPointer(int _pCount); // warning: 'p' on what isn't a pointer
+  void fg_WrongBool(double _bRatio); // warning: 'b' on what isn't an integer or a boolean
+  void fg_WrongFunction(double _fRatio); // warning: 'f' on a number
+  void fg_Flags(umint _bFlags); // fine: 'b' on an integer, a set of flags
+  void fg_Number(umint _nNodes, int _rCount); // fine: 'n' and 'r' on what isn't an array
+  void fg_Array(int (&_pValues)[4]); // warning: an array takes no concept prefix but 'r'
+  void fg_Range(int (&_rValues)[4]); // fine: an array is a range
+  void fg_Double(bool *_pbFlag); // warning: only the outer concept
+
+The other concepts of the coding standard, ``n`` (number of) and ``r``
+(range), depend on what a variable means, not on its type, so they are not
+checked, except that an array takes no concept prefix other than ``r``,
+whatever its elements are: ``CStr const *g_pWeekDays[7]`` and ``umint
+(&_nCounts)[4]`` are reported, also an array referred to. It is a range, so
+``r`` fits it, ``int (&o_rValues)[4]``, also what a template argument makes
+one, ``tf_CRange &_rValues`` given an ``int[4]``. ``c`` is not a concept
+prefix of variables: it is the prefix of C++
+concepts, ``cIterable``.
+
+A pointer written to a type that depends on template parameters, ``tf_CType
+*``, ``typename tf_CTraits::CType *`` or ``decltype(tf_CTraits::fs_Run) *``,
+also as what a value wrapper holds, ``TCAtomic<typename t_CTraits::CType *>``,
+is a pointer, whatever an argument makes what it points to: it needs a concept
+prefix, and ``p`` fits it always, also where an instantiation makes it a
+function pointer. The prefix of a type and the prefix of a value agree, so
+``f`` fits it only where what it points to is named as a function type
+(below), ``tf_FFunction *_fCallback``, and then ``f`` or ``p`` does. An
+instantiation that makes what an ``f``-named one points to neither a function
+nor a function object, ``tf_FFunction *_fCallback`` given an ``int *``,
+reports ``f`` there, naming the instantiation in a note. Instantiations only
+report a prefix that is wrong in them: they never allow the unprefixed name,
+and never reject ``p``.
+
+.. example-check
+
+  struct CDocTraits
+  {
+    using CType = int;
+  };
+  void fg_DocTarget();
+  template <typename tf_CType> void fg_Unprefixed(tf_CType *_Value); // warning: a written pointer needs a concept prefix
+  template <typename tf_CTraits> void fg_Member(typename tf_CTraits::CType *_Value); // warning: also to a member type
+  template <typename tf_CTraits> void fg_Named(typename tf_CTraits::CType *_fValue); // warning: 'f' needs what it points to named as a function type
+  template <typename tf_FFunction> void fg_Pointer(tf_FFunction *_pObject) {} // fine: 'p' fits every instantiation, also a function
+  template <typename tf_FFunction> void fg_Call(tf_FFunction *_fObject) {} // warning: an instantiation makes it point to an 'int'
+  void fg_DocUse(int *_pValue) // fine
+  {
+    fg_Pointer(&fg_DocTarget);
+    fg_Pointer(_pValue);
+    fg_Call(&fg_DocTarget);
+    fg_Call(_pValue);
+  }
+
+Otherwise a type that depends on a template parameter requires a concept prefix only
+where no argument can change it, as the template is written: a
+specialization of a listed smart pointer or function object template written
+as it is, also in parentheses or annotated, ``[[clang::annotate_type("...")]]``,
+when each of its partial specializations and those declared explicitly is one
+too, like ``TCSharedPointer<tf_CType> _pValue``, a written pointer (above),
+like ``tf_CType *_pValue``, a function or a pointer to
+one, like ``void (&_fCallback)(tf_CValue)``, a pointer to a member, a lambda
+declared in the template, ``auto fRun = [&] { ... }``, a type named as a
+function type (below), a local deduced from what has one of those
+types as written, ``auto pValue = static_cast<tf_CType *>(nullptr)``, also an
+init capture, a static member or a variable template, and a copy of what is
+named as a function type, ``auto fCopy = _fAction``. Where an argument can
+change it, a name takes no concept prefix that the instantiations would
+require, which can be mutually exclusive: unprefixed it is always allowed.
+That is a member of what depends on template parameters, ``typename
+tf_CTraits::CPointer _Value``, also through an alias template,
+``TCIdentity<typename t_CTraits::CValue>``, a specialization given what
+depends on them, ``TCAtomic<typename t_CTraits::CBool>``, a non-type template
+parameter of such a type, ``typename t_CTraits::CBool t_Flag``, a type
+computed from them, ``decltype(_pValue)``, what a call, a member, an element or
+an iterator that depends on them gives, ``auto Empty = _Vector.f_IsEmpty()``,
+and a structured binding in a template. Its instantiations only exclude a prefix that is wrong in one of them,
+``auto pValue = _Value`` that one makes an ``int``, which the report names in a
+note, ``in instantiation of function template specialization 'fg_Read<int>'``,
+also of a template parameter, whose template head is of each instantiation of
+what it declares, also a prefix other than
+``r`` on what one makes an array, but not ``i`` on what one makes a pointer, which generic code
+walks like any other iterator, ``tf_CIterator _iBegin`` given an ``int *``,
+wherever it is: a parameter of a lambda in a template, of a
+friend defined in a class template, of a member function defined outside of
+its class template, a member of a partial specialization or of an anonymous
+member union, a non-type template parameter, also a pack of them, a variable
+template, also a partial specialization of one, a static member, the
+variable of a ``catch``. Its instantiations are what clang instantiated from it:
+not an explicit specialization, ``template <> void fg_Reset<int>(int _Value)``,
+also of a member or of a member template written for an instantiation of its
+class, which has its own declaration, checked as written, nor an instance of a
+partial specialization, which is one of the partial specialization's own
+parameters. A null pointer an instantiation makes, ``nullptr`` given to
+``auto t_fCallback`` or a ``std::nullptr_t``, is the empty value of a pointer
+and of a function pointer, so ``p`` and ``f`` fit it. A parameter of a function
+type in the default argument of a template parameter, ``typename tf_FCallback
+= void (typename tf_CTraits::CUserData _pUserData)``, has the types of the
+specializations where clang used the default, not of one where a call deduces
+the argument or it is given, also the same type. A parameter of a lambda in the requires clause of a
+function template, which clang keeps only as it is written, isn't checked,
+nor are the instantiations of a non-type template parameter of an alias
+template or a concept, whose uses clang doesn't keep: one of such a type takes
+no concept prefix that its instantiations would require. One of a type that
+doesn't depend on the template parameters, ``bool ...tp_bToCheck`` of a
+concept, is checked like any other. A pointer to a parameter named as a function type, like
+``tf_FFunction *``, also an alias or alias template named as one,
+``FCallback<tf_CType> *``, or to a dependent member type or member alias template
+named as one, ``typename TCSignatures<tf_CType>::template FCallback<int> *``,
+can be a function, or a pointer to a function object, so
+it needs either ``f`` or ``p``, like ``_fCallback`` or ``_pCallback``, and
+an instantiation that makes it point to what is neither reports ``f`` there
+(above). A type
+named as a function type, with the ``F`` or ``TF`` type prefix, is a function
+object, as its name says: a template parameter, ``tf_FFunction &&_fFunction``,
+a dependent member type or member alias template, ``typename
+t_CTraits::FCallback _fCallback``, or an alias, ``FCallback _fCallback``, also
+of a reference, ``using FCallbackReference = CAction &``, also referred to
+again, ``FCallbackReference &``, which is the alias, also one a using
+declaration brings in from what depends on template parameters, ``using
+typename TCParent<t_CType>::FCallback``. An alias or a class declared in a
+system header has a name of its own library, like Windows' ``FILETIME`` or
+macOS' ``FSRef``, and isn't named as a function type, nor is one
+:option:`NotFunctionTypes` lists. The
+other way around, one named as a function object whose type is a template
+parameter, ``tf_CType &&_fValue``, has that parameter named as a function
+type, ``tf_FValue``. A template parameter named otherwise, ``tf_CType
+&&_Value``, can be anything, also a function object, so its name isn't
+checked. Malterlib's ``zbool``, ``TCAutoClearInt<bool>`` and
+``TCAtomic<bool>`` are booleans, and a ``TCAtomic`` or ``TCAutoClear`` of a
+pointer, ``TCAtomic<int *>``, is a pointer, or of a pointer to a function,
+``TCAtomic<void (*)()>``, a function object. A smart pointer is a pointer also
+through an alias, ``using CNodePtr = TCSharedPointer<CNode>``, except through
+one of `SmartPointerHandleTypes`, a handle named for what it gives, like
+``CActorSubscription``, which takes no concept prefix, also not ``p``. A
+value deduced of the type such an alias names, ``auto Subscription =
+_fMake()``, is that handle, also where what it is deduced from doesn't spell
+the alias, or spells the smart pointer, ``auto &Subscription = _pOriginal``,
+also in each instantiation of a template, ``auto Subscription =
+fg_Make<tf_CType>()``: the alias is looked up in the namespaces and classes
+of the smart pointer and of its arguments. What a member of a class template
+gives, ``_Result.f_Get()``, is named as the object's type writes the class's
+arguments only where it names that class itself; of an object of a class
+derived from it, ``auto bReady = Box.f_Get()`` of a ``TCContextBox<CContext *,
+bool>`` derived from ``TCBox<t_CValue>``, it is what clang instantiated.
+
+Options
+-------
+
+.. option:: SmartPointerTypes
+
+   Semicolon-separated list of smart pointer class templates. Qualified names
+   match qualified names. A class a name names exactly is one, whatever it
+   declares; a class derived from it, or one whose name a pattern only
+   matches, like ``*Pointer``, is one by what it can be used for: a unary
+   ``operator*``, ``operator->`` or a conversion to ``bool``, read like the
+   operators of IteratorTypes, also a conversion: one deleted or constrained by
+   ``requires false`` is none, one whose constraint clang never checked can be
+   one, and one the class declares hides the base's of the same name. A
+   conversion to what converts to ``bool`` in a condition, a raw pointer, a
+   number or an enum that isn't scoped, also a conversion template, can be
+   one: the prefix is allowed and isn't required. Built in are `std::unique_ptr;std::shared_ptr;std::weak_ptr`, and the Malterlib options file (:doc:`/clang-tidy/MalterlibOptionsFile`) adds Malterlib's, like `TCSharedPointer`.
+
+.. option:: SmartPointerHandleTypes
+
+   Semicolon-separated list of the aliases of smart pointers that are handles,
+   named for what they give rather than as pointers, which take no concept
+   prefix, like Malterlib's `CActorSubscription` that the Malterlib options file
+   lists. A class derived from one of them is a handle too, like
+   `TCActorSubscriptionWithID`, which only adds an ID to the
+   `CActorSubscription` it derives from. One with a base that depends on the
+   parameters of its template, `struct TCAdapter : t_CBase`, can be one as it
+   is instantiated, and one whose bases go deeper than are followed isn't
+   known not to be one: they can be named either way, with ``p`` or without,
+   and the instantiations only exclude what is wrong in them. So can a class
+   whose base an instantiation is given, ``TCAdapter<CActorSubscription>`` of
+   ``struct TCAdapter : t_CBase``, when the base is what a handle is an alias
+   of, which the instantiation keeps without the alias, also from a pack of
+   bases, ``tp_CBases...``, when the base is written as a parameter, or a
+   member of one, not one written before or after the pack, nor as a
+   template given them,
+   ``TCUniquePointer<t_CType>``, which is what it names. An alias named as a
+   pointer of a class derived from a handle, ``using CSubscriptionPointer =
+   CSubscriptionWithID``, is a handle too, and what else that class is, like
+   an iterator, it is too. One of these that is also an iterator, which a
+   handle is named as, can have ``i`` too, also of what depends on
+   parameters. Default is
+   empty: every alias of a smart pointer is a pointer, and the bases of one
+   aren't gone through.
+
+.. option:: FunctionObjectTypes
+
+   Semicolon-separated list of function object class templates, including the
+   classes derived from them, also without a name, ``struct : TCFunction<void
+   ()> {} g_fCallback;``, matched like `IteratorTypes`, like `*Functor*`.
+   A class is told as it is defined in the translation unit: a
+   specialization of a template as it is instantiated there, with its own
+   bases, and one that isn't instantiated only by the name of its template;
+   a base that depends on parameters of a template isn't followed. A
+   specialization written with parameters, ``TCWrapper<tf_CType *>``, is one
+   only when each specialization it can be, also partial or declared
+   explicitly, is, not one whose arguments can't be what is written, like
+   ``TCWrapper<int>``, also an iterator, ``TCVectorIterator<tf_CType>``. A class whose name a pattern only contains, like
+   ``*Functor*``, is one when it declares a call operator or a conversion to
+   a function, whatever they are, also deleted or constrained, but not a
+   conversion template, which a call never goes through. A class with
+   a call operator isn't one by itself, like `TCActor`, whose call operator
+   calls the actor. Built in are `std::function;std::move_only_function;std::copyable_function`, and the Malterlib options file (:doc:`/clang-tidy/MalterlibOptionsFile`) adds Malterlib's, like `TCFunction` and `*Functor*`.
+
+.. option:: IteratorTypes
+
+   Semicolon-separated list of iterator types and aliases. A leading `*`
+   matches the end of a name, and with a trailing `*` too, a name containing
+   the rest. A class that such a pattern matches, also through an alias it
+   matches, is one only when it, or a base, has what the concept needs: a unary
+   `operator*`, `operator->` or
+   `operator++` for an iterator, also a hidden friend or one in its namespace,
+   or in the namespace of a template argument of it, also of an enum, a
+   template, or the parameters and result of a function type,
+   or in the parent of an inline namespace it is in,
+   also a template instantiated for it,
+   that takes it, also a member template whose constraints can't be told
+   without what it is instantiated with that is instantiated, and a call operator for a function object,
+   (a member template nothing instantiates with a parameter a use can't give,
+   one without a default that no parameter of the function names, can be one),
+   so `CIteratorEndSentinel` and `CActorFunctorInfo` are neither, and an alias
+   of what depends on template parameters, which can be either, isn't
+   required to be named as one. One whose operator can't be told to be
+   usable, ``operator++() requires t_bEnabled`` where nothing uses it, which
+   clang checks only where it is used, or that has only a non-member operator
+   template that nothing instantiates for it whose operand can take it (one
+   that names it, also by its own name in its template, or a base of it, by
+   reference or by value, a template parameter, a specialization of its
+   template or of a base's, one of a template template parameter, or another
+   type that depends on template parameters), can be one: the prefix is
+   allowed and isn't required. One whose operator is deleted or constrained by
+   ``requires false``, or that has none, isn't one. Built in is `*iterator`, and the Malterlib options file (:doc:`/clang-tidy/MalterlibOptionsFile`) adds `*Iterator*`.
+
+.. option:: ValueWrapperTypes
+
+   Semicolon-separated list of templates that wrap a value whose concept is
+   the wrapper's, like ``TCAtomic<bool>``, a boolean, and ``TCAtomic<int *>``,
+   a pointer. Default is `std::atomic`; Malterlib's options file adds
+   `TCAtomic`, `TCAutoClear` and `TCAutoClearInt`.
+
+.. option:: FlagTypes
+
+   Semicolon-separated list of classes that are a flag, which a name may give
+   the ``b`` prefix, but needn't, like ``CAtomicFlag m_bReplied``, but not a
+   class with a conversion to ``bool`` that isn't one, like an optional. None
+   are built in; the Malterlib options file
+   (:doc:`/clang-tidy/MalterlibOptionsFile`) adds `CAtomicFlag`.
+
+.. option:: IgnoredNames
+
+   Semicolon-separated list of names that are not checked. None are built in; the Malterlib options file (:doc:`/clang-tidy/MalterlibOptionsFile`) adds `mc_Value`, the result of a type trait.
+
+.. option:: NotFunctionTypes
+
+   Semicolon-separated list of the names of aliases and classes that start
+   with the ``F`` or ``TF`` type prefix but aren't function types, of a
+   library whose headers aren't system headers, also qualified,
+   ``NLibrary::FForeign``, which is only the one it names. None are built in; those of
+   system headers aren't taken as function types anyway.
+
+.. option:: NotFunctionObjectTypes
+
+   Semicolon-separated list of classes that :option:`FunctionObjectTypes`
+   would match but aren't function objects, also through a base, as their call
+   operator only binds and gives a builder, like the helpers of Malterlib's
+   ``g_ActorFunctor``, which the Malterlib options file lists. A class with a
+   base that depends on the parameters of its template, which an
+   instantiation can make one of these, isn't known to be a function object:
+   its generic form can be named either way, also as any other concept it
+   can be, like an iterator, which then doesn't decide it. So isn't one whose
+   bases can't be told otherwise, not defined in the translation unit, like a
+   specialization nothing completes, nor of what depends on parameters, whose
+   primary template and partial specializations disagree about it. Nor is
+   one known to be a handle, or not, when they disagree about that: it can be
+   named either way, also as an iterator. None are built
+   in.
+
+.. option:: OpaqueHandleTypes
+
+   Semicolon-separated list of the opaque handles of systems that are pointers
+   on some targets and an integer, an array or a structure on others, like
+   ``pthread_t``, ``va_list`` and Windows' ``HANDLE``, which take no concept
+   prefix, as none would fit every target: ``p``, ``f``, ``b`` and ``i`` on
+   one are reported, whatever it is on this target, also through an alias of
+   one, and
+   so doesn't a value wrapper that holds one, whose prefixes are reported the
+   same way, ``TCAtomic<pthread_t>``, also of one that is a boolean on this
+   target, also
+   through an alias template of the wrapper, ``TCWrapped<pthread_t>``, or a
+   default argument of the wrapper, ``TCAtomic<>``, also when the wrapper was
+   declared before it was defined. None are
+   built in; the Malterlib options file lists those Malterlib uses.

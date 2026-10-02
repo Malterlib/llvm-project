@@ -85,6 +85,19 @@ public:
     this->DiagEngine = DiagEngine;
   }
 
+  /// Whether it reports diagnostics, which it does when it checks code, not
+  /// when it only lists the checks and their options.
+  bool hasDiagnosticsEngine() const { return DiagEngine; }
+
+  /// The file system of the files the checks check, like one with the files of
+  /// --vfsoverlay, or else the one setFileSystem gave, or null, like when the
+  /// checks are only listed.
+  llvm::vfs::FileSystem *getFileSystem() const;
+  /// The file system for when there are no files, like for --dump-config.
+  void setFileSystem(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS) {
+    FileSystem = std::move(FS);
+  }
+
   ~ClangTidyContext();
 
   ClangTidyContext(const ClangTidyContext &) = delete;
@@ -242,6 +255,7 @@ private:
 
   std::unique_ptr<DiagnosticOptions> DiagOpts = nullptr;
   DiagnosticsEngine *DiagEngine = nullptr;
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem;
   std::unique_ptr<ClangTidyOptionsProvider> OptionsProvider;
 
   std::string CurrentFile;
@@ -329,6 +343,7 @@ private:
   bool passesLineFilter(StringRef FileName, unsigned LineNumber) const;
 
   void forwardDiagnostic(const Diagnostic &Info);
+  void flushForwardedDiagnostics();
 
   ClangTidyContext &Context;
   DiagnosticsEngine *ExternalDiagEngine;
@@ -341,6 +356,11 @@ private:
   bool LastErrorRelatesToUserCode = false;
   bool LastErrorPassesLineFilter = false;
   bool LastErrorWasIgnored = false;
+  /// The last error and its notes, until they are forwarded to the external
+  /// diagnostics engine.
+  std::vector<StoredDiagnostic> ForwardedDiagnostics;
+  /// The places and messages of the forwarded diagnostics.
+  llvm::StringSet<> ForwardedKeys;
   /// Tracks whether we're currently inside a
   /// `BeginSourceFile()/EndSourceFile()` pair. Outside of a source file, we
   /// should only receive diagnostics that have to source location, such as

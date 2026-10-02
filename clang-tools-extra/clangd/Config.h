@@ -120,6 +120,16 @@ struct Config {
       // A comma-separated list of globs specify which clang-tidy checks to run.
       std::string Checks;
       llvm::StringMap<std::string> CheckOptions;
+      /// Of each of CheckOptions, the fragment that set it, counted in the
+      /// order they apply, and the values of earlier fragments it took the
+      /// place of, with theirs, for the options whose values edit those before,
+      /// like the lists of the Malterlib checks, which a later fragment's
+      /// edit, also of another option of them, follows.
+      llvm::StringMap<unsigned> CheckOptionFragments;
+      llvm::StringMap<std::vector<std::pair<std::string, unsigned>>>
+          ReplacedCheckOptions;
+      /// How many fragments set CheckOptions.
+      unsigned CheckOptionsFragmentCount = 0;
       FastCheckPolicy FastCheckFilter = FastCheckPolicy::Strict;
     } ClangTidy;
 

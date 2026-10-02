@@ -1,0 +1,24 @@
+# The wildcards of a repository's IncludeFiles, each with a path relative to
+# the repository and whether it matches, as mib tidy matches it (Malterlib's
+# fg_StrMatchWildcard): pattern, path, match or no-match, separated by tabs.
+# plugin-wildcards.cpp checks the plugin against it, and the same rows are
+# run through Malterlib's matcher.
+*?.cpp	Bad.cpp	no-match
+?*.cpp	Bad.cpp	match
+*.cpp	Bad.cpp	match
+*	Bad.cpp	match
+*?	Bad.cpp	no-match
+**.cpp	Bad.cpp	match
+*??.cpp	Bad.cpp	no-match
+B*?d.cpp	Bad.cpp	no-match
+*a	aa	no-match
+*.cpp	x.cpp.cpp	no-match
+*.h	a.b.h	match
+*d.cpp	Bdd.cpp	match
+?	A	match
+??	A	no-match
+*/G.h	Generated/G.h	match
+Generated/*	Generated/G.h	match
+*.h	Sub/Dir/X.h	match
+L.*	L.h	match
+L.*	M.h	no-match

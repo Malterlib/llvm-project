@@ -28,6 +28,7 @@ add_extra_unittest(ClangTidyTests
   GlobListTest.cpp
   GoogleModuleTest.cpp
   LLVMModuleTest.cpp
+  MalterlibModuleTest.cpp
   ModernizeModuleTest.cpp
   NamespaceAliaserTest.cpp
   OptionsProviderTest.cpp
@@ -58,6 +59,7 @@ target_link_libraries(ClangTidyTests
   clangTidyGoogleModule
   clangTidyMiscModule
   clangTidyLLVMModule
+  clangTidyMalterlibModule
   clangTidyModernizeModule
   clangTidyObjCModule
   clangTidyReadabilityModule
