@@ -29,6 +29,13 @@ void NoLint(); // NOLINT(malterlib-function-naming)
 // CHECK-UNKNOWN: error: unknown argument 'unknown=1' for the malterlib plugin
 // CHECK-REGEX: error: invalid regular expression '[' for the malterlib plugin's header-filter
 
+// The plugin checks only part of a translation unit, so it offers no fixes,
+// which clang-tidy applies.
+// RUN: printf 'class CFixed\n{\npublic:\n\tint m_Value;\n};\n' > %t.fix.cpp
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -fdiagnostics-parseable-fixits -fplugin-arg-malterlib-checks='-*,malterlib-struct-not-class' %t.fix.cpp 2>&1 | FileCheck --check-prefix=CHECK-NOFIX %s
+// CHECK-NOFIX: warning: 'CFixed' should be declared with 'struct'
+// CHECK-NOFIX-NOT: fix-it:
+
 // Header filters apply before the diagnostics reach the compiler.
 // RUN: mkdir -p %t.dir && echo "void BadInHeader();" > %t.dir/header.h
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -include %t.dir/header.h -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' -fplugin-arg-malterlib-header-filter='.*' -fplugin-arg-malterlib-exclude-header-filter='header\.h' %s 2>&1 | FileCheck --check-prefix=CHECK-FILTERED %s
