@@ -23,6 +23,7 @@
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/PrecompiledPreamble.h"
 #include "clang/Tooling/CompilationDatabase.h"
+#include "llvm/ADT/StringSet.h"
 #include <memory>
 #include <vector>
 
@@ -57,6 +58,13 @@ struct ParseInputs {
   // Prevent reuse of the cached preamble/AST. Slow! Useful to workaround
   // clangd's assumption that missing header files will stay missing.
   bool ForceRebuild = false;
+  // Rebuild the AST even if the inputs didn't change, e.g. because files it
+  // includes outside the preamble may have changed on disk.
+  bool RebuildAST = false;
+  // Files reported changed on disk. A preamble built from any of them is
+  // rebuilt, even if their size and modification time (in seconds) look the
+  // same.
+  std::shared_ptr<const llvm::StringSet<>> ChangedFiles;
   // Used to recover from diagnostics (e.g. find missing includes for symbol).
   const SymbolIndex *Index = nullptr;
   ParseOptions Opts = ParseOptions();

@@ -16,6 +16,7 @@
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/Preprocessor.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MD5.h"
 #include <cstddef>
@@ -112,6 +113,24 @@ public:
   bool CanReuse(const CompilerInvocation &Invocation,
                 const llvm::MemoryBufferRef &MainFileBuffer,
                 PreambleBounds Bounds, llvm::vfs::FileSystem &VFS) const;
+
+  /// Calls \p Callback with each file the preamble was built from, other than
+  /// its main file, and each file it depends on not existing, as spelled when
+  /// building it.
+  void
+  ForEachDependency(llvm::function_ref<void(llvm::StringRef)> Callback) const {
+    for (const auto &File : FilesInPreamble)
+      Callback(File.getKey());
+    for (const auto &File : MissingFiles)
+      Callback(File.getKey());
+  }
+
+  /// Check whether the files the preamble was built from, other than the main
+  /// file, are unchanged. Unlike CanReuse, this doesn't look at the main file's
+  /// contents. Files for which \p Ignore returns true are not checked.
+  bool DependenciesUnchanged(
+      const CompilerInvocation &Invocation, llvm::vfs::FileSystem &VFS,
+      llvm::function_ref<bool(llvm::StringRef)> Ignore = nullptr) const;
 
   /// Changes options inside \p CI to use PCH from this preamble. Also remaps
   /// main file to \p MainFileBuffer and updates \p VFS to ensure the preamble

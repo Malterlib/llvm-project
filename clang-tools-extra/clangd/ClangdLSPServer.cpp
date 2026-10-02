@@ -536,6 +536,7 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
       Params.capabilities.HierarchicalDocumentSymbol;
   SupportsReferenceContainer = Params.capabilities.ReferenceContainer;
   SupportFileStatus = Params.initializationOptions.FileStatus;
+  WatchFiles = Params.capabilities.DidChangeWatchedFilesDynamicRegistration;
   SupportsDocumentChanges = Params.capabilities.DocumentChanges;
   SupportsChangeAnnotation = Params.capabilities.ChangeAnnotation;
   HoverContentFormat = Params.capabilities.HoverContentFormat;
@@ -652,6 +653,11 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
       {"foldingRangeProvider", true},
   };
 
+  // Tells clients that clangd reparses open files when files change on disk,
+  // so they don't need to trigger that themselves. clangd extension.
+  if (WatchFiles)
+    ServerCaps["fileWatching"] = llvm::json::Object{{"reparseOpenFiles", true}};
+
   {
     LSPBinder Binder(Handlers, *this);
     bindMethods(Binder, Params.capabilities);
@@ -707,7 +713,47 @@ void ClangdLSPServer::onInitialize(const InitializeParams &Params,
   applyConfiguration(Params.initializationOptions.ConfigSettings);
 }
 
-void ClangdLSPServer::onInitialized(const InitializedParams &Params) {}
+void ClangdLSPServer::onInitialized(const InitializedParams &Params) {
+  if (!WatchFiles)
+    return;
+  // Files that clangd parses or that are commonly included, with extensions
+  // matched case-insensitively like editors detect languages, also on
+  // case-sensitive file systems. Other included files, e.g. without an
+  // extension, aren't watched: that would report every change in the
+  // workspace. Changes to them are picked up when the files that include them
+  // are edited or saved.
+  std::string SourceFiles = "**/*.{";
+  for (llvm::StringRef Extension :
+       {"c",   "i",    "cc",   "cp",  "cpp", "cxx", "c++", "ii",  "cppm",
+        "ccm", "cxxm", "c++m", "ixx", "mpp", "mxx", "h",   "hh",  "hp",
+        "hpp", "hxx",  "h++",  "inc", "inl", "ipp", "tcc", "tpp", "txx",
+        "def", "m",    "mm",   "mi",  "mii", "cu",  "cuh"}) {
+    if (SourceFiles.back() != '{')
+      SourceFiles += ',';
+    for (char C : Extension) {
+      if (llvm::isAlpha(C))
+        SourceFiles += {'[', llvm::toLower(C), llvm::toUpper(C), ']'};
+      else
+        SourceFiles += C;
+    }
+  }
+  SourceFiles += '}';
+  DidChangeWatchedFilesRegistrationOptions Options;
+  Options.watchers = {
+      {std::move(SourceFiles)},
+      {"**/compile_commands.json"},
+      {"**/compile_flags.txt"},
+      {"**/.clang-tidy"},
+      {"**/.clangd"},
+  };
+  RegisterCapability({{{"clangd-watched-files",
+                        "workspace/didChangeWatchedFiles", toJSON(Options)}}},
+                     [](llvm::Expected<std::nullptr_t> Response) {
+                       if (!Response)
+                         elog("Failed to register file watchers: {0}",
+                              Response.takeError());
+                     });
+}
 
 void ClangdLSPServer::onShutdown(const NoParams &,
                                  Callback<std::nullptr_t> Reply) {
@@ -770,13 +816,8 @@ void ClangdLSPServer::onDocumentDidSave(
 }
 
 void ClangdLSPServer::onFileEvent(const DidChangeWatchedFilesParams &Params) {
-  // We could also reparse all open files here. However:
-  //  - this could be frequent, and revalidating all the preambles isn't free
-  //  - this is useful e.g. when switching git branches, but we're likely to see
-  //    fresh headers but still have the old-branch main-file content
   Server->onFileEvent(Params);
   // FIXME: observe config files, immediately expire time-based caches, reparse:
-  //  - compile_commands.json and compile_flags.txt
   //  - .clang_format and .clang-tidy
   //  - .clangd and clangd/config.yaml
 }
@@ -1746,6 +1787,8 @@ void ClangdLSPServer::bindMethods(LSPBinder &Bind,
   EndWorkDoneProgress = Bind.outgoingNotification("$/progress");
   if(Caps.SemanticTokenRefreshSupport)
     SemanticTokensRefresh = Bind.outgoingMethod("workspace/semanticTokens/refresh");
+  if (Caps.DidChangeWatchedFilesDynamicRegistration)
+    RegisterCapability = Bind.outgoingMethod("client/registerCapability");
   // clang-format on
 }
 

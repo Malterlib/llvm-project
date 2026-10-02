@@ -585,6 +585,10 @@ struct ClientCapabilities {
   /// notification. This is a clangd extension.
   /// textDocument.inactiveRegionsCapabilities.inactiveRegions
   bool InactiveRegions = false;
+
+  /// Whether the client supports registering file watchers at runtime.
+  /// workspace.didChangeWatchedFiles.dynamicRegistration
+  bool DidChangeWatchedFilesDynamicRegistration = false;
 };
 bool fromJSON(const llvm::json::Value &, ClientCapabilities &,
               llvm::json::Path);
@@ -851,6 +855,32 @@ struct DidChangeWatchedFilesParams {
 };
 bool fromJSON(const llvm::json::Value &, DidChangeWatchedFilesParams &,
               llvm::json::Path);
+
+/// A glob pattern of files the client should report changes to.
+struct FileSystemWatcher {
+  std::string globPattern;
+};
+llvm::json::Value toJSON(const FileSystemWatcher &);
+
+struct DidChangeWatchedFilesRegistrationOptions {
+  std::vector<FileSystemWatcher> watchers;
+};
+llvm::json::Value toJSON(const DidChangeWatchedFilesRegistrationOptions &);
+
+/// A capability the server registers with client/registerCapability.
+struct Registration {
+  /// Identifies the registration, e.g. to unregister it.
+  std::string id;
+  /// The method the registration is for.
+  std::string method;
+  llvm::json::Value registerOptions = nullptr;
+};
+llvm::json::Value toJSON(const Registration &);
+
+struct RegistrationParams {
+  std::vector<Registration> registrations;
+};
+llvm::json::Value toJSON(const RegistrationParams &);
 
 struct DidChangeConfigurationParams {
   ConfigurationSettings settings;

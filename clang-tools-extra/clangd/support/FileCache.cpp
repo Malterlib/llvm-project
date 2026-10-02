@@ -8,6 +8,7 @@
 
 #include "support/FileCache.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <atomic>
 #include <optional>
 
 namespace clang {
@@ -21,6 +22,14 @@ static constexpr uint64_t CacheDiskMismatch =
     std::numeric_limits<uint64_t>::max();
 // The cached value reflects that the file doesn't exist.
 static constexpr uint64_t FileNotFound = CacheDiskMismatch - 1;
+
+// When files that caches read last changed, as far as clangd was told.
+static std::atomic<std::chrono::steady_clock::rep> LastChange{
+    std::chrono::steady_clock::time_point::min().time_since_epoch().count()};
+
+void noteCachedFilesChanged() {
+  LastChange = std::chrono::steady_clock::now().time_since_epoch().count();
+}
 
 FileCache::FileCache(llvm::StringRef Path)
     : Path(Path), ValidTime(std::chrono::steady_clock::time_point::min()),
@@ -37,7 +46,11 @@ void FileCache::read(
   // We're going to update the cache and return whatever's in it.
   llvm::scope_exit Return(Read);
 
-  // Return any sufficiently recent result without doing any further work.
+  // Return any sufficiently recent result without doing any further work, but
+  // not one from before a change was noted.
+  FreshTime = std::max(FreshTime, std::chrono::steady_clock::time_point(
+                                      std::chrono::steady_clock::duration(
+                                          LastChange.load())));
   if (ValidTime > FreshTime)
     return;
 

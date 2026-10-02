@@ -22,7 +22,9 @@
 #include "support/ThreadsafeFS.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Threading.h"
 #include <atomic>
 #include <condition_variable>
@@ -78,8 +80,7 @@ public:
     llvm::ThreadPriority ThreadPri = llvm::ThreadPriority::Low;
     unsigned QueuePri = 0; // Higher-priority tasks will run first.
     std::string Tag;       // Allows priority to be boosted later.
-    uint64_t Key = 0;      // If the key matches a previous task, drop this one.
-                           // (in practice this means we never reindex a file).
+    uint64_t Key = 0;      // If the key matches a queued task, drop this one.
 
     bool operator<(const Task &O) const { return QueuePri < O.QueuePri; }
   };
@@ -98,6 +99,9 @@ public:
   // Add tasks to the queue.
   void push(Task);
   void append(std::vector<Task>);
+  // Whether a task with \p Key is running.
+  bool isActive(uint64_t Key);
+
   // Boost priority of current and new tasks with matching Tag, if they are
   // lower priority.
   // Reducing the boost of a tag affects future tasks but not current ones.
@@ -127,7 +131,11 @@ private:
   std::vector<Task> Queue; // max-heap
   llvm::StringMap<unsigned> Boosts;
   std::function<void(Stats)> OnProgress;
-  llvm::DenseSet<uint64_t> SeenKeys;
+  llvm::DenseSet<uint64_t> QueuedKeys; // Keys of tasks in Queue.
+  llvm::DenseSet<uint64_t> ActiveKeys; // Keys of tasks being run.
+  // Tasks pushed while a task with the same key was running, to be queued
+  // when it finishes.
+  llvm::DenseMap<uint64_t, Task> Deferred;
 };
 
 // Builds an in-memory index by by running the static indexer action over
@@ -169,6 +177,14 @@ public:
     Queue.push(changedFilesTask(ChangedFiles));
   }
 
+  /// Reindexes translation units affected by files that changed on disk:
+  /// changed source files with compile commands, and a translation unit
+  /// including each changed header. Deleted files are removed from the index.
+  void reindexChangedFiles(std::vector<std::string> ChangedFiles);
+
+  /// Whether \p File has been indexed or loaded from the index storage.
+  bool isIndexed(PathRef File) const;
+
   /// Boosts priority of indexing related to Path.
   /// Typically used to index TUs when headers are opened.
   void boostRelated(llvm::StringRef Path);
@@ -201,9 +217,11 @@ private:
   /// Given index results from a TU, only update symbols coming from files with
   /// different digests than \p ShardVersionsSnapshot. Also stores new index
   /// information on IndexStorage.
+  /// \p CommandGeneration is non-zero when the TU is indexed because its
+  /// compile command changed, see CommandChangedTUs.
   void update(llvm::StringRef MainFile, IndexFileIn Index,
               const llvm::StringMap<ShardVersion> &ShardVersionsSnapshot,
-              bool HadErrors);
+              bool HadErrors, unsigned CommandGeneration);
 
   // configuration
   const ThreadsafeFS &TFS;
@@ -216,13 +234,64 @@ private:
   FileSymbols IndexedSymbols;
   BackgroundIndexRebuilder Rebuilder;
   llvm::StringMap<ShardVersion> ShardVersions; // Key is absolute file path.
-  std::mutex ShardVersionsMu;
+  // Incremented when compile commands of indexed files are found to change.
+  unsigned CommandGeneration = 0;
+  struct CommandChange {
+    // CommandGeneration when the change was found.
+    unsigned Generation;
+    // The new command.
+    std::vector<std::string> CommandLine;
+    std::string Directory;
+  };
+  // Main files whose compile command changed since they were last indexed.
+  // Key is from commandChangedKey(). The symbols of files they include can
+  // depend on the command even if their contents didn't change, so indexing
+  // them with the new command replaces the shards of included files not yet
+  // indexed in that generation.
+  llvm::StringMap<CommandChange> CommandChangedTUs;
+  // The latest CommandGeneration each file was indexed in.
+  llvm::StringMap<unsigned> IndexedCommandGeneration;
+  // Main files to reindex even if their shards are up to date. Key is from
+  // commandChangedKey().
+  llvm::StringSet<> ForcedTUs;
+  // Files reported deleted in this session, case-folded.
+  llvm::StringSet<> DeletedFiles;
+  // Serializes processing batches of changed files.
+  std::mutex FileEventsMu;
+  // Case-folded keys of ShardVersions.
+  llvm::StringSet<> IndexedFiles;
+  // The commands main files were last indexed with in this session, keyed by
+  // commandChangedKey(). Shards store them too, but storage may be missing.
+  llvm::StringMap<tooling::CompileCommand> IndexedCommands;
+  mutable std::mutex ShardVersionsMu;
   std::function<void(std::vector<std::string>)> OnIndexedHeaders;
 
   std::vector<std::string>
   updateIndexedTUForHeaders(PathRef MainFile,
                             llvm::ArrayRef<std::string> Headers);
   llvm::StringMap<std::string> HeaderToIndexedTU;
+  // Changed files without a known includer, case-folded. Removed when a TU
+  // that includes them is indexed.
+  llvm::StringSet<> PendingChangedHeaders;
+  // Paths of the TUs in IndexedTUToHeaders, by their case-folded keys.
+  llvm::StringMap<std::string> IndexedTUPaths;
+  // Deleted headers and a TU that included them, to reindex if they're
+  // recreated: the TU's shards don't change when a header it includes appears.
+  llvm::StringMap<std::string> DeletedHeaderToIndexedTU;
+
+  // Main files whose last indexing failed to find includes or probed for files
+  // with __has_include, keyed by the lowercased file names, and the reverse, to
+  // reindex them when a file with such a name appears or disappears.
+  llvm::StringMap<llvm::StringSet<>> MissingIncludeToTUs;
+  llvm::StringMap<std::vector<std::string>> TUToMissingIncludes;
+  // Main files loaded from shards that recorded errors, whose missing includes
+  // are unknown as they weren't indexed in this session. Missing includes
+  // aren't stored in shards, so files that only probed for a missing header
+  // with __has_include, which isn't an error, aren't known after a restart
+  // until they're indexed again.
+  llvm::StringSet<> UntrackedErrorTUs;
+  llvm::StringSet<> IndexedThisSession;
+  std::mutex MissingIncludesMu;
   llvm::StringMap<std::vector<std::string>> IndexedTUToHeaders;
   mutable std::mutex HeaderToIndexedTUMu;
 
@@ -233,6 +302,10 @@ private:
   BackgroundQueue::Task
   changedFilesTask(const std::vector<std::string> &ChangedFiles);
   BackgroundQueue::Task indexFileTask(std::string Path);
+  void removeFromIndex(PathRef File);
+  void updateMissingIncludes(PathRef MainFile, std::vector<std::string> Names);
+  // Reindexes MainFile, even if its shards are up to date.
+  void reindexAgain(PathRef MainFile);
 
   // from lowest to highest priority
   enum QueuePriority {

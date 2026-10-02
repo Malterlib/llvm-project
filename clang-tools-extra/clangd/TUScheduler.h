@@ -345,6 +345,11 @@ public:
   /// This can be called from the background-index thread.
   void reparseFilesWithNewContext(llvm::ArrayRef<std::string> Files);
 
+  /// Reparse all open files with their current contents, e.g. because their
+  /// compile commands may have changed. Unchanged files are cheap to reparse.
+  /// This can be called from any thread.
+  void reparseAllFiles();
+
   /// Wait until there are no scheduled or running tasks.
   /// Mostly useful for synchronizing tests.
   bool blockUntilIdle(Deadline D) const;

@@ -37,6 +37,10 @@ namespace clangd {
 /// Caches for particular data (e.g. compilation databases) should inherit and:
 ///  - add mutable storage for the cached parsed data
 ///  - add a public interface implemented on top of read()
+/// Notes that the files FileCaches read may have changed, like a file watcher
+/// reports: reads then check their files again, however recently they did.
+void noteCachedFilesChanged();
+
 class FileCache {
 protected:
   // Path must be absolute.

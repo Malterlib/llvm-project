@@ -25,6 +25,7 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include "llvm/TargetParser/Host.h"
@@ -115,7 +116,10 @@ class DirectoryBasedGlobalCompilationDatabase::DirectoryCache {
       std::unique_ptr<llvm::MemoryBuffer> Buffer; // Set only if FoundNewData
     };
 
-    LoadResult load(llvm::vfs::FileSystem &FS, bool HasOldData);
+    // With IgnoreMetadata, the file is read even if its size and modification
+    // time are unchanged.
+    LoadResult load(llvm::vfs::FileSystem &FS, bool HasOldData,
+                    bool IgnoreMetadata = false);
   };
 
   // If we've looked for a CDB here and found none, the time when that happened.
@@ -164,10 +168,12 @@ public:
   // CDB as needing broadcast, and broadcast it next time we can).
   std::shared_ptr<const tooling::CompilationDatabase>
   get(const ThreadsafeFS &TFS, bool &ShouldBroadcast,
-      stopwatch::time_point FreshTime, stopwatch::time_point FreshTimeMissing) {
-    // Fast path for common case without taking lock.
-    if (stopwatch::time_point(stopwatch::duration(NoCDBAt.load())) >
-        FreshTimeMissing) {
+      stopwatch::time_point FreshTime, stopwatch::time_point FreshTimeMissing,
+      bool IgnoreMetadata = false) {
+    // Fast path for common case without taking lock. With IgnoreMetadata, the
+    // caller knows the files changed, so cached results don't count.
+    if (!IgnoreMetadata && stopwatch::time_point(stopwatch::duration(
+                               NoCDBAt.load())) > FreshTimeMissing) {
       ShouldBroadcast = false;
       return nullptr;
     }
@@ -187,10 +193,10 @@ public:
     });
 
     // If our cache is valid, serve from it.
-    if (CachePopulatedAt > FreshTime)
+    if (!IgnoreMetadata && CachePopulatedAt > FreshTime)
       return CDB;
 
-    if (/*MayCache=*/load(*TFS.view(/*CWD=*/std::nullopt))) {
+    if (/*MayCache=*/load(*TFS.view(/*CWD=*/std::nullopt), IgnoreMetadata)) {
       // Use new timestamp, as loading may be slow.
       CachePopulatedAt = stopwatch::now();
       NoCDBAt.store((CDB ? stopwatch::time_point::min() : CachePopulatedAt)
@@ -203,12 +209,12 @@ public:
 
 private:
   // Updates `CDB` from disk state. Returns false on failure.
-  bool load(llvm::vfs::FileSystem &FS);
+  bool load(llvm::vfs::FileSystem &FS, bool IgnoreMetadata);
 };
 
 DirectoryBasedGlobalCompilationDatabase::DirectoryCache::CachedFile::LoadResult
 DirectoryBasedGlobalCompilationDatabase::DirectoryCache::CachedFile::load(
-    llvm::vfs::FileSystem &FS, bool HasOldData) {
+    llvm::vfs::FileSystem &FS, bool HasOldData, bool IgnoreMetadata) {
   auto Stat = FS.status(Path);
   if (!Stat || !Stat->isRegularFile()) {
     Size = NoFileCached;
@@ -216,7 +222,8 @@ DirectoryBasedGlobalCompilationDatabase::DirectoryCache::CachedFile::load(
     return {LoadResult::FileNotFound, nullptr};
   }
   // If both the size and mtime match, presume unchanged without reading.
-  if (HasOldData && Stat->getLastModificationTime() == ModifiedTime &&
+  if (HasOldData && !IgnoreMetadata &&
+      Stat->getLastModificationTime() == ModifiedTime &&
       Stat->getSize() == Size)
     return {LoadResult::FoundSameData, nullptr};
   auto Buf = FS.getBufferForFile(Path);
@@ -270,7 +277,7 @@ parseFixed(PathRef Path, llvm::StringRef Data, std::string &Error) {
 }
 
 bool DirectoryBasedGlobalCompilationDatabase::DirectoryCache::load(
-    llvm::vfs::FileSystem &FS) {
+    llvm::vfs::FileSystem &FS, bool IgnoreMetadata) {
   dlog("Probing directory {0}", Path);
   std::string Error;
 
@@ -290,7 +297,7 @@ bool DirectoryBasedGlobalCompilationDatabase::DirectoryCache::load(
                             CDBFile{&BuildCompileCommandsJson, parseJSON},
                             CDBFile{&CompileFlagsTxt, parseFixed}}) {
     bool Active = ActiveCachedFile == Entry.File;
-    auto Loaded = Entry.File->load(FS, Active);
+    auto Loaded = Entry.File->load(FS, Active, IgnoreMetadata);
     switch (Loaded.Result) {
     case CachedFile::LoadResult::FileNotFound:
       if (Active) {
@@ -403,6 +410,48 @@ DirectoryBasedGlobalCompilationDatabase::getDirectoryCaches(
   for (unsigned I = 0; I < Dirs.size(); ++I)
     Ret.push_back(&DirCaches.try_emplace(FoldedDirs[I], Dirs[I]).first->second);
   return Ret;
+}
+
+void DirectoryBasedGlobalCompilationDatabase::checkForChanges(
+    llvm::ArrayRef<std::string> CDBFiles) const {
+  // A directory's cache covers the database files in it and in its build/
+  // subdirectory.
+  llvm::StringSet<> Dirs;
+  for (const std::string &File : CDBFiles) {
+    std::string Dir = removeDots(llvm::sys::path::parent_path(File));
+    if (Dir.empty())
+      continue;
+    if (pathEqual(llvm::sys::path::filename(Dir), "build"))
+      Dirs.insert(llvm::sys::path::parent_path(Dir));
+    Dirs.insert(std::move(Dir));
+  }
+
+  // Only refresh caches that exist: a directory nobody looked up a database
+  // in yet is read fresh when it is first needed.
+  std::vector<DirectoryCache *> Caches;
+  {
+    std::lock_guard<std::mutex> Lock(DirCachesMutex);
+    for (const auto &Dir : Dirs) {
+      auto It = DirCaches.find(maybeCaseFoldPath(Dir.getKey()));
+      if (It != DirCaches.end())
+        Caches.push_back(&It->second);
+    }
+  }
+
+  auto Now = std::chrono::steady_clock::now();
+  for (DirectoryCache *Cache : Caches) {
+    bool ShouldBroadcast = true;
+    // Files reported changed can keep their size and modification time, e.g.
+    // with timestamps of a resolution of seconds, so read them regardless.
+    auto CDB = Cache->get(Opts.TFS, ShouldBroadcast, /*FreshTime=*/Now,
+                          /*FreshTimeMissing=*/Now, /*IgnoreMetadata=*/true);
+    if (!CDB || !ShouldBroadcast)
+      continue;
+    CDBLookupResult Result;
+    Result.CDB = std::move(CDB);
+    Result.PI.SourceRoot = Cache->Path;
+    broadcastCDB(std::move(Result));
+  }
 }
 
 std::optional<DirectoryBasedGlobalCompilationDatabase::CDBLookupResult>
@@ -909,6 +958,12 @@ bool DelegatingCDB::blockUntilIdle(Deadline D) const {
   if (!Base)
     return true;
   return Base->blockUntilIdle(D);
+}
+
+void DelegatingCDB::checkForChanges(
+    llvm::ArrayRef<std::string> CDBFiles) const {
+  if (Base)
+    Base->checkForChanges(CDBFiles);
 }
 
 } // namespace clangd

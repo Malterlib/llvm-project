@@ -28,6 +28,7 @@
 #include "FS.h"
 #include "Headers.h"
 #include "ModulesBuilder.h"
+#include "SourceCode.h"
 
 #include "clang-include-cleaner/Record.h"
 #include "support/Path.h"
@@ -128,6 +129,12 @@ struct PreambleData {
   // Whether there was a (possibly-incomplete) include-guard on the main file.
   // We need to propagate this information "by hand" to subsequent parses.
   bool MainIsIncludeGuarded = false;
+  // In header-in-context mode, the including file the preamble was built from,
+  // and the digest of its contents. That file is the preamble's main file, so
+  // the preamble's own dependency tracking doesn't cover it. Empty if the
+  // preamble was built from the file itself.
+  std::string ProxyFile;
+  FileDigest ProxyFileDigest = {};
 };
 
 using PreambleParsedCallback =
@@ -169,6 +176,14 @@ buildPreamble(PathRef FileName, CompilerInvocation CI,
 bool isPreambleCompatible(const PreambleData &Preamble,
                           const ParseInputs &Inputs, PathRef FileName,
                           const CompilerInvocation &CI);
+
+/// Returns true if something \p Preamble was built from changed, other than the
+/// preamble region of the main file: the compile command, or files on disk such
+/// as included headers. Unlike edits to the main file, these changes can't be
+/// patched, so diagnostics computed with such a preamble are misleading.
+bool preambleDependenciesChanged(const PreambleData &Preamble,
+                                 const ParseInputs &Inputs, PathRef FileName,
+                                 const CompilerInvocation &CI);
 
 /// Stores information required to parse a TU using a (possibly stale) Baseline
 /// preamble. Later on this information can be injected into the main file by
