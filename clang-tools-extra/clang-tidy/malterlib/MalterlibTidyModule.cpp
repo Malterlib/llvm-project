@@ -8,12 +8,25 @@
 
 #include "../ClangTidy.h"
 #include "../ClangTidyModule.h"
+#include "ActorDispatchThisCheck.h"
+#include "ActorPhaseCheck.h"
+#include "AsyncDestroyCheck.h"
+#include "CoawaitPrecedenceCheck.h"
 #include "ConceptualPrefixCheck.h"
+#include "ContinueRunningOnActorCheck.h"
+#include "CoroutineActorReferenceCheck.h"
+#include "CoroutineLambdaCallCheck.h"
+#include "CoroutineReferenceCaptureCheck.h"
+#include "CoroutineReferenceParameterCheck.h"
+#include "CoroutineThreadLocalReferenceCheck.h"
+#include "CoroutineUnsafeThisCheck.h"
 #include "FunctionNamingCheck.h"
 #include "HeaderDeclarationsOnlyCheck.h"
 #include "MacroNamingCheck.h"
 #include "ParameterNamingCheck.h"
+#include "RunsToCompletionCheck.h"
 #include "StructNotClassCheck.h"
+#include "ThreadLocalStorageCheck.h"
 #include "TypeNamingCheck.h"
 #include "UnusedParameterCastCheck.h"
 #include "VariableNamingCheck.h"
@@ -26,8 +39,28 @@ namespace {
 class MalterlibModule : public ClangTidyModule {
 public:
   void addCheckFactories(ClangTidyCheckFactories &CheckFactories) override {
+    CheckFactories.registerCheck<ActorDispatchThisCheck>(
+        "malterlib-actor-dispatch-this");
+    CheckFactories.registerCheck<ActorPhaseCheck>("malterlib-actor-phase");
+    CheckFactories.registerCheck<AsyncDestroyCheck>("malterlib-async-destroy");
+    CheckFactories.registerCheck<CoawaitPrecedenceCheck>(
+        "malterlib-coawait-precedence");
     CheckFactories.registerCheck<ConceptualPrefixCheck>(
         "malterlib-conceptual-prefix");
+    CheckFactories.registerCheck<ContinueRunningOnActorCheck>(
+        "malterlib-continue-running-on-actor");
+    CheckFactories.registerCheck<CoroutineActorReferenceCheck>(
+        "malterlib-coroutine-actor-reference");
+    CheckFactories.registerCheck<CoroutineLambdaCallCheck>(
+        "malterlib-coroutine-lambda-call");
+    CheckFactories.registerCheck<CoroutineReferenceCaptureCheck>(
+        "malterlib-coroutine-reference-capture");
+    CheckFactories.registerCheck<CoroutineReferenceParameterCheck>(
+        "malterlib-coroutine-reference-parameter");
+    CheckFactories.registerCheck<CoroutineThreadLocalReferenceCheck>(
+        "malterlib-coroutine-thread-local-reference");
+    CheckFactories.registerCheck<CoroutineUnsafeThisCheck>(
+        "malterlib-coroutine-unsafe-this");
     CheckFactories.registerCheck<FunctionNamingCheck>(
         "malterlib-function-naming");
     CheckFactories.registerCheck<HeaderDeclarationsOnlyCheck>(
@@ -35,8 +68,12 @@ public:
     CheckFactories.registerCheck<MacroNamingCheck>("malterlib-macro-naming");
     CheckFactories.registerCheck<ParameterNamingCheck>(
         "malterlib-parameter-naming");
+    CheckFactories.registerCheck<RunsToCompletionCheck>(
+        "malterlib-runs-to-completion");
     CheckFactories.registerCheck<StructNotClassCheck>(
         "malterlib-struct-not-class");
+    CheckFactories.registerCheck<ThreadLocalStorageCheck>(
+        "malterlib-thread-local-storage");
     CheckFactories.registerCheck<TypeNamingCheck>("malterlib-type-naming");
     CheckFactories.registerCheck<UnusedParameterCastCheck>(
         "malterlib-unused-parameter-cast");
