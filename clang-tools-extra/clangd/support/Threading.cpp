@@ -11,9 +11,15 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/thread.h"
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <optional>
 #include <thread>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 #ifdef __USE_POSIX
 #include <pthread.h>
 #elif defined(__APPLE__)
@@ -68,6 +74,117 @@ void Semaphore::unlock() {
   Lock.unlock();
 
   SlotsChanged.notify_one();
+}
+
+namespace {
+#if defined(__linux__)
+// The nice value threads run at normally.
+int normalNice() {
+  static const int Nice = [] {
+    errno = 0;
+    int Nice = getpriority(PRIO_PROCESS, getpid());
+    return Nice == -1 && errno ? 0 : Nice;
+  }();
+  return Nice;
+}
+
+// Low priority is a nice value 10 above the normal one, which gives a thread
+// about a tenth of the CPU time of a normal one, like QOS_CLASS_UTILITY on
+// macOS. llvm::ThreadPriority::Low is SCHED_IDLE instead, which runs only on
+// otherwise idle CPUs, below even nice 19.
+bool setThreadLow(uint64_t ThreadID, bool Low) {
+  int Nice = Low ? std::min(normalNice() + 10, 19) : normalNice();
+  return !setpriority(PRIO_PROCESS, ThreadID, Nice);
+}
+#endif
+
+bool setCurrentThreadLow(bool Low) {
+#if defined(__linux__)
+  return setThreadLow(llvm::get_threadid(), Low);
+#else
+  return llvm::set_thread_priority(Low ? llvm::ThreadPriority::Low
+                                       : llvm::ThreadPriority::Default) ==
+         llvm::SetThreadPriorityResult::SUCCESS;
+#endif
+}
+} // namespace
+
+bool AdjustableThreadPriority::isSupported() {
+  // Probe on a separate thread, as it may not be able to raise its priority.
+  static const bool Supported = [] {
+#if defined(__linux__)
+    if (normalNice() >= 19)
+      return false;
+#endif
+    bool Result = false;
+    std::thread([&] {
+      Result = setCurrentThreadLow(true) && setCurrentThreadLow(false);
+    }).join();
+    return Result;
+  }();
+  return Supported;
+}
+
+void AdjustableThreadPriority::setLow(bool Low) {
+  std::lock_guard<std::mutex> Lock(Mu);
+  if (WantLow == Low)
+    return;
+  WantLow = Low;
+  if (Low || !Attached || !IsLow.value_or(false))
+    return;
+  // Raise the running task, as the thread only applies the requested priority
+  // before its next one.
+#if defined(__APPLE__)
+  if (!Override)
+    Override = pthread_override_qos_class_start_np(Thread, QOS_CLASS_DEFAULT,
+                                                   /*relative_priority=*/0);
+#elif defined(__linux__)
+  // isSupported() checked that threads may lower their nice value again.
+  if (setThreadLow(ThreadID, false))
+    IsLow = false;
+#endif
+  // Windows only lets a thread leave background mode itself.
+}
+
+void AdjustableThreadPriority::attach() {
+  std::lock_guard<std::mutex> Lock(Mu);
+  assert(!Attached && "Already attached?");
+#if defined(__APPLE__)
+  Thread = pthread_self();
+#elif defined(__linux__)
+  ThreadID = llvm::get_threadid();
+#endif
+  Attached = true;
+  // The thread may inherit the priority of the thread that created it.
+  IsLow.reset();
+}
+
+bool AdjustableThreadPriority::apply() {
+  std::lock_guard<std::mutex> Lock(Mu);
+  assert(Attached && "Not attached?");
+  bool Low = WantLow;
+  if (IsLow != Low && setCurrentThreadLow(Low))
+    IsLow = Low;
+#if defined(__APPLE__)
+  // The thread set its own priority, so the override is no longer needed.
+  if (Override) {
+    pthread_override_qos_class_end_np(Override);
+    Override = nullptr;
+  }
+#endif
+  return IsLow.value_or(false);
+}
+
+void AdjustableThreadPriority::detach() {
+  std::lock_guard<std::mutex> Lock(Mu);
+  assert(Attached && "Not attached?");
+#if defined(__APPLE__)
+  if (Override) {
+    pthread_override_qos_class_end_np(Override);
+    Override = nullptr;
+  }
+#endif
+  Attached = false;
 }
 
 AsyncTaskRunner::~AsyncTaskRunner() { wait(); }
