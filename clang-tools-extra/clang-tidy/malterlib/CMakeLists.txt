@@ -6,12 +6,17 @@ set(LLVM_LINK_COMPONENTS
 add_clang_library(clangTidyMalterlibModule STATIC
   ConceptualPrefixCheck.cpp
   FunctionNamingCheck.cpp
+  HeaderDeclarationsOnlyCheck.cpp
   MacroNamingCheck.cpp
   MalterlibCheck.cpp
   MalterlibTidyModule.cpp
   NamingUtils.cpp
+  NoZeroBitScanCheck.cpp
   ParameterNamingCheck.cpp
+  ParameterOwnershipCheck.cpp
+  StructNotClassCheck.cpp
   TypeNamingCheck.cpp
+  UnusedParameterCastCheck.cpp
   VariableNamingCheck.cpp
 
   LINK_LIBS
