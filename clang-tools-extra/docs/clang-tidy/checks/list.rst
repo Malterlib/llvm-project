@@ -22,6 +22,7 @@ Clang-Tidy Checks
    linuxkernel/*
    llvm/*
    llvmlibc/*
+   malterlib/*
    misc/*
    modernize/*
    mpi/*
@@ -260,6 +261,12 @@ Clang-Tidy Checks
    :doc:`llvmlibc-implementation-in-namespace <llvmlibc/implementation-in-namespace>`,
    :doc:`llvmlibc-inline-function-decl <llvmlibc/inline-function-decl>`, "Yes"
    :doc:`llvmlibc-restrict-system-libc-headers <llvmlibc/restrict-system-libc-headers>`, "Yes"
+   :doc:`malterlib-conceptual-prefix <malterlib/conceptual-prefix>`,
+   :doc:`malterlib-function-naming <malterlib/function-naming>`,
+   :doc:`malterlib-macro-naming <malterlib/macro-naming>`,
+   :doc:`malterlib-parameter-naming <malterlib/parameter-naming>`,
+   :doc:`malterlib-type-naming <malterlib/type-naming>`,
+   :doc:`malterlib-variable-naming <malterlib/variable-naming>`,
    :doc:`misc-anonymous-namespace-in-header <misc/anonymous-namespace-in-header>`,
    :doc:`misc-confusable-identifiers <misc/confusable-identifiers>`,
    :doc:`misc-const-correctness <misc/const-correctness>`, "Yes"
