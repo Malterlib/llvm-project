@@ -466,7 +466,27 @@ private:
 
   // Using generic TraverseNode for Stmt would prevent data-recursion.
   bool dataTraverseStmtPre(Stmt *StmtNode) {
+    // The operand of a co_await or co_yield met again, in the expressions
+    // that make and call its awaiter, which refer to it too, or of a
+    // co_return, in the call of `return_value`, has the parents below it
+    // already: only the new parent is added. Traversing it again would
+    // traverse nested awaits, or nested coroutine lambdas that return, a
+    // number of times that grows exponentially with how deep they nest.
+    bool Traversed = false;
+    if (auto It = CoroutineOperands.find(StmtNode);
+        It != CoroutineOperands.end()) {
+      Traversed = It->second;
+      It->second = true;
+    }
+    if (const auto *Suspend = dyn_cast<CoroutineSuspendExpr>(StmtNode);
+        Suspend && !Traversed && Suspend->getOperand())
+      CoroutineOperands.try_emplace(Suspend->getOperand(), false);
+    if (const auto *Return = dyn_cast<CoreturnStmt>(StmtNode);
+        Return && !Traversed && Return->getOperand())
+      CoroutineOperands.try_emplace(Return->getOperand(), false);
     addParent(StmtNode, &Map.PointerParents);
+    if (Traversed)
+      return false;
     ParentStack.push_back(DynTypedNode::create(*StmtNode));
     return true;
   }
@@ -477,6 +497,9 @@ private:
 
   ParentMap &Map;
   llvm::SmallVector<DynTypedNode, 16> ParentStack;
+  // The operands of co_await, co_yield and co_return met, and whether each was
+  // traversed.
+  llvm::DenseMap<const Stmt *, bool> CoroutineOperands;
 };
 
 ParentMapContext::ParentMap::ParentMap(ASTContext &Ctx) {
