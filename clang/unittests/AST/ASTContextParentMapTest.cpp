@@ -196,5 +196,109 @@ void F(const Decomposable& d) {
       varDecl(hasName("x"), hasAncestor(decompositionDecl())), Lang_CXX20));
 }
 
+// The operand of a co_return is also below the call of return_value: it has
+// both parents, also when coroutine lambdas that return nest so deep that
+// traversing it again for each would never end.
+TEST(GetParents, CoreturnOperand) {
+  std::string Code = R"cpp(
+namespace std {
+template <class Ret, class... Args> struct coroutine_traits {
+  using promise_type = typename Ret::promise_type;
+};
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+} // namespace std
+struct Awaitable {
+  bool await_ready() noexcept;
+  template <class Handle> void await_suspend(Handle) noexcept;
+  int await_resume() noexcept;
+};
+struct Task {
+  struct promise_type {
+    Task get_return_object();
+    Awaitable initial_suspend();
+    Awaitable final_suspend() noexcept;
+    void return_value(int);
+    void unhandled_exception();
+  };
+};
+int h(Task);
+int g();
+)cpp";
+  std::string Returns = "g()";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Returns = "h([]() -> Task { co_return " + Returns + "; }())";
+  Code += "int nested() { return " + Returns + "; }";
+  auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+  auto &Ctx = AST->getASTContext();
+  const auto *Inner = selectFirst<CallExpr>(
+      "g", match(callExpr(callee(functionDecl(hasName("g")))).bind("g"), Ctx));
+  ASSERT_TRUE(Inner);
+  const auto *Return = selectFirst<CoreturnStmt>(
+      "return",
+      match(coreturnStmt(has(equalsNode(Inner))).bind("return"), Ctx));
+  ASSERT_TRUE(Return);
+  EXPECT_EQ(Ctx.getParents(*Inner).size(), 2u);
+  EXPECT_THAT(Ctx.getParents(*Return->getPromiseCall()),
+              ElementsAre(DynTypedNode::create(*Return)));
+}
+
+// The operand of a co_await is also below the expressions that make and call
+// its awaiter: it has both parents, and what is below it its own, also when
+// awaits nest so deep that traversing it again for each would never end.
+TEST(GetParents, CoawaitOperand) {
+  std::string Code = R"cpp(
+namespace std {
+template <class Ret, class... Args> struct coroutine_traits {
+  using promise_type = typename Ret::promise_type;
+};
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+} // namespace std
+struct Awaitable {
+  bool await_ready() noexcept;
+  template <class Handle> void await_suspend(Handle) noexcept;
+  int await_resume() noexcept;
+};
+struct Task {
+  struct promise_type {
+    Task get_return_object();
+    Awaitable initial_suspend();
+    Awaitable final_suspend() noexcept;
+    void return_void();
+    void unhandled_exception();
+  };
+};
+Awaitable f(int);
+int g();
+)cpp";
+  std::string Awaits = "g()";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Awaits = "co_await f(" + Awaits + ")";
+  Code += "Task nested() { " + Awaits + "; }";
+  auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+  auto &Ctx = AST->getASTContext();
+  const auto *Inner = selectFirst<CallExpr>(
+      "g", match(callExpr(callee(functionDecl(hasName("g")))).bind("g"), Ctx));
+  ASSERT_TRUE(Inner);
+  EXPECT_THAT(Ctx.getParents(*Inner),
+              ElementsAre(DynTypedNode::create(
+                  *selectFirst<CallExpr>("f", match(callExpr(hasArgument(
+                                                         0, equalsNode(Inner)))
+                                                         .bind("f"),
+                                                     Ctx)))));
+  const auto *Operand = selectFirst<CallExpr>(
+      "f", match(callExpr(hasArgument(0, equalsNode(Inner))).bind("f"), Ctx));
+  ASSERT_TRUE(Operand);
+  const auto *Await = selectFirst<CoawaitExpr>(
+      "await", match(coawaitExpr(has(equalsNode(Operand))).bind("await"), Ctx));
+  ASSERT_TRUE(Await);
+  EXPECT_EQ(Ctx.getParents(*Operand).size(), 2u);
+  EXPECT_TRUE(llvm::is_contained(Ctx.getParents(*Operand),
+                                 DynTypedNode::create(*Await)));
+}
+
 } // end namespace ast_matchers
 } // end namespace clang
