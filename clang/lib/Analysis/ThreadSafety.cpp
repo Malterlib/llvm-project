@@ -2508,6 +2508,11 @@ static const Expr *UnpackConstruction(const Expr *E) {
   if (auto *CE = dyn_cast<CastExpr>(E))
     if (CE->getCastKind() == CK_NoOp)
       E = CE->getSubExpr()->IgnoreParens();
+  // The object of a co_await or co_yield is the one its await_resume call
+  // returns, which the variable it initializes destroys.
+  if (auto *Suspend = dyn_cast<CoroutineSuspendExpr>(E))
+    if (const Expr *Resume = Suspend->getResumeExpr())
+      E = Resume->IgnoreParens();
   if (auto *CE = dyn_cast<CastExpr>(E))
     if (CE->getCastKind() == CK_ConstructorConversion ||
         CE->getCastKind() == CK_UserDefinedConversion)

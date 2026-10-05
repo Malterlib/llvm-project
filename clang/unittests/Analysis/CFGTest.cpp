@@ -246,6 +246,128 @@ TEST(CFG, SwitchCoveredEnumWithDefault) {
   EXPECT_FALSE(defaultBlock2->isReachable());
 }
 
+// The operand of a co_await is evaluated as part of its common expression, so
+// its temporaries are destroyed once, and nested awaits are visited once each
+// instead of exponentially often.
+TEST(CFG, CoawaitOperandTemporaries) {
+  std::string Code = R"cpp(
+    namespace std {
+    template <typename R, typename...> struct coroutine_traits {
+      using promise_type = typename R::promise_type;
+    };
+    template <typename P = void> struct coroutine_handle {
+      static coroutine_handle from_address(void *) noexcept;
+    };
+    } // namespace std
+    struct Temporary { ~Temporary(); };
+    struct Awaitable {
+      bool await_ready() noexcept;
+      template <typename H> void await_suspend(H) noexcept;
+      int await_resume() noexcept;
+    };
+    struct Task {
+      struct promise_type {
+        Task get_return_object();
+        Awaitable initial_suspend();
+        Awaitable final_suspend() noexcept;
+        void return_void();
+        void unhandled_exception();
+      };
+    };
+    Awaitable work(int, Temporary const &);
+    Task f() {
+  )cpp";
+  std::string Awaits = "0";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Awaits = "co_await work(" + Awaits + ", Temporary())";
+  Code += Awaits + "; }";
+
+  std::unique_ptr<ASTUnit> AST = tooling::buildASTFromCodeWithArgs(
+      Code, {"-std=c++20", "-Wno-everything"});
+  ASSERT_TRUE(AST);
+  CFGCallback Callback(std::move(AST));
+  Callback.Options.AddTemporaryDtors = true;
+  ast_matchers::MatchFinder Finder;
+  Finder.addMatcher(
+      ast_matchers::functionDecl(ast_matchers::hasName("f")).bind("func"),
+      &Callback);
+  Finder.matchAST(Callback.AST->getASTContext());
+  BuildResult &B = Callback.TheBuildResult;
+  ASSERT_EQ(BuildResult::BuiltCFG, B.getStatus());
+
+  unsigned TemporaryDtors = 0;
+  for (const CFGBlock *Block : *B.getCFG())
+    for (const CFGElement &Element : *Block)
+      if (Element.getAs<CFGTemporaryDtor>())
+        ++TemporaryDtors;
+  EXPECT_EQ(40u, TemporaryDtors);
+}
+
+// The result of a co_await that a reference extends the lifetime of is
+// destroyed at the end of the scope, not of the full-expression.
+TEST(CFG, CoawaitResultLifetimeExtended) {
+  const char *Code = R"cpp(
+    namespace std {
+    template <typename R, typename...> struct coroutine_traits {
+      using promise_type = typename R::promise_type;
+    };
+    template <typename P = void> struct coroutine_handle {
+      static coroutine_handle from_address(void *) noexcept;
+    };
+    } // namespace std
+    struct Temporary { ~Temporary(); };
+    struct Suspend {
+      bool await_ready() noexcept;
+      template <typename H> void await_suspend(H) noexcept;
+      void await_resume() noexcept;
+    };
+    struct Awaitable {
+      bool await_ready() noexcept;
+      template <typename H> void await_suspend(H) noexcept;
+      Temporary await_resume() noexcept;
+    };
+    struct Task {
+      struct promise_type {
+        Task get_return_object();
+        Suspend initial_suspend();
+        Suspend final_suspend() noexcept;
+        void return_void();
+        void unhandled_exception();
+      };
+    };
+    Awaitable work();
+    void use(const Temporary &);
+    Task f() {
+      const Temporary &Value = co_await work();
+      use(Value);
+    }
+  )cpp";
+  std::unique_ptr<ASTUnit> AST = tooling::buildASTFromCodeWithArgs(
+      Code, {"-std=c++20", "-Wno-everything"});
+  ASSERT_TRUE(AST);
+  CFGCallback Callback(std::move(AST));
+  Callback.Options.AddTemporaryDtors = true;
+  ast_matchers::MatchFinder Finder;
+  Finder.addMatcher(
+      ast_matchers::functionDecl(ast_matchers::hasName("f")).bind("func"),
+      &Callback);
+  Finder.matchAST(Callback.AST->getASTContext());
+  BuildResult &B = Callback.TheBuildResult;
+  ASSERT_EQ(BuildResult::BuiltCFG, B.getStatus());
+
+  unsigned TemporaryDtors = 0;
+  unsigned AutomaticDtors = 0;
+  for (const CFGBlock *Block : *B.getCFG())
+    for (const CFGElement &Element : *Block) {
+      if (Element.getAs<CFGTemporaryDtor>())
+        ++TemporaryDtors;
+      if (Element.getAs<CFGAutomaticObjDtor>())
+        ++AutomaticDtors;
+    }
+  EXPECT_EQ(0u, TemporaryDtors);
+  EXPECT_EQ(1u, AutomaticDtors);
+}
+
 TEST(CFG, IsLinear) {
   auto expectLinear = [](bool IsLinear, const char *Code) {
     BuildResult B = BuildCFG(Code);
