@@ -5229,6 +5229,28 @@ tryAgain:
       // will be wrapped in their own ExprWithCleanups.
       return Block;
 
+    case Stmt::CoawaitExprClass:
+    case Stmt::CoyieldExprClass: {
+      // The operand is evaluated as part of the common expression, which is
+      // what VisitCoroutineSuspendExpr visits. Visiting the operand too would
+      // add its temporaries twice and, with nested awaits, visit the
+      // innermost operand exponentially often. The result of the resume
+      // expression is the value of the expression, which a reference can
+      // extend the lifetime of, `const T &Value = co_await Awaitable;`.
+      auto *Suspend = cast<CoroutineSuspendExpr>(E);
+      CFGBlock *B = Block;
+      for (Expr *Child :
+           {Suspend->getCommonExpr(), Suspend->getReadyExpr(),
+            Suspend->getSuspendExpr(), Suspend->getResumeExpr()})
+        if (Child)
+          if (CFGBlock *R = VisitForTemporaries(
+                  Child,
+                  Child == Suspend->getResumeExpr() && ExternallyDestructed,
+                  Context))
+            B = R;
+      return B;
+    }
+
     case Stmt::CXXDefaultArgExprClass:
       E = cast<CXXDefaultArgExpr>(E)->getExpr();
       goto tryAgain;
