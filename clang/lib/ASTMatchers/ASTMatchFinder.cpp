@@ -86,6 +86,43 @@ struct MemoizedMatchResult {
   BoundNodesTreeBuilder Nodes;
 };
 
+// The operands of the co_await and co_yield expressions met in a traversal.
+// The expressions that make and call the awaiter of one refer to its operand
+// again, and so does the call of `return_value` of a co_return, so traversing
+// every child of each would traverse nested awaits, `co_await f(co_await
+// g())`, or nested coroutine lambdas that return, a number of times that
+// grows exponentially with how deep they nest. Each operand is traversed
+// once, as the operand, which is the first child, in each way the code
+// around it is traversed: the operands of a rewritten operator, like
+// `co_await f() == g()`, are traversed both as written and as they are
+// rewritten, and so are the operands of a co_await in them.
+class CoroutineOperands {
+public:
+  // Whether \p S is to be traversed: not an operand met again in the same
+  // traversal, which \p NotAsIs tells, that of the code as written.
+  bool shouldTraverse(const Stmt *S, bool NotAsIs = false) {
+    if (auto It = Operands.find(Key(S, NotAsIs)); It != Operands.end()) {
+      if (It->second)
+        return false;
+      It->second = true;
+    }
+    if (const auto *Suspend = dyn_cast_or_null<CoroutineSuspendExpr>(S))
+      if (const Expr *Operand = Suspend->getOperand())
+        Operands.try_emplace(Key(Operand, NotAsIs), false);
+    if (const auto *Return = dyn_cast_or_null<CoreturnStmt>(S))
+      if (const Expr *Operand = Return->getOperand())
+        Operands.try_emplace(Key(Operand, NotAsIs), false);
+    return true;
+  }
+
+  void clear() { Operands.clear(); }
+
+private:
+  using Key = llvm::PointerIntPair<const Stmt *, 1, bool>;
+  // Whether each was traversed.
+  llvm::DenseMap<Key, bool> Operands;
+};
+
 // A RecursiveASTVisitor that traverses all children or all descendants of
 // a node.
 class MatchChildASTVisitor
@@ -181,6 +218,8 @@ public:
     if (CurrentDepth == 0 || (CurrentDepth <= MaxDepth && MaxDepth < INT_MAX))
       Queue = nullptr;
 
+    if (!Operands.shouldTraverse(StmtNode))
+      return true;
     ScopedIncrement ScopedDepth(&CurrentDepth);
     Stmt *StmtToTraverse = getStmtToTraverse(StmtNode);
     if (!StmtToTraverse)
@@ -331,6 +370,7 @@ private:
   void reset() {
     Matches = false;
     CurrentDepth = 0;
+    Operands.clear();
   }
 
   // Forwards the call to the corresponding Traverse*() method in the
@@ -414,6 +454,7 @@ private:
   const bool IgnoreImplicitChildren;
   const ASTMatchFinder::BindKind Bind;
   bool Matches;
+  CoroutineOperands Operands;
 };
 
 // Controls the outermost traversal of the AST and allows to match multiple
@@ -1406,6 +1447,9 @@ private:
                  llvm::SmallPtrSet<const ObjCCompatibleAliasDecl *, 2>>
       CompatibleAliases;
 
+  // The operands of co_await and co_yield met, each traversed once.
+  CoroutineOperands Operands;
+
   // Maps (matcher, node) -> the match result for memoization.
   typedef std::map<MatchKey, MemoizedMatchResult> MemoizationMap;
   MemoizationMap ResultCache;
@@ -1541,7 +1585,8 @@ bool MatchASTVisitor::TraverseDecl(Decl *DeclNode) {
 }
 
 bool MatchASTVisitor::TraverseStmt(Stmt *StmtNode, DataRecursionQueue *Queue) {
-  if (shouldSkipNode(StmtNode))
+  if (shouldSkipNode(StmtNode) ||
+      !Operands.shouldTraverse(StmtNode, TraversingASTNodeNotAsIs))
     return true;
 
   bool ScopedTraversal = TraversingASTNodeNotSpelledInSource ||

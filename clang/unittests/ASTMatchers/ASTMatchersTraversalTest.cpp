@@ -596,6 +596,153 @@ void foo()
                                   varDecl(hasName("lPtrDecay"))))))));
 }
 
+// The operand of a co_await is also below the expressions that make and call
+// its awaiter: it is matched once, also when awaits nest so deep that
+// traversing it again for each would never end.
+TEST(Matcher, MatchesCoawaitOperandOnce) {
+  std::string Code = R"cpp(
+namespace std {
+template <class Ret, class... Args> struct coroutine_traits {
+  using promise_type = typename Ret::promise_type;
+};
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+} // namespace std
+struct Awaitable {
+  bool await_ready() noexcept;
+  template <class Handle> void await_suspend(Handle) noexcept;
+  int await_resume() noexcept;
+};
+struct Task {
+  struct promise_type {
+    Task get_return_object();
+    Awaitable initial_suspend();
+    Awaitable final_suspend() noexcept;
+    void return_void();
+    void unhandled_exception();
+  };
+};
+Awaitable f(int);
+int g();
+)cpp";
+  std::string Awaits = "g()";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Awaits = "co_await f(" + Awaits + ")";
+  Code += "Task nested() { " + Awaits + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, callExpr(callee(functionDecl(hasName("g")))).bind("g"),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(
+                       callExpr(callee(functionDecl(hasName("g")))).bind("g"))),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   hasBody(coroutineBodyStmt(hasBody(compoundStmt(
+                       forEachDescendant(coawaitExpr().bind("await"))))))),
+      std::make_unique<VerifyIdIsBoundTo<CoawaitExpr>>("await", 40),
+      {"-std=c++20"}));
+}
+
+// The operand of a co_return is also below the call of return_value: it is
+// matched once, also when coroutine lambdas that return nest so deep that
+// traversing it again for each would never end.
+// The operands of a rewritten operator are traversed both as written and as
+// rewritten, and so is the operand of a co_await in them, which each finds.
+TEST(Matcher, MatchesCoawaitOperandInRewrittenOperator) {
+  std::string Code = R"cpp(
+namespace std {
+template <class Ret, class... Args> struct coroutine_traits {
+  using promise_type = typename Ret::promise_type;
+};
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+} // namespace std
+struct Awaitable {
+  bool await_ready() noexcept;
+  template <class Handle> void await_suspend(Handle) noexcept;
+  int await_resume() noexcept;
+};
+struct Task {
+  struct promise_type {
+    Task get_return_object();
+    Awaitable initial_suspend();
+    Awaitable final_suspend() noexcept;
+    void return_void();
+    void unhandled_exception();
+  };
+};
+Awaitable f(int);
+struct Compared {
+  bool operator==(int) const;
+};
+Task rewritten() { bool Equal = co_await f(42) == Compared{}; }
+)cpp";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, integerLiteral(equals(42)).bind("literal"),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource,
+               integerLiteral(equals(42)).bind("literal")),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesCoreturnOperandOnce) {
+  std::string Code = R"cpp(
+namespace std {
+template <class Ret, class... Args> struct coroutine_traits {
+  using promise_type = typename Ret::promise_type;
+};
+template <class Promise = void> struct coroutine_handle {
+  static coroutine_handle from_address(void *) noexcept;
+};
+} // namespace std
+struct Awaitable {
+  bool await_ready() noexcept;
+  template <class Handle> void await_suspend(Handle) noexcept;
+  int await_resume() noexcept;
+};
+struct Task {
+  struct promise_type {
+    Task get_return_object();
+    Awaitable initial_suspend();
+    Awaitable final_suspend() noexcept;
+    void return_value(int);
+    void unhandled_exception();
+  };
+};
+int h(Task);
+int g();
+)cpp";
+  std::string Returns = "g()";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Returns = "h([]() -> Task { co_return " + Returns + "; }())";
+  Code += "int nested() { return " + Returns + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, callExpr(callee(functionDecl(hasName("g")))).bind("g"),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(
+                       callExpr(callee(functionDecl(hasName("g")))).bind("g"))),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(coreturnStmt().bind("return"))),
+      std::make_unique<VerifyIdIsBoundTo<CoreturnStmt>>("return", 40),
+      {"-std=c++20"}));
+}
+
 TEST(Matcher, MatchesCoroutine) {
   FileContentMappings M;
   M.push_back(std::make_pair("/coro_header", R"cpp(
