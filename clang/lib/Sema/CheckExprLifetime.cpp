@@ -14,7 +14,10 @@
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Sema.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerIntPair.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 namespace clang::sema {
 using lifetimes::isGslOwnerType;
@@ -196,6 +199,25 @@ using Local = Expr *;
 /// Expressions we stepped over when looking for the local state. Any steps
 /// that would inhibit lifetime extension or take us out of subexpressions of
 /// the initializer are included.
+/// What visitVarInitOnce looks at in a path up to and including an entry, of
+/// the entry it is kept with while the entry stays where it is in the path,
+/// which only changes after it. A copy or a move of the entry is elsewhere,
+/// and isn't of it.
+struct PathSummary {
+  const void *Of = nullptr;
+  unsigned First = 0;
+  unsigned Last = 0;
+  bool HasMember = false;
+  bool HasInit = false;
+
+  PathSummary() = default;
+  PathSummary(const PathSummary &) {}
+  PathSummary &operator=(const PathSummary &) {
+    Of = nullptr;
+    return *this;
+  }
+};
+
 struct IndirectLocalPathEntry {
   enum EntryKind {
     DefaultInit,
@@ -217,6 +239,7 @@ struct IndirectLocalPathEntry {
     const Decl *D = nullptr;
     const LambdaCapture *Capture;
   };
+  mutable PathSummary Summary;
   IndirectLocalPathEntry() {}
   IndirectLocalPathEntry(EntryKind K, Expr *E) : Kind(K), E(E) {}
   IndirectLocalPathEntry(EntryKind K, Expr *E, const Decl *D)
@@ -238,11 +261,130 @@ using LocalVisitor = llvm::function_ref<bool(IndirectLocalPath &Path, Local L,
                                              ReferenceKind RK)>;
 } // namespace
 
+/// Where on the path each variable whose initializer is visited while the
+/// expression of one entity is checked is, which it is at most once, as
+/// isVarOnPath keeps it from being visited again from its own initializer.
+static thread_local llvm::DenseMap<
+    const VarDecl *, std::pair<const IndirectLocalPath *, unsigned>>
+    *VarInitsOnPath = nullptr;
+
+static void pushVarInit(IndirectLocalPath &Path, DeclRefExpr *DRE,
+                        VarDecl *VD) {
+  Path.push_back({IndirectLocalPathEntry::VarInit, DRE, VD});
+  if (VarInitsOnPath)
+    (*VarInitsOnPath)[VD] = {&Path, Path.size() - 1};
+}
+
 static bool isVarOnPath(const IndirectLocalPath &Path, VarDecl *VD) {
+  // Where it was last put on a path, instead of looking at each entry of a
+  // path that is as long as a chain of references, `int &R2 = B ? R1 : R1;`.
+  if (VarInitsOnPath) {
+    auto It = VarInitsOnPath->find(VD);
+    if (It == VarInitsOnPath->end())
+      return false;
+    if (It->second.first == &Path) {
+      const unsigned I = It->second.second;
+      return I < Path.size() &&
+             Path[I].Kind == IndirectLocalPathEntry::VarInit && Path[I].D == VD;
+    }
+  }
   for (auto E : Path)
     if (E.Kind == IndirectLocalPathEntry::VarInit && E.D == VD)
       return true;
   return false;
+}
+
+static SourceRange nextPathEntryRange(const IndirectLocalPath &Path, unsigned I,
+                                      Expr *E);
+
+/// What the visitors of locals look at in the part of a path before the
+/// initializer of a variable: the kind of its first entry that isn't a member
+/// or a lambda capture, whether it has a member, whether it has the
+/// initializer of a variable or a default member initializer, which the
+/// path to a default argument can have before it, the kind of its last entry
+/// that isn't a reference, address, lifetimebound call or member, and the
+/// range a diagnostic would point at.
+using VarInitKey =
+    std::tuple<const void *, unsigned, unsigned, unsigned, unsigned>;
+
+/// How the expression a variable or a default is reached by is visited: as
+/// what a reference binds, of its kind, as an initializer, also whether its
+/// subinitializers are visited again, or as an argument of a call.
+enum class VarInitMode : unsigned {
+  ReferenceBinding = 0,
+  Initializer = 4,
+  CallArgument = 8,
+};
+
+/// Whether the visitor of locals is the one that follows the initializer of a
+/// const variable an lvalue-to-rvalue conversion reads, which looks only for
+/// those, rather than the visitor of the check, which reports what it finds:
+/// what one of them visits isn't what the other has.
+static thread_local bool VisitingConstLookup = false;
+
+/// The variables whose initializers were visited while the expression of one
+/// entity is checked, with what the visitors look at in the paths that led to
+/// them. Reached again along a path that only differs in other ways, like the
+/// references or lifetimebound calls it goes through in a chain of references
+/// made of conditionals of the ones before, `const T &R2 = B ? f(R1) : g(R1);`,
+/// a variable retains the same locals with the same diagnostics, so its
+/// initializer is visited once instead of once per path, which is exponential
+/// in the length of the chain.
+static thread_local llvm::DenseSet<VarInitKey> *VisitedVarInits = nullptr;
+
+/// Whether the initializer of \p VD, reached by \p Path through \p DRE, is to
+/// be visited, or with the expression of a default argument for \p VD, the
+/// one that \p DRE uses, which each of its uses shares unless it is rewritten
+/// for them, also those in other default arguments, `const int &f1(const int
+/// &V [[clang::lifetimebound]] = B ? f0() : f0())`, or of a default member
+/// initializer, which each initialization that uses it shares unless it is
+/// rewritten for them, like one that materializes a temporary an aggregate
+/// extends, also those in other ones, `S1 M = B ? S1{} : S1{};`.
+static bool visitVarInitOnce(const IndirectLocalPath &Path, Expr *DRE,
+                             const void *VD, unsigned Mode) {
+  if (!VisitedVarInits)
+    return true;
+  using Entry = IndirectLocalPathEntry;
+  const unsigned None = Entry::ParenAggInit + 1;
+  // From the last entry whose summary is of it, which the entries before it
+  // haven't changed since, so each entry of a path that is as long as a chain
+  // of references is looked at once.
+  unsigned I = Path.size();
+  while (I && Path[I - 1].Summary.Of != &Path[I - 1])
+    --I;
+  unsigned First = I ? Path[I - 1].Summary.First : None;
+  unsigned Last = I ? Path[I - 1].Summary.Last : None;
+  bool HasMember = I && Path[I - 1].Summary.HasMember;
+  bool HasInit = I && Path[I - 1].Summary.HasInit;
+  for (; I != Path.size(); ++I) {
+    const IndirectLocalPathEntry &E = Path[I];
+    HasMember |= E.Kind == Entry::MemberExpr;
+    HasInit |= E.Kind == Entry::VarInit || E.Kind == Entry::DefaultInit;
+    if (First == None && E.Kind != Entry::MemberExpr &&
+        E.Kind != Entry::LambdaCaptureInit)
+      First = E.Kind;
+    if (E.Kind != Entry::VarInit && E.Kind != Entry::AddressOf &&
+        E.Kind != Entry::LifetimeBoundCall && E.Kind != Entry::MemberExpr)
+      Last = E.Kind;
+    E.Summary.Of = &E;
+    E.Summary.First = First;
+    E.Summary.Last = Last;
+    E.Summary.HasMember = HasMember;
+    E.Summary.HasInit = HasInit;
+  }
+  SourceRange Range = nextPathEntryRange(Path, 0, DRE);
+  // Of a default argument that no entry before it places, its use, where the
+  // diagnostics of the path point once its entry is pushed, which each use
+  // has its own of.
+  if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(DRE);
+      Default && Range == Default->getSourceRange())
+    Range = Default->getUsedLocation();
+  return VisitedVarInits
+      ->insert({VD, (First << 6) | (Last << 2) | (HasInit << 1) | HasMember,
+                Range.getBegin().getRawEncoding(),
+                Range.getEnd().getRawEncoding(),
+                (Mode << 1) | VisitingConstLookup})
+      .second;
 }
 
 static bool pathContainsInit(const IndirectLocalPath &Path) {
@@ -495,6 +637,9 @@ static void visitFunctionCallArguments(IndirectLocalPath &Path, Expr *Call,
     Expr *Arg = Args[I];
     RevertToOldSizeRAII RAII(Path);
     if (auto *DAE = dyn_cast<CXXDefaultArgExpr>(Arg)) {
+      if (!visitVarInitOnce(Path, DAE, DAE->getExpr(),
+                            unsigned(VarInitMode::CallArgument)))
+        continue;
       Path.push_back(
           {IndirectLocalPathEntry::DefaultArg, DAE, DAE->getParam()});
       Arg = DAE->getExpr();
@@ -584,8 +729,13 @@ static void visitLocalsRetainedByReferenceBinding(IndirectLocalPath &Path,
     }
 
     // Step into CXXDefaultInitExprs so we can diagnose cases where a
-    // constructor inherits one as an implicit mem-initializer.
+    // constructor inherits one as an implicit mem-initializer. Its
+    // expression is shared by each initialization that uses it, and is
+    // visited once per what the visitors look at in the path to it.
     if (auto *DIE = dyn_cast<CXXDefaultInitExpr>(Init)) {
+      if (!visitVarInitOnce(Path, DIE, DIE->getExpr(),
+                            unsigned(VarInitMode::ReferenceBinding) | RK))
+        return;
       Path.push_back(
           {IndirectLocalPathEntry::DefaultInit, DIE, DIE->getField()});
       Init = DIE->getExpr();
@@ -621,8 +771,11 @@ static void visitLocalsRetainedByReferenceBinding(IndirectLocalPath &Path,
         // The lifetime of a reference parameter is unknown; assume it's OK
         // for now.
         break;
-      } else if (VD->getInit() && !isVarOnPath(Path, VD)) {
-        Path.push_back({IndirectLocalPathEntry::VarInit, DRE, VD});
+      } else if (VD->getInit() && !isVarOnPath(Path, VD) &&
+                 visitVarInitOnce(Path, DRE, VD,
+                                  unsigned(VarInitMode::ReferenceBinding) |
+                                      RK)) {
+        pushVarInit(Path, DRE, VD);
         visitLocalsRetainedByReferenceBinding(Path, VD->getInit(),
                                               RK_ReferenceBinding, Visit);
       }
@@ -683,8 +836,14 @@ static void visitLocalsRetainedByInitializer(IndirectLocalPath &Path,
     Old = Init;
 
     // Step into CXXDefaultInitExprs so we can diagnose cases where a
-    // constructor inherits one as an implicit mem-initializer.
+    // constructor inherits one as an implicit mem-initializer. Its
+    // expression is shared by each initialization that uses it, and is
+    // visited once per what the visitors look at in the path to it.
     if (auto *DIE = dyn_cast<CXXDefaultInitExpr>(Init)) {
+      if (!visitVarInitOnce(Path, DIE, DIE->getExpr(),
+                            unsigned(VarInitMode::Initializer) |
+                                RevisitSubinits))
+        return;
       Path.push_back(
           {IndirectLocalPathEntry::DefaultInit, DIE, DIE->getField()});
       Init = DIE->getExpr();
@@ -708,24 +867,34 @@ static void visitLocalsRetainedByInitializer(IndirectLocalPath &Path,
         // If we can match the lvalue to a const object, we can look at its
         // initializer.
         Path.push_back({IndirectLocalPathEntry::LValToRVal, CE});
-        return visitLocalsRetainedByReferenceBinding(
-            Path, Init, RK_ReferenceBinding,
-            [&](IndirectLocalPath &Path, Local L, ReferenceKind RK) -> bool {
-              if (auto *DRE = dyn_cast<DeclRefExpr>(L)) {
-                auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
-                if (VD && VD->getType().isConstQualified() && VD->getInit() &&
-                    !isVarOnPath(Path, VD)) {
-                  Path.push_back({IndirectLocalPathEntry::VarInit, DRE, VD});
-                  visitLocalsRetainedByInitializer(Path, VD->getInit(), Visit,
-                                                   true);
+        {
+          const bool OuterLookup = VisitingConstLookup;
+          llvm::SaveAndRestore ConstLookup(VisitingConstLookup, true);
+          return visitLocalsRetainedByReferenceBinding(
+              Path, Init, RK_ReferenceBinding,
+              [&](IndirectLocalPath &Path, Local L, ReferenceKind RK) -> bool {
+                // What it finds is visited by the visitor it was given, the
+                // one of the check or, in the lookup of another, that one.
+                llvm::SaveAndRestore Outer(VisitingConstLookup, OuterLookup);
+                if (auto *DRE = dyn_cast<DeclRefExpr>(L)) {
+                  auto *VD = dyn_cast<VarDecl>(DRE->getDecl());
+                  if (VD && VD->getType().isConstQualified() && VD->getInit() &&
+                      !isVarOnPath(Path, VD) &&
+                      visitVarInitOnce(Path, DRE, VD,
+                                       unsigned(VarInitMode::Initializer) |
+                                           1)) {
+                    pushVarInit(Path, DRE, VD);
+                    visitLocalsRetainedByInitializer(Path, VD->getInit(), Visit,
+                                                     true);
+                  }
+                } else if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(L)) {
+                  if (MTE->getType().isConstQualified())
+                    visitLocalsRetainedByInitializer(Path, MTE->getSubExpr(),
+                                                     Visit, true);
                 }
-              } else if (auto *MTE = dyn_cast<MaterializeTemporaryExpr>(L)) {
-                if (MTE->getType().isConstQualified())
-                  visitLocalsRetainedByInitializer(Path, MTE->getSubExpr(),
-                                                   Visit, true);
-              }
-              return false;
-            });
+                return false;
+              });
+        }
 
         // We assume that objects can be retained by pointers cast to integers,
         // but not if the integer is cast to floating-point type or to _Complex.
@@ -1138,6 +1307,13 @@ checkExprLifetimeImpl(Sema &SemaRef, const InitializedEntity *InitEntity,
   // for temporaries within its initializer.
   if (LK == LK_FullExpression)
     return;
+
+  llvm::DenseSet<VarInitKey> Visited;
+  llvm::SaveAndRestore VisitedScope(VisitedVarInits, &Visited);
+  llvm::DenseMap<const VarDecl *,
+                 std::pair<const IndirectLocalPath *, unsigned>>
+      OnPath;
+  llvm::SaveAndRestore OnPathScope(VarInitsOnPath, &OnPath);
 
   // FIXME: consider moving the TemporaryVisitor and visitLocalsRetained*
   // functions to a dedicated class.
