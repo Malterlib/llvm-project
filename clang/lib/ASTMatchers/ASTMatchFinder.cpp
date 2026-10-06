@@ -96,29 +96,47 @@ struct MemoizedMatchResult {
 // around it is traversed: the operands of a rewritten operator, like
 // `co_await f() == g()`, are traversed both as written and as they are
 // rewritten, and so are the operands of a co_await in them.
+// The same goes for the initializers of an initializer list, which its
+// syntactic and semantic forms both have, so traversing both forms of nested
+// lists, `S{.x = S{.x = 0}.x}`, would traverse the innermost a number of times
+// that doubles with each level: each is traversed once, in the form that
+// is traversed first.
 class CoroutineOperands {
 public:
   // Whether \p S is to be traversed: not an operand met again in the same
-  // traversal, which \p NotAsIs tells, that of the code as written.
-  bool shouldTraverse(const Stmt *S, bool NotAsIs = false) {
-    if (auto It = Operands.find(Key(S, NotAsIs)); It != Operands.end()) {
+  // traversal, which \p Mode tells: that of the code as written, and that of
+  // what isn't spelled in source, in which different matchers can match.
+  bool shouldTraverse(const Stmt *S, unsigned Mode = 0) {
+    if (auto It = Operands.find(Key(S, Mode)); It != Operands.end()) {
       if (It->second)
         return false;
       It->second = true;
     }
     if (const auto *Suspend = dyn_cast_or_null<CoroutineSuspendExpr>(S))
       if (const Expr *Operand = Suspend->getOperand())
-        Operands.try_emplace(Key(Operand, NotAsIs), false);
+        Operands.try_emplace(Key(Operand, Mode), false);
     if (const auto *Return = dyn_cast_or_null<CoreturnStmt>(S))
       if (const Expr *Operand = Return->getOperand())
-        Operands.try_emplace(Key(Operand, NotAsIs), false);
+        Operands.try_emplace(Key(Operand, Mode), false);
+    if (const auto *List = dyn_cast_or_null<InitListExpr>(S))
+      if (const InitListExpr *Semantic =
+              List->isSemanticForm() ? List : List->getSemanticForm();
+          Semantic && Semantic->getSyntacticForm())
+        // Also what the semantic form converts, which the syntactic form
+        // has as it is, like the initializer of a designator, `.x = (v)`.
+        for (const Expr *Init : Semantic->inits())
+          for (const Expr *Inner = Init; Inner;) {
+            Operands.try_emplace(Key(Inner, Mode), false);
+            const Expr *Next = Inner->IgnoreImplicit();
+            Inner = Next != Inner ? Next : nullptr;
+          }
     return true;
   }
 
   void clear() { Operands.clear(); }
 
 private:
-  using Key = llvm::PointerIntPair<const Stmt *, 1, bool>;
+  using Key = llvm::PointerIntPair<const Stmt *, 2, unsigned>;
   // Whether each was traversed.
   llvm::DenseMap<Key, bool> Operands;
 };
@@ -1595,12 +1613,12 @@ bool MatchASTVisitor::TraverseDecl(Decl *DeclNode) {
 }
 
 bool MatchASTVisitor::TraverseStmt(Stmt *StmtNode, DataRecursionQueue *Queue) {
-  if (shouldSkipNode(StmtNode) ||
-      !Operands.shouldTraverse(StmtNode, TraversingASTNodeNotAsIs))
-    return true;
-
   bool ScopedTraversal = TraversingASTNodeNotSpelledInSource ||
                          TraversingASTChildrenNotSpelledInSource;
+  if (shouldSkipNode(StmtNode) ||
+      !Operands.shouldTraverse(StmtNode, (TraversingASTNodeNotAsIs ? 1 : 0) |
+                                             (ScopedTraversal ? 2 : 0)))
+    return true;
 
   ASTNodeNotSpelledInSourceScope RAII(this, ScopedTraversal);
   match(*StmtNode);

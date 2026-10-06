@@ -484,6 +484,19 @@ private:
     if (const auto *Return = dyn_cast<CoreturnStmt>(StmtNode);
         Return && !Traversed && Return->getOperand())
       CoroutineOperands.try_emplace(Return->getOperand(), false);
+    // So do the initializers of an initializer list, which its syntactic and
+    // semantic forms both have, also what the semantic form converts, which
+    // the syntactic form has as it is, like the initializer of a designator.
+    if (const auto *List = dyn_cast<InitListExpr>(StmtNode); List && !Traversed)
+      if (const InitListExpr *Semantic =
+              List->isSemanticForm() ? List : List->getSemanticForm();
+          Semantic && Semantic->getSyntacticForm())
+        for (const Expr *Init : Semantic->inits())
+          for (const Expr *Inner = Init; Inner;) {
+            CoroutineOperands.try_emplace(Inner, false);
+            const Expr *Next = Inner->IgnoreImplicit();
+            Inner = Next != Inner ? Next : nullptr;
+          }
     addParent(StmtNode, &Map.PointerParents);
     if (Traversed)
       return false;
@@ -497,8 +510,8 @@ private:
 
   ParentMap &Map;
   llvm::SmallVector<DynTypedNode, 16> ParentStack;
-  // The operands of co_await, co_yield and co_return met, and whether each was
-  // traversed.
+  // The operands of co_await, co_yield and co_return met, and the
+  // initializers of initializer lists, and whether each was traversed.
   llvm::DenseMap<const Stmt *, bool> CoroutineOperands;
 };
 

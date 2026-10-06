@@ -300,5 +300,28 @@ int g();
                                  DynTypedNode::create(*Await)));
 }
 
+// The initializers of nested initializer lists, which their syntactic and
+// semantic forms share, are traversed once, also however deep they nest, and
+// get the parents in both forms.
+TEST(GetParents, NestedInitListInitializers) {
+  std::string Code = "struct S { int x; };\n";
+  std::string Initialized = "7";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Initialized = "S{.x = (" + Initialized + ")}.x";
+  Code += "int nested() { return " + Initialized + "; }";
+  auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+  auto &Ctx = AST->getASTContext();
+  const auto *Literal = selectFirst<IntegerLiteral>(
+      "literal", match(integerLiteral(equals(7)).bind("literal"), Ctx));
+  ASSERT_TRUE(Literal);
+  // The parenthesized initializer, which the designator has as it is and the
+  // semantic form converts.
+  const DynTypedNodeList Parents = Ctx.getParents(*Literal);
+  ASSERT_EQ(Parents.size(), 1u);
+  const auto *Paren = Parents[0].get<ParenExpr>();
+  ASSERT_TRUE(Paren);
+  EXPECT_EQ(Ctx.getParents(*Paren).size(), 2u);
+}
+
 } // end namespace ast_matchers
 } // end namespace clang
