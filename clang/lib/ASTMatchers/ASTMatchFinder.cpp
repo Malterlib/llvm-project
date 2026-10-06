@@ -552,14 +552,18 @@ public:
 
   bool dataTraverseNode(Stmt *S, DataRecursionQueue *Queue) {
     if (auto *RF = dyn_cast<CXXForRangeStmt>(S)) {
-      {
+      // Like the operands of a rewritten operator below: within one way of
+      // traversing it, the other can't match anything, and traversing both
+      // for loops nested in their range initializers would traverse the
+      // innermost a number of times that doubles with each level.
+      if (!TraversingASTNodeNotSpelledInSource) {
         ASTNodeNotAsIsSourceScope RAII(this, true);
         TraverseStmt(RF->getInit());
         // Don't traverse under the loop variable
         match(*RF->getLoopVariable());
         TraverseStmt(RF->getRangeInit());
       }
-      {
+      if (!TraversingASTNodeNotAsIs) {
         ASTNodeNotSpelledInSourceScope RAII(this, true);
         for (auto *SubStmt : RF->children()) {
           if (SubStmt != RF->getBody())
@@ -569,12 +573,18 @@ public:
       TraverseStmt(RF->getBody());
       return true;
     } else if (auto *RBO = dyn_cast<CXXRewrittenBinaryOperator>(S)) {
-      {
+      // The operands are traversed as written, for the matchers that ignore
+      // what isn't spelled in source, and in the rewritten form, for the
+      // others. Within one of them, the other can't match anything, and
+      // traversing both for each of nested rewritten operators, like
+      // `((a < b) < c) < d`, would traverse the innermost operands a number
+      // of times that doubles with each level.
+      if (!TraversingASTNodeNotSpelledInSource) {
         ASTNodeNotAsIsSourceScope RAII(this, true);
         TraverseStmt(const_cast<Expr *>(RBO->getLHS()));
         TraverseStmt(const_cast<Expr *>(RBO->getRHS()));
       }
-      {
+      if (!TraversingASTNodeNotAsIs) {
         ASTNodeNotSpelledInSourceScope RAII(this, true);
         for (auto *SubStmt : RBO->children()) {
           TraverseStmt(SubStmt);

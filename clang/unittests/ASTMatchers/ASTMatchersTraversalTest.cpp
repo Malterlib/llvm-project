@@ -653,6 +653,72 @@ int g();
 // traversing it again for each would never end.
 // The operands of a rewritten operator are traversed both as written and as
 // rewritten, and so is the operand of a co_await in them, which each finds.
+// The operands of nested rewritten operators are traversed once in each way
+// they can match, also however deep they nest.
+TEST(Matcher, MatchesNestedRewrittenOperatorOperandsOnce) {
+  std::string Code = R"cpp(
+namespace std {
+struct strong_ordering {
+  int n;
+  constexpr operator int() const { return n; }
+  static const strong_ordering less, equal, greater;
+};
+constexpr strong_ordering strong_ordering::less = {-1};
+constexpr strong_ordering strong_ordering::equal = {0};
+constexpr strong_ordering strong_ordering::greater = {1};
+} // namespace std
+struct Value {
+  Value(int);
+  Value(bool);
+};
+std::strong_ordering operator<=>(Value, Value);
+)cpp";
+  std::string Compared = "Value(7)";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Compared = "Value((" + Compared + ") < Value(0))";
+  Code += "void nested() { " + Compared + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, integerLiteral(equals(7)).bind("literal"),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource,
+               integerLiteral(equals(7)).bind("literal")),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, cxxRewrittenBinaryOperator().bind("compare"),
+      std::make_unique<VerifyIdIsBoundTo<CXXRewrittenBinaryOperator>>(
+          "compare", 40),
+      {"-std=c++20"}));
+}
+
+// So are the initializers of range-based for loops nested in each other's
+// range, through lambdas.
+TEST(Matcher, MatchesNestedRangeForInitializersOnce) {
+  std::string Code = R"cpp(
+struct Range {
+  int *begin();
+  int *end();
+};
+)cpp";
+  std::string Nested = "Range{}";
+  for (int Depth = 0; Depth < 30; ++Depth)
+    Nested = "([&] { for (int Value : " + Nested + ") {} return Range{}; }())";
+  Code += "void nested() { for (int Value : " + Nested + ") {} }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, cxxForRangeStmt().bind("loop"),
+      std::make_unique<VerifyIdIsBoundTo<CXXForRangeStmt>>("loop", 31),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource,
+               cxxForRangeStmt().bind("loop")),
+      std::make_unique<VerifyIdIsBoundTo<CXXForRangeStmt>>("loop", 31),
+      {"-std=c++20"}));
+}
+
 TEST(Matcher, MatchesCoawaitOperandInRewrittenOperator) {
   std::string Code = R"cpp(
 namespace std {
