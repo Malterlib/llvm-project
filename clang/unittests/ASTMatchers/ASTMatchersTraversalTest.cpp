@@ -694,6 +694,48 @@ std::strong_ordering operator<=>(Value, Value);
       {"-std=c++20"}));
 }
 
+// The initializers of nested initializer lists, which their syntactic and
+// semantic forms share, are traversed once, also however deep they nest.
+TEST(Matcher, MatchesNestedInitListInitializersOnce) {
+  std::string Code = "struct S { int x; };\n";
+  std::string Initialized = "7";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Initialized = "S{.x = (" + Initialized + ")}.x";
+  Code += "int nested() { return " + Initialized + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, integerLiteral(equals(7)).bind("literal"),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource,
+               integerLiteral(equals(7)).bind("literal")),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+  // Also met first where nothing can match, in what isn't spelled in source
+  // traversed as written, like the default argument of a lambda in a rewritten
+  // operator, it is traversed again where it is spelled.
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      "struct Compared { bool operator==(int) const; };\n"
+      "struct S { int *x; };\n"
+      "bool f() { return [](S v = S{.x = (int *)0}) { return 1; }() == "
+      "Compared{}; }",
+      traverse(TK_IgnoreUnlessSpelledInSource, cStyleCastExpr().bind("cast")),
+      std::make_unique<VerifyIdIsBoundTo<CStyleCastExpr>>("cast", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, designatedInitExpr().bind("designated"),
+      std::make_unique<VerifyIdIsBoundTo<DesignatedInitExpr>>("designated",
+                                                              40),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(integerLiteral(equals(7)).bind("literal"))),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("literal", 1),
+      {"-std=c++20"}));
+}
+
 // So are the initializers of range-based for loops nested in each other's
 // range, through lambdas.
 TEST(Matcher, MatchesNestedRangeForInitializersOnce) {
