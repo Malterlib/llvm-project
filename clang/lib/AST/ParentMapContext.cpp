@@ -16,6 +16,7 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TemplateBase.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace clang;
@@ -434,6 +435,15 @@ private:
   }
 
   bool TraverseDecl(Decl *DeclNode) {
+    // A declaration met again, like a parameter of a lambda's call operator
+    // in the type of the lambda's conversion to a pointer to a function, has
+    // the parents below it already: only the new parent is added. Traversing
+    // it again would traverse lambdas in default arguments a number of times
+    // that multiplies with each level.
+    if (DeclNode && !TraversedDecls.insert(DeclNode).second) {
+      addParent(DeclNode, &Map.PointerParents);
+      return true;
+    }
     return TraverseNode(
         DeclNode, DeclNode, [&] { return VisitorBase::TraverseDecl(DeclNode); },
         &Map.PointerParents);
@@ -513,6 +523,8 @@ private:
   // The operands of co_await, co_yield and co_return met, and the
   // initializers of initializer lists, and whether each was traversed.
   llvm::DenseMap<const Stmt *, bool> CoroutineOperands;
+  // The declarations traversed.
+  llvm::DenseSet<const Decl *> TraversedDecls;
 };
 
 ParentMapContext::ParentMap::ParentMap(ASTContext &Ctx) {

@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/Timer.h"
 #include <deque>
 #include <memory>
@@ -46,6 +47,132 @@ typedef MatchFinder::MatchCallback MatchCallback;
 // revisit this number; also, put up micro-benchmarks that we can
 // optimize this on.
 static const unsigned MaxMemoizationEntries = 10000;
+
+// Whether \p TypeLocNode is the type of \p Function, or of a conversion
+// function, the type its name has, which is written apart from it, `operator
+// int (*)()`.
+static bool isTypeOf(const FunctionDecl *Function, TypeLoc TypeLocNode) {
+  if (!Function)
+    return false;
+  if (const TypeSourceInfo *Info = Function->getTypeSourceInfo();
+      Info && Info->getTypeLoc() == TypeLocNode)
+    return true;
+  const TypeSourceInfo *Named =
+      isa<CXXConversionDecl>(Function)
+          ? Function->getNameInfo().getNamedTypeInfo()
+          : nullptr;
+  return Named && Named->getTypeLoc() == TypeLocNode;
+}
+
+// The template parameters of \p Template when it is of a lambda's conversion
+// to a pointer to a function or of the static function it gives, which are
+// those of the lambda's call operator.
+static const TemplateParameterList *
+lambdaCallOperatorParametersOf(const FunctionTemplateDecl *Template) {
+  const auto *Method =
+      dyn_cast_or_null<CXXMethodDecl>(Template->getTemplatedDecl());
+  return Method && Method->isImplicit() && Method->getParent()->isLambda()
+             ? Template->getTemplateParameters()
+             : nullptr;
+}
+
+// Whether \p Node is a parameter of another function of the lambda that
+// \p Function is of, its call operator, its conversion to a pointer to a
+// function or the static function it gives, which share their signature: not
+// one of a function declared in a lambda in it, `[] { void f(T Param); }`.
+static bool isParameterOfOtherLambdaFunction(const FunctionDecl *Function,
+                                             const Decl *Node) {
+  const auto *Parameter = dyn_cast_or_null<ParmVarDecl>(Node);
+  if (!Function || !Parameter || Parameter->getDeclContext() == Function)
+    return false;
+  // Nor one of its own template, which the type of the conversion of a
+  // generic lambda instantiated for a pointer has, `int (*)(int, int)`.
+  if (const FunctionDecl *Pattern = Function->getTemplateInstantiationPattern();
+      Pattern && Parameter->getDeclContext() == Pattern)
+    return false;
+  const auto *Own = dyn_cast<CXXMethodDecl>(Function);
+  const auto *Other = dyn_cast<CXXMethodDecl>(Parameter->getDeclContext());
+  return Own && Other && Own->getParent() == Other->getParent();
+}
+
+// Whether \p Node is one of \p Parameters.
+static bool isOfTemplateParameters(const TemplateParameterList *Parameters,
+                                   const Decl *Node) {
+  return Parameters && Node && llvm::is_contained(Parameters->asArray(), Node);
+}
+
+// Whether \p Node is the trailing requires clause of the call operator of the
+// lambda that \p Function, its conversion or static function, is of, which
+// \p Function has too.
+static bool isLambdaCallOperatorConstraint(const FunctionDecl *Function,
+                                           const Stmt *Node) {
+  const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Function);
+  if (!Method || !Node || !Method->getParent()->isLambda())
+    return false;
+  const CXXMethodDecl *CallOperator =
+      Method->getParent()->getLambdaCallOperator();
+  return CallOperator && CallOperator != Method &&
+         CallOperator->getTrailingRequiresClause().ConstraintExpr == Node;
+}
+
+// The expressions in the types of a lambda's call operator, its return type,
+// a `decltype` of a parameter or its exception specification, which the types
+// of the lambda's conversion to a pointer to a function and of the static
+// function it gives share, unless one is instantiated apart from the call
+// operator, like those of a generic lambda converted to a pointer, whose
+// expressions are its own, `decltype(Value)` of its own parameter. The call
+// operator comes first in the lambda's class.
+struct LambdaSignatureStmts {
+  // The call operator traversed, of the lambda's class traversed.
+  const FunctionDecl *CallOperator = nullptr;
+  // Whether a type of it is traversed.
+  bool InTypeOfCallOperator = false;
+  // What its types have.
+  llvm::SmallPtrSet<const Stmt *, 8> *InCallOperator = nullptr;
+
+  // Whether \p Node, met in a type of the conversion or the static function
+  // when \p InTypeOfOther, is one the call operator's types have, which is
+  // traversed with the call operator. One in those is noted.
+  bool skips(const Stmt *Node, bool InTypeOfOther) {
+    if (!Node || !InCallOperator)
+      return false;
+    if (InTypeOfCallOperator)
+      InCallOperator->insert(Node);
+    return InTypeOfOther && InCallOperator->contains(Node);
+  }
+
+  // Of each lambda's class, also one in the signature of another.
+  struct ClassScope {
+    ClassScope(LambdaSignatureStmts &State, const CXXRecordDecl *Class)
+        : State(State), SavedCallOperator(State.CallOperator),
+          SavedInType(State.InTypeOfCallOperator),
+          SavedInCallOperator(State.InCallOperator) {
+      if (Class && Class->isLambda()) {
+        State.CallOperator = nullptr;
+        State.InTypeOfCallOperator = false;
+        State.InCallOperator = &Own;
+      }
+    }
+    ~ClassScope() {
+      State.CallOperator = SavedCallOperator;
+      State.InTypeOfCallOperator = SavedInType;
+      State.InCallOperator = SavedInCallOperator;
+    }
+    LambdaSignatureStmts &State;
+    const FunctionDecl *SavedCallOperator;
+    bool SavedInType;
+    llvm::SmallPtrSet<const Stmt *, 8> *SavedInCallOperator;
+    llvm::SmallPtrSet<const Stmt *, 8> Own;
+  };
+  struct MethodScope {
+    MethodScope(LambdaSignatureStmts &State, const CXXMethodDecl *Method)
+        : Restore(State.CallOperator,
+                  Method->getParent()->isLambda()
+                      ? (Method->isImplicit() ? nullptr : Method)
+                      : State.CallOperator) {}
+    llvm::SaveAndRestore<const FunctionDecl *> Restore;
+  };
+};
 
 enum class MatchType {
   Ancestors,
@@ -208,6 +335,12 @@ public:
   // They are public only to allow CRTP to work. They are *not *part
   // of the public API of this class.
   bool TraverseDecl(Decl *DeclNode) {
+    // Like in the match finder, the parameters of a lambda's call operator
+    // are traversed with the call operator only.
+    if (isParameterOfOtherLambdaFunction(ParametersOf, DeclNode))
+      return true;
+    if (isOfTemplateParameters(SkippedTemplateParameters, DeclNode))
+      return true;
 
     if (DeclNode && DeclNode->isImplicit() &&
         Finder->isTraversalIgnoringImplicitNodes())
@@ -232,6 +365,15 @@ public:
   }
 
   bool TraverseStmt(Stmt *StmtNode, DataRecursionQueue *Queue = nullptr) {
+    // Like in the match finder, the expressions in the return type and the
+    // exception specification of a lambda's call operator, and its trailing
+    // requires clause, are traversed with the call operator only.
+    if (Signature.skips(StmtNode, InTypeOfParametersOf) ||
+        (SkippedTemplateParameters && StmtNode &&
+         StmtNode == SkippedTemplateParameters->getRequiresClause()) ||
+        isLambdaCallOperatorConstraint(ParametersOf, StmtNode))
+      return true;
+
     // If we need to keep track of the depth, we can't perform data recursion.
     if (CurrentDepth == 0 || (CurrentDepth <= MaxDepth && MaxDepth < INT_MAX))
       Queue = nullptr;
@@ -267,6 +409,13 @@ public:
   bool TraverseTypeLoc(TypeLoc TypeLocNode, bool TraverseQualifier = true) {
     if (TypeLocNode.isNull())
       return true;
+    llvm::SaveAndRestore<bool> RestoreInType(
+        InTypeOfParametersOf,
+        InTypeOfParametersOf || isTypeOf(ParametersOf, TypeLocNode));
+    llvm::SaveAndRestore<bool> RestoreInCallOperatorType(
+        Signature.InTypeOfCallOperator,
+        Signature.InTypeOfCallOperator ||
+            isTypeOf(Signature.CallOperator, TypeLocNode));
     ScopedIncrement ScopedDepth(&CurrentDepth);
     // Match the Type.
     if (!match(*TypeLocNode.getType()))
@@ -371,10 +520,67 @@ public:
     return VisitorBase::TraverseStmt(Node->getBody());
   }
 
+  // The conversion of a lambda to a pointer to a function, and the static
+  // function it gives, have the parameters, the return type and the exception
+  // specification of the lambda's call operator in their types, like for the
+  // match finder below. Only in a traversal of the lambda's class, which has
+  // the call operator too: one that starts at the conversion or the static
+  // function finds them in it.
+  bool TraverseCXXRecordDecl(CXXRecordDecl *D) {
+    llvm::SaveAndRestore<bool> Restore(InLambdaClass,
+                                       D && D->isLambda() ? true
+                                                          : InLambdaClass);
+    // A lambda in a type of another's conversion or static function, like in
+    // its exception specification, has its own signature, which isn't in
+    // that type.
+    const bool Lambda = D && D->isLambda();
+    llvm::SaveAndRestore<const FunctionDecl *> RestoreParametersOf(
+        ParametersOf, Lambda ? nullptr : ParametersOf);
+    llvm::SaveAndRestore<bool> RestoreInType(
+        InTypeOfParametersOf, Lambda ? false : InTypeOfParametersOf);
+    LambdaSignatureStmts::ClassScope Class(Signature, D);
+    return VisitorBase::TraverseCXXRecordDecl(D);
+  }
+  bool TraverseCXXConversionDecl(CXXConversionDecl *D) {
+    llvm::SaveAndRestore<const FunctionDecl *> Restore(
+        ParametersOf,
+        InLambdaClass && D->getParent()->isLambda() ? D : nullptr);
+    return VisitorBase::TraverseCXXConversionDecl(D);
+  }
+  bool TraverseCXXMethodDecl(CXXMethodDecl *D) {
+    const FunctionDecl *Own = ParametersOf;
+    if (InLambdaClass && D->getParent()->isLambda())
+      Own = D->isImplicit() ? D : nullptr;
+    llvm::SaveAndRestore<const FunctionDecl *> Restore(ParametersOf, Own);
+    LambdaSignatureStmts::MethodScope Method(Signature, D);
+    return VisitorBase::TraverseCXXMethodDecl(D);
+  }
+  bool TraverseFunctionTemplateDecl(FunctionTemplateDecl *D) {
+    llvm::SaveAndRestore<const TemplateParameterList *> Restore(
+        SkippedTemplateParameters, InLambdaClass
+                                       ? lambdaCallOperatorParametersOf(D)
+                                       : SkippedTemplateParameters);
+    return VisitorBase::TraverseFunctionTemplateDecl(D);
+  }
+
   bool shouldVisitTemplateInstantiations() const { return true; }
   bool shouldVisitImplicitCode() const { return !IgnoreImplicitChildren; }
 
 private:
+  // The function whose own parameters are the only ones traversed, when set.
+  const FunctionDecl *ParametersOf = nullptr;
+  // Whether a type of ParametersOf is traversed.
+  bool InTypeOfParametersOf = false;
+  // The template parameters of a lambda's call operator, which the templates
+  // of its conversion and static function have too, when traversed through
+  // those.
+  const TemplateParameterList *SkippedTemplateParameters = nullptr;
+  // Whether the class of a lambda is traversed.
+  bool InLambdaClass = false;
+  // What the types of the conversion and the static function share with
+  // those of the call operator.
+  LambdaSignatureStmts Signature;
+
   // Used for updating the depth during traversal.
   struct ScopedIncrement {
     explicit ScopedIncrement(int *Depth) : Depth(Depth) { ++(*Depth); }
@@ -617,11 +823,16 @@ public:
         TraverseLambdaCapture(LE, &C, std::get<1>(I));
       }
 
-      {
+      // Like the operands of a rewritten operator below: within one way of
+      // traversing the parameters, the other can't match anything, and
+      // traversing both for lambdas nested in default arguments would
+      // traverse the innermost a number of times that doubles with each
+      // level.
+      if (!TraversingASTNodeNotAsIs) {
         ASTNodeNotSpelledInSourceScope RAII(this, true);
         TraverseDecl(LE->getLambdaClass());
       }
-      {
+      if (!TraversingASTNodeNotSpelledInSource) {
         ASTNodeNotAsIsSourceScope RAII(this, true);
 
         // We need to poke around to find the bits that might be explicitly
@@ -648,8 +859,10 @@ public:
         for (const auto &E : T->exceptions())
           TraverseType(E, /*TraverseQualifier=*/true);
 
+        // Not queued, which would traverse it after this scope ends, as if
+        // it weren't written.
         if (Expr *NE = T->getNoexceptExpr())
-          TraverseStmt(NE, Queue);
+          TraverseStmt(NE);
 
         if (LE->hasExplicitResultType())
           TraverseTypeLoc(Proto.getReturnLoc(), /*TraverseQualifier=*/true);
@@ -825,6 +1038,47 @@ public:
     return TraversingASTNodeNotAsIs;
   }
 
+  // The conversion of a lambda to a pointer to a function, and the static
+  // function it gives, have the parameters, the return type and the exception
+  // specification of the lambda's call operator in their types, which are
+  // traversed with the call operator. Traversing them again would traverse
+  // lambdas in their default arguments, or in a `decltype` or a `noexcept` of
+  // them, a number of times that multiplies with each level. In the types,
+  // also the one the name of the conversion has, the parameters and the
+  // expressions are skipped.
+  bool TraverseCXXConversionDecl(CXXConversionDecl *D) {
+    llvm::SaveAndRestore<const FunctionDecl *> Restore(
+        ParametersOf, D->getParent()->isLambda() ? D : nullptr);
+    return RecursiveASTVisitor<MatchASTVisitor>::TraverseCXXConversionDecl(D);
+  }
+  bool TraverseCXXMethodDecl(CXXMethodDecl *D) {
+    const FunctionDecl *Own = ParametersOf;
+    if (D->getParent()->isLambda())
+      Own = D->isImplicit() ? D : nullptr;
+    llvm::SaveAndRestore<const FunctionDecl *> Restore(ParametersOf, Own);
+    LambdaSignatureStmts::MethodScope Method(Signature, D);
+    return RecursiveASTVisitor<MatchASTVisitor>::TraverseCXXMethodDecl(D);
+  }
+  bool TraverseCXXRecordDecl(CXXRecordDecl *D) {
+    // A lambda in a type of another's conversion or static function has its
+    // own signature, as above.
+    const bool Lambda = D && D->isLambda();
+    llvm::SaveAndRestore<const FunctionDecl *> RestoreParametersOf(
+        ParametersOf, Lambda ? nullptr : ParametersOf);
+    llvm::SaveAndRestore<bool> RestoreInType(
+        InTypeOfParametersOf, Lambda ? false : InTypeOfParametersOf);
+    LambdaSignatureStmts::ClassScope Class(Signature, D);
+    return RecursiveASTVisitor<MatchASTVisitor>::TraverseCXXRecordDecl(D);
+  }
+  // So do the templates of a generic lambda's conversion and static
+  // function, which have the template parameters of its call operator.
+  bool TraverseFunctionTemplateDecl(FunctionTemplateDecl *D) {
+    llvm::SaveAndRestore<const TemplateParameterList *> Restore(
+        SkippedTemplateParameters, lambdaCallOperatorParametersOf(D));
+    return RecursiveASTVisitor<MatchASTVisitor>::TraverseFunctionTemplateDecl(
+        D);
+  }
+
   bool TraverseTemplateInstantiations(ClassTemplateDecl *D) {
     ASTNodeNotSpelledInSourceScope RAII(this, true);
     return RecursiveASTVisitor<MatchASTVisitor>::TraverseTemplateInstantiations(
@@ -847,6 +1101,16 @@ private:
   bool TraversingASTNodeNotSpelledInSource = false;
   bool TraversingASTNodeNotAsIs = false;
   bool TraversingASTChildrenNotSpelledInSource = false;
+  // The function whose own parameters are the only ones traversed, when set.
+  const FunctionDecl *ParametersOf = nullptr;
+  // Whether a type of ParametersOf is traversed.
+  bool InTypeOfParametersOf = false;
+  // The template parameters of a lambda's call operator, when traversed
+  // through the template of its conversion or static function.
+  const TemplateParameterList *SkippedTemplateParameters = nullptr;
+  // What the types of the conversion and the static function share with
+  // those of the call operator.
+  LambdaSignatureStmts Signature;
 
   class CurMatchData {
 // We don't have enough free low bits in 32bit builds to discriminate 8 pointer
@@ -1584,6 +1848,11 @@ bool MatchASTVisitor::TraverseDecl(Decl *DeclNode) {
   if (shouldSkipNode(DeclNode))
     return true;
 
+  if (isParameterOfOtherLambdaFunction(ParametersOf, DeclNode))
+    return true;
+  if (isOfTemplateParameters(SkippedTemplateParameters, DeclNode))
+    return true;
+
   if (Options.SkipDeclsInModules && DeclNode->isInAnotherModuleUnit())
     return true;
 
@@ -1613,6 +1882,12 @@ bool MatchASTVisitor::TraverseDecl(Decl *DeclNode) {
 }
 
 bool MatchASTVisitor::TraverseStmt(Stmt *StmtNode, DataRecursionQueue *Queue) {
+  if (Signature.skips(StmtNode, InTypeOfParametersOf) ||
+      (SkippedTemplateParameters && StmtNode &&
+       StmtNode == SkippedTemplateParameters->getRequiresClause()) ||
+      isLambdaCallOperatorConstraint(ParametersOf, StmtNode))
+    return true;
+
   bool ScopedTraversal = TraversingASTNodeNotSpelledInSource ||
                          TraversingASTChildrenNotSpelledInSource;
   if (shouldSkipNode(StmtNode) ||
@@ -1638,6 +1913,13 @@ bool MatchASTVisitor::TraverseTypeLoc(TypeLoc TypeLocNode,
                                       bool TraverseQualifier) {
   if (shouldSkipNode(TypeLocNode))
     return true;
+  llvm::SaveAndRestore<bool> RestoreInType(
+      InTypeOfParametersOf,
+      InTypeOfParametersOf || isTypeOf(ParametersOf, TypeLocNode));
+  llvm::SaveAndRestore<bool> RestoreInCallOperatorType(
+      Signature.InTypeOfCallOperator,
+      Signature.InTypeOfCallOperator ||
+          isTypeOf(Signature.CallOperator, TypeLocNode));
   // The RecursiveASTVisitor only visits types if they're not within TypeLocs.
   // We still want to find those types via matchers, so we match them here. Note
   // that the TypeLocs are structurally a shadow-hierarchy to the expressed
