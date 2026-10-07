@@ -323,5 +323,44 @@ TEST(GetParents, NestedInitListInitializers) {
   EXPECT_EQ(Ctx.getParents(*Paren).size(), 2u);
 }
 
+// A parameter of a lambda's call operator, which the types of the lambda's
+// conversion to a pointer to a function and of its static invoker have too,
+// is traversed once, also however deep lambdas nest in default arguments.
+TEST(GetParents, NestedLambdaDefaultArguments) {
+  std::string Nested = "7";
+  for (int Depth = 0; Depth < 40; ++Depth)
+    Nested = "[](int Value = " + Nested + ") { return Value; }(0)";
+  std::string Code = "int nested() { return " + Nested + "; }";
+  auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+  auto &Ctx = AST->getASTContext();
+  const auto *Literal = selectFirst<IntegerLiteral>(
+      "literal", match(integerLiteral(equals(7)).bind("literal"), Ctx));
+  ASSERT_TRUE(Literal);
+  const DynTypedNodeList Parents = Ctx.getParents(*Literal);
+  ASSERT_EQ(Parents.size(), 1u);
+  const auto *Parameter = Parents[0].get<ParmVarDecl>();
+  ASSERT_TRUE(Parameter);
+  EXPECT_FALSE(Ctx.getParents(*Parameter).empty());
+}
+
+// So are the expressions in the return type and the exception specification
+// of a lambda's call operator, which those types have too.
+TEST(GetParents, NestedLambdaReturnTypesAndExceptionSpecifications) {
+  for (bool Noexcept : {false, true}) {
+    std::string Nested = "7";
+    for (int Depth = 0; Depth < 40; ++Depth)
+      Nested = Noexcept
+                   ? "[]() noexcept(noexcept(" + Nested + ")) { return 0; }()"
+                   : "[]() -> decltype(" + Nested + ") { return 0; }()";
+    std::string Code = "int nested() { return " + Nested + "; }";
+    auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+    auto &Ctx = AST->getASTContext();
+    const auto *Literal = selectFirst<IntegerLiteral>(
+        "literal", match(integerLiteral(equals(7)).bind("literal"), Ctx));
+    ASSERT_TRUE(Literal);
+    EXPECT_FALSE(Ctx.getParents(*Literal).empty());
+  }
+}
+
 } // end namespace ast_matchers
 } // end namespace clang

@@ -761,6 +761,225 @@ struct Range {
       {"-std=c++20"}));
 }
 
+TEST(Matcher, MatchesNestedLambdaDefaultArgumentsOnce) {
+  std::string Nested = "7";
+  for (int Depth = 0; Depth < 30; ++Depth)
+    Nested = "[](int Value = " + Nested + ") { return Value; }(0)";
+  std::string Code = "int nested() { return " + Nested + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, lambdaExpr().bind("lambda"),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource, lambdaExpr().bind("lambda")),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesParametersOfFunctionsInLambdaSignatures) {
+  // A function declared in a lambda in the signature of another, which the
+  // conversion of a generic lambda to a pointer instantiates, has parameters
+  // of its own, not those of the lambda's signature.
+  StringRef Code = R"cpp(
+    auto Lambda = []<typename T>(T)
+        noexcept(noexcept([] { void fg_Test(T Param); }())) {};
+    void (*Pointer)(int) = Lambda;
+  )cpp";
+  EXPECT_TRUE(matches(Code,
+                      parmVarDecl(hasName("Param"), hasType(asString("int"))),
+                      langCxx20OrLater()));
+  EXPECT_TRUE(matches(Code,
+                      cxxRecordDecl(isLambda(), hasDescendant(parmVarDecl(
+                                                    hasName("Param"),
+                                                    hasType(asString("int"))))),
+                      langCxx20OrLater()));
+}
+
+TEST(Matcher, MatchesDescendantsInNestedLambdaDefaultArgumentsOnce) {
+  std::string Nested = "7";
+  for (int Depth = 0; Depth < 30; ++Depth)
+    Nested = "[](int Value = " + Nested + ") { return Value; }(0)";
+  std::string Code = "int nested() { return " + Nested + "; }";
+  EXPECT_TRUE(notMatches(
+      Code, functionDecl(hasName("nested"), hasDescendant(stringLiteral()))));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(integerLiteral(equals(7)).bind("seven"))),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+      {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesNestedLambdaReturnTypesAndExceptionSpecificationsOnce) {
+  for (bool Noexcept : {false, true}) {
+    std::string Nested = "7";
+    for (int Depth = 0; Depth < 30; ++Depth)
+      Nested = Noexcept
+                   ? "[]() noexcept(noexcept(" + Nested + ")) { return 0; }()"
+                   : "[]() -> decltype(" + Nested + ") { return 0; }()";
+    std::string Code = "int nested() { return " + Nested + "; }";
+    EXPECT_TRUE(matchAndVerifyResultTrue(
+        Code, lambdaExpr().bind("lambda"),
+        std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+        {"-std=c++20"}));
+    EXPECT_TRUE(matchAndVerifyResultTrue(
+        Code,
+        traverse(TK_IgnoreUnlessSpelledInSource, lambdaExpr().bind("lambda")),
+        std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+        {"-std=c++20"}));
+    EXPECT_TRUE(matchAndVerifyResultTrue(
+        Code,
+        functionDecl(
+            hasName("nested"),
+            forEachDescendant(integerLiteral(equals(7)).bind("seven"))),
+        std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+        {"-std=c++20"}));
+  }
+}
+
+TEST(Matcher, MatchesNestedGenericLambdaTemplateDefaultsOnce) {
+  std::string Nested = "7";
+  for (int Depth = 0; Depth < 30; ++Depth)
+    Nested = "[]<typename T = decltype(" + Nested + ")>() { return 0; }";
+  std::string Code = "void nested() { (void)" + Nested + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, lambdaExpr().bind("lambda"),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource, lambdaExpr().bind("lambda")),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(integerLiteral(equals(7)).bind("seven"))),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+      {"-std=c++20"}));
+  // A query that starts at the template of the conversion finds them in it.
+  EXPECT_TRUE(matchesConditionally(
+      "auto Lambda = []<typename T = int>(T Value) { return Value; };",
+      functionTemplateDecl(has(cxxConversionDecl()),
+                           hasDescendant(templateTypeParmDecl(hasName("T")))),
+      true, {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesExpressionsOfInstantiatedLambdaInvokerTypes) {
+  // The static function of a generic lambda converted to a pointer is
+  // instantiated with its own type, whose `decltype` refers to its own
+  // parameter, unlike the call operator's that the template's has.
+  const std::string Code =
+      "auto Lambda = []<typename T>(T Value) -> decltype(Value) {\n"
+      "  return Value;\n"
+      "};\n"
+      "int (*Pointer)(int) = Lambda;\n";
+  auto OfInvoker = declRefExpr(to(parmVarDecl(hasDeclContext(
+      cxxMethodDecl(hasName("__invoke"), isTemplateInstantiation())))));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, OfInvoker.bind("ref"),
+      std::make_unique<VerifyIdIsBoundTo<DeclRefExpr>>("ref", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, lambdaExpr(forEachDescendant(OfInvoker.bind("ref"))),
+      std::make_unique<VerifyIdIsBoundTo<DeclRefExpr>>("ref", 1),
+      {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesParametersOfInstantiatedLambdaConversions) {
+  // The conversion of a generic lambda instantiated for a pointer has the
+  // parameters of its template in its type, which are found, also from the
+  // lambda, and what their types have in them.
+  const std::string Code =
+      "auto Lambda = []<typename T>(T Value, decltype(Value + 1) Other) {\n"
+      "  return Value + Other;\n"
+      "};\n"
+      "int (*Pointer)(int, int) = Lambda;\n";
+  auto OfConversion = parmVarDecl(hasDeclContext(cxxConversionDecl()));
+  EXPECT_TRUE(matches(Code, OfConversion, langCxx20OrLater()));
+  EXPECT_TRUE(matches(Code, lambdaExpr(hasDescendant(OfConversion)),
+                      langCxx20OrLater()));
+  EXPECT_TRUE(matches(Code, binaryOperator(hasAncestor(OfConversion)),
+                      langCxx20OrLater()));
+}
+
+TEST(Matcher, MatchesLambdasInTypesOfInstantiatedLambdaInvokers) {
+  // A lambda in the exception specification of a generic lambda converted to
+  // a pointer has a signature of its own, which isn't in the type of the
+  // conversion or the static function: its instantiated default argument is
+  // found.
+  const std::string Code =
+      "auto Lambda = []<typename T>(T Value)\n"
+      "    noexcept(noexcept([](T Inner = T{42}) {}())) {};\n"
+      "void (*Pointer)(int) = Lambda;\n";
+  EXPECT_TRUE(matches(Code, initListExpr(hasType(asString("int"))),
+                      langCxx20OrLater()));
+}
+
+TEST(Matcher, MatchesNestedLambdaTrailingRequiresClausesOnce) {
+  std::string Nested = "7 > 0";
+  for (int Depth = 0; Depth < 30; ++Depth)
+    Nested = "(sizeof(decltype([]<typename>() requires (" + Nested +
+             ") { return 0; })) > 0)";
+  std::string Code = "bool nested() { return " + Nested + "; }";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, lambdaExpr().bind("lambda"),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource, lambdaExpr().bind("lambda")),
+      std::make_unique<VerifyIdIsBoundTo<LambdaExpr>>("lambda", 30),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("nested"),
+                   forEachDescendant(integerLiteral(equals(7)).bind("seven"))),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+      {"-std=c++20"}));
+  // A query that starts at the conversion finds its constraint in it.
+  EXPECT_TRUE(matchesConditionally(
+      "auto Lambda = []<typename T>(T Value) requires (sizeof(T) > 7) { "
+      "return Value; };",
+      cxxConversionDecl(hasDescendant(integerLiteral(equals(7)))), true,
+      {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesLambdaExceptionSpecificationOnceAsWritten) {
+  StringRef Code = "auto Lambda = []() noexcept(7 > 1) { return 0; };";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, integerLiteral(equals(7)).bind("seven"),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1)));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      traverse(TK_IgnoreUnlessSpelledInSource,
+               integerLiteral(equals(7)).bind("seven")),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1)));
+}
+
+TEST(Matcher, MatchesLambdaReturnTypeUnderConversion) {
+  // A query that starts at the conversion of a lambda to a pointer to a
+  // function finds the expressions in its type.
+  StringRef Code =
+      "auto Lambda = []() noexcept(sizeof(int) > 1) -> decltype(42) { "
+      "return 0; };";
+  EXPECT_TRUE(matches(
+      Code, cxxConversionDecl(hasDescendant(integerLiteral(equals(42))))));
+  EXPECT_TRUE(matches(
+      Code, cxxConversionDecl(hasDescendant(integerLiteral(equals(1))))));
+}
+
+TEST(Matcher, MatchesLambdaParametersUnderConversion) {
+  // A query that starts at the conversion of a lambda to a pointer to a
+  // function finds the parameters in its type.
+  StringRef Code = "auto Lambda = [](int Value = 42) { return Value; };";
+  EXPECT_TRUE(matches(
+      Code, cxxConversionDecl(hasDescendant(parmVarDecl(hasName("Value"))))));
+  EXPECT_TRUE(matches(
+      Code, parmVarDecl(hasName("Value"), hasAncestor(cxxConversionDecl()))));
+}
+
 TEST(Matcher, MatchesCoawaitOperandInRewrittenOperator) {
   std::string Code = R"cpp(
 namespace std {
