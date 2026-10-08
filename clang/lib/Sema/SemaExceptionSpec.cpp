@@ -21,6 +21,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/SemaInternal.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include <optional>
 
@@ -1110,6 +1111,26 @@ static CanThrowResult canTypeidThrow(Sema &S, const CXXTypeidExpr *DC) {
   return S.canThrow(DC->getExprOperand());
 }
 
+/// Whether \p E, the expression of a default argument or a default member
+/// initializer, which each of their uses shares, can throw: checked once in
+/// the outermost check that meets it, not for each path that leads to it, like
+/// the uses of `int f1(int = f0() + f0());`, whose number doubles with each
+/// link of such a chain. Whether it can throw doesn't depend on the path.
+static CanThrowResult canSharedThrow(Sema &S, const Expr *E) {
+  std::optional<llvm::DenseMap<const Expr *, CanThrowResult>> Owned;
+  if (!S.SharedCanThrow)
+    S.SharedCanThrow = &Owned.emplace();
+  const llvm::scope_exit Reset([&] {
+    if (Owned)
+      S.SharedCanThrow = nullptr;
+  });
+  if (auto It = S.SharedCanThrow->find(E); It != S.SharedCanThrow->end())
+    return It->second;
+  const CanThrowResult CT = S.canThrow(E);
+  (*S.SharedCanThrow)[E] = CT;
+  return CT;
+}
+
 CanThrowResult Sema::canThrow(const Stmt *S) {
   // C++ [expr.unary.noexcept]p3:
   //   [Can throw] if in a potentially-evaluated context the expression would
@@ -1350,10 +1371,10 @@ CanThrowResult Sema::canThrow(const Stmt *S) {
   }
 
   case Expr::CXXDefaultArgExprClass:
-    return canThrow(cast<CXXDefaultArgExpr>(S)->getExpr());
+    return canSharedThrow(*this, cast<CXXDefaultArgExpr>(S)->getExpr());
 
   case Expr::CXXDefaultInitExprClass:
-    return canThrow(cast<CXXDefaultInitExpr>(S)->getExpr());
+    return canSharedThrow(*this, cast<CXXDefaultInitExpr>(S)->getExpr());
 
   case Expr::ChooseExprClass: {
     auto *CE = cast<ChooseExpr>(S);

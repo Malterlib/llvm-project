@@ -1980,6 +1980,30 @@ public:
 
   bool shouldVisitDiscardedStmt() const { return false; }
 
+  // The expression of a default argument or member initializer is shared by
+  // each of its uses, also those in other default arguments, like `int f1(int
+  // = f0() + f0());`, and uses the same declarations each time, so each is
+  // visited once for each of what checkFunc does differently: the caller, the
+  // device context and whether the root is emitted.
+  llvm::DenseSet<std::tuple<const Expr *, const FunctionDecl *, unsigned>>
+      VisitedDefaults;
+  bool firstVisitOfDefault(const Expr *E) {
+    const FunctionDecl *Caller =
+        UsePath.empty() ? nullptr
+                        : static_cast<const FunctionDecl *>(UsePath.back());
+    unsigned Context =
+        unsigned(InOMPDeviceContext > 0) | unsigned(ShouldEmitRootNode) << 1;
+    return VisitedDefaults.insert({E, Caller, Context}).second;
+  }
+  void VisitCXXDefaultArgExpr(CXXDefaultArgExpr *E) {
+    if (firstVisitOfDefault(E->getExpr()))
+      Inherited::VisitCXXDefaultArgExpr(E);
+  }
+  void VisitCXXDefaultInitExpr(CXXDefaultInitExpr *E) {
+    if (firstVisitOfDefault(E->getExpr()))
+      Inherited::VisitCXXDefaultInitExpr(E);
+  }
+
   void VisitOMPTargetDirective(OMPTargetDirective *Node) {
     ++InOMPDeviceContext;
     Inherited::VisitOMPTargetDirective(Node);

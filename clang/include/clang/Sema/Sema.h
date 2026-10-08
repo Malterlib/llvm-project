@@ -6632,6 +6632,21 @@ public:
   // argument locations.
   llvm::DenseMap<ParmVarDecl *, SourceLocation> UnparsedDefaultArgLocs;
 
+  /// The default arguments and default member initializers rewritten for the
+  /// immediate invocations and source locations in them, for the parameter or
+  /// field, and the location and context of the outermost use that the
+  /// rewrite is for, which the uses of the parameter or field in other default
+  /// arguments and initializers that the use rewrites share, with the cleanups
+  /// its temporaries need, which each full expression a use is in needs. Only
+  /// while that outermost rewrite is made, \p RewritingDefaultArgs deep: a
+  /// call Sema builds again, like one with an immediate invocation in it that
+  /// it rebuilds, is rewritten again, in the state it is built in then.
+  llvm::DenseMap<std::tuple<const ValueDecl *, SourceLocation::UIntTy,
+                            const DeclContext *>,
+                 std::pair<Expr *, CleanupInfo>>
+      RewrittenDefaultArgs;
+  unsigned RewritingDefaultArgs = 0;
+
   /// UndefinedInternals - all the used, undefined objects which require a
   /// definition in this translation unit.
   llvm::MapVector<NamedDecl *, SourceLocation> UndefinedButUsed;
@@ -6718,6 +6733,10 @@ public:
                                ExceptionSpecificationType &EST);
 
   CanThrowResult canThrow(const Stmt *E);
+  /// Whether the default arguments and default member initializers that the
+  /// outermost check of whether an expression can throw meets can throw,
+  /// which their uses share: each is checked once, not for each path to it.
+  llvm::DenseMap<const Expr *, CanThrowResult> *SharedCanThrow = nullptr;
   /// Determine whether the callee of a particular function call can throw.
   /// E, D and Loc are all optional.
   static CanThrowResult canCalleeThrow(Sema &S, const Expr *E, const Decl *D,

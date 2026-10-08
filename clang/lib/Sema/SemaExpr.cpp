@@ -64,6 +64,8 @@
 #include "clang/Sema/SemaPseudoObject.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -5681,6 +5683,85 @@ struct ImmediateCallVisitor : DynamicRecursiveASTVisitor {
   }
 
   bool HasImmediateCalls = false;
+  // Whether it materializes a temporary, whose identity and lifetime are those
+  // of each use, so that a use can't share the rewrite of another. Not in an
+  // operand that isn't evaluated, `sizeof(f(1))`, which makes none.
+  bool HasTemporaries = false;
+  // And one that the aggregate a default member initializer initializes can
+  // extend the lifetime of: not one a call is given, also as its object,
+  // `[] { ... }()`, nor one whose value is discarded, which lasts until the end
+  // of the full expression.
+  bool HasExtendableTemporaries = false;
+
+  bool VisitMaterializeTemporaryExpr(MaterializeTemporaryExpr *E) override {
+    HasTemporaries |= Unevaluated == 0;
+    HasExtendableTemporaries |= Unevaluated == 0 && InCall == 0;
+    return DynamicRecursiveASTVisitor::VisitStmt(E);
+  }
+  bool TraverseCallExpr(CallExpr *E) override {
+    return traverseInCall(
+        [&] { return DynamicRecursiveASTVisitor::TraverseCallExpr(E); });
+  }
+  bool TraverseCXXMemberCallExpr(CXXMemberCallExpr *E) override {
+    return traverseInCall([&] {
+      return DynamicRecursiveASTVisitor::TraverseCXXMemberCallExpr(E);
+    });
+  }
+  bool TraverseCXXOperatorCallExpr(CXXOperatorCallExpr *E) override {
+    return traverseInCall([&] {
+      return DynamicRecursiveASTVisitor::TraverseCXXOperatorCallExpr(E);
+    });
+  }
+  bool TraverseCXXConstructExpr(CXXConstructExpr *E) override {
+    return traverseInCall([&] {
+      return DynamicRecursiveASTVisitor::TraverseCXXConstructExpr(E);
+    });
+  }
+  bool TraverseCXXTemporaryObjectExpr(CXXTemporaryObjectExpr *E) override {
+    return traverseInCall([&] {
+      return DynamicRecursiveASTVisitor::TraverseCXXTemporaryObjectExpr(E);
+    });
+  }
+  // Also parenthesized aggregate initialization, `R(f())`, which doesn't extend
+  // the lifetime of a temporary bound to a reference member.
+  bool TraverseCXXParenListInitExpr(CXXParenListInitExpr *E) override {
+    return traverseInCall([&] {
+      return DynamicRecursiveASTVisitor::TraverseCXXParenListInitExpr(E);
+    });
+  }
+  bool TraverseUnaryExprOrTypeTraitExpr(UnaryExprOrTypeTraitExpr *E) override {
+    return traverseUnevaluated([&] {
+      return DynamicRecursiveASTVisitor::TraverseUnaryExprOrTypeTraitExpr(E);
+    });
+  }
+  bool TraverseCXXNoexceptExpr(CXXNoexceptExpr *E) override {
+    return traverseUnevaluated(
+        [&] { return DynamicRecursiveASTVisitor::TraverseCXXNoexceptExpr(E); });
+  }
+  bool TraverseCXXTypeidExpr(CXXTypeidExpr *E) override {
+    if (E->isPotentiallyEvaluated())
+      return DynamicRecursiveASTVisitor::TraverseCXXTypeidExpr(E);
+    return traverseUnevaluated(
+        [&] { return DynamicRecursiveASTVisitor::TraverseCXXTypeidExpr(E); });
+  }
+  bool TraverseRequiresExpr(RequiresExpr *E) override {
+    return traverseUnevaluated(
+        [&] { return DynamicRecursiveASTVisitor::TraverseRequiresExpr(E); });
+  }
+  bool TraverseDecltypeTypeLoc(DecltypeTypeLoc TL,
+                               bool TraverseQualifier) override {
+    return traverseUnevaluated([&] {
+      return DynamicRecursiveASTVisitor::TraverseDecltypeTypeLoc(
+          TL, TraverseQualifier);
+    });
+  }
+  bool TraverseTypeOfExprTypeLoc(TypeOfExprTypeLoc TL,
+                                 bool TraverseQualifier) override {
+    return traverseUnevaluated([&] {
+      return DynamicRecursiveASTVisitor::TraverseTypeOfExprTypeLoc(
+          TL, TraverseQualifier);
+    });
+  }
 
   bool VisitCallExpr(CallExpr *E) override {
     if (const FunctionDecl *FD = E->getDirectCallee())
@@ -5713,13 +5794,79 @@ struct ImmediateCallVisitor : DynamicRecursiveASTVisitor {
     return VisitCXXMethodDecl(E->getCallOperator());
   }
 
-  bool VisitCXXDefaultArgExpr(CXXDefaultArgExpr *E) override {
-    return TraverseStmt(E->getExpr());
+  // The scan only tells whether there is an immediate invocation, a source
+  // location or a temporary, so each node is looked at once, and once more
+  // where it isn't evaluated and where a call is given it, which tell
+  // different things of its temporaries. Traversing implicit code reaches
+  // nodes that are shared, which would otherwise be traversed through each path
+  // to them, a number of times that doubles with each level: the expression of
+  // a default argument or member initializer, shared by each of its uses, also
+  // those in other default arguments, like `int f1(int = f0() + f0());`, the
+  // initializers of an initializer list, shared by its syntactic and semantic
+  // forms, like `S{.x = S{.x = 0}.x}`, and the operand of co_await and
+  // co_yield, shared by the expressions that make its awaiter.
+  bool TraverseStmt(Stmt *S) override {
+    if (S && !VisitedStmts[Unevaluated ? 2 : InCall ? 1 : 0].insert(S).second)
+      return true;
+    // A temporary of an operand whose value is discarded, `(void)T{}` and
+    // the left operand of a comma, lasts until the end of the full expression
+    // too, like one a call is given, and so does one whose value is read,
+    // `int x = S{}.x;`, which nothing refers to after.
+    if (auto *Cast = dyn_cast_or_null<CastExpr>(S);
+        Cast && (Cast->getCastKind() == CK_ToVoid ||
+                 Cast->getCastKind() == CK_LValueToRValue))
+      return traverseInCall(
+          [&] { return DynamicRecursiveASTVisitor::TraverseStmt(S); });
+    if (auto *Comma = dyn_cast_or_null<BinaryOperator>(S);
+        Comma && Comma->isCommaOp())
+      return traverseInCall([&] { return TraverseStmt(Comma->getLHS()); }) &&
+             TraverseStmt(Comma->getRHS());
+    return DynamicRecursiveASTVisitor::TraverseStmt(S);
   }
 
-  bool VisitCXXDefaultInitExpr(CXXDefaultInitExpr *E) override {
-    return TraverseStmt(E->getExpr());
+  // So is the signature of a lambda, which its call operator, its conversion
+  // to a pointer to a function and its static invoker all have, also a
+  // lambda in it, like `[]() -> decltype([] { ... }()) { ... }`.
+  bool TraverseDecl(Decl *D) override {
+    if (D && !VisitedDecls.insert(D).second)
+      return true;
+    return DynamicRecursiveASTVisitor::TraverseDecl(D);
   }
+
+  // And a type that isn't where it is written, like the type of a parameter
+  // of an instantiation where it is written as the template parameter, which
+  // a type that names another twice, like the parameters and result of
+  // `F17 (*)(F17, F17)`, meets once for each path to it.
+  bool TraverseType(QualType T, bool TraverseQualifier) override {
+    if (!T.isNull() && !VisitedTypes[Unevaluated ? 2
+                                     : InCall    ? 1
+                                                 : 0]
+                            .insert(T.getAsOpaquePtr())
+                            .second)
+      return true;
+    return DynamicRecursiveASTVisitor::TraverseType(T, TraverseQualifier);
+  }
+
+private:
+  template <typename F> bool traverseUnevaluated(F Traverse) {
+    ++Unevaluated;
+    const bool Result = Traverse();
+    --Unevaluated;
+    return Result;
+  }
+  template <typename F> bool traverseInCall(F Traverse) {
+    ++InCall;
+    const bool Result = Traverse();
+    --InCall;
+    return Result;
+  }
+
+  unsigned Unevaluated = 0;
+  unsigned InCall = 0;
+  // Where it is evaluated, also in a call, and where it isn't.
+  llvm::SmallPtrSet<const Stmt *, 32> VisitedStmts[3];
+  llvm::SmallPtrSet<const Decl *, 8> VisitedDecls;
+  llvm::SmallPtrSet<const void *, 16> VisitedTypes[3];
 };
 
 struct EnsureImmediateInvocationInDefaultArgs
@@ -5806,8 +5953,31 @@ ExprResult Sema::BuildCXXDefaultArgExpr(SourceLocation CallLoc,
 
     // Rewrite the call argument that was created from the corresponding
     // parameter's default argument.
-    if (V.HasImmediateCalls ||
-        (NeedRebuild && isa_and_present<ExprWithCleanups>(Param->getInit()))) {
+    // The uses of a parameter in the default arguments that the rewrite of an
+    // outer use rewrites, `int f1(int = g(f0(), f0()));`, are rewritten for
+    // the same outer use, the same way, so they share the rewrite, like uses
+    // share a default argument that isn't rewritten: rewriting each would
+    // rewrite the first a number of times that doubles with each. Its
+    // temporaries last until the end of the full expression, each time it is
+    // evaluated, but not where a range-based for extends their lifetimes,
+    // where each use has its own.
+    const auto Rewritten = std::make_tuple(
+        static_cast<const ValueDecl *>(Param),
+        InitializationContext->Loc.getRawEncoding(),
+        static_cast<const DeclContext *>(InitializationContext->Context));
+    const bool ShareRewrite =
+        RewritingDefaultArgs && !RebuildingImmediateInvocation &&
+        V.HasImmediateCalls && (!V.HasTemporaries || !NeedRebuild);
+    if (ShareRewrite)
+      if (auto It = RewrittenDefaultArgs.find(Rewritten);
+          It != RewrittenDefaultArgs.end()) {
+        Init = It->second.first;
+        Cleanup.mergeFrom(It->second.second);
+      }
+    if (Init) {
+    } else if (V.HasImmediateCalls ||
+               (NeedRebuild &&
+                isa_and_present<ExprWithCleanups>(Param->getInit()))) {
       if (V.HasImmediateCalls)
         ExprEvalContexts.back().DelayedDefaultInitializationContext = {
             CallLoc, Param, CurContext};
@@ -5816,18 +5986,28 @@ ExprResult Sema::BuildCXXDefaultArgExpr(SourceLocation CallLoc,
       currentEvaluationContext().InLifetimeExtendingContext =
           parentEvaluationContext().InLifetimeExtendingContext;
       EnsureImmediateInvocationInDefaultArgs Immediate(*this);
+      // The cleanups of the temporaries of the rewrite, which each full
+      // expression it is in needs too.
+      const CleanupInfo Outer = Cleanup;
+      Cleanup.reset();
       ExprResult Res;
+      ++RewritingDefaultArgs;
       runWithSufficientStackSpace(CallLoc, [&] {
         Res = Immediate.TransformInitializer(Param->getInit(),
                                              /*NotCopy=*/false);
       });
-      if (Res.isInvalid())
-        return ExprError();
-      Res = ConvertParamDefaultArgument(Param, Res.get(),
-                                        Res.get()->getBeginLoc());
+      if (--RewritingDefaultArgs == 0)
+        RewrittenDefaultArgs.clear();
+      if (!Res.isInvalid())
+        Res = ConvertParamDefaultArgument(Param, Res.get(),
+                                          Res.get()->getBeginLoc());
+      const CleanupInfo Rewrite = Cleanup;
+      Cleanup.mergeFrom(Outer);
       if (Res.isInvalid())
         return ExprError();
       Init = Res.get();
+      if (ShareRewrite)
+        RewrittenDefaultArgs[Rewritten] = {Init, Rewrite};
     }
   }
 
@@ -5912,7 +6092,33 @@ ExprResult Sema::BuildCXXDefaultInitExpr(SourceLocation Loc, FieldDecl *Field) {
   // extension when warranted.
   bool ContainsAnyTemporaries =
       isa_and_present<ExprWithCleanups>(Field->getInClassInitializer());
-  if (Field->getInClassInitializer() &&
+  // The uses of a field in the initializers that the rewrite of an outer use
+  // rewrites, `struct S1 { S0 m = b ? S0{} : S0{}; };`, are rewritten for the
+  // same outer use, the same way, so they share the rewrite, like those of a
+  // default argument: rewriting each would rewrite the first a number of times
+  // that doubles with each, also where it is rewritten for its temporaries,
+  // `int x = b ? S{}.x : S{}.x;`. Not when it materializes a temporary the
+  // aggregate it initializes can extend the lifetime of: each use has its own,
+  // like the two of `int const &m = f();` in `S{}` of `struct S { T a, b; };`,
+  // but not one a call is given, which lasts until the end of the full
+  // expression, nor any where a range-based for extends their lifetimes.
+  const auto Rewritten = std::make_tuple(
+      static_cast<const ValueDecl *>(Field),
+      InitializationContext->Loc.getRawEncoding(),
+      static_cast<const DeclContext *>(InitializationContext->Context));
+  const bool ShareRewrite =
+      RewritingDefaultArgs && !RebuildingImmediateInvocation &&
+      (V.HasImmediateCalls || (NeedRebuild && ContainsAnyTemporaries)) &&
+      !V.HasExtendableTemporaries &&
+      (!V.HasTemporaries ||
+       !parentEvaluationContext().InLifetimeExtendingContext);
+  if (ShareRewrite)
+    if (auto It = RewrittenDefaultArgs.find(Rewritten);
+        It != RewrittenDefaultArgs.end()) {
+      Init = It->second.first;
+      Cleanup.mergeFrom(It->second.second);
+    }
+  if (!Init && Field->getInClassInitializer() &&
       !Field->getInClassInitializer()->containsErrors() &&
       (V.HasImmediateCalls || (NeedRebuild && ContainsAnyTemporaries))) {
     ExprEvalContexts.back().DelayedDefaultInitializationContext = {Loc, Field,
@@ -5924,18 +6130,30 @@ ExprResult Sema::BuildCXXDefaultInitExpr(SourceLocation Loc, FieldDecl *Field) {
     currentEvaluationContext().InLifetimeExtendingContext =
         parentEvaluationContext().InLifetimeExtendingContext;
     EnsureImmediateInvocationInDefaultArgs Immediate(*this);
+    // The cleanups of the temporaries of the rewrite, which each full
+    // expression it is in needs too, like the initialization of each member
+    // that uses it.
+    const CleanupInfo Outer = Cleanup;
+    Cleanup.reset();
     ExprResult Res;
+    ++RewritingDefaultArgs;
     runWithSufficientStackSpace(Loc, [&] {
       Res = Immediate.TransformInitializer(Field->getInClassInitializer(),
                                            /*CXXDirectInit=*/false);
     });
+    if (--RewritingDefaultArgs == 0)
+      RewrittenDefaultArgs.clear();
     if (!Res.isInvalid())
       Res = ConvertMemberDefaultInitExpression(Field, Res.get(), Loc);
+    const CleanupInfo Rewrite = Cleanup;
+    Cleanup.mergeFrom(Outer);
     if (Res.isInvalid()) {
       Field->setInvalidDecl();
       return ExprError();
     }
     Init = Res.get();
+    if (ShareRewrite)
+      RewrittenDefaultArgs[Rewritten] = {Init, Rewrite};
   }
 
   if (Field->getInClassInitializer()) {
@@ -19145,18 +19363,41 @@ void Sema::MarkFunctionReferenced(SourceLocation Loc, FunctionDecl *Func,
   // If a constructor was defined in the context of a default parameter
   // or of another default member initializer (ie a PotentiallyEvaluatedIfUsed
   // context), its initializers may not be referenced yet.
+  // Each constructor's once while the initializers of one are marked, which
+  // mark the same declarations each time, in the context the constructor
+  // gives: one used in a default member initializer of its own class, `int n
+  // = b ? S{}.n : 0;`, would mark them again without end, and a chain of
+  // classes whose member is initialized with two of the one before, `S1 m = b
+  // ? S1{} : S1{};`, a number of times that doubles with each. Of the thread
+  // rather than of the frame of the outermost one, which a crash that a
+  // CrashRecoveryContext recovers from leaves without returning, emptied for
+  // each outermost one and for another Sema.
+  struct CMarkingInitializers {
+    llvm::SmallPtrSet<const CXXConstructorDecl *, 8> Marked;
+    const Sema *Of = nullptr;
+    unsigned Depth = 0;
+  };
+  static thread_local CMarkingInitializers MarkingInitializers;
   if (CXXConstructorDecl *Constructor = dyn_cast<CXXConstructorDecl>(Func)) {
-    EnterExpressionEvaluationContext EvalContext(
-        *this,
-        Constructor->isImmediateFunction()
-            ? ExpressionEvaluationContext::ImmediateFunctionContext
-            : ExpressionEvaluationContext::PotentiallyEvaluated,
-        Constructor);
-    for (CXXCtorInitializer *Init : Constructor->inits()) {
-      if (Init->isInClassMemberInitializer())
-        runWithSufficientStackSpace(Init->getSourceLocation(), [&]() {
-          MarkDeclarationsReferencedInExpr(Init->getInit());
-        });
+    if (MarkingInitializers.Depth == 0 || MarkingInitializers.Of != this) {
+      MarkingInitializers.Marked.clear();
+      MarkingInitializers.Of = this;
+    }
+    if (MarkingInitializers.Marked.insert(Constructor).second) {
+      ++MarkingInitializers.Depth;
+      const llvm::scope_exit Leave([] { --MarkingInitializers.Depth; });
+      EnterExpressionEvaluationContext EvalContext(
+          *this,
+          Constructor->isImmediateFunction()
+              ? ExpressionEvaluationContext::ImmediateFunctionContext
+              : ExpressionEvaluationContext::PotentiallyEvaluated,
+          Constructor);
+      for (CXXCtorInitializer *Init : Constructor->inits()) {
+        if (Init->isInClassMemberInitializer())
+          runWithSufficientStackSpace(Init->getSourceLocation(), [&]() {
+            MarkDeclarationsReferencedInExpr(Init->getInit());
+          });
+      }
     }
   }
 
@@ -21072,6 +21313,23 @@ public:
     S.MarkMemberReferenced(E);
     Visit(E->getBase());
   }
+
+  // The expression of a default argument or member initializer is shared by
+  // each of its uses, also those in other default arguments, like `int f1(int
+  // = f0() + f0());`, and marks the same declarations each time, so each is
+  // visited once.
+  void VisitCXXDefaultArgExpr(CXXDefaultArgExpr *E) {
+    if (VisitedDefaults.insert(E->getExpr()).second)
+      Inherited::VisitCXXDefaultArgExpr(E);
+  }
+
+  void VisitCXXDefaultInitExpr(CXXDefaultInitExpr *E) {
+    if (VisitedDefaults.insert(E->getExpr()).second)
+      Inherited::VisitCXXDefaultInitExpr(E);
+  }
+
+private:
+  llvm::SmallPtrSet<const Expr *, 8> VisitedDefaults;
 };
 } // namespace
 
