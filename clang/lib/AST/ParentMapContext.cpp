@@ -507,6 +507,15 @@ private:
             const Expr *Next = Inner->IgnoreImplicit();
             Inner = Next != Inner ? Next : nullptr;
           }
+    // So does the expression of a default argument or default member
+    // initializer, which each of its uses shares, also those in other
+    // default arguments, like `int f1(int = g(f0(), f0()));`.
+    if (!Traversed) {
+      if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(StmtNode))
+        CoroutineOperands.try_emplace(Default->getExpr(), false);
+      else if (const auto *Init = dyn_cast<CXXDefaultInitExpr>(StmtNode))
+        CoroutineOperands.try_emplace(Init->getExpr(), false);
+    }
     addParent(StmtNode, &Map.PointerParents);
     if (Traversed)
       return false;
@@ -520,8 +529,9 @@ private:
 
   ParentMap &Map;
   llvm::SmallVector<DynTypedNode, 16> ParentStack;
-  // The operands of co_await, co_yield and co_return met, and the
-  // initializers of initializer lists, and whether each was traversed.
+  // The operands of co_await, co_yield and co_return met, the initializers
+  // of initializer lists, and the expressions of default arguments and
+  // default member initializers, and whether each was traversed.
   llvm::DenseMap<const Stmt *, bool> CoroutineOperands;
   // The declarations traversed.
   llvm::DenseSet<const Decl *> TraversedDecls;
