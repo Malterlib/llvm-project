@@ -946,6 +946,50 @@ TEST(Matcher, MatchesNestedLambdaTrailingRequiresClausesOnce) {
       {"-std=c++20"}));
 }
 
+// What a default argument is, which each call that uses it shares, is matched
+// once, also when default arguments call the function before them, each
+// twice, which traversing it again for each call would multiply.
+TEST(Matcher, MatchesSharedDefaultArgumentOnce) {
+  std::string Code = "int g();\nint f0(int = g());\n";
+  for (int Depth = 1; Depth <= 8; ++Depth)
+    Code += "int f" + std::to_string(Depth) + "(int = f" +
+            std::to_string(Depth - 1) + "() + f" + std::to_string(Depth - 1) +
+            "());\n";
+  Code += "int use() { return f8(); }\n";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, callExpr(callee(functionDecl(hasName("g")))).bind("g"),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("use"),
+                   forEachDescendant(
+                       callExpr(callee(functionDecl(hasName("g")))).bind("g"))),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+}
+
+TEST(Matcher, MatchesDefaultArgumentOfLambdaInRewrittenOperator) {
+  // The default argument of a lambda's parameter in an operand of a rewritten
+  // operator is matched, where it is declared as the operator is written,
+  // where the matchers that traverse implicit code don't match, and where it
+  // is used as the operator is rewritten.
+  StringRef Code = R"cpp(
+    struct S { bool operator==(int) const; };
+    bool f() {
+      return [](int Value = 7) { return Value; }() == S{};
+    }
+  )cpp";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      functionDecl(hasName("f"),
+                   forEachDescendant(integerLiteral(equals(7)).bind("seven"))),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code, integerLiteral(equals(7)).bind("seven"),
+      std::make_unique<VerifyIdIsBoundTo<IntegerLiteral>>("seven", 1),
+      {"-std=c++20"}));
+}
+
 TEST(Matcher, MatchesLambdaExceptionSpecificationOnceAsWritten) {
   StringRef Code = "auto Lambda = []() noexcept(7 > 1) { return 0; };";
   EXPECT_TRUE(matchAndVerifyResultTrue(
