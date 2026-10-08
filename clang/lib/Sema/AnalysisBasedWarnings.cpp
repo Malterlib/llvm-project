@@ -2843,6 +2843,7 @@ void sema::AnalysisBasedWarnings::issueWarningsForRegisteredVarDecl(
   AC.getCFGBuildOptions().AddInitializers = true;
   AC.getCFGBuildOptions().AddImplicitDtors = true;
   AC.getCFGBuildOptions().AddTemporaryDtors = true;
+  AC.getCFGBuildOptions().OmitRepeatedSharedTemporaryDtors = true;
   AC.getCFGBuildOptions().AddCXXNewAllocator = false;
   AC.getCFGBuildOptions().AddCXXDefaultInitExprInCtors = true;
 
@@ -2912,6 +2913,7 @@ public:
 static void setLifetimeSafetyCFGBuildOptions(AnalysisDeclContext &AC) {
   AC.getCFGBuildOptions().PruneTriviallyFalseEdges = true;
   AC.getCFGBuildOptions().AddLifetime = true;
+  AC.getCFGBuildOptions().OmitRepeatedSharedTemporaryDtors = true;
   AC.getCFGBuildOptions().AddParameterLifetimes = true;
   AC.getCFGBuildOptions().AddInitializers = true;
   AC.getCFGBuildOptions().AddCXXDefaultInitExprInCtors = true;
@@ -3098,6 +3100,7 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   AC.getCFGBuildOptions().AddImplicitDtors = true;
   AC.getCFGBuildOptions().AddParameterLifetimes = true;
   AC.getCFGBuildOptions().AddTemporaryDtors = true;
+  AC.getCFGBuildOptions().OmitRepeatedSharedTemporaryDtors = true;
   AC.getCFGBuildOptions().AddCXXNewAllocator = false;
   AC.getCFGBuildOptions().AddCXXDefaultInitExprInCtors = true;
 
@@ -3125,6 +3128,7 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   }
   if (EnableLifetimeSafetyAnalysis)
     AC.getCFGBuildOptions().AddLifetime = true;
+    AC.getCFGBuildOptions().OmitRepeatedSharedTemporaryDtors = true;
 
   // Install the logical handler.
   std::optional<LogicalErrorHandler> LEH;
