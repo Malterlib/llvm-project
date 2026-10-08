@@ -227,7 +227,11 @@ struct MemoizedMatchResult {
 // syntactic and semantic forms both have, so traversing both forms of nested
 // lists, `S{.x = S{.x = 0}.x}`, would traverse the innermost a number of times
 // that doubles with each level: each is traversed once, in the form that
-// is traversed first.
+// is traversed first. And for what a default argument or a default member
+// initializer is, which each use of it shares, so default arguments that call
+// the function before, `int f2(int = f1() + f1());`, would be traversed a
+// number of times that doubles with each: each is traversed once, where it is
+// first met.
 class CoroutineOperands {
 public:
   // Whether \p S is to be traversed: not an operand met again in the same
@@ -257,13 +261,36 @@ public:
             const Expr *Next = Inner->IgnoreImplicit();
             Inner = Next != Inner ? Next : nullptr;
           }
+    // And what a default argument or a default member initializer is, which
+    // each use of it shares, and which where it is declared, as written, has
+    // too, which finds what a use can.
+    const Expr *Shared = nullptr;
+    if (const auto *Default = dyn_cast_or_null<CXXDefaultArgExpr>(S))
+      Shared = Default->getExpr();
+    else if (const auto *Default = dyn_cast_or_null<CXXDefaultInitExpr>(S))
+      Shared = Default->getExpr();
+    if (Shared)
+      Operands.try_emplace(Key(Shared, Mode),
+                           Declared.contains(Key(Shared, Mode)));
     return true;
   }
 
-  void clear() { Operands.clear(); }
+  // That \p Shared, a default argument or a default member initializer, is
+  // traversed where it is declared, in the traversal \p Mode tells, where
+  // the matchers of that traversal find what a use can.
+  void traverseDeclared(const Expr *Shared, unsigned Mode) {
+    if (Shared)
+      Declared.insert(Key(Shared, Mode));
+  }
+
+  void clear() {
+    Operands.clear();
+    Declared.clear();
+  }
 
 private:
   using Key = llvm::PointerIntPair<const Stmt *, 2, unsigned>;
+  llvm::DenseSet<Key> Declared;
   // Whether each was traversed.
   llvm::DenseMap<Key, bool> Operands;
 };
@@ -1876,6 +1903,21 @@ bool MatchASTVisitor::TraverseDecl(Decl *DeclNode) {
 
   ASTNodeNotSpelledInSourceScope RAII1(this, ScopedTraversal);
   ASTChildrenNotSpelledInSourceScope RAII2(this, ScopedChildren);
+
+  // Its default argument or default member initializer is traversed here,
+  // and not again where a use has it in the same traversal.
+  const unsigned DeclaredMode = (TraversingASTNodeNotAsIs ? 1 : 0) |
+                                (TraversingASTNodeNotSpelledInSource ||
+                                         TraversingASTChildrenNotSpelledInSource
+                                     ? 2
+                                     : 0);
+  if (const auto *Parameter = dyn_cast<ParmVarDecl>(DeclNode);
+      Parameter && Parameter->hasDefaultArg() &&
+      !Parameter->hasUninstantiatedDefaultArg() &&
+      !Parameter->hasUnparsedDefaultArg())
+    Operands.traverseDeclared(Parameter->getDefaultArg(), DeclaredMode);
+  else if (const auto *Field = dyn_cast<FieldDecl>(DeclNode))
+    Operands.traverseDeclared(Field->getInClassInitializer(), DeclaredMode);
 
   match(*DeclNode);
   return RecursiveASTVisitor<MatchASTVisitor>::TraverseDecl(DeclNode);
