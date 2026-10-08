@@ -34,10 +34,13 @@
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Lex/Preprocessor.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <optional>
 using namespace clang;
@@ -3694,6 +3697,41 @@ namespace {
   };
 }
 
+/// Whether \p E, the expression of a default argument or a default member
+/// initializer, which each of their uses shares, has side effects: one found
+/// without them is not checked again in the outermost check that meets it,
+/// not for each path that leads to it, like the uses of `int f1(int = f0() +
+/// f0());`, whose number doubles with each link of such a chain. Whether it
+/// has them doesn't depend on the path.
+static bool sharedHasSideEffects(const Expr *E, const ASTContext &Ctx,
+                                 bool IncludePossibleEffects) {
+  // By whether it includes possible effects, which the check passes on, of
+  // the thread rather than of the frame of the outermost check, which a crash
+  // that a CrashRecoveryContext recovers from leaves without returning: they
+  // are emptied for each outermost check, and for one of another AST.
+  struct CChecked {
+    std::array<llvm::SmallPtrSet<const Expr *, 8>, 2> Free;
+    const ASTContext *Context = nullptr;
+    unsigned Depth = 0;
+  };
+  static thread_local CChecked Checked;
+  if (Checked.Depth == 0 || Checked.Context != &Ctx) {
+    for (llvm::SmallPtrSet<const Expr *, 8> &Free : Checked.Free)
+      Free.clear();
+    Checked.Context = &Ctx;
+  }
+  ++Checked.Depth;
+  const llvm::scope_exit Leave([] { --Checked.Depth; });
+  llvm::SmallPtrSet<const Expr *, 8> &Free =
+      Checked.Free[IncludePossibleEffects];
+  if (Free.contains(E))
+    return false;
+  if (E->HasSideEffects(Ctx, IncludePossibleEffects))
+    return true;
+  Free.insert(E);
+  return false;
+}
+
 bool Expr::HasSideEffects(const ASTContext &Ctx,
                           bool IncludePossibleEffects) const {
   // In circumstances where we care about definite side effects instead of
@@ -3875,13 +3913,13 @@ bool Expr::HasSideEffects(const ASTContext &Ctx,
         Ctx, IncludePossibleEffects);
 
   case CXXDefaultArgExprClass:
-    return cast<CXXDefaultArgExpr>(this)->getExpr()->HasSideEffects(
-        Ctx, IncludePossibleEffects);
+    return sharedHasSideEffects(cast<CXXDefaultArgExpr>(this)->getExpr(), Ctx,
+                                IncludePossibleEffects);
 
   case CXXDefaultInitExprClass: {
     const FieldDecl *FD = cast<CXXDefaultInitExpr>(this)->getField();
     if (const Expr *E = FD->getInClassInitializer())
-      return E->HasSideEffects(Ctx, IncludePossibleEffects);
+      return sharedHasSideEffects(E, Ctx, IncludePossibleEffects);
     // If we've not yet parsed the initializer, assume it has side-effects.
     return true;
   }
