@@ -303,6 +303,188 @@ TEST(CFG, CoawaitOperandTemporaries) {
   EXPECT_EQ(40u, TemporaryDtors);
 }
 
+// The default argument of each function uses the one before it twice, so the
+// expression of the first is met 2^40 times through the uses, which share it:
+// one without temporaries to destroy is visited for them once, also one that
+// makes a temporary without a destructor, like the `int` of `int f0(int const
+// & = 0)`, and the temporaries of a default argument that has them are
+// destroyed for each use.
+TEST(CFG, SharedDefaultArgumentTemporaries) {
+  std::string Code = R"cpp(
+    struct Temporary { ~Temporary(); };
+    int g(int, int);
+    int t(Temporary const & = Temporary());
+    Temporary sink(int);
+    int f0(int const & = 0);
+  )cpp";
+  for (int Depth = 1; Depth <= 40; ++Depth)
+    Code += "int f" + std::to_string(Depth) + "(int = f" +
+            std::to_string(Depth - 1) + "() + f" + std::to_string(Depth - 1) +
+            "());\n";
+  Code += "void probe() { sink(f40()); g(t(), t()); }";
+
+  std::unique_ptr<ASTUnit> AST = tooling::buildASTFromCodeWithArgs(
+      Code, {"-std=c++20", "-Wno-everything"});
+  ASSERT_TRUE(AST);
+  CFGCallback Callback(std::move(AST));
+  Callback.Options.AddTemporaryDtors = true;
+  ast_matchers::MatchFinder Finder;
+  Finder.addMatcher(
+      ast_matchers::functionDecl(ast_matchers::hasName("probe")).bind("func"),
+      &Callback);
+  Finder.matchAST(Callback.AST->getASTContext());
+  BuildResult &B = Callback.TheBuildResult;
+  ASSERT_EQ(BuildResult::BuiltCFG, B.getStatus());
+
+  unsigned TemporaryDtors = 0;
+  for (const CFGBlock *Block : *B.getCFG())
+    for (const CFGElement &Element : *Block)
+      if (Element.getAs<CFGTemporaryDtor>())
+        ++TemporaryDtors;
+  EXPECT_EQ(3u, TemporaryDtors);
+}
+
+// One with temporaries that are destroyed, used through a chain of
+// conditionals, `int f1(int = b ? f0() : f0());`, is reached through a number
+// of paths that doubles with each link, each of which needs its destructors:
+// each use of it up to 4096 times in a full expression, of which the chain
+// has two in the default argument of the second link, they are all added, and
+// past that those of the rest are left out, which only end their temporaries.
+// But not one whose destructor doesn't return, which changes the flow, or
+// releases a capability, which the thread safety analysis tracks: then the
+// CFG isn't built, rather than built without some of them. Separate uses in
+// the source, each reached once, are all added however many they are.
+static BuildResult buildConditionalChain(int Depth,
+                                         const char *Temporary = R"cpp(
+    struct Temporary { ~Temporary(); };
+  )cpp",
+                                         bool Omit = true) {
+  std::string Code = Temporary;
+  Code += R"cpp(
+    extern bool b;
+    int f0(Temporary const & = Temporary());
+  )cpp";
+  for (int Link = 1; Link <= Depth; ++Link)
+    Code += "int f" + std::to_string(Link) + "(int = b ? f" +
+            std::to_string(Link - 1) + "() : f" + std::to_string(Link - 1) +
+            "());\n";
+  Code += "void probe() { f" + std::to_string(Depth) + "(); }";
+  CFG::BuildOptions Options;
+  Options.AddTemporaryDtors = true;
+  Options.OmitRepeatedSharedTemporaryDtors = Omit;
+  return BuildCFG(Code.c_str(), Options, ast_matchers::hasName("probe"));
+}
+
+TEST(CFG, SharedDefaultArgumentConditionalTemporaries) {
+  auto TemporaryDtors = [](const BuildResult &Built) {
+    unsigned Count = 0;
+    for (const CFGBlock *Block : *Built.getCFG())
+      for (const CFGElement &Element : *Block)
+        if (Element.getAs<CFGTemporaryDtor>())
+          ++Count;
+    return Count;
+  };
+  for (auto [Depth, Dtors] : {std::pair{12, 4096u}, std::pair{13, 8192u},
+                              std::pair{14, 8192u}, std::pair{40, 8192u}}) {
+    BuildResult Built = buildConditionalChain(Depth);
+    ASSERT_EQ(BuildResult::BuiltCFG, Built.getStatus());
+    EXPECT_EQ(Dtors, TemporaryDtors(Built));
+  }
+  const char *NoReturn = R"cpp(
+    struct Temporary { [[noreturn]] ~Temporary(); };
+  )cpp";
+  const char *Capability = R"cpp(
+    struct __attribute__((scoped_lockable)) Temporary { ~Temporary(); };
+  )cpp";
+  EXPECT_EQ(BuildResult::BuiltCFG,
+            buildConditionalChain(13, NoReturn).getStatus());
+  EXPECT_EQ(BuildResult::SawFunctionBody,
+            buildConditionalChain(14, NoReturn).getStatus());
+  EXPECT_EQ(BuildResult::SawFunctionBody,
+            buildConditionalChain(14, Capability).getStatus());
+  // Without OmitRepeatedSharedTemporaryDtors, for analyses that track what a
+  // destructor does, like the analyzer, not past the limit either.
+  EXPECT_EQ(BuildResult::BuiltCFG,
+            buildConditionalChain(13, R"cpp(
+    struct Temporary { ~Temporary(); };
+  )cpp", /*Omit=*/false).getStatus());
+  EXPECT_EQ(BuildResult::SawFunctionBody,
+            buildConditionalChain(14, R"cpp(
+    struct Temporary { ~Temporary(); };
+  )cpp", /*Omit=*/false).getStatus());
+
+  std::string Separate = R"cpp(
+    struct Temporary { [[noreturn]] ~Temporary(); };
+    int consume(Temporary = {});
+    void probe() { int Values[] = {
+  )cpp";
+  for (int Use = 0; Use < 4097; ++Use)
+    Separate += "consume(), ";
+  Separate += "0}; }";
+  CFG::BuildOptions Options;
+  Options.AddTemporaryDtors = true;
+  EXPECT_EQ(BuildResult::BuiltCFG,
+            BuildCFG(Separate.c_str(), Options, ast_matchers::hasName("probe"))
+                .getStatus());
+  // Also through the use in a default argument that they share.
+  std::string Shared = R"cpp(
+    struct Temporary { [[noreturn]] ~Temporary(); };
+    int consume(Temporary const & = Temporary{});
+    int forward(int = consume());
+    void probe() { int Values[] = {
+  )cpp";
+  for (int Use = 0; Use < 4097; ++Use)
+    Shared += "forward(), ";
+  Shared += "0}; }";
+  EXPECT_EQ(BuildResult::BuiltCFG,
+            BuildCFG(Shared.c_str(), Options, ast_matchers::hasName("probe"))
+                .getStatus());
+}
+
+// So is one whose temporaries are only tracked for their lifetime, which ends
+// with the full expression however many uses make them: each is tracked once
+// in it, and one with temporaries that are destroyed for each use.
+TEST(CFG, SharedDefaultArgumentLifetimes) {
+  std::string Code = R"cpp(
+    struct Temporary { ~Temporary(); };
+    int g(int, int);
+    int t(Temporary const & = Temporary());
+    Temporary sink(int);
+    int f0(int const & = 0);
+  )cpp";
+  for (int Depth = 1; Depth <= 40; ++Depth)
+    Code += "int f" + std::to_string(Depth) + "(int = f" +
+            std::to_string(Depth - 1) + "() + f" + std::to_string(Depth - 1) +
+            "());\n";
+  Code += "void probe() { sink(f40()); g(t(), t()); }";
+
+  std::unique_ptr<ASTUnit> AST = tooling::buildASTFromCodeWithArgs(
+      Code, {"-std=c++20", "-Wno-everything"});
+  ASSERT_TRUE(AST);
+  CFGCallback Callback(std::move(AST));
+  Callback.Options.AddTemporaryDtors = true;
+  Callback.Options.AddLifetime = true;
+  ast_matchers::MatchFinder Finder;
+  Finder.addMatcher(
+      ast_matchers::functionDecl(ast_matchers::hasName("probe")).bind("func"),
+      &Callback);
+  Finder.matchAST(Callback.AST->getASTContext());
+  BuildResult &B = Callback.TheBuildResult;
+  ASSERT_EQ(BuildResult::BuiltCFG, B.getStatus());
+
+  unsigned TemporaryDtors = 0;
+  unsigned Expiring = 0;
+  for (const CFGBlock *Block : *B.getCFG())
+    for (const CFGElement &Element : *Block) {
+      if (Element.getAs<CFGTemporaryDtor>())
+        ++TemporaryDtors;
+      if (const auto Cleanup = Element.getAs<CFGFullExprCleanup>())
+        Expiring += Cleanup->getExpiringMTEs().size();
+    }
+  EXPECT_EQ(3u, TemporaryDtors);
+  EXPECT_EQ(3u, Expiring);
+}
+
 // The result of a co_await that a reference extends the lifetime of is
 // destroyed at the end of the scope, not of the full-expression.
 TEST(CFG, CoawaitResultLifetimeExtended) {

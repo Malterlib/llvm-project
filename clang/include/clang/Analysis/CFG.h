@@ -1306,6 +1306,12 @@ public:
     bool AddVirtualBaseBranches = false;
     bool OmitImplicitValueInitializers = false;
     bool AssumeReachableDefaultInSwitchStatements = false;
+    // Past the limit of the visits of a shared default argument or default
+    // member initializer for its temporaries in a full expression, leave out
+    // the destructors of the rest of its uses, rather than not build the CFG,
+    // for analyses that need the flow of a destructor but not its effects:
+    // one that doesn't return or releases a capability still isn't left out.
+    bool OmitRepeatedSharedTemporaryDtors = false;
 
     BuildOptions() = default;
 
