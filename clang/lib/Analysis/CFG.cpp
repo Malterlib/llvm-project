@@ -567,6 +567,33 @@ class CFGBuilder {
   // Caches boolean evaluations of expressions to avoid multiple re-evaluations
   // during construction of branches for chained logical operators.
   using CachedBoolEvalsTy = llvm::DenseMap<Expr *, TryResult>;
+
+  // The temporaries hasTemporaries looks for: those that are destroyed, those
+  // whose lifetime is tracked too, or those whose destruction the analyses
+  // need on each path, whose destructor doesn't return, which changes the
+  // flow, or releases a capability, which the thread safety analysis tracks.
+  enum class TemporaryKind { Destroyed, Lifetime, Significant };
+  // Whether the expression of each default argument or default member
+  // initializer met when visiting for temporaries has temporaries to visit,
+  // of each kind.
+  llvm::DenseMap<const Expr *, bool> SharedHasTemporaries[3];
+  bool hasTemporaries(const Stmt *S, TemporaryKind Kind);
+  bool visitSharedForTemporaries(const Stmt *Use, const Stmt *S);
+  // The expressions of default arguments and default member initializers
+  // visited in the full expression being visited for temporaries that only
+  // have temporaries whose lifetime is tracked, which end with it however many
+  // of its uses make them, so each is tracked once.
+  llvm::SmallPtrSet<const Stmt *, 8> SharedLifetimeVisited;
+  // How many times each use of those with temporaries that are destroyed has
+  // been visited in the full expression for a use of the source, which a
+  // chain of conditionals of them, `int f1(int = b ? f0() : f0());`, makes a
+  // number that doubles with each for the uses in them, past a limit of which
+  // their destructors are left out: not the separate uses of the source, each
+  // visited once, also through the same uses in the default arguments they
+  // share.
+  llvm::DenseMap<std::pair<const Stmt *, const Stmt *>, unsigned> SharedVisits;
+  // The use of the source whose shared expression is being visited, if any.
+  const Stmt *SharedSourceUse = nullptr;
   CachedBoolEvalsTy CachedBoolEvals;
 
 public:
@@ -1843,6 +1870,8 @@ CFGBlock *CFGBuilder::addInitializer(CXXCtorInitializer *I) {
       // Generate destructors for temporaries in initialization expression.
       TempDtorContext Context;
       auto *FullExprWithCleanups = cast<ExprWithCleanups>(ActualInit);
+      SharedLifetimeVisited.clear();
+      SharedVisits.clear();
       VisitForTemporaries(FullExprWithCleanups->getSubExpr(),
                           /*ExternallyDestructed=*/false, Context);
 
@@ -3177,6 +3206,8 @@ CFGBlock *CFGBuilder::VisitDeclSubExpr(DeclStmt *DS) {
       // Generate destructors for temporaries in initialization expression.
       TempDtorContext Context;
       auto *FullExprWithCleanups = cast<ExprWithCleanups>(Init);
+      SharedLifetimeVisited.clear();
+      SharedVisits.clear();
       VisitForTemporaries(FullExprWithCleanups->getSubExpr(),
                           /*ExternallyDestructed=*/true, Context);
 
@@ -4995,6 +5026,8 @@ CFGBlock *CFGBuilder::VisitExprWithCleanups(ExprWithCleanups *E,
     // destructors of temporaries.
     TempDtorContext Context;
     Expr *FullExpr = E->getSubExpr();
+    SharedLifetimeVisited.clear();
+    SharedVisits.clear();
     VisitForTemporaries(FullExpr, ExternallyDestructed, Context);
 
     addFullExprCleanupMarker(Context, E);
@@ -5251,14 +5284,150 @@ tryAgain:
       return B;
     }
 
+    // The expression of a default argument or default member initializer is
+    // shared by each of its uses, also those in other default arguments,
+    // `int f1(int = f0() + f0());`: one without temporaries adds nothing, one
+    // whose temporaries are only tracked for their lifetime, `int f0(int
+    // const & = 0);`, adds the same each time, and visiting it through each of
+    // them would visit the first a number of times that doubles with each.
     case Stmt::CXXDefaultArgExprClass:
-      E = cast<CXXDefaultArgExpr>(E)->getExpr();
-      goto tryAgain;
+      if (!visitSharedForTemporaries(E, cast<CXXDefaultArgExpr>(E)->getExpr()))
+        return Block;
+      {
+        const SaveAndRestore SourceUse(SharedSourceUse,
+                                       SharedSourceUse ? SharedSourceUse : E);
+        return VisitForTemporaries(cast<CXXDefaultArgExpr>(E)->getExpr(),
+                                   ExternallyDestructed, Context);
+      }
 
     case Stmt::CXXDefaultInitExprClass:
-      E = cast<CXXDefaultInitExpr>(E)->getExpr();
-      goto tryAgain;
+      if (!visitSharedForTemporaries(E, cast<CXXDefaultInitExpr>(E)->getExpr()))
+        return Block;
+      {
+        const SaveAndRestore SourceUse(SharedSourceUse,
+                                       SharedSourceUse ? SharedSourceUse : E);
+        return VisitForTemporaries(cast<CXXDefaultInitExpr>(E)->getExpr(),
+                                   ExternallyDestructed, Context);
+      }
   }
+}
+
+/// Whether the shared expression \p S of a default argument or default member
+/// initializer is visited for temporaries where it is used, \p Use: when it
+/// has temporaries that are destroyed, or the first time in the full
+/// expression when it only has temporaries whose lifetime is tracked. A use of
+/// one with temporaries that are destroyed reached more than 4096 times for a
+/// use of the source in a full expression, as one in another default argument
+/// through a chain of conditionals of them, isn't visited again: the CFG
+/// isn't built, as the effects of a destructor of the rest can be what an
+/// analysis tracks, like the analyzer. With OmitRepeatedSharedTemporaryDtors,
+/// for analyses that only need their flow, the destructors of the rest are
+/// left out, which only end their temporaries, unless one is significant,
+/// whose destruction changes the flow on each path.
+bool CFGBuilder::visitSharedForTemporaries(const Stmt *Use, const Stmt *S) {
+  if (hasTemporaries(S, TemporaryKind::Destroyed)) {
+    if (badCFG)
+      return false;
+    if (++SharedVisits[{SharedSourceUse ? SharedSourceUse : Use, Use}] <= 4096)
+      return true;
+    if (!BuildOpts.OmitRepeatedSharedTemporaryDtors ||
+        hasTemporaries(S, TemporaryKind::Significant))
+      badCFG = true;
+    return false;
+  }
+  return BuildOpts.AddLifetime && hasTemporaries(S, TemporaryKind::Lifetime) &&
+         SharedLifetimeVisited.insert(S).second;
+}
+
+/// Whether the destructor of \p Record, or of one of its bases or members,
+/// is `analyzer_noreturn`, which ends the path for the analyzer like a
+/// `noreturn` one, which isAnyDestructorNoReturn tells: each class once.
+static bool anyDestructorAnalyzerNoReturn(
+    const CXXRecordDecl *Record,
+    llvm::SmallPtrSetImpl<const CXXRecordDecl *> &Looked) {
+  if (!Record || !Record->hasDefinition() || !Looked.insert(Record).second)
+    return false;
+  Record = Record->getDefinition();
+  if (const CXXDestructorDecl *Dtor = Record->getDestructor();
+      Dtor && Dtor->isAnalyzerNoReturn())
+    return true;
+  for (const CXXBaseSpecifier &Base : Record->bases())
+    if (anyDestructorAnalyzerNoReturn(Base.getType()->getAsCXXRecordDecl(),
+                                      Looked))
+      return true;
+  for (const FieldDecl *Field : Record->fields())
+    if (anyDestructorAnalyzerNoReturn(
+            Field->getType()->getBaseElementTypeUnsafe()->getAsCXXRecordDecl(),
+            Looked))
+      return true;
+  return false;
+}
+
+static bool anyDestructorAnalyzerNoReturn(const CXXRecordDecl *Record) {
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Looked;
+  return anyDestructorAnalyzerNoReturn(Record, Looked);
+}
+
+/// Whether \p S has what VisitForTemporaries visits, of \p Kind: temporaries
+/// that are destroyed, also those whose lifetime is tracked, or significant
+/// ones, also in the default arguments it uses, or coroutine expressions,
+/// where it can't be told.
+bool CFGBuilder::hasTemporaries(const Stmt *S, TemporaryKind Kind) {
+  if (!S || isa<BlockExpr, StmtExpr, CXXNoexceptExpr>(S))
+    return false;
+  // Nor what isn't evaluated, `sizeof(Temporary{})`, unless it is of a
+  // variable length array, also the bounds of one that is its type operand,
+  // `sizeof(int[size(Temporary{})])`, or `typeid` of what isn't polymorphic.
+  if (const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(S))
+    return (Trait->isArgumentType() ? Trait->getArgumentType()
+                                    : Trait->getArgumentExpr()->getType())
+               ->isVariablyModifiedType() &&
+           llvm::any_of(Trait->children(), [&](const Stmt *Child) {
+             return hasTemporaries(Child, Kind);
+           });
+  if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
+      Typeid && !Typeid->isPotentiallyEvaluated())
+    return false;
+  if (isa<CoroutineSuspendExpr>(S))
+    return true;
+  if (const auto *Bind = dyn_cast<CXXBindTemporaryExpr>(S)) {
+    if (Kind != TemporaryKind::Significant)
+      return true;
+    const CXXDestructorDecl *Dtor = Bind->getTemporary()->getDestructor();
+    if (!Dtor || Dtor->getParent()->isAnyDestructorNoReturn() ||
+        anyDestructorAnalyzerNoReturn(Dtor->getParent()) ||
+        Dtor->getParent()->hasAttr<ScopedLockableAttr>())
+      return true;
+    return hasTemporaries(Bind->getSubExpr(), Kind);
+  }
+  // A temporary whose lifetime is tracked, not one only made, like the `int` a
+  // reference parameter is given, `int f(int const & = 0)`, without them.
+  if (isa<MaterializeTemporaryExpr>(S) && Kind == TemporaryKind::Lifetime)
+    return true;
+  if (const auto *Lambda = dyn_cast<LambdaExpr>(S))
+    return llvm::any_of(Lambda->capture_inits(), [&](const Expr *Init) {
+      return hasTemporaries(Init, Kind);
+    });
+  const Expr *Shared = nullptr;
+  if (const auto *Default = dyn_cast<CXXDefaultArgExpr>(S))
+    Shared = Default->getExpr();
+  else if (const auto *Default = dyn_cast<CXXDefaultInitExpr>(S))
+    Shared = Default->getExpr();
+  if (Shared) {
+    llvm::DenseMap<const Expr *, bool> &Decided =
+        SharedHasTemporaries[static_cast<unsigned>(Kind)];
+    if (auto It = Decided.find(Shared); It != Decided.end())
+      return It->second;
+    // Taken to have them while it is looked at, which a default argument
+    // that uses itself can't, but it is the safe answer.
+    Decided[Shared] = true;
+    const bool Has = hasTemporaries(Shared, Kind);
+    Decided[Shared] = Has;
+    return Has;
+  }
+  return llvm::any_of(S->children(), [&](const Stmt *Child) {
+    return hasTemporaries(Child, Kind);
+  });
 }
 
 CFGBlock *CFGBuilder::VisitChildrenForTemporaries(Stmt *E,
