@@ -56,6 +56,7 @@
 #include "clang/Basic/TargetBuiltins.h"
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/ADT/APFixedPoint.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -817,6 +818,42 @@ namespace {
     /// evaluation frame.
     llvm::SmallVector<Cleanup, 16> CleanupStack;
 
+    /// The default arguments checked for undefined behavior in this
+    /// evaluation.
+    llvm::SmallPtrSet<const Expr *, 8> CheckedDefaults;
+
+    /// Whether the value of a default argument that has the same value at
+    /// each use is kept from the first, in DefaultArgumentValues, which the
+    /// check of an expression for overflow does, which evaluates what nothing
+    /// needs the value of. One with a source location is kept for each use of
+    /// the outermost default argument or initializer it is in, whose location
+    /// it has.
+    bool ReusesDefaultArgumentValues = false;
+    llvm::DenseMap<std::pair<const Expr *, const Expr *>, APValue>
+        DefaultArgumentValues;
+    /// Those whose evaluation failed, which fails again at each use, like
+    /// the discarded left side of a comma, `int f1(int = (f0(), f0()))`,
+    /// whose evaluation goes on after it. One that failed because it went
+    /// past the limit of the depth of calls fails again only where it is
+    /// used as deep or deeper, which is kept: the depth it failed at, or 0
+    /// for one that fails at any depth.
+    llvm::DenseMap<std::pair<const Expr *, const Expr *>, unsigned>
+        FailedDefaultArguments;
+    /// The number of times the evaluation went past the limit of the depth
+    /// of calls.
+    unsigned DepthLimitsExceeded = 0;
+    /// The temporary of the default argument evaluated, which a reference
+    /// parameter binds, whose value is kept in DefaultArgumentValues like that
+    /// of one that is a number, with the outermost default argument or
+    /// initializer of its source location, if it has one.
+    std::pair<const Expr *, const Expr *> DefaultArgumentTemporary;
+    /// Whether an expression has a source location, whose value is of where
+    /// the default argument it is in is used.
+    llvm::DenseMap<const Stmt *, bool> UsesSourceLocation;
+    /// Whether an expression refers to `this`, the object a default member
+    /// initializer it is in initializes.
+    llvm::DenseMap<const Stmt *, bool> UsesThis;
+
     /// EvaluatingDecl - This is the declaration whose initializer is being
     /// evaluated, if any.
     APValue::LValueBase EvaluatingDecl;
@@ -945,6 +982,7 @@ namespace {
       }
       if (CallStackDepth <= getLangOpts().ConstexprCallDepth)
         return true;
+      ++DepthLimitsExceeded;
       FFDiag(Loc, diag::note_constexpr_depth_limit_exceeded)
         << getLangOpts().ConstexprCallDepth;
       return false;
@@ -2005,6 +2043,60 @@ static bool IsGlobalLValue(APValue::LValueBase B) {
     // implicit variable declaration we invent when checking whether a constexpr
     // constructor can produce a constant expression. We must assume that such
     // an expression might be a global lvalue.
+    return true;
+  }
+}
+
+/// Whether a default argument of \p Type can have a value that is the same at
+/// each use, which the check of an expression for overflow keeps: a number,
+/// also a complex one, `_Complex double`, a vector or fixed-point one, a
+/// pointer, `int *p = choose(f0(), f0())`, a pointer to a member, or a class,
+/// `Value v = add(f0(), f0())` of `struct Value { int n; }`, also with a copy
+/// constructor of its own, which what is initialized with the value doesn't
+/// run, as the value is that object, and with a destructor that is trivial or
+/// constexpr, which destroys each object made of the value as it does the
+/// first.
+static bool hasReusableDefaultValue(QualType Type) {
+  if (Type->isIntegralOrEnumerationType() || Type->isRealFloatingType() ||
+      Type->isAnyComplexType() || Type->isVectorType() ||
+      Type->isFixedPointType() || Type->isPointerType() ||
+      Type->isMemberPointerType() || Type->isNullPtrType())
+    return true;
+  const CXXRecordDecl *Record = Type->getAsCXXRecordDecl();
+  if (!Record || !Record->hasDefinition())
+    return false;
+  if (Record->hasTrivialDestructor())
+    return true;
+  const CXXDestructorDecl *Destructor = Record->getDestructor();
+  return Destructor && Destructor->isConstexpr();
+}
+
+/// Whether \p Value is the same at each use: without a pointer into what an
+/// evaluation made, like a temporary or an allocation, which each makes its
+/// own of, but to an object with static storage duration, a function, or null.
+static bool isReusableDefaultValue(const APValue &Value) {
+  switch (Value.getKind()) {
+  case APValue::LValue: {
+    const APValue::LValueBase Base = Value.getLValueBase();
+    return !Base.is<DynamicAllocLValue>() && IsGlobalLValue(Base);
+  }
+  case APValue::Struct:
+    for (unsigned I = 0, N = Value.getStructNumBases(); I != N; ++I)
+      if (!isReusableDefaultValue(Value.getStructBase(I)))
+        return false;
+    for (unsigned I = 0, N = Value.getStructNumFields(); I != N; ++I)
+      if (!isReusableDefaultValue(Value.getStructField(I)))
+        return false;
+    return true;
+  case APValue::Union:
+    return isReusableDefaultValue(Value.getUnionValue());
+  case APValue::Array:
+    for (unsigned I = 0, N = Value.getArrayInitializedElts(); I != N; ++I)
+      if (!isReusableDefaultValue(Value.getArrayInitializedElt(I)))
+        return false;
+    return !Value.hasArrayFiller() ||
+           isReusableDefaultValue(Value.getArrayFiller());
+  default:
     return true;
   }
 }
@@ -8569,10 +8661,126 @@ public:
     { return StmtVisitorTy::Visit(E->getResultExpr()); }
   bool VisitSubstNonTypeTemplateParmExpr(const SubstNonTypeTemplateParmExpr *E)
     { return StmtVisitorTy::Visit(E->getReplacement()); }
+  // A default argument is checked for undefined behavior the first time an
+  // evaluation meets it, and not again for the other paths that lead to it in
+  // the same evaluation, which would check the default arguments of the calls
+  // in it once for each path, like `int f1(int = f0() + f0());`. Without the
+  // check, the evaluation of the other paths stops at the first failure. Each
+  // use checks it again: its value can depend on where it is used, `int f(int
+  // = __builtin_LINE())`, and on definitions after it, `int f(int = g() + 1)`
+  // before `constexpr int g() { ... }`. A default member initializer can
+  // depend on the object it initializes, `int y = __INT_MAX__ + x;`, and is
+  // checked for each.
+  bool checksDefault(const Expr *E) {
+    return Info.CheckingForUndefinedBehavior &&
+           Info.CheckedDefaults.insert(E).second;
+  }
   bool VisitCXXDefaultArgExpr(const CXXDefaultArgExpr *E) {
     TempVersionRAII RAII(*Info.CurrentCall);
     SourceLocExprScopeGuard Guard(E, Info.CurrentCall->CurSourceLocExprScope);
-    return StmtVisitorTy::Visit(E->getExpr());
+    const unsigned DepthLimitsExceeded = Info.DepthLimitsExceeded;
+    const bool Checks = checksDefault(E->getExpr());
+    llvm::SaveAndRestore CheckingForUB(Info.CheckingForUndefinedBehavior,
+                                       Checks);
+    // One whose check went past the limit of the depth of calls is checked
+    // again on the next path, which can be less deep.
+    auto Recheck = llvm::make_scope_exit([&] {
+      if (Checks && Info.DepthLimitsExceeded != DepthLimitsExceeded)
+        Info.CheckedDefaults.erase(E->getExpr());
+    });
+    // A number has the same value at each use, which is evaluated once when
+    // nothing needs it: a chain of default arguments that each call the
+    // function of the one before twice, `constexpr int f1(int = f0() +
+    // f0());`, would take a number of steps that doubles with each. Of an
+    // expression with a source location, at each use in the same outermost
+    // default argument or initializer, of whose use the location is. So is
+    // an lvalue of what has static storage duration, `int const & = (f0(),
+    // f0())` of functions that return a reference to a global, but not a
+    // temporary a reference parameter binds, which is kept below.
+    const Expr *Arg = E->getExpr();
+    if (Info.ReusesDefaultArgumentValues &&
+        (Arg->isGLValue() ? !isa<MaterializeTemporaryExpr>(Arg)
+                          : hasReusableDefaultValue(Arg->getType()))) {
+      const auto Key = std::make_pair(
+          Arg, usesSourceLocation(Arg)
+                   ? Info.CurrentCall->CurSourceLocExprScope.getDefaultExpr()
+                   : nullptr);
+      if (auto It = Info.DefaultArgumentValues.find(Key);
+          It != Info.DefaultArgumentValues.end())
+        return DerivedSuccess(It->second, E);
+      if (failedBefore(Key))
+        return false;
+      APValue Value;
+      const bool HadSideEffects = Info.EvalStatus.HasSideEffects;
+      const unsigned DepthLimitsExceeded = Info.DepthLimitsExceeded;
+      if (!Evaluate(Value, Info, Arg)) {
+        failed(Key, DepthLimitsExceeded);
+        return false;
+      }
+      if ((HadSideEffects || !Info.EvalStatus.HasSideEffects) &&
+          isReusableDefaultValue(Value))
+        Info.DefaultArgumentValues[Key] = Value;
+      return DerivedSuccess(Value, E);
+    }
+    // So has the number of the temporary a reference parameter binds, `int
+    // const & = f0() + f0()`, which each use makes its own of.
+    llvm::SaveAndRestore Temporary(
+        Info.DefaultArgumentTemporary,
+        std::pair<const Expr *, const Expr *>(
+            Info.ReusesDefaultArgumentValues &&
+                    isa<MaterializeTemporaryExpr>(Arg)
+                ? Arg
+                : nullptr,
+            Info.ReusesDefaultArgumentValues &&
+                    isa<MaterializeTemporaryExpr>(Arg) &&
+                    usesSourceLocation(Arg)
+                ? Info.CurrentCall->CurSourceLocExprScope.getDefaultExpr()
+                : nullptr));
+    if (!Info.DefaultArgumentTemporary.first)
+      return StmtVisitorTy::Visit(Arg);
+    // And of one whose evaluation failed, also through a comma, `int const &
+    // = (f0(), f0())`, which fails again.
+    if (failedBefore(Info.DefaultArgumentTemporary))
+      return false;
+    if (StmtVisitorTy::Visit(Arg))
+      return true;
+    failed(Info.DefaultArgumentTemporary, DepthLimitsExceeded);
+    return false;
+  }
+  /// Whether the default argument or initializer \p Key failed before,
+  /// where it fails again.
+  bool failedBefore(std::pair<const Expr *, const Expr *> Key) {
+    auto It = Info.FailedDefaultArguments.find(Key);
+    return It != Info.FailedDefaultArguments.end() &&
+           Info.CallStackDepth >= It->second;
+  }
+  /// That it failed, at the depth it did if it went past the limit of the
+  /// depth of calls, which it didn't before \p DepthLimitsExceeded.
+  void failed(std::pair<const Expr *, const Expr *> Key,
+              unsigned DepthLimitsExceeded) {
+    const unsigned Depth = Info.DepthLimitsExceeded != DepthLimitsExceeded
+                               ? Info.CallStackDepth
+                               : 0;
+    auto [It, Inserted] = Info.FailedDefaultArguments.try_emplace(Key, Depth);
+    if (!Inserted)
+      It->second = std::min(It->second, Depth);
+  }
+  bool usesSourceLocation(const Stmt *S) {
+    if (!S)
+      return false;
+    if (auto It = Info.UsesSourceLocation.find(S);
+        It != Info.UsesSourceLocation.end())
+      return It->second;
+    bool Uses = isa<SourceLocExpr>(S);
+    if (auto *Default = dyn_cast<CXXDefaultArgExpr>(S))
+      Uses = usesSourceLocation(Default->getExpr());
+    else if (auto *Default = dyn_cast<CXXDefaultInitExpr>(S))
+      Uses = usesSourceLocation(Default->getExpr());
+    else
+      for (const Stmt *Child : S->children())
+        if (!Uses && usesSourceLocation(Child))
+          Uses = true;
+    return Info.UsesSourceLocation[S] = Uses;
   }
   bool VisitCXXDefaultInitExpr(const CXXDefaultInitExpr *E) {
     TempVersionRAII RAII(*Info.CurrentCall);
@@ -8580,7 +8788,59 @@ public:
     if (!E->getExpr())
       return Error(E);
     SourceLocExprScopeGuard Guard(E, Info.CurrentCall->CurSourceLocExprScope);
-    return StmtVisitorTy::Visit(E->getExpr());
+    // Like a default argument, one that doesn't refer to the object it
+    // initializes has the same value at each use, kept from the first in the
+    // check for overflow: a chain of classes whose member is initialized
+    // with the sum of two of the one before, `int x = S<N - 1>{}.x + S<N -
+    // 1>{}.x;`, would take a number of steps that doubles with each.
+    const Expr *Init = E->getExpr();
+    if (Info.ReusesDefaultArgumentValues && Init->isPRValue() &&
+        hasReusableDefaultValue(Init->getType()) && !usesThis(Init)) {
+      const auto Key = std::make_pair(
+          Init, usesSourceLocation(Init)
+                    ? Info.CurrentCall->CurSourceLocExprScope.getDefaultExpr()
+                    : nullptr);
+      if (auto It = Info.DefaultArgumentValues.find(Key);
+          It != Info.DefaultArgumentValues.end())
+        return DerivedSuccess(It->second, E);
+      if (failedBefore(Key))
+        return false;
+      APValue Value;
+      const bool HadSideEffects = Info.EvalStatus.HasSideEffects;
+      const unsigned DepthLimitsExceeded = Info.DepthLimitsExceeded;
+      if (!Evaluate(Value, Info, Init)) {
+        failed(Key, DepthLimitsExceeded);
+        return false;
+      }
+      if ((HadSideEffects || !Info.EvalStatus.HasSideEffects) &&
+          isReusableDefaultValue(Value))
+        Info.DefaultArgumentValues[Key] = Value;
+      return DerivedSuccess(Value, E);
+    }
+    return StmtVisitorTy::Visit(Init);
+  }
+  /// Whether \p S refers to `this`, also implicitly, `x` of `this->x`, or
+  /// through a lambda that captures it: not in the default member
+  /// initializers of another object it initializes, `S{}.x`, whose `this` is
+  /// that object, nor in operands that aren't evaluated, `sizeof(this)`,
+  /// whose value doesn't depend on the object.
+  bool usesThis(const Stmt *S) {
+    if (!S)
+      return false;
+    if (auto It = Info.UsesThis.find(S); It != Info.UsesThis.end())
+      return It->second;
+    bool Uses = isa<CXXThisExpr>(S);
+    const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(S);
+    const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
+    if (!Uses && !isa<CXXDefaultInitExpr, CXXNoexceptExpr, RequiresExpr>(S) &&
+        !(Trait && !Trait->getTypeOfArgument()->isVariablyModifiedType()) &&
+        !(Typeid && !Typeid->isPotentiallyEvaluated()))
+      for (const Stmt *Child : S->children())
+        if (usesThis(Child)) {
+          Uses = true;
+          break;
+        }
+    return Info.UsesThis[S] = Uses;
   }
 
   bool VisitExprWithCleanups(const ExprWithCleanups *E) {
@@ -9553,10 +9813,25 @@ bool LValueExprEvaluator::VisitMaterializeTemporaryExpr(
   const Expr *Inner =
       E->getSubExpr()->skipRValueSubobjectAdjustments(CommaLHSs, Adjustments);
 
+  // The number kept for a default argument whose value the check for
+  // overflow reuses, if it has one, also of one after commas, `int const & =
+  // (f0(), f0())`, whose left sides are evaluated with it.
+  const bool Reuses = Info.DefaultArgumentTemporary.first == E &&
+                      Inner->isPRValue() &&
+                      hasReusableDefaultValue(Inner->getType());
+  const auto Key = std::make_pair(Inner, Info.DefaultArgumentTemporary.second);
+  std::optional<APValue> Kept;
+  if (Reuses)
+    if (auto It = Info.DefaultArgumentValues.find(Key);
+        It != Info.DefaultArgumentValues.end())
+      Kept = It->second;
+  const bool HadSideEffects = Info.EvalStatus.HasSideEffects;
+
   // If we passed any comma operators, evaluate their LHSs.
-  for (const Expr *E : CommaLHSs)
-    if (!EvaluateIgnoredValue(Info, E))
-      return false;
+  if (!Kept)
+    for (const Expr *E : CommaLHSs)
+      if (!EvaluateIgnoredValue(Info, E))
+        return false;
 
   // A materialized temporary with static storage duration can appear within the
   // result of a constant expression evaluation, so we need to preserve its
@@ -9579,8 +9854,18 @@ bool LValueExprEvaluator::VisitMaterializeTemporaryExpr(
 
   QualType Type = Inner->getType();
 
-  // Materialize the temporary itself.
-  if (!EvaluateInPlace(*Value, Info, Result, Inner)) {
+  // Materialize the temporary itself, of the number kept, if it has one.
+  if (Kept) {
+    *Value = *Kept;
+  } else if (Reuses) {
+    if (!EvaluateInPlace(*Value, Info, Result, Inner)) {
+      *Value = APValue();
+      return false;
+    }
+    if ((HadSideEffects || !Info.EvalStatus.HasSideEffects) &&
+        isReusableDefaultValue(*Value))
+      Info.DefaultArgumentValues[Key] = *Value;
+  } else if (!EvaluateInPlace(*Value, Info, Result, Inner)) {
     *Value = APValue();
     return false;
   }
@@ -22049,6 +22334,7 @@ void Expr::EvaluateForOverflow(const ASTContext &Ctx) const {
   if (!FastEvaluateAsRValue(this, EVResult.Val, Ctx, IsConst)) {
     EvalInfo Info(Ctx, EVResult, EvaluationMode::IgnoreSideEffects);
     Info.CheckingForUndefinedBehavior = true;
+    Info.ReusesDefaultArgumentValues = true;
     (void)::EvaluateAsRValue(Info, this, EVResult.Val);
   }
 }
