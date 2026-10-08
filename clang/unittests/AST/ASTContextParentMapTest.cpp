@@ -362,5 +362,31 @@ TEST(GetParents, NestedLambdaReturnTypesAndExceptionSpecifications) {
   }
 }
 
+TEST(GetParents, SharedDefaultArguments) {
+  // The default argument of each function uses the one before it twice, so
+  // the expression of the first is met 2^40 times through the uses, which
+  // share it.
+  std::string Code = "int g(int, int); int f0(int = 7);";
+  for (int Depth = 1; Depth <= 40; ++Depth)
+    Code += " int f" + std::to_string(Depth) + "(int = g(f" +
+            std::to_string(Depth - 1) + "(), f" + std::to_string(Depth - 1) +
+            "()));";
+  auto AST = tooling::buildASTFromCodeWithArgs(Code, {"-std=c++20"});
+  auto &Ctx = AST->getASTContext();
+  const auto *Literal = selectFirst<IntegerLiteral>(
+      "literal", match(integerLiteral(equals(7)).bind("literal"), Ctx));
+  ASSERT_TRUE(Literal);
+  // Its parents are the parameter it is the default argument of and its
+  // uses.
+  bool Parameter = false;
+  bool Use = false;
+  for (const DynTypedNode &Parent : Ctx.getParents(*Literal)) {
+    Parameter |= Parent.get<ParmVarDecl>() != nullptr;
+    Use |= Parent.get<CXXDefaultArgExpr>() != nullptr;
+  }
+  EXPECT_TRUE(Parameter);
+  EXPECT_TRUE(Use);
+}
+
 } // end namespace ast_matchers
 } // end namespace clang
