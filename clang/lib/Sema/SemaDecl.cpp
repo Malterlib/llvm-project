@@ -12994,9 +12994,19 @@ namespace {
 
     bool isInitList;
     llvm::SmallVector<unsigned, 4> InitFieldIndex;
+    // The opaque values whose source expressions have been handled: one each
+    // of several expressions refer to, like the awaiter of a co_await that
+    // each of its await_ready, await_suspend and await_resume copies, `bool
+    // await_ready(this Awaiter)`, which would handle the awaits in its
+    // operand a number of times that grows exponentially with each level.
+    llvm::SmallPtrSet<const OpaqueValueExpr *, 8> HandledOpaqueValues;
 
   public:
     typedef EvaluatedExprVisitor<SelfReferenceChecker> Inherited;
+
+    // Every subexpression of the expression that makes the awaiter of a
+    // co_await is visited, the operand in it too.
+    bool shouldVisitCoroutineOperandOnce() const { return true; }
 
     SelfReferenceChecker(Sema &S, Decl *OrigDecl) : Inherited(S.Context),
                                                     S(S), OrigDecl(OrigDecl) {
@@ -13108,7 +13118,8 @@ namespace {
       }
 
       if (OpaqueValueExpr *OVE = dyn_cast<OpaqueValueExpr>(E)) {
-        if (Expr *SE = OVE->getSourceExpr())
+        if (Expr *SE = OVE->getSourceExpr();
+            SE && HandledOpaqueValues.insert(OVE).second)
           HandleValue(SE);
         return;
       }
@@ -13130,13 +13141,27 @@ namespace {
 
         Expr *Base = E->IgnoreParenImpCasts();
         while (MemberExpr *ME = dyn_cast<MemberExpr>(Base)) {
-          // Check for static member variables and don't warn on them.
-          if (!isa<FieldDecl>(ME->getMemberDecl()))
+          // Check for static member variables and don't warn on them, but
+          // what is evaluated to name one, `co_await f(x).ms_Awaiter`, can
+          // use the variable, which is visited only there.
+          if (!isa<FieldDecl>(ME->getMemberDecl())) {
+            Expr *Object = ME->getBase()->IgnoreParenImpCasts();
+            while (MemberExpr *Inner = dyn_cast<MemberExpr>(Object))
+              Object = Inner->getBase()->IgnoreParenImpCasts();
+            if (!isa<DeclRefExpr>(Object))
+              Visit(ME->getBase());
             return;
+          }
           Base = ME->getBase()->IgnoreParenImpCasts();
         }
         if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(Base))
           HandleDeclRefExpr(DRE);
+        // The base of a member of something else, `f(x).m`, can use the
+        // variable too, like VisitMemberExpr visits it. The operand of a
+        // co_await, `co_await f(x).m`, is visited only where its awaiter is
+        // made, which copies it, `await_transform(f(x).m)`.
+        else
+          Visit(Base);
         return;
       }
 

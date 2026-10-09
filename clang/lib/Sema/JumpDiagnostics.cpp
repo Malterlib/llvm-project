@@ -665,6 +665,33 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
     break;
   }
 
+  // The operand of a co_await or co_yield is evaluated as part of the
+  // expression that makes its awaiter, which is a child too; walking it in
+  // both would walk nested awaits a number of times that doubles with each
+  // level. It is walked once, there, when that expression has it, and each
+  // child once, also the operand where it is that expression itself.
+  const auto *Suspend = dyn_cast<CoroutineSuspendExpr>(S);
+  const Expr *SkippedOperand = nullptr;
+  if (const Expr *Operand = Suspend ? Suspend->getOperand() : nullptr;
+      Operand && Suspend->getCommonExpr() &&
+      Operand != Suspend->getCommonExpr()) {
+    // Not into the awaits in it, whose operands are not this one.
+    SmallVector<const Stmt *, 8> Pending{Suspend->getCommonExpr()};
+    while (!Pending.empty()) {
+      const Stmt *Current = Pending.pop_back_val();
+      if (Current == Operand) {
+        SkippedOperand = Operand;
+        break;
+      }
+      if (isa<CoroutineSuspendExpr>(Current))
+        continue;
+      for (const Stmt *Child : Current->children())
+        if (Child)
+          Pending.push_back(Child);
+    }
+  }
+  llvm::SmallPtrSet<const Stmt *, 8> Walked;
+
   for (Stmt *SubStmt : S->children()) {
     if (!SubStmt)
         continue;
@@ -672,6 +699,9 @@ void JumpScopeChecker::BuildScopeInformation(Stmt *S,
       --StmtsToSkip;
       continue;
     }
+    if (Suspend &&
+        (SubStmt == SkippedOperand || !Walked.insert(SubStmt).second))
+      continue;
 
     // Cases, labels, attributes, and defaults aren't "scope parents".  It's also
     // important to handle these iteratively instead of recursively in

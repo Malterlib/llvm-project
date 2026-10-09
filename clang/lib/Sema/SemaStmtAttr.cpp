@@ -16,6 +16,7 @@
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/ScopeInfo.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <optional>
 
 using namespace clang;
@@ -226,6 +227,18 @@ public:
       return;
     ConstEvaluatedExprVisitor<CallExprFinder>::Visit(St);
   }
+
+  // Each statement once, also the operand of a co_await, which the
+  // expressions that make its awaiter share: visiting it in each would visit
+  // nested awaits a number of times that doubles with each level.
+  void VisitStmt(const Stmt *S) {
+    if (!Visited.insert(S).second)
+      return;
+    Inherited::VisitStmt(S);
+  }
+
+private:
+  llvm::SmallPtrSet<const Stmt *, 16> Visited;
 };
 } // namespace
 
