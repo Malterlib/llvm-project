@@ -965,6 +965,9 @@ class CommaVisitor : public EvaluatedExprVisitor<CommaVisitor> {
   Sema &SemaRef;
 public:
   CommaVisitor(Sema &SemaRef) : Inherited(SemaRef.Context), SemaRef(SemaRef) {}
+  // It goes into every subexpression, also of the expression that makes the
+  // awaiter of a co_await, which has the operand in it.
+  bool shouldVisitCoroutineOperandOnce() const { return true; }
   void VisitBinaryOperator(BinaryOperator *E) {
     if (E->getOpcode() == BO_Comma)
       SemaRef.DiagnoseCommaOperator(E->getLHS(), E->getExprLoc());
@@ -1965,6 +1968,10 @@ namespace {
   public:
     typedef EvaluatedExprVisitor<DeclMatcher> Inherited;
 
+    // It goes into every subexpression, also of the expression that makes the
+    // awaiter of a co_await, which has the operand in it.
+    bool shouldVisitCoroutineOperandOnce() const { return true; }
+
     DeclMatcher(Sema &S, DeclSetVector &Decls, Stmt *Statement) :
         Inherited(S.Context), Decls(Decls), FoundDecl(false) {
       if (!Statement) return;
@@ -2164,6 +2171,10 @@ namespace {
     }
 
     typedef ConstEvaluatedExprVisitor<BreakContinueFinder> Inherited;
+
+    // It goes into every subexpression, also of the expression that makes the
+    // awaiter of a co_await, which has the operand in it.
+    bool shouldVisitCoroutineOperandOnce() const { return true; }
 
     void VisitContinueStmt(const ContinueStmt* E) {
       ContinueLoc = E->getKwLoc();

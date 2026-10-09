@@ -1950,6 +1950,10 @@ class DeferredDiagnosticsEmitter
 public:
   typedef UsedDeclVisitor<DeferredDiagnosticsEmitter> Inherited;
 
+  // It goes into every subexpression, also of the expression that makes the
+  // awaiter of a co_await, which has the operand in it.
+  bool shouldVisitCoroutineOperandOnce() const { return true; }
+
   // Whether the function is already in the current use-path.
   llvm::SmallPtrSet<CanonicalDeclPtr<Decl>, 4> InUsePath;
 
