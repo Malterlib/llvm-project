@@ -153,15 +153,22 @@ public:
   LogicalErrorHandler(Sema &S) : S(S) {}
 
   static bool HasMacroID(const Expr *E) {
-    if (E->getExprLoc().isMacroID())
-      return true;
+    // Each expression once, also one that several reach, like the operand of
+    // a co_await, which the expressions that make its awaiter share.
+    llvm::SmallPtrSet<const Expr *, 16> Visited;
+    SmallVector<const Expr *, 16> Pending{E};
+    while (!Pending.empty()) {
+      const Expr *Current = Pending.pop_back_val();
+      if (!Visited.insert(Current).second)
+        continue;
+      if (Current->getExprLoc().isMacroID())
+        return true;
 
-    // Recurse to children.
-    for (const Stmt *SubStmt : E->children())
-      if (const Expr *SubExpr = dyn_cast_or_null<Expr>(SubStmt))
-        if (HasMacroID(SubExpr))
-          return true;
-
+      // Recurse to children.
+      for (const Stmt *SubStmt : Current->children())
+        if (const Expr *SubExpr = dyn_cast_or_null<Expr>(SubStmt))
+          Pending.push_back(SubExpr);
+    }
     return false;
   }
 
@@ -899,6 +906,10 @@ public:
 
   ContainsReference(ASTContext &Context, const DeclRefExpr *Needle)
     : Inherited(Context), FoundReference(false), Needle(Needle) {}
+
+  // It goes into every subexpression, also of the expression that makes the
+  // awaiter of a co_await, which has the operand in it.
+  bool shouldVisitCoroutineOperandOnce() const { return true; }
 
   void VisitExpr(const Expr *E) {
     // Stop evaluating if we already have a reference.

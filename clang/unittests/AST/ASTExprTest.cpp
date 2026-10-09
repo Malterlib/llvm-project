@@ -12,7 +12,9 @@
 
 #include "ASTPrint.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/IgnoreExpr.h"
 #include "clang/AST/OpenACCClause.h"
 #include "clang/AST/StmtOpenACC.h"
@@ -24,6 +26,7 @@ using namespace clang;
 
 using clang::ast_matchers::cxxRecordDecl;
 using clang::ast_matchers::forStmt;
+using clang::ast_matchers::functionDecl;
 using clang::ast_matchers::has;
 using clang::ast_matchers::hasName;
 using clang::ast_matchers::initListExpr;
@@ -53,6 +56,52 @@ const VarDecl *getVariableNode(ASTUnit *AST, const std::string &Name) {
   auto Result = match(varDecl(hasName(Name)).bind("var"), AST->getASTContext());
   EXPECT_EQ(Result.size(), 1u);
   return Result[0].getNodeAs<VarDecl>("var");
+}
+
+TEST(ASTExpr, EvaluatedExprVisitorVisitsCoawaitAsExpression) {
+  // A visitor of evaluated expressions that doesn't visit the operand of a
+  // co_await once meets the co_await as any other expression, by VisitExpr.
+  constexpr char Code[] = R"cpp(
+    namespace std {
+    template <class R, class... A> struct coroutine_traits {
+      using promise_type = typename R::promise_type;
+    };
+    template <class P = void> struct coroutine_handle {
+      static coroutine_handle from_address(void *) noexcept;
+    };
+    }
+    struct Awaiter {
+      bool await_ready() noexcept;
+      template <class P> void await_suspend(std::coroutine_handle<P>) noexcept;
+      int await_resume() noexcept;
+    };
+    struct Task {
+      struct promise_type {
+        Task get_return_object();
+        Awaiter initial_suspend();
+        Awaiter final_suspend() noexcept;
+        void return_void();
+        void unhandled_exception();
+      };
+    };
+    Task f() { co_await Awaiter{}; }
+  )cpp";
+  auto AST = buildASTFromCodeWithArgs(Code, /*Args=*/{"-std=c++20"});
+  ASSERT_TRUE(AST);
+  const auto *Function = selectFirst<FunctionDecl>(
+      "f", match(functionDecl(hasName("f")).bind("f"), AST->getASTContext()));
+  ASSERT_TRUE(Function && Function->getBody());
+  struct Finder : ConstEvaluatedExprVisitor<Finder> {
+    bool Found = false;
+    explicit Finder(const ASTContext &Context)
+        : ConstEvaluatedExprVisitor(Context) {}
+    void VisitExpr(const Expr *E) {
+      Found |= isa<CoawaitExpr>(E);
+      ConstEvaluatedExprVisitor::VisitExpr(E);
+    }
+  } Visitor(AST->getASTContext());
+  Visitor.Visit(Function->getBody());
+  EXPECT_TRUE(Visitor.Found);
 }
 
 TEST(ASTExpr, IgnoreExprCallbackForwarded) {

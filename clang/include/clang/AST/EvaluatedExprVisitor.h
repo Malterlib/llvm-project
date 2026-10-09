@@ -35,6 +35,11 @@ public:
   // Return whether this visitor should recurse into discarded statements for a
   // 'constexpr-if'.
   bool shouldVisitDiscardedStmt() const { return true; }
+  // Return whether the operand of a co_await or co_yield is visited only in
+  // the expression that makes its awaiter when that expression has it. Only a
+  // visitor that goes into every subexpression of that expression can, as one
+  // that stops at a call would miss the operand in it.
+  bool shouldVisitCoroutineOperandOnce() const { return false; }
 #define PTR(CLASS) typename Ptr<CLASS>::type
 
   explicit EvaluatedExprVisitorBase(const ASTContext &Context) : Context(Context) { }
@@ -96,6 +101,51 @@ public:
          I != E; ++I)
       if (*I)
         this->Visit(*I);
+  }
+
+  void VisitCoroutineSuspendExpr(PTR(CoroutineSuspendExpr) E) {
+    // The operand of a co_await or co_yield is evaluated as part of the
+    // expression that makes its awaiter, which is a child too; visiting it
+    // in both would visit nested awaits a number of times that doubles with
+    // each level. A visitor that goes into all of that expression visits it
+    // once, there, when that expression has it. Another visits it as an
+    // expression, as any other, and so all of its children.
+    if (!getDerived().shouldVisitCoroutineOperandOnce()) {
+      getDerived().VisitExpr(E);
+      return;
+    }
+    const Expr *Operand = E->getOperand();
+    const Expr *Common = E->getCommonExpr();
+    bool InCommon = false;
+    if (Operand && Common) {
+      // Not into the awaits in it, whose operands are not this one.
+      llvm::SmallVector<const Stmt *, 8> Pending{Common};
+      while (!Pending.empty() && !InCommon) {
+        const Stmt *Current = Pending.pop_back_val();
+        if (Current == Operand) {
+          InCommon = true;
+          break;
+        }
+        if (isa<CoroutineSuspendExpr>(Current))
+          continue;
+        for (const Stmt *Child : Current->children())
+          if (Child)
+            Pending.push_back(Child);
+      }
+    }
+    // When it is that expression itself, `co_await Awaiter` of an lvalue,
+    // it is visited once, as that.
+    bool OperandVisited = false;
+    for (auto *SubStmt : E->children()) {
+      if (!SubStmt)
+        continue;
+      if (SubStmt == Operand) {
+        if ((InCommon && Common != Operand) || OperandVisited)
+          continue;
+        OperandVisited = true;
+      }
+      this->Visit(SubStmt);
+    }
   }
 
   /// The basis case walks all of the children of the statement or
