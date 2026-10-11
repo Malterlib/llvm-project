@@ -308,6 +308,8 @@ static AccessResult IsDerivedFromInclusive(const CXXRecordDecl *Derived,
 
   AccessResult OnFailure = AR_inaccessible;
   SmallVector<const CXXRecordDecl*, 8> Queue; // actually a stack
+  // Each class once, also a virtual base reached along many paths.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Searched;
 
   while (true) {
     if (Derived->isDependentContext() && !Derived->hasDefinition() &&
@@ -331,7 +333,8 @@ static AccessResult IsDerivedFromInclusive(const CXXRecordDecl *Derived,
       if (CheckDependent && MightInstantiateTo(RD, Target))
         OnFailure = AR_dependent;
 
-      Queue.push_back(RD);
+      if (Searched.insert(RD).second)
+        Queue.push_back(RD);
     }
 
     if (Queue.empty()) break;
@@ -617,8 +620,17 @@ struct ProtectedFriendContext {
   bool CheckDependent;
   bool EverDependent;
 
-  /// The path down to the current base class.
-  SmallVector<const CXXRecordDecl*, 20> CurPath;
+  /// What the paths from a class down to the naming class allow, each class
+  /// searched once, also a virtual base reached along many paths.
+  struct Paths {
+    /// Whether a class on one, from where it last inherits privately, or
+    /// from the class if it doesn't, is a friend.
+    bool Friend = false;
+    /// Whether one inherits only non-privately, so that a friend before the
+    /// class grants access along it too.
+    bool NonPrivate = false;
+  };
+  llvm::DenseMap<const CXXRecordDecl *, Paths> Searched;
 
   ProtectedFriendContext(Sema &S, const EffectiveContext &EC,
                          const CXXRecordDecl *InstanceContext,
@@ -628,43 +640,48 @@ struct ProtectedFriendContext {
                      NamingClass->isDependentContext()),
       EverDependent(false) {}
 
-  /// Check classes in the current path for friendship, starting at
-  /// the given index.
-  bool checkFriendshipAlongPath(unsigned I) {
-    assert(I < CurPath.size());
-    for (unsigned E = CurPath.size(); I != E; ++I) {
-      switch (GetFriendKind(S, EC, CurPath[I])) {
-      case AR_accessible:   return true;
-      case AR_inaccessible: continue;
-      case AR_dependent:    EverDependent = true; continue;
-      }
+  bool isFriend(const CXXRecordDecl *Class) {
+    switch (GetFriendKind(S, EC, Class)) {
+    case AR_accessible:
+      return true;
+    case AR_inaccessible:
+      return false;
+    case AR_dependent:
+      EverDependent = true;
+      return false;
     }
-    return false;
+    llvm_unreachable("unknown access result");
   }
 
   /// Perform a search starting at the given class.
   ///
-  /// PrivateDepth is the index of the last (least derived) class
-  /// along the current path such that a notional public member of
-  /// the final class in the path would have access in that class.
-  bool findFriendship(const CXXRecordDecl *Cur, unsigned PrivateDepth) {
-    // If we ever reach the naming class, check the current path for
-    // friendship.  We can also stop recursing because we obviously
-    // won't find the naming class there again.
-    if (Cur == NamingClass)
-      return checkFriendshipAlongPath(PrivateDepth);
+  /// A public member of the naming class has access in a class on a path
+  /// from where the path last inherits privately, so a friend there grants
+  /// access, and a class is checked for friendship only where it is on a
+  /// path that reaches the naming class. The search stops at the first
+  /// friend found.
+  Paths findFriendship(const CXXRecordDecl *Cur) {
+    if (auto It = Searched.find(Cur); It != Searched.end())
+      return It->second;
+
+    Paths Result;
+    // If we ever reach the naming class, it is a friend or not.  We can also
+    // stop recursing because we obviously won't find the naming class there
+    // again.
+    if (Cur == NamingClass) {
+      Result.Friend = isFriend(Cur);
+      Result.NonPrivate = true;
+      return Searched[Cur] = Result;
+    }
 
     if (CheckDependent && MightInstantiateTo(Cur, NamingClass))
       EverDependent = true;
 
+    // Whether Cur is on a path that reaches the naming class from where it
+    // last inherits privately.
+    bool OnPath = false;
     // Recurse into the base classes.
     for (const auto &I : Cur->bases()) {
-      // If this is private inheritance, then a public member of the
-      // base will not have any access in classes derived from Cur.
-      unsigned BasePrivateDepth = PrivateDepth;
-      if (I.getAccessSpecifier() == AS_private)
-        BasePrivateDepth = CurPath.size() - 1;
-
       const CXXRecordDecl *RD;
 
       QualType T = I.getType();
@@ -676,20 +693,20 @@ struct ProtectedFriendContext {
         continue;
       }
 
-      // Recurse.  We don't need to clean up if this returns true.
-      CurPath.push_back(RD);
-      if (findFriendship(RD->getCanonicalDecl(), BasePrivateDepth))
-        return true;
-      CurPath.pop_back();
+      Paths Base = findFriendship(RD->getCanonicalDecl());
+      // We don't need to search further once a friend grants access.
+      if (Base.Friend)
+        return Searched[Cur] = Base;
+      OnPath |= Base.NonPrivate;
+      // If this is private inheritance, then a public member of the
+      // base will not have any access in classes derived from Cur.
+      if (I.getAccessSpecifier() != AS_private)
+        Result.NonPrivate |= Base.NonPrivate;
     }
 
-    return false;
-  }
-
-  bool findFriendship(const CXXRecordDecl *Cur) {
-    assert(CurPath.empty());
-    CurPath.push_back(Cur);
-    return findFriendship(Cur, 0);
+    if (OnPath)
+      Result.Friend = isFriend(Cur);
+    return Searched[Cur] = Result;
   }
 };
 }
@@ -733,7 +750,8 @@ static AccessResult GetProtectedFriendKind(Sema &S, const EffectiveContext &EC,
   if (!InstanceContext) return GetFriendKind(S, EC, NamingClass);
 
   ProtectedFriendContext PRC(S, EC, InstanceContext, NamingClass);
-  if (PRC.findFriendship(InstanceContext)) return AR_accessible;
+  if (PRC.findFriendship(InstanceContext).Friend)
+    return AR_accessible;
   if (PRC.EverDependent) return AR_dependent;
   return AR_inaccessible;
 }

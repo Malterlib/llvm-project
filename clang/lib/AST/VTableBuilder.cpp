@@ -556,6 +556,11 @@ private:
   /// VisitedVirtualBases - Visited virtual bases.
   llvm::SmallPtrSet<const CXXRecordDecl *, 4> VisitedVirtualBases;
 
+  /// SearchedBases - The bases AddVBaseOffsets has searched for vbase
+  /// offsets, whose virtual bases are all visited, which another path to them
+  /// then adds none of.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 4> SearchedBases;
+
   /// VCallOffsets - Keeps track of vcall offsets.
   VCallOffsetMap VCallOffsets;
 
@@ -772,8 +777,9 @@ VCallAndVBaseOffsetBuilder::AddVBaseOffsets(const CXXRecordDecl *RD,
           VTableComponent::MakeVBaseOffset(Offset));
     }
 
-    // Check the base class looking for more vbase offsets.
-    AddVBaseOffsets(BaseDecl, OffsetInLayoutClass);
+    // Check the base class looking for more vbase offsets, once.
+    if (BaseDecl->getNumVBases() && SearchedBases.insert(BaseDecl).second)
+      AddVBaseOffsets(BaseDecl, OffsetInLayoutClass);
   }
 }
 
@@ -984,7 +990,8 @@ private:
   /// LayoutVTablesForVirtualBases - Layout vtables for all virtual bases of the
   /// given base (excluding any primary bases).
   void LayoutVTablesForVirtualBases(const CXXRecordDecl *RD,
-                                    VisitedVirtualBasesSetTy &VBases);
+                                    VisitedVirtualBasesSetTy &VBases,
+                                    VisitedVirtualBasesSetTy &SearchedBases);
 
   /// isBuildingConstructionVTable - Return whether this vtable builder is
   /// building a construction vtable.
@@ -1674,7 +1681,8 @@ void ItaniumVTableBuilder::LayoutVTable() {
                                VBases);
   VBases.clear();
 
-  LayoutVTablesForVirtualBases(MostDerivedClass, VBases);
+  VisitedVirtualBasesSetTy SearchedBases;
+  LayoutVTablesForVirtualBases(MostDerivedClass, VBases, SearchedBases);
 
   // -fapple-kext adds an extra entry at end of vtbl.
   bool IsAppleKext = Context.getLangOpts().AppleKext;
@@ -1894,7 +1902,8 @@ void ItaniumVTableBuilder::DeterminePrimaryVirtualBases(
 }
 
 void ItaniumVTableBuilder::LayoutVTablesForVirtualBases(
-    const CXXRecordDecl *RD, VisitedVirtualBasesSetTy &VBases) {
+    const CXXRecordDecl *RD, VisitedVirtualBasesSetTy &VBases,
+    VisitedVirtualBasesSetTy &SearchedBases) {
   // Itanium C++ ABI 2.5.2:
   //   Then come the virtual base virtual tables, also in inheritance graph
   //   order, and again excluding primary bases (which share virtual tables with
@@ -1925,9 +1934,11 @@ void ItaniumVTableBuilder::LayoutVTablesForVirtualBases(
     }
 
     // We only need to check the base for virtual base vtables if it actually
-    // has virtual bases.
-    if (BaseDecl->getNumVBases())
-      LayoutVTablesForVirtualBases(BaseDecl, VBases);
+    // has virtual bases, and only once: a base already searched has had the
+    // vtables of its virtual bases laid out, which another path to it then
+    // lays out none of.
+    if (BaseDecl->getNumVBases() && SearchedBases.insert(BaseDecl).second)
+      LayoutVTablesForVirtualBases(BaseDecl, VBases, SearchedBases);
   }
 }
 

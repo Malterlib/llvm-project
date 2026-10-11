@@ -919,12 +919,22 @@ void CGRecordLowering::accumulateVBases() {
 
 bool CGRecordLowering::hasOwnStorage(const CXXRecordDecl *Decl,
                                      const CXXRecordDecl *Query) const {
-  const ASTRecordLayout &DeclLayout = Context.getASTRecordLayout(Decl);
-  if (DeclLayout.isPrimaryBaseVirtual() && DeclLayout.getPrimaryBase() == Query)
-    return false;
-  for (const auto &Base : Decl->bases())
-    if (!hasOwnStorage(Base.getType()->getAsCXXRecordDecl(), Query))
+  // Whether none of \p Decl and its bases has \p Query as its virtual primary
+  // base, each class once: one reached through each class of a chain of
+  // diamonds of virtual bases would be searched a number of times that
+  // doubles with each.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Searched;
+  SmallVector<const CXXRecordDecl *, 8> Pending{Decl};
+  while (!Pending.empty()) {
+    const CXXRecordDecl *Current = Pending.pop_back_val();
+    if (!Searched.insert(Current).second)
+      continue;
+    const ASTRecordLayout &Layout = Context.getASTRecordLayout(Current);
+    if (Layout.isPrimaryBaseVirtual() && Layout.getPrimaryBase() == Query)
       return false;
+    for (const auto &Base : Current->bases())
+      Pending.push_back(Base.getType()->getAsCXXRecordDecl());
+  }
   return true;
 }
 

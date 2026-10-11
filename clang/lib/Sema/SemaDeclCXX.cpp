@@ -10733,11 +10733,22 @@ private:
   static bool CheckMostOverridenMethods(
       const CXXMethodDecl *MD,
       const llvm::SmallPtrSetImpl<const CXXMethodDecl *> &Methods) {
-    if (MD->size_overridden_methods() == 0)
-      return Methods.count(MD->getCanonicalDecl());
-    for (const CXXMethodDecl *O : MD->overridden_methods())
-      if (CheckMostOverridenMethods(O, Methods))
-        return true;
+    // Each overridden method once, like AddMostOverridenMethods: one that is
+    // in none of them is reached through each class of a chain of diamonds of
+    // virtual bases that override it.
+    llvm::SmallPtrSet<const CXXMethodDecl *, 8> Visited;
+    SmallVector<const CXXMethodDecl *, 8> Pending{MD};
+    while (!Pending.empty()) {
+      const CXXMethodDecl *Method = Pending.pop_back_val();
+      if (!Visited.insert(Method).second)
+        continue;
+      if (Method->size_overridden_methods() == 0) {
+        if (Methods.count(Method->getCanonicalDecl()))
+          return true;
+      } else {
+        llvm::append_range(Pending, Method->overridden_methods());
+      }
+    }
     return false;
   }
 
@@ -10790,11 +10801,20 @@ public:
 /// Add the most overridden methods from MD to Methods
 static void AddMostOverridenMethods(const CXXMethodDecl *MD,
                         llvm::SmallPtrSetImpl<const CXXMethodDecl *>& Methods) {
-  if (MD->size_overridden_methods() == 0)
-    Methods.insert(MD->getCanonicalDecl());
-  else
-    for (const CXXMethodDecl *O : MD->overridden_methods())
-      AddMostOverridenMethods(O, Methods);
+  // Each overridden method once: one a method overrides through each class of
+  // a chain of diamonds of virtual bases, which each override it, would be
+  // reached a number of times that doubles with each.
+  llvm::SmallPtrSet<const CXXMethodDecl *, 8> Visited;
+  SmallVector<const CXXMethodDecl *, 8> Pending{MD};
+  while (!Pending.empty()) {
+    const CXXMethodDecl *Method = Pending.pop_back_val();
+    if (!Visited.insert(Method).second)
+      continue;
+    if (Method->size_overridden_methods() == 0)
+      Methods.insert(Method->getCanonicalDecl());
+    else
+      llvm::append_range(Pending, Method->overridden_methods());
+  }
 }
 
 void Sema::FindHiddenVirtualMethods(CXXMethodDecl *MD,
@@ -19531,32 +19551,40 @@ void Sema::MarkVirtualMemberExceptionSpecsNeeded(SourceLocation Loc,
 void Sema::MarkVirtualMembersReferenced(SourceLocation Loc,
                                         const CXXRecordDecl *RD,
                                         bool ConstexprOnly) {
-  // Mark all functions which will appear in RD's vtable as used.
-  CXXFinalOverriderMap FinalOverriders;
-  RD->getFinalOverriders(FinalOverriders);
-  for (const auto &FinalOverrider : FinalOverriders) {
-    for (const auto &OverridingMethod : FinalOverrider.second) {
-      assert(OverridingMethod.second.size() > 0 && "no final overrider");
-      CXXMethodDecl *Overrider = OverridingMethod.second.front().Method;
+  // Each class once: a base with virtual bases of several bases is reached
+  // through each, which would take a time that grows exponentially with how
+  // many diamonds are stacked, and marks the same members.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Marked;
+  auto Mark = [&](auto &Self, const CXXRecordDecl *Class,
+                  bool OnlyConstexpr) -> void {
+    // Mark all functions which will appear in RD's vtable as used.
+    CXXFinalOverriderMap FinalOverriders;
+    Class->getFinalOverriders(FinalOverriders);
+    for (const auto &FinalOverrider : FinalOverriders) {
+      for (const auto &OverridingMethod : FinalOverrider.second) {
+        assert(OverridingMethod.second.size() > 0 && "no final overrider");
+        CXXMethodDecl *Overrider = OverridingMethod.second.front().Method;
 
-      // C++ [basic.def.odr]p2:
-      //   [...] A virtual member function is used if it is not pure. [...]
-      if (!Overrider->isPureVirtual() &&
-          (!ConstexprOnly || Overrider->isConstexpr()))
-        MarkFunctionReferenced(Loc, Overrider);
+        // C++ [basic.def.odr]p2:
+        //   [...] A virtual member function is used if it is not pure. [...]
+        if (!Overrider->isPureVirtual() &&
+            (!OnlyConstexpr || Overrider->isConstexpr()))
+          MarkFunctionReferenced(Loc, Overrider);
+      }
     }
-  }
 
-  // Only classes that have virtual bases need a VTT.
-  if (RD->getNumVBases() == 0)
-    return;
+    // Only classes that have virtual bases need a VTT.
+    if (Class->getNumVBases() == 0)
+      return;
 
-  for (const auto &I : RD->bases()) {
-    const auto *Base = I.getType()->castAsCXXRecordDecl();
-    if (Base->getNumVBases() == 0)
-      continue;
-    MarkVirtualMembersReferenced(Loc, Base);
-  }
+    for (const auto &I : Class->bases()) {
+      const auto *Base = I.getType()->castAsCXXRecordDecl();
+      if (Base->getNumVBases() == 0 || !Marked.insert(Base).second)
+        continue;
+      Self(Self, Base, /*OnlyConstexpr=*/false);
+    }
+  };
+  Mark(Mark, RD, ConstexprOnly);
 }
 
 static
