@@ -38,9 +38,17 @@ using namespace clang;
 
 #define DEBUG_LOGGING 0
 
-static bool recordIsNotEmpty(const RecordDecl *RD) {
+static bool
+recordIsNotEmpty(const RecordDecl *RD,
+                 llvm::SmallDenseMap<const RecordDecl *, bool, 8> &Decided) {
+  // Each record once: many fields can have the same type, which deciding
+  // again for each would take a time that grows exponentially with how deep
+  // such types nest.
+  if (auto It = Decided.find(RD); It != Decided.end())
+    return It->second;
   // We consider a record decl to be empty if it contains only unnamed bit-
   // fields, zero-width fields, and fields of empty record type.
+  bool NotEmpty = false;
   for (const auto *FD : RD->fields()) {
     if (FD->isUnnamedBitField())
       continue;
@@ -49,10 +57,18 @@ static bool recordIsNotEmpty(const RecordDecl *RD) {
     // The only case remaining to check is for a field declaration of record
     // type and whether that record itself is empty.
     if (const auto *FieldRD = FD->getType()->getAsRecordDecl();
-        !FieldRD || recordIsNotEmpty(FieldRD))
-      return true;
+        !FieldRD || recordIsNotEmpty(FieldRD, Decided)) {
+      NotEmpty = true;
+      break;
+    }
   }
-  return false;
+  Decided[RD] = NotEmpty;
+  return NotEmpty;
+}
+
+static bool recordIsNotEmpty(const RecordDecl *RD) {
+  llvm::SmallDenseMap<const RecordDecl *, bool, 8> Decided;
+  return recordIsNotEmpty(RD, Decided);
 }
 
 static bool isTrackedVar(const VarDecl *vd, const DeclContext *dc) {
