@@ -740,7 +740,10 @@ protected:
   /// DeterminePrimaryBase - Determine the primary base of the given class.
   void DeterminePrimaryBase(const CXXRecordDecl *RD);
 
-  void SelectPrimaryVBase(const CXXRecordDecl *RD);
+  /// Searches the bases of \p RD, each class once, in \p Searched.
+  void
+  SelectPrimaryVBase(const CXXRecordDecl *RD,
+                     llvm::SmallPtrSetImpl<const CXXRecordDecl *> &Searched);
 
   void EnsureVTablePointerAlignment(CharUnits UnpackedBaseAlign);
 
@@ -820,7 +823,15 @@ protected:
 };
 } // end anonymous namespace
 
-void ItaniumRecordLayoutBuilder::SelectPrimaryVBase(const CXXRecordDecl *RD) {
+void ItaniumRecordLayoutBuilder::SelectPrimaryVBase(
+    const CXXRecordDecl *RD,
+    llvm::SmallPtrSetImpl<const CXXRecordDecl *> &Searched) {
+  // A class searched before has no primary base to find, and set the first
+  // nearly empty virtual base if it has one: a virtual base of several bases
+  // is reached through each, which would take a time that grows exponentially
+  // with how many diamonds are stacked.
+  if (!Searched.insert(RD).second)
+    return;
   for (const auto &I : RD->bases()) {
     assert(!I.getType()->isDependentType() &&
            "Cannot layout class with dependent bases.");
@@ -842,7 +853,7 @@ void ItaniumRecordLayoutBuilder::SelectPrimaryVBase(const CXXRecordDecl *RD) {
         FirstNearlyEmptyVBase = Base;
     }
 
-    SelectPrimaryVBase(Base);
+    SelectPrimaryVBase(Base, Searched);
     if (PrimaryBase)
       return;
   }
@@ -881,7 +892,8 @@ void ItaniumRecordLayoutBuilder::DeterminePrimaryBase(const CXXRecordDecl *RD) {
   // the first nearly empty virtual base that is not an indirect primary
   // virtual base class, if one exists.
   if (RD->getNumVBases() != 0) {
-    SelectPrimaryVBase(RD);
+    llvm::SmallPtrSet<const CXXRecordDecl *, 8> Searched;
+    SelectPrimaryVBase(RD, Searched);
     if (PrimaryBase)
       return;
   }

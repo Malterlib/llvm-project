@@ -22,6 +22,7 @@
 #include "clang/Basic/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/iterator_range.h"
 #include <algorithm>
@@ -124,6 +125,10 @@ CXXRecordDecl::isCurrentInstantiation(const DeclContext *CurContext) const {
 
 bool CXXRecordDecl::forallBases(ForallBasesCallback BaseMatches) const {
   SmallVector<const CXXRecordDecl*, 8> Queue;
+  // Each base class once: one reached again, like a virtual base of a chain
+  // of diamonds through each class of each diamond derived from it, has had
+  // its bases searched, a number of times that would double with each.
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Searched;
 
   const CXXRecordDecl *Record = this;
   while (true) {
@@ -133,6 +138,8 @@ bool CXXRecordDecl::forallBases(ForallBasesCallback BaseMatches) const {
         return false;
       if (Base->isDependentContext() && !Base->isCurrentInstantiation(Record))
         return false;
+      if (!Searched.insert(Base).second)
+        continue;
 
       Queue.push_back(Base);
       if (!BaseMatches(Base))
@@ -533,9 +540,16 @@ void FinalOverriderCollector::Collect(const CXXRecordDecl *RD,
     // functions using data recursion and update all of the methods it
     // overrides.
     SmallVector<OverriddenMethodsRange, 4> Stack(1, OverriddenMethods);
+    // Each method it overrides once: one that several of them override, like
+    // the destructor of a virtual base that each class of a diamond overrides,
+    // is reached through each, which would take a time that grows
+    // exponentially with how many diamonds are stacked.
+    llvm::SmallPtrSet<const CXXMethodDecl *, 8> Replaced;
     while (!Stack.empty()) {
       for (const CXXMethodDecl *OM : Stack.pop_back_val()) {
         const CXXMethodDecl *CanonOM = OM->getCanonicalDecl();
+        if (!Replaced.insert(CanonOM).second)
+          continue;
 
         // C++ [class.virtual]p2:
         //   A virtual member function C::vf of a class object S is
@@ -616,7 +630,13 @@ CXXRecordDecl::getFinalOverriders(CXXFinalOverriderMap &FinalOverriders) const {
 
 static void
 AddIndirectPrimaryBases(const CXXRecordDecl *RD, ASTContext &Context,
-                        CXXIndirectPrimaryBaseSet& Bases) {
+                        CXXIndirectPrimaryBaseSet &Bases,
+                        llvm::SmallPtrSetImpl<const CXXRecordDecl *> &Visited) {
+  // Each class once: a virtual base of several bases is reached through each,
+  // which would take a time that grows exponentially with how many diamonds
+  // are stacked, and adds the same bases.
+  if (!Visited.insert(RD).second)
+    return;
   // If the record has a virtual primary base class, add it to our set.
   const ASTRecordLayout &Layout = Context.getASTRecordLayout(RD);
   if (Layout.isPrimaryBaseVirtual())
@@ -632,9 +652,8 @@ AddIndirectPrimaryBases(const CXXRecordDecl *RD, ASTContext &Context,
     // Only bases with virtual bases participate in computing the
     // indirect primary virtual base classes.
     if (BaseDecl->getNumVBases())
-      AddIndirectPrimaryBases(BaseDecl, Context, Bases);
+      AddIndirectPrimaryBases(BaseDecl, Context, Bases, Visited);
   }
-
 }
 
 void
@@ -644,6 +663,7 @@ CXXRecordDecl::getIndirectPrimaryBases(CXXIndirectPrimaryBaseSet& Bases) const {
   if (!getNumVBases())
     return;
 
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Visited;
   for (const auto &I : bases()) {
     assert(!I.getType()->isDependentType() &&
            "Cannot get indirect primary bases for class with dependent bases.");
@@ -654,6 +674,6 @@ CXXRecordDecl::getIndirectPrimaryBases(CXXIndirectPrimaryBaseSet& Bases) const {
     // Only bases with virtual bases participate in computing the
     // indirect primary virtual base classes.
     if (BaseDecl->getNumVBases())
-      AddIndirectPrimaryBases(BaseDecl, Context, Bases);
+      AddIndirectPrimaryBases(BaseDecl, Context, Bases, Visited);
   }
 }
