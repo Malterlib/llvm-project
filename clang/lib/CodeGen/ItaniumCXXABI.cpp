@@ -4575,7 +4575,28 @@ namespace {
   struct SeenBases {
     llvm::SmallPtrSet<const CXXRecordDecl *, 16> NonVirtualBases;
     llvm::SmallPtrSet<const CXXRecordDecl *, 16> VirtualBases;
+    /// The flags another walk of the bases of each class gives, of those
+    /// asked for.
+    llvm::DenseMap<const CXXRecordDecl *, unsigned> RepeatFlags;
   };
+}
+
+/// The flags a walk of the bases of \p RD gives when a walk of them went
+/// before, which saw each of them: diamond shaped for each virtual base, and
+/// non-diamond repeat for each non-virtual one, also of the bases of each.
+static unsigned ComputeVMIClassTypeInfoRepeatFlags(const CXXRecordDecl *RD,
+                                                   SeenBases &Bases) {
+  if (auto It = Bases.RepeatFlags.find(RD); It != Bases.RepeatFlags.end())
+    return It->second;
+  unsigned Flags = 0;
+  for (const auto &I : RD->bases()) {
+    Flags |= I.isVirtual() ? ItaniumRTTIBuilder::VMI_DiamondShaped
+                           : ItaniumRTTIBuilder::VMI_NonDiamondRepeat;
+    Flags |= ComputeVMIClassTypeInfoRepeatFlags(
+        I.getType()->castAsCXXRecordDecl(), Bases);
+  }
+  Bases.RepeatFlags[RD] = Flags;
+  return Flags;
 }
 
 /// ComputeVMIClassTypeInfoFlags - Compute the value of the flags member in
@@ -4587,6 +4608,9 @@ static unsigned ComputeVMIClassTypeInfoFlags(const CXXBaseSpecifier *Base,
   unsigned Flags = 0;
 
   auto *BaseDecl = Base->getType()->castAsCXXRecordDecl();
+  // Whether a walk of its bases went before, which saw them all.
+  const bool Walked = Bases.VirtualBases.contains(BaseDecl) ||
+                      Bases.NonVirtualBases.contains(BaseDecl);
   if (Base->isVirtual()) {
     // Mark the virtual base as seen.
     if (!Bases.VirtualBases.insert(BaseDecl).second) {
@@ -4609,7 +4633,9 @@ static unsigned ComputeVMIClassTypeInfoFlags(const CXXBaseSpecifier *Base,
     }
   }
 
-  // Walk all bases.
+  // Walk all bases, or give what another walk of them does.
+  if (Walked)
+    return Flags | ComputeVMIClassTypeInfoRepeatFlags(BaseDecl, Bases);
   for (const auto &I : BaseDecl->bases())
     Flags |= ComputeVMIClassTypeInfoFlags(&I, Bases);
 

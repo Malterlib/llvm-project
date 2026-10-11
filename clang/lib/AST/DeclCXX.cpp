@@ -48,6 +48,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <set>
 
 using namespace clang;
 
@@ -1876,12 +1877,83 @@ static CanQualType GetConversionType(ASTContext &Context, NamedDecl *Conv) {
 /// \param VOutput the set to which to add conversions from virtual bases
 /// \param HiddenVBaseCs the set of conversions which were hidden in a
 ///   virtual base along some inheritance path
+/// What the collection of the conversions of a class keeps: each class in a
+/// virtual base it went into, with the access, and of each class reached in a
+/// virtual base, the types that the classes above it on any path from the
+/// class whose conversions are collected that reaches it in a virtual base
+/// convert to, which hide those conversions of it on that path.
+struct VisibleConversionsSearch {
+  std::set<std::pair<const CXXRecordDecl *, AccessSpecifier>> VisitedInVirtual;
+  llvm::DenseMap<const CXXRecordDecl *, llvm::SmallPtrSet<CanQualType, 8>>
+      HiddenAbove;
+};
+
+/// The HiddenAbove of \p Search of each class \p Root derives from, from each
+/// class to its bases, each after all the classes derived from it, by the
+/// paths that reach it in a virtual base and those that don't, which reach
+/// other subobjects of it.
+static void computeHiddenAbove(ASTContext &Context, const CXXRecordDecl *Root,
+                               VisibleConversionsSearch &Search) {
+  llvm::SmallVector<const CXXRecordDecl *, 16> Order;
+  llvm::SmallPtrSet<const CXXRecordDecl *, 16> Seen;
+  std::function<void(const CXXRecordDecl *)> Visit =
+      [&](const CXXRecordDecl *Record) {
+        if (!Seen.insert(Record).second)
+          return;
+        for (const auto &Base : Record->bases())
+          if (const auto *BaseDecl = Base.getType()->getAsCXXRecordDecl())
+            Visit(BaseDecl);
+        Order.push_back(Record);
+      };
+  Visit(Root);
+  // Of each class and whether a path reaches it in a virtual base.
+  llvm::DenseMap<std::pair<const CXXRecordDecl *, unsigned>,
+                 llvm::SmallPtrSet<CanQualType, 8>>
+      Above;
+  Above[{Root, 0u}];
+  for (const CXXRecordDecl *Record : llvm::reverse(Order))
+    for (bool InVirtual : {false, true}) {
+      auto It = Above.find({Record, unsigned(InVirtual)});
+      if (It == Above.end())
+        continue;
+      llvm::SmallPtrSet<CanQualType, 8> Passed = It->second;
+      for (auto I = Record->conversion_begin(), E = Record->conversion_end();
+           I != E; ++I)
+        Passed.insert(GetConversionType(Context, I.getDecl()));
+      for (const auto &Base : Record->bases())
+        if (const auto *BaseDecl = Base.getType()->getAsCXXRecordDecl()) {
+          llvm::SmallPtrSet<CanQualType, 8> &BaseAbove =
+              Above[{BaseDecl, unsigned(InVirtual || Base.isVirtual())}];
+          for (CanQualType Type : Passed)
+            BaseAbove.insert(Type);
+        }
+    }
+  for (auto &[Key, Types] : Above)
+    if (Key.second)
+      Search.HiddenAbove[Key.first] = std::move(Types);
+}
+
 static void CollectVisibleConversions(
     ASTContext &Context, const CXXRecordDecl *Record, bool InVirtual,
     AccessSpecifier Access,
     const llvm::SmallPtrSet<CanQualType, 8> &ParentHiddenTypes,
     ASTUnresolvedSet &Output, UnresolvedSetImpl &VOutput,
-    llvm::SmallPtrSet<NamedDecl *, 8> &HiddenVBaseCs) {
+    llvm::SmallPtrSet<NamedDecl *, 8> &HiddenVBaseCs,
+    VisibleConversionsSearch &Search) {
+  // A class of a virtual base is one subobject, which each path to it reaches,
+  // and a conversion of it is hidden when a class above it on any of them
+  // converts to the same type, HiddenAbove: reached again with the same
+  // access, it adds the same conversions, and going into it again for each
+  // path would take a time that grows exponentially with how many diamonds
+  // are stacked.
+  const llvm::SmallPtrSet<CanQualType, 8> *HiddenIn = &ParentHiddenTypes;
+  if (InVirtual) {
+    if (!Search.VisitedInVirtual.insert({Record, Access}).second)
+      return;
+    if (auto It = Search.HiddenAbove.find(Record);
+        It != Search.HiddenAbove.end())
+      HiddenIn = &It->second;
+  }
   // The set of types which have conversions in this class or its
   // subclasses.  As an optimization, we don't copy the derived set
   // unless it might change.
@@ -1898,7 +1970,7 @@ static void CollectVisibleConversions(
 
     for (CXXRecordDecl::conversion_iterator I = ConvI; I != ConvE; ++I) {
       CanQualType ConvType(GetConversionType(Context, I.getDecl()));
-      bool Hidden = ParentHiddenTypes.count(ConvType);
+      bool Hidden = HiddenIn->count(ConvType);
       if (!Hidden)
         HiddenTypesBuffer.insert(ConvType);
 
@@ -1931,7 +2003,8 @@ static void CollectVisibleConversions(
     bool BaseInVirtual = InVirtual || I.isVirtual();
 
     CollectVisibleConversions(Context, Base, BaseInVirtual, BaseAccess,
-                              *HiddenTypes, Output, VOutput, HiddenVBaseCs);
+                              *HiddenTypes, Output, VOutput, HiddenVBaseCs,
+                              Search);
   }
 }
 
@@ -1963,6 +2036,9 @@ static void CollectVisibleConversions(ASTContext &Context,
     HiddenTypes.insert(GetConversionType(Context, ConvI.getDecl()));
 
   // Recursively collect conversions from base classes.
+  VisibleConversionsSearch Search;
+  if (Record->getNumVBases())
+    computeHiddenAbove(Context, Record, Search);
   for (const auto &I : Record->bases()) {
     const auto *Base = I.getType()->getAsCXXRecordDecl();
     if (!Base)
@@ -1970,7 +2046,7 @@ static void CollectVisibleConversions(ASTContext &Context,
 
     CollectVisibleConversions(Context, Base, I.isVirtual(),
                               I.getAccessSpecifier(), HiddenTypes, Output,
-                              VBaseCs, HiddenVBaseCs);
+                              VBaseCs, HiddenVBaseCs, Search);
   }
 
   // Add any unhidden conversions provided by virtual bases.
@@ -2424,12 +2500,20 @@ bool CXXMethodDecl::isStatic() const {
 
 static bool recursivelyOverrides(const CXXMethodDecl *DerivedMD,
                                  const CXXMethodDecl *BaseMD) {
-  for (const CXXMethodDecl *MD : DerivedMD->overridden_methods()) {
-    if (MD->getCanonicalDecl() == BaseMD->getCanonicalDecl())
-      return true;
-    if (recursivelyOverrides(MD, BaseMD))
-      return true;
-  }
+  // Each overridden method once: one that several of them override, like the
+  // destructor of a virtual base that each class of a diamond overrides, is
+  // reached through each, which would take a time that grows exponentially
+  // with how many diamonds are stacked.
+  llvm::SmallPtrSet<const CXXMethodDecl *, 8> Visited;
+  llvm::SmallVector<const CXXMethodDecl *, 8> Pending{DerivedMD};
+  while (!Pending.empty())
+    for (const CXXMethodDecl *MD :
+         Pending.pop_back_val()->overridden_methods()) {
+      if (MD->getCanonicalDecl() == BaseMD->getCanonicalDecl())
+        return true;
+      if (Visited.insert(MD->getCanonicalDecl()).second)
+        Pending.push_back(MD);
+    }
   return false;
 }
 
@@ -2464,11 +2548,19 @@ CXXMethodDecl::getCorrespondingMethodDeclaredInClass(const CXXRecordDecl *RD,
   return nullptr;
 }
 
-CXXMethodDecl *
-CXXMethodDecl::getCorrespondingMethodInClass(const CXXRecordDecl *RD,
-                                             bool MayBeBase) {
-  if (auto *MD = getCorrespondingMethodDeclaredInClass(RD, MayBeBase))
+/// The method of \p RD that corresponds to \p Method, as
+/// CXXMethodDecl::getCorrespondingMethodInClass, with what it found in each
+/// base in \p Found: a virtual base of several bases is reached through each,
+/// which searching again would take a time that grows exponentially with how
+/// many diamonds are stacked.
+static CXXMethodDecl *correspondingMethodInClass(
+    CXXMethodDecl *Method, const CXXRecordDecl *RD, bool MayBeBase,
+    llvm::SmallDenseMap<const CXXRecordDecl *, CXXMethodDecl *, 8> &Found) {
+  if (auto *MD = Method->getCorrespondingMethodDeclaredInClass(RD, MayBeBase))
     return MD;
+  if (!MayBeBase)
+    if (auto It = Found.find(RD->getCanonicalDecl()); It != Found.end())
+      return It->second;
 
   llvm::SmallVector<CXXMethodDecl*, 4> FinalOverriders;
   auto AddFinalOverrider = [&](CXXMethodDecl *D) {
@@ -2491,11 +2583,24 @@ CXXMethodDecl::getCorrespondingMethodInClass(const CXXRecordDecl *RD,
     const auto *Base = I.getType()->getAsCXXRecordDecl();
     if (!Base)
       continue;
-    if (CXXMethodDecl *D = this->getCorrespondingMethodInClass(Base))
+    if (CXXMethodDecl *D =
+            correspondingMethodInClass(Method, Base,
+                                       /*MayBeBase=*/false, Found))
       AddFinalOverrider(D);
   }
 
-  return FinalOverriders.size() == 1 ? FinalOverriders.front() : nullptr;
+  CXXMethodDecl *Corresponding =
+      FinalOverriders.size() == 1 ? FinalOverriders.front() : nullptr;
+  if (!MayBeBase)
+    Found[RD->getCanonicalDecl()] = Corresponding;
+  return Corresponding;
+}
+
+CXXMethodDecl *
+CXXMethodDecl::getCorrespondingMethodInClass(const CXXRecordDecl *RD,
+                                             bool MayBeBase) {
+  llvm::SmallDenseMap<const CXXRecordDecl *, CXXMethodDecl *, 8> Found;
+  return correspondingMethodInClass(this, RD, MayBeBase, Found);
 }
 
 CXXMethodDecl *
