@@ -379,6 +379,11 @@ private:
   void addParent(MapNodeTy MapNode, MapTy *Parents) {
     if (ParentStack.empty())
       return;
+    // A node right in a type being traversed, which has the parent of what
+    // the type is in.
+    if (!TypeRootsStack.empty() &&
+        TypeRootsStack.back().Depth == ParentStack.size())
+      TypeRootsStack.back().add(TypeRoot(MapNode));
 
     // FIXME: Currently we add the same parent multiple times, but only
     // when no memoization data is available for the type.
@@ -447,6 +452,40 @@ private:
     return TraverseNode(
         DeclNode, DeclNode, [&] { return VisitorBase::TraverseDecl(DeclNode); },
         &Map.PointerParents);
+  }
+  // Each type once that isn't where it is written, like the type a field of
+  // an instantiation has where it is written as the template parameter: a
+  // type that names another twice, like the parameters and result of
+  // `F39 (*)(F39, F39)`, is met once for each path to it, a number of times
+  // exponential in the depth of such types. A type has no parents, and what
+  // is right in it, like the expression of a `noexcept` of a function type,
+  // has the parent of what the type is in, also where it is met again, which
+  // is added to it then.
+  bool TraverseType(QualType TypeNode, bool TraverseQualifier = true) {
+    if (TypeNode.isNull())
+      return true;
+    const void *Key = TypeNode.getAsOpaquePtr();
+    if (!TraversedTypes.insert(Key).second) {
+      if (auto It = TypeRoots.find(Key); It != TypeRoots.end())
+        for (const TypeRoot &Root : It->second) {
+          Root.addParent(*this);
+          if (!TypeRootsStack.empty() &&
+              TypeRootsStack.back().Depth == ParentStack.size())
+            TypeRootsStack.back().add(Root);
+        }
+      return true;
+    }
+    TypeRootsStack.push_back({ParentStack.size(), {}, {}});
+    bool Result = VisitorBase::TraverseType(TypeNode, TraverseQualifier);
+    TypeRootsCollector Collected = TypeRootsStack.pop_back_val();
+    if (!Collected.Roots.empty()) {
+      if (!TypeRootsStack.empty() &&
+          TypeRootsStack.back().Depth == ParentStack.size())
+        for (const TypeRoot &Root : Collected.Roots)
+          TypeRootsStack.back().add(Root);
+      TypeRoots[Key] = std::move(Collected.Roots);
+    }
+    return Result;
   }
   bool TraverseTypeLoc(TypeLoc TypeLocNode, bool TraverseQualifier = true) {
     return TraverseNode(
@@ -535,6 +574,37 @@ private:
   llvm::DenseMap<const Stmt *, bool> CoroutineOperands;
   // The declarations traversed.
   llvm::DenseSet<const Decl *> TraversedDecls;
+  // And the types.
+  llvm::DenseSet<const void *> TraversedTypes;
+  // A node right in a type, which a parent added where the type is met again
+  // is a parent of.
+  struct TypeRoot {
+    const void *Pointer = nullptr;
+    DynTypedNode Other;
+    TypeRoot(const void *Pointer) : Pointer(Pointer) {}
+    TypeRoot(const DynTypedNode &Other) : Other(Other) {}
+    void addParent(ASTVisitor &Visitor) const {
+      if (Pointer)
+        Visitor.addParent(Pointer, &Visitor.Map.PointerParents);
+      else
+        Visitor.addParent(Other, &Visitor.Map.OtherParents);
+    }
+  };
+  // The nodes right in the types traversed that have any.
+  llvm::DenseMap<const void *, llvm::SmallVector<TypeRoot, 1>> TypeRoots;
+  // Those of the types being traversed, each of the depth of the parent
+  // stack it is traversed at, each node once.
+  struct TypeRootsCollector {
+    size_t Depth;
+    llvm::SmallVector<TypeRoot, 1> Roots;
+    llvm::SmallPtrSet<const void *, 4> Seen;
+    void add(const TypeRoot &Root) {
+      if (Root.Pointer && !Seen.insert(Root.Pointer).second)
+        return;
+      Roots.push_back(Root);
+    }
+  };
+  llvm::SmallVector<TypeRootsCollector, 4> TypeRootsStack;
 };
 
 ParentMapContext::ParentMap::ParentMap(ASTContext &Ctx) {

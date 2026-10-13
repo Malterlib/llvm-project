@@ -1992,6 +1992,66 @@ void fg_Run(typename TCIdentity<tf_FCallback>::CType *_fCallback) {}
 void fg_Test() { fg_Run<CTraits>(nullptr); }
 }
 
+namespace NRound336Shared {
+// A type that names another twice in each of many levels is looked through
+// once for each type it is made of, not each path to it.
+using FLeft0 = void (*)();
+using FRight0 = void (*)();
+#define DLevel(N, P)                                                          \
+  using FLeft##N = FLeft##P (*)(FLeft##P, FLeft##P);                          \
+  using FRight##N = FRight##P (*)(FRight##P, FRight##P);
+DLevel(1, 0)
+DLevel(2, 1)
+DLevel(3, 2)
+DLevel(4, 3)
+DLevel(5, 4)
+DLevel(6, 5)
+DLevel(7, 6)
+DLevel(8, 7)
+DLevel(9, 8)
+DLevel(10, 9)
+DLevel(11, 10)
+DLevel(12, 11)
+DLevel(13, 12)
+DLevel(14, 13)
+DLevel(15, 14)
+DLevel(16, 15)
+DLevel(17, 16)
+DLevel(18, 17)
+DLevel(19, 18)
+DLevel(20, 19)
+DLevel(21, 20)
+DLevel(22, 21)
+DLevel(23, 22)
+DLevel(24, 23)
+DLevel(25, 24)
+DLevel(26, 25)
+DLevel(27, 26)
+DLevel(28, 27)
+DLevel(29, 28)
+DLevel(30, 29)
+DLevel(31, 30)
+DLevel(32, 31)
+DLevel(33, 32)
+DLevel(34, 33)
+DLevel(35, 34)
+DLevel(36, 35)
+DLevel(37, 36)
+DLevel(38, 37)
+DLevel(39, 38)
+DLevel(40, 39)
+template <typename t_FSignature> struct TCFunction {};
+template <typename t_CType> struct TCHolder {
+  template <typename tf_FOnResult = TCFunction<void()>>
+  void f_Test(t_CType _Value, tf_FOnResult _fOnResult = {}) {}
+};
+template <typename tf_CType> void fg_Both(tf_CType _First, tf_CType _Second) {
+  TCHolder<tf_CType> Holder;
+  Holder.f_Test(_First);
+}
+void fg_Use() { fg_Both(FLeft40{}, FRight40{}); }
+}
+
 namespace NRound340NonDeduced {
 // A parameter named only through an alias that stands for a qualified type
 // isn't deduced, so its default is used.
