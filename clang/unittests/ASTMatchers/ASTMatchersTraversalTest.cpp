@@ -904,6 +904,58 @@ TEST(Matcher, MatchesParametersOfInstantiatedLambdaConversions) {
                       langCxx20OrLater()));
 }
 
+TEST(Matcher, MatchesSharedTypesOnce) {
+  // A type that names another twice, like the parameters and result of
+  // `F39 (*)(F39, F39)`, which the field of an instantiation has where it is
+  // written as the template parameter, is traversed once, not once for each
+  // path to it, which is exponential in the depth of such types, also for
+  // its descendants, where each is still found.
+  std::string Code = "template <class T> struct TCBox { T m_Value; };\n"
+                     "using F0 = int;\n";
+  for (int Depth = 1; Depth <= 40; ++Depth)
+    Code += "using F" + std::to_string(Depth) + " = F" +
+            std::to_string(Depth - 1) + " (*)(F" + std::to_string(Depth - 1) +
+            ", F" + std::to_string(Depth - 1) + ");\n";
+  Code += "TCBox<F40> Value;\n";
+  EXPECT_TRUE(matches(Code, functionProtoType(), langCxx20OrLater()));
+  EXPECT_TRUE(notMatches(
+      Code, recordType(hasDeclaration(namedDecl(hasName("Nothing")))),
+      langCxx20OrLater()));
+  EXPECT_TRUE(
+      notMatches(Code,
+                 classTemplateSpecializationDecl(hasDescendant(recordType(
+                     hasDeclaration(namedDecl(hasName("Nothing")))))),
+                 langCxx20OrLater()));
+  EXPECT_TRUE(matches(
+      Code, classTemplateSpecializationDecl(hasDescendant(builtinType())),
+      langCxx20OrLater()));
+  // Nor below what a matcher of children matches, where nothing matches.
+  EXPECT_TRUE(notMatches(Code,
+                         classTemplateSpecializationDecl(has(accessSpecDecl())),
+                         langCxx20OrLater()));
+  EXPECT_TRUE(matches(
+      Code, classTemplateSpecializationDecl(has(fieldDecl(hasName("m_Value")))),
+      langCxx20OrLater()));
+}
+
+TEST(Matcher, SharedTypesKeepEachParent) {
+  // What is right in a type traversed once, like the expression of the
+  // `noexcept` of the function type of two captures of a lambda, has each of
+  // what the type is in as a parent.
+  const std::string Code = "void f() noexcept(true);\n"
+                           "void test() {\n"
+                           "  auto a = f;\n"
+                           "  auto b = f;\n"
+                           "  auto l = [a, b] {};\n"
+                           "}\n";
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      Code,
+      fieldDecl(allOf(fieldDecl().bind("f"),
+                      hasDescendant(cxxBoolLiteral(
+                          hasAncestor(fieldDecl(equalsBoundNode("f"))))))),
+      std::make_unique<VerifyIdIsBoundTo<FieldDecl>>("f", 2)));
+}
+
 TEST(Matcher, MatchesLambdasInTypesOfInstantiatedLambdaInvokers) {
   // A lambda in the exception specification of a generic lambda converted to
   // a pointer has a signature of its own, which isn't in the type of the
@@ -965,6 +1017,40 @@ TEST(Matcher, MatchesSharedDefaultArgumentOnce) {
                    forEachDescendant(
                        callExpr(callee(functionDecl(hasName("g")))).bind("g"))),
       std::make_unique<VerifyIdIsBoundTo<CallExpr>>("g", 1), {"-std=c++20"}));
+}
+
+// But again where it is met after a type alias that the traversal didn't know
+// when it matched it, which a matcher that looks for a class by the name of an
+// alias, `isDerivedFrom("Alias")`, then matches, also in a type.
+TEST(Matcher, MatchesSharedNodesAgainAfterTypeAlias) {
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      R"cpp(
+        struct A {};
+        struct B : A {};
+        int read(B);
+        int use(int = read(B{}));
+        using Alias = A;
+        int result = use();
+      )cpp",
+      callExpr(callee(functionDecl(hasName("read"))),
+               hasArgument(0, hasType(cxxRecordDecl(isDerivedFrom("Alias")))))
+          .bind("read"),
+      std::make_unique<VerifyIdIsBoundTo<CallExpr>>("read", 1),
+      {"-std=c++20"}));
+  EXPECT_TRUE(matchAndVerifyResultTrue(
+      R"cpp(
+        struct A {};
+        struct B : A {};
+        template <class T> struct Box1 { T value; };
+        Box1<B> first;
+        using Alias = A;
+        template <class T> struct Box2 { T value; };
+        Box2<decltype(first.value)> second;
+      )cpp",
+      recordType(hasDeclaration(cxxRecordDecl(isDerivedFrom("Alias"))))
+          .bind("type"),
+      std::make_unique<VerifyIdIsBoundTo<RecordType>>("type"),
+      {"-std=c++20"}));
 }
 
 TEST(Matcher, MatchesDefaultArgumentOfLambdaInRewrittenOperator) {
