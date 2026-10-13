@@ -6647,6 +6647,26 @@ public:
       RewrittenDefaultArgs;
   unsigned RewritingDefaultArgs = 0;
 
+  /// The types alias template specializations substitute to, during the
+  /// outermost substitution of one, by the template, its arguments, the
+  /// context and whether the substitution is in a SFINAE context: an alias
+  /// that names another twice, `TCPair<TCPrevious<T>, TCPrevious<T>>`, makes
+  /// the same specialization once, not once for each path to it, which is
+  /// exponential in the depth of such aliases. Not one that made the closure
+  /// type of a lambda, which each substitution makes its own of, nor one met
+  /// again after the instantiation of a definition started or finished, which
+  /// can change what it substitutes to, like `__is_complete_type(T)` after
+  /// `sizeof(T)`, also one its own substitution instantiated: with that
+  /// number before it was made.
+  std::map<llvm::FoldingSetNodeID, std::pair<QualType, unsigned>>
+      AliasTemplateSubstitutions;
+  unsigned SubstitutingAliasTemplates = 0;
+  /// The number of closure types of lambdas made.
+  unsigned NumLambdaClosureTypes = 0;
+  /// The number of times the instantiation of a definition of a class,
+  /// enumeration, function or variable started or finished.
+  unsigned NumDefinitionInstantiations = 0;
+
   /// UndefinedInternals - all the used, undefined objects which require a
   /// definition in this translation unit.
   llvm::MapVector<NamedDecl *, SourceLocation> UndefinedButUsed;
@@ -11876,6 +11896,13 @@ public:
                                SourceLocation TemplateLoc,
                                TemplateArgumentListInfo &TemplateArgs,
                                Scope *Scope, bool ForNestedNameSpecifier);
+  /// CheckTemplateIdType of an alias template specialization not met before
+  /// in the outermost substitution of one.
+  QualType CheckTemplateIdTypeOnce(ElaboratedTypeKeyword Keyword,
+                                   TemplateName Template,
+                                   SourceLocation TemplateLoc,
+                                   TemplateArgumentListInfo &TemplateArgs,
+                                   Scope *Scope, bool ForNestedNameSpecifier);
 
   TypeResult
   ActOnTemplateIdType(Scope *S, ElaboratedTypeKeyword ElaboratedKeyword,
