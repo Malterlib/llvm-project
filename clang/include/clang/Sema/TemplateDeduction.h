@@ -14,14 +14,16 @@
 #ifndef LLVM_CLANG_SEMA_TEMPLATEDEDUCTION_H
 #define LLVM_CLANG_SEMA_TEMPLATEDEDUCTION_H
 
-#include "clang/Sema/Ownership.h"
-#include "clang/Sema/SemaConcept.h"
 #include "clang/AST/ASTConcept.h"
 #include "clang/AST/DeclAccessPair.h"
 #include "clang/AST/DeclTemplate.h"
 #include "clang/AST/TemplateBase.h"
 #include "clang/Basic/PartialDiagnostic.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Sema/Ownership.h"
+#include "clang/Sema/SemaConcept.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include <cassert>
 #include <cstddef>
@@ -72,6 +74,45 @@ public:
       : Loc(Loc), DeducedDepth(DeducedDepth) {}
   TemplateDeductionInfo(const TemplateDeductionInfo &) = delete;
   TemplateDeductionInfo &operator=(const TemplateDeductionInfo &) = delete;
+
+  /// A match of a type of a parameter against a type of an argument that
+  /// succeeded, with the deduced arguments it left of the template parameters
+  /// the type of the parameter uses, by their index, each with whether it was
+  /// deduced from an array bound, and whether it deduced any.
+  struct SucceededTypeMatch {
+    SmallVector<std::tuple<unsigned, TemplateArgument, bool>, 2> Deduced;
+    bool HasDeducedAnyParam;
+    /// A deduction of a pack it made in an expansion of the same pack, which
+    /// checks what it deduces against what the other deductions in that
+    /// expansion deduced, and adds it: the deferred deduction of the expansion
+    /// before and after the match, each with whether it was deduced from an
+    /// array bound.
+    struct OuterPackDeduction {
+      unsigned Index;
+      TemplateArgument Before;
+      bool BeforeFromArrayBound;
+      TemplateArgument After;
+      bool AfterFromArrayBound;
+    };
+    /// Those it made, by the index of the pack: it succeeds again only from
+    /// the same deferred deductions, and makes the same.
+    SmallVector<OuterPackDeduction, 0> OuterPacks;
+  };
+  /// Those of this deduction, by the template parameters, the two types and
+  /// how they were matched: a match of the same types from the deduced
+  /// arguments one left succeeds again and deduces nothing new, so a type
+  /// that names another twice, like `TCTypeList<CPrevious, CPrevious>`, is
+  /// matched once, not once for each path to it, which is exponential in the
+  /// depth of such types.
+  llvm::DenseMap<std::tuple<const void *, const void *, const void *, unsigned>,
+                 SucceededTypeMatch>
+      SucceededTypeMatches;
+  /// The matches that succeeded once, which are kept only when they succeed
+  /// again: finding the template parameters a type uses goes through all of
+  /// it, which for each match of a chain of types that each name the next
+  /// once would take a time quadratic in its length.
+  llvm::DenseSet<std::tuple<const void *, const void *, const void *, unsigned>>
+      SucceededTypeMatchesOnce;
 
   enum ForBaseTag { ForBase };
   /// Create temporary template deduction info for speculatively deducing
