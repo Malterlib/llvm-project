@@ -2908,6 +2908,13 @@ namespace {
       return ClassesTransitive.insert(RD);
     }
 
+    /// Whether the canonical type \p T is seen first, whose associated classes
+    /// and namespaces are the same each time: a type that names another twice,
+    /// like a specialization `L<T, T>`, has those of the other added once, not
+    /// once for each path to it, which is exponential in the depth of such
+    /// types.
+    bool addType(const Type *T) { return Types.insert(T).second; }
+
     Sema &S;
     Sema::AssociatedNamespaceSet &Namespaces;
     Sema::AssociatedClassSet &Classes;
@@ -2915,6 +2922,7 @@ namespace {
 
   private:
     Sema::AssociatedClassSet ClassesTransitive;
+    llvm::SmallPtrSet<const Type *, 16> Types;
   };
 } // end anonymous namespace
 
@@ -3158,6 +3166,12 @@ addAssociatedClassesAndNamespaces(AssociatedLookup &Result, QualType Ty) {
   const Type *T = Ty->getCanonicalTypeInternal().getTypePtr();
 
   while (true) {
+    if (!Result.addType(T)) {
+      if (Queue.empty())
+        break;
+      T = Queue.pop_back_val();
+      continue;
+    }
     switch (T->getTypeClass()) {
 
 #define TYPE(Class, Base)
