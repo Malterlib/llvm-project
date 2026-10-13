@@ -87,6 +87,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MD5.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/SipHash.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/AArch64TargetParser.h"
@@ -15019,6 +15020,17 @@ static auto unwrapSugar(SplitQualType &T, Qualifiers &QTotal) {
   return R;
 }
 
+namespace {
+/// The common sugared types found during the outermost finding of one, by the
+/// two types and whether qualifiers are dropped: a type that names another
+/// twice, like the parameters and result of `CPrevious (*)(CPrevious,
+/// CPrevious)`, finds that of the other once, not once for each path to it,
+/// which is exponential in the depth of such types.
+using CommonSugaredTypeMap =
+    llvm::DenseMap<std::tuple<const void *, const void *, unsigned>, QualType>;
+thread_local CommonSugaredTypeMap *CurrentCommonSugaredTypes = nullptr;
+} // namespace
+
 QualType ASTContext::getCommonSugaredType(QualType X, QualType Y,
                                           bool Unqualified) const {
   assert(Unqualified ? hasSameUnqualifiedType(X, Y) : hasSameType(X, Y));
@@ -15030,6 +15042,16 @@ QualType ASTContext::getCommonSugaredType(QualType X, QualType Y,
     if (Y.isCanonical())
       return Y;
   }
+
+  CommonSugaredTypeMap Results;
+  std::optional<llvm::SaveAndRestore<CommonSugaredTypeMap *>> Outermost;
+  if (!CurrentCommonSugaredTypes)
+    Outermost.emplace(CurrentCommonSugaredTypes, &Results);
+  const auto Key = std::make_tuple(X.getAsOpaquePtr(), Y.getAsOpaquePtr(),
+                                   static_cast<unsigned>(Unqualified));
+  if (auto It = CurrentCommonSugaredTypes->find(Key);
+      It != CurrentCommonSugaredTypes->end())
+    return It->second;
 
   SplitQualType SX = X.split(), SY = Y.split();
   Qualifiers QX, QY;
@@ -15096,6 +15118,7 @@ QualType ASTContext::getCommonSugaredType(QualType X, QualType Y,
   // with the sugar nodes we could not unify.
   QualType R = getQualifiedType(SX.Ty, QX);
   assert(Unqualified ? hasSameUnqualifiedType(R, X) : hasSameType(R, X));
+  CurrentCommonSugaredTypes->try_emplace(Key, R);
   return R;
 }
 
