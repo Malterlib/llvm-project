@@ -848,6 +848,10 @@ struct clang::DeducedPack {
   // The outer deduction for this pack, if any.
   DeducedPack *Outer = nullptr;
 
+  // The number of deductions of this pack in its expansion, which tells
+  // whether a match made one.
+  unsigned NumInnerDeductions = 0;
+
   DeducedPack(unsigned Index) : Index(Index) {}
 };
 
@@ -1120,6 +1124,7 @@ public:
       // Pick where we're going to put the merged pack.
       DeducedTemplateArgument *Loc;
       if (Pack.Outer) {
+        ++Pack.Outer->NumInnerDeductions;
         if (Pack.Outer->DeferredDeduction.isNull()) {
           // Defer checking this pack until we have a complete pack to compare
           // it against.
@@ -1592,7 +1597,137 @@ degradeCallPartialOrderingKind(PartialOrderingKind POK) {
 /// \returns the result of template argument deduction so far. Note that a
 /// "success" result means that template argument deduction has not yet failed,
 /// but it may still fail, later, for other reasons.
+static TemplateDeductionResult DeduceTemplateArgumentsByTypeMatchOnce(
+    Sema &S, TemplateParameterList *TemplateParams, QualType P, QualType A,
+    TemplateDeductionInfo &Info,
+    SmallVectorImpl<DeducedTemplateArgument> &Deduced, unsigned TDF,
+    PartialOrderingKind POK, bool DeducedFromArrayBound,
+    bool *HasDeducedAnyParam);
+
 static TemplateDeductionResult DeduceTemplateArgumentsByTypeMatch(
+    Sema &S, TemplateParameterList *TemplateParams, QualType P, QualType A,
+    TemplateDeductionInfo &Info,
+    SmallVectorImpl<DeducedTemplateArgument> &Deduced, unsigned TDF,
+    PartialOrderingKind POK, bool DeducedFromArrayBound,
+    bool *HasDeducedAnyParam) {
+  // A match of the same types, with their sugar, that succeeded and left the
+  // deduced arguments of the template parameters the type of the parameter
+  // uses as they are now succeeds again, deducing nothing new. Not one that
+  // left others, like the elements of a pack each deduced from empty, or
+  // before a deduction that failed was undone. Not of a type that matches
+  // without going through others, like a template parameter itself, which
+  // takes no longer than looking it up.
+  if (!P->isDependentType() || isa<TemplateTypeParmType>(P.getCanonicalType()))
+    return DeduceTemplateArgumentsByTypeMatchOnce(
+        S, TemplateParams, P, A, Info, Deduced, TDF, POK, DeducedFromArrayBound,
+        HasDeducedAnyParam);
+  const auto Key =
+      std::make_tuple(static_cast<const void *>(TemplateParams),
+                      P.getAsOpaquePtr(), A.getAsOpaquePtr(),
+                      TDF | static_cast<unsigned>(POK) << 24 |
+                          static_cast<unsigned>(DeducedFromArrayBound) << 26);
+  auto SameArgument = [](const DeducedTemplateArgument &Current,
+                         const TemplateArgument &Argument,
+                         bool FromArrayBound) {
+    if (FromArrayBound != Current.wasDeducedFromArrayBound() ||
+        Argument.getKind() != Current.getKind())
+      return false;
+    if (Current.isNull())
+      return true;
+    if (Current.getKind() == TemplateArgument::Type)
+      return Argument.getAsType().getAsOpaquePtr() ==
+             Current.getAsType().getAsOpaquePtr();
+    return Argument.structurallyEquals(Current);
+  };
+  // The packs being expanded, with the deferred deductions of their
+  // expansions, which a match that deduces one of them checks what it deduces
+  // against, and adds it to.
+  struct PendingPack {
+    unsigned Index;
+    DeducedPack *Pack;
+    unsigned NumInnerDeductions;
+    DeducedTemplateArgument Before;
+  };
+  SmallVector<PendingPack, 2> Pending;
+  for (auto [Index, Pack] : llvm::enumerate(Info.PendingDeducedPacks))
+    if (Pack)
+      Pending.push_back({static_cast<unsigned>(Index), Pack,
+                         Pack->NumInnerDeductions, Pack->DeferredDeduction});
+  auto PendingPackAt = [&](unsigned Index) -> DeducedPack * {
+    return Index < Info.PendingDeducedPacks.size()
+               ? Info.PendingDeducedPacks[Index]
+               : nullptr;
+  };
+  auto SameDeduced =
+      [&](const TemplateDeductionInfo::SucceededTypeMatch &Match) {
+        // Not one that deduced a pack outside an expansion of it, where one
+        // is being expanded now, which would add it to that expansion's.
+        auto DeducedInExpansion = [&](unsigned Index) {
+          return llvm::any_of(Match.OuterPacks, [&](const auto &Outer) {
+            return Outer.Index == Index;
+          });
+        };
+        if (!llvm::all_of(Match.Deduced, [&](const auto &Entry) {
+              const auto &[Index, Argument, FromArrayBound] = Entry;
+              if (Index >= Deduced.size())
+                return false;
+              if (Argument.getKind() == TemplateArgument::Pack &&
+                  PendingPackAt(Index) && !DeducedInExpansion(Index))
+                return false;
+              return SameArgument(Deduced[Index], Argument, FromArrayBound);
+            }))
+          return false;
+        return llvm::all_of(Match.OuterPacks, [&](const auto &Outer) {
+          DeducedPack *Pack = PendingPackAt(Outer.Index);
+          return Pack && SameArgument(Pack->DeferredDeduction, Outer.Before,
+                                      Outer.BeforeFromArrayBound);
+        });
+      };
+  if (auto It = Info.SucceededTypeMatches.find(Key);
+      It != Info.SucceededTypeMatches.end() && SameDeduced(It->second)) {
+    for (const auto &Outer : It->second.OuterPacks) {
+      DeducedPack *Pack = PendingPackAt(Outer.Index);
+      Pack->DeferredDeduction =
+          DeducedTemplateArgument(Outer.After, Outer.AfterFromArrayBound);
+      ++Pack->NumInnerDeductions;
+    }
+    if (HasDeducedAnyParam && It->second.HasDeducedAnyParam)
+      *HasDeducedAnyParam = true;
+    return TemplateDeductionResult::Success;
+  }
+  bool HasDeducedAnyParamCopy = false;
+  const TemplateDeductionResult Result = DeduceTemplateArgumentsByTypeMatchOnce(
+      S, TemplateParams, P, A, Info, Deduced, TDF, POK, DeducedFromArrayBound,
+      &HasDeducedAnyParamCopy);
+  if (HasDeducedAnyParam && HasDeducedAnyParamCopy)
+    *HasDeducedAnyParam = true;
+  if (Result == TemplateDeductionResult::Success &&
+      (Info.SucceededTypeMatches.contains(Key) ||
+       !Info.SucceededTypeMatchesOnce.insert(Key).second)) {
+    llvm::SmallBitVector Used(
+        std::max<size_t>(Deduced.size(), TemplateParams->size()));
+    MarkUsedTemplateParameters(S.Context, P, /*OnlyDeduced=*/false,
+                               Info.getDeducedDepth(), Used);
+    TemplateDeductionInfo::SucceededTypeMatch &Match =
+        Info.SucceededTypeMatches[Key];
+    Match.Deduced.clear();
+    for (unsigned Index : Used.set_bits())
+      if (Index < Deduced.size())
+        Match.Deduced.emplace_back(Index, Deduced[Index],
+                                   Deduced[Index].wasDeducedFromArrayBound());
+    Match.HasDeducedAnyParam = HasDeducedAnyParamCopy;
+    Match.OuterPacks.clear();
+    for (const PendingPack &Pack : Pending)
+      if (Pack.Pack->NumInnerDeductions != Pack.NumInnerDeductions)
+        Match.OuterPacks.push_back(
+            {Pack.Index, Pack.Before, Pack.Before.wasDeducedFromArrayBound(),
+             Pack.Pack->DeferredDeduction,
+             Pack.Pack->DeferredDeduction.wasDeducedFromArrayBound()});
+  }
+  return Result;
+}
+
+static TemplateDeductionResult DeduceTemplateArgumentsByTypeMatchOnce(
     Sema &S, TemplateParameterList *TemplateParams, QualType P, QualType A,
     TemplateDeductionInfo &Info,
     SmallVectorImpl<DeducedTemplateArgument> &Deduced, unsigned TDF,
@@ -6817,6 +6952,21 @@ MarkUsedTemplateParameters(ASTContext &Ctx,
                                Depth, Used);
 }
 
+namespace {
+/// The types the outermost marking of the template parameters a type uses
+/// went through, with what it marks: each once, as one met again marks
+/// nothing new, also one that a type names twice, like the arguments of
+/// `TCTypeList<CPrevious, CPrevious>`, not once for each path to it, which is
+/// exponential in the depth of such types.
+struct MarkingTypes {
+  llvm::SmallPtrSet<const Type *, 16> *Visited = nullptr;
+  llvm::SmallBitVector *Used = nullptr;
+  bool OnlyDeduced = false;
+  unsigned Depth = 0;
+};
+thread_local MarkingTypes CurrentMarkingTypes;
+} // namespace
+
 /// Mark the template parameters that are used by the given
 /// type.
 static void
@@ -6832,6 +6982,19 @@ MarkUsedTemplateParameters(ASTContext &Ctx, QualType T,
     return;
 
   T = Ctx.getCanonicalType(T);
+
+  llvm::SmallPtrSet<const Type *, 16> Visited;
+  std::optional<llvm::SaveAndRestore<MarkingTypes>> Marking;
+  if (CurrentMarkingTypes.Used == &Used &&
+      CurrentMarkingTypes.OnlyDeduced == OnlyDeduced &&
+      CurrentMarkingTypes.Depth == Depth) {
+    if (!CurrentMarkingTypes.Visited->insert(T.getTypePtr()).second)
+      return;
+  } else {
+    Visited.insert(T.getTypePtr());
+    Marking.emplace(CurrentMarkingTypes,
+                    MarkingTypes{&Visited, &Used, OnlyDeduced, Depth});
+  }
   switch (T->getTypeClass()) {
   case Type::Pointer:
     MarkUsedTemplateParameters(Ctx,
