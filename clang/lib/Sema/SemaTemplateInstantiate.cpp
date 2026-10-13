@@ -34,6 +34,7 @@
 #include "clang/Sema/Template.h"
 #include "clang/Sema/TemplateDeduction.h"
 #include "clang/Sema/TemplateInstCallback.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -3578,6 +3579,10 @@ bool Sema::InstantiateClassImpl(
                                 Instantiation->getInstantiatedFromMemberClass(),
                                      Pattern, PatternDef, TSK, Complain))
     return true;
+  // Also when it is done, which changes what is complete or defined too.
+  ++NumDefinitionInstantiations;
+  const auto Finished =
+      llvm::make_scope_exit([&] { ++NumDefinitionInstantiations; });
 
   llvm::TimeTraceScope TimeScope("InstantiateClass", [&]() {
     llvm::TimeTraceMetadata M;
@@ -3841,6 +3846,10 @@ bool Sema::InstantiateEnum(SourceLocation PointOfInstantiation,
                                  Instantiation->getInstantiatedFromMemberEnum(),
                                      Pattern, PatternDef, TSK,/*Complain*/true))
     return true;
+  // Also when it is done, which changes what is complete or defined too.
+  ++NumDefinitionInstantiations;
+  const auto Finished =
+      llvm::make_scope_exit([&] { ++NumDefinitionInstantiations; });
   Pattern = PatternDef;
 
   // Record the point of instantiation.
