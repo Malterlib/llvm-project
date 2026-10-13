@@ -40,6 +40,7 @@
 #include "clang/Sema/Template.h"
 #include "clang/Sema/TemplateDeduction.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -6253,6 +6254,11 @@ namespace {
   {
     Sema &S;
     SourceRange SR;
+    /// The types visited, each once: one met again found nothing, or the
+    /// visit would have stopped. A type that names another twice, like a
+    /// function type `void(T, T)`, is otherwise visited for each path to it,
+    /// which is exponential in the depth of such types.
+    llvm::SmallPtrSet<const Type *, 16> Visited;
 
     typedef TypeVisitor<UnnamedLocalNoLinkageFinder, bool> inherited;
 
@@ -6260,7 +6266,9 @@ namespace {
     UnnamedLocalNoLinkageFinder(Sema &S, SourceRange SR) : S(S), SR(SR) { }
 
     bool Visit(QualType T) {
-      return T.isNull() ? false : inherited::Visit(T.getTypePtr());
+      if (T.isNull() || !Visited.insert(T.getTypePtr()).second)
+        return false;
+      return inherited::Visit(T.getTypePtr());
     }
 
 #define TYPE(Class, Parent) \
