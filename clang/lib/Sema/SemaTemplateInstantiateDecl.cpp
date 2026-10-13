@@ -33,6 +33,7 @@
 #include "clang/Sema/SemaSwift.h"
 #include "clang/Sema/Template.h"
 #include "clang/Sema/TemplateInstCallback.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <optional>
@@ -5699,6 +5700,10 @@ void Sema::InstantiateFunctionDefinition(SourceLocation PointOfInstantiation,
         std::make_pair(Function, PointOfInstantiation));
     return;
   }
+  // Also when it is done, which changes what is complete or defined too.
+  ++NumDefinitionInstantiations;
+  const auto Finished =
+      llvm::make_scope_exit([&] { ++NumDefinitionInstantiations; });
 
   llvm::TimeTraceScope TimeScope("InstantiateFunction", [&]() {
     llvm::TimeTraceMetadata M;
@@ -6375,6 +6380,11 @@ void Sema::InstantiateVariableDefinition(SourceLocation PointOfInstantiation,
       InstantiatingTemplate Inst(*this, PointOfInstantiation, Var);
       if (Inst.isInvalid())
         return;
+      // Each time a definition is instantiated, not where one already is, and
+      // also when it is done, which changes what is complete or defined too.
+      ++NumDefinitionInstantiations;
+      const auto Finished =
+          llvm::make_scope_exit([&] { ++NumDefinitionInstantiations; });
       PrettyDeclStackTraceEntry CrashInfo(Context, Var, SourceLocation(),
                                           "instantiating variable initializer");
 
@@ -6480,6 +6490,11 @@ void Sema::InstantiateVariableDefinition(SourceLocation PointOfInstantiation,
   InstantiatingTemplate Inst(*this, PointOfInstantiation, Var);
   if (Inst.isInvalid())
     return;
+  // Each time a definition is instantiated, not where one already is, and also
+  // when it is done, which changes what is complete or defined too.
+  ++NumDefinitionInstantiations;
+  const auto Finished =
+      llvm::make_scope_exit([&] { ++NumDefinitionInstantiations; });
   PrettyDeclStackTraceEntry CrashInfo(Context, Var, SourceLocation(),
                                       "instantiating variable definition");
 

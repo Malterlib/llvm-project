@@ -39,6 +39,7 @@
 #include "clang/Sema/SemaInternal.h"
 #include "clang/Sema/Template.h"
 #include "clang/Sema/TemplateDeduction.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
@@ -3769,6 +3770,86 @@ QualType Sema::CheckTemplateIdType(ElaboratedTypeKeyword Keyword,
                                    SourceLocation TemplateLoc,
                                    TemplateArgumentListInfo &TemplateArgs,
                                    Scope *Scope, bool ForNestedNameSpecifier) {
+  // An alias template specialization written as one met before in the
+  // outermost substitution of one, by its template, its arguments as written,
+  // the context and whether it is a SFINAE context, also in the default
+  // arguments of another, `class A = L19<T>, class B = L19<T>`, which are
+  // checked before it is substituted, is the same type: not one whose check
+  // made the closure type of a lambda, which each makes its own of.
+  const auto *AliasTemplate = dyn_cast_or_null<TypeAliasTemplateDecl>(
+      Name.getTemplateDeclAndDefaultArgs().first.getAsTemplateDecl());
+  if (!AliasTemplate)
+    return CheckTemplateIdTypeOnce(Keyword, Name, TemplateLoc, TemplateArgs,
+                                   Scope, ForNestedNameSpecifier);
+  llvm::SaveAndRestore Substituting(SubstitutingAliasTemplates,
+                                    SubstitutingAliasTemplates + 1);
+  auto Forget = llvm::make_scope_exit([&] {
+    if (SubstitutingAliasTemplates == 1)
+      AliasTemplateSubstitutions.clear();
+  });
+  // Only one whose check leaves the arguments as written, which it otherwise
+  // updates with their conversions: of types, not expansions of packs, of a
+  // template without template template parameters, whose defaults it adds.
+  // Nor one written with a tag keyword, `struct L19<T>`, which the check
+  // diagnoses at each use.
+  if ((Keyword != ElaboratedTypeKeyword::None &&
+       Keyword != ElaboratedTypeKeyword::Typename) ||
+      !llvm::all_of(TemplateArgs.arguments(),
+                    [](const TemplateArgumentLoc &Arg) {
+                      return Arg.getArgument().getKind() ==
+                                 TemplateArgument::Type &&
+                             !Arg.getArgument().isPackExpansion();
+                    }) ||
+      llvm::any_of(*AliasTemplate->getTemplateParameters(),
+                   [](const NamedDecl *Param) {
+                     return isa<TemplateTemplateParmDecl>(Param);
+                   }))
+    return CheckTemplateIdTypeOnce(Keyword, Name, TemplateLoc, TemplateArgs,
+                                   Scope, ForNestedNameSpecifier);
+  llvm::FoldingSetNodeID Key;
+  // Not the key of a substitution of the pattern.
+  Key.AddInteger(1);
+  Key.AddPointer(Name.getAsVoidPointer());
+  Key.AddInteger(llvm::to_underlying(Keyword));
+  Key.AddPointer(CurContext);
+  Key.AddBoolean(isSFINAEContext());
+  Key.AddBoolean(ForNestedNameSpecifier);
+  for (const TemplateArgumentLoc &Arg : TemplateArgs.arguments())
+    Arg.getArgument().Profile(Key, Context);
+  if (auto It = AliasTemplateSubstitutions.find(Key);
+      It != AliasTemplateSubstitutions.end() &&
+      It->second.second == NumDefinitionInstantiations) {
+    // What the check does at the use itself, which the one it was met at
+    // doesn't do for it: marking the template referenced, and diagnosing the
+    // use of its pattern, like of a deprecated one, which a pragma can
+    // suppress at one use only.
+    MarkAnyDeclReferenced(TemplateLoc, const_cast<TypeAliasTemplateDecl *>(
+                                           AliasTemplate),
+                          /*OdrUse=*/false);
+    TypeAliasDecl *Pattern = AliasTemplate->getTemplatedDecl();
+    (void)DiagnoseUseOfDecl(Pattern, TemplateLoc);
+    MarkAnyDeclReferenced(TemplateLoc, Pattern, /*OdrUse=*/false);
+    return It->second.first;
+  }
+  const unsigned LambdaClosureTypes = NumLambdaClosureTypes;
+  // With the number before it was made, which a definition its substitution
+  // instantiates changes, like one `sizeof(T)` completes after
+  // `__is_complete_type(T)` saw it incomplete: met again, it is made again.
+  const unsigned DefinitionInstantiations = NumDefinitionInstantiations;
+  QualType Result = CheckTemplateIdTypeOnce(
+      Keyword, Name, TemplateLoc, TemplateArgs, Scope, ForNestedNameSpecifier);
+  if (!Result.isNull() && LambdaClosureTypes == NumLambdaClosureTypes)
+    AliasTemplateSubstitutions.insert_or_assign(
+        std::move(Key), std::pair(Result, DefinitionInstantiations));
+  return Result;
+}
+
+QualType Sema::CheckTemplateIdTypeOnce(ElaboratedTypeKeyword Keyword,
+                                       TemplateName Name,
+                                       SourceLocation TemplateLoc,
+                                       TemplateArgumentListInfo &TemplateArgs,
+                                       Scope *Scope,
+                                       bool ForNestedNameSpecifier) {
   auto [UnderlyingName, DefaultArgs] = Name.getTemplateDeclAndDefaultArgs();
 
   TemplateDecl *Template = UnderlyingName.getAsTemplateDecl();
@@ -3852,6 +3933,29 @@ QualType Sema::CheckTemplateIdType(ElaboratedTypeKeyword Keyword,
     if (Pattern->isInvalidDecl())
       return QualType();
 
+    llvm::FoldingSetNodeID Key;
+    // Not the key of a specialization as written.
+    Key.AddInteger(0);
+    Key.AddPointer(AliasTemplate);
+    Key.AddPointer(CurContext);
+    Key.AddBoolean(isSFINAEContext());
+    for (const TemplateArgument &Arg : CTAI.SugaredConverted) {
+      Arg.Profile(Key, Context);
+      // And the expression itself, which profiles as any that is the same.
+      if (Arg.getKind() == TemplateArgument::Expression)
+        Key.AddPointer(Arg.getAsExpr());
+    }
+    if (auto It = AliasTemplateSubstitutions.find(Key);
+        It != AliasTemplateSubstitutions.end() &&
+        It->second.second == NumDefinitionInstantiations) {
+      CanonType = It->second.first;
+      return Context.getTemplateSpecializationType(
+          Keyword, Name, TemplateArgs.arguments(), CTAI.CanonicalConverted,
+          CanonType);
+    }
+    const unsigned LambdaClosureTypes = NumLambdaClosureTypes;
+    const unsigned DefinitionInstantiations = NumDefinitionInstantiations;
+
     // Only substitute for the innermost template argument list.
     MultiLevelTemplateArgumentList TemplateArgLists;
     TemplateArgLists.addOuterTemplateArguments(Template, CTAI.SugaredConverted,
@@ -3880,6 +3984,9 @@ QualType Sema::CheckTemplateIdType(ElaboratedTypeKeyword Keyword,
     CanonType =
         SubstType(Pattern->getUnderlyingType(), TemplateArgLists,
                   AliasTemplate->getLocation(), AliasTemplate->getDeclName());
+    if (!CanonType.isNull() && LambdaClosureTypes == NumLambdaClosureTypes)
+      AliasTemplateSubstitutions.insert_or_assign(
+          std::move(Key), std::pair(CanonType, DefinitionInstantiations));
     if (CanonType.isNull()) {
       // If this was enable_if and we failed to find the nested type
       // within enable_if in a SFINAE context, dig out the specific
