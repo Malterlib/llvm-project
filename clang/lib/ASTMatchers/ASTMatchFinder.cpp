@@ -239,9 +239,9 @@ public:
   // what isn't spelled in source, in which different matchers can match.
   bool shouldTraverse(const Stmt *S, unsigned Mode = 0) {
     if (auto It = Operands.find(Key(S, Mode)); It != Operands.end()) {
-      if (It->second)
+      if (It->second == Aliases + 1)
         return false;
-      It->second = true;
+      It->second = Aliases + 1;
     }
     if (const auto *Suspend = dyn_cast_or_null<CoroutineSuspendExpr>(S))
       if (const Expr *Operand = Suspend->getOperand())
@@ -271,7 +271,7 @@ public:
       Shared = Default->getExpr();
     if (Shared)
       Operands.try_emplace(Key(Shared, Mode),
-                           Declared.contains(Key(Shared, Mode)));
+                           Declared.lookup(Key(Shared, Mode)));
     return true;
   }
 
@@ -280,19 +280,50 @@ public:
   // the matchers of that traversal find what a use can.
   void traverseDeclared(const Expr *Shared, unsigned Mode) {
     if (Shared)
-      Declared.insert(Key(Shared, Mode));
+      Declared[Key(Shared, Mode)] = Aliases + 1;
   }
+
+  // Whether \p T, a type, not where it is written, is to be traversed: not
+  // one met again in the same traversal, which \p Mode tells, which a type
+  // that names another twice, like the parameters and result of `CPrevious
+  // (*)(CPrevious, CPrevious)`, meets once for each path to it, a number of
+  // times exponential in the depth of such types. What it matches is the same
+  // each time, as types have no parents.
+  bool shouldTraverseType(QualType T, unsigned Mode = 0) {
+    if (T.isNull())
+      return true;
+    auto [It, Inserted] =
+        Types.try_emplace(std::make_pair(T.getAsOpaquePtr(), Mode), Aliases);
+    if (Inserted)
+      return true;
+    if (It->second == Aliases)
+      return false;
+    It->second = Aliases;
+    return true;
+  }
+
+  // That the traversal met another type alias, which the name of a class a
+  // matcher looks for can be, `isDerivedFrom("CAlias")`: what was traversed
+  // before it, which then matched without it, is traversed again where it is
+  // met again, like a default argument at a use after the alias,
+  // `use(int = read(B{})); using Alias = A; int r = use();`.
+  void metAlias() { ++Aliases; }
 
   void clear() {
     Operands.clear();
     Declared.clear();
+    Types.clear();
+    Aliases = 0;
   }
 
 private:
   using Key = llvm::PointerIntPair<const Stmt *, 2, unsigned>;
-  llvm::DenseSet<Key> Declared;
-  // Whether each was traversed.
-  llvm::DenseMap<Key, bool> Operands;
+  // Of each, the number of aliases met before it was traversed, plus one.
+  llvm::DenseMap<Key, unsigned> Declared;
+  llvm::DenseMap<std::pair<const void *, unsigned>, unsigned> Types;
+  // Whether each was traversed: zero if not, else as Declared.
+  llvm::DenseMap<Key, unsigned> Operands;
+  unsigned Aliases = 0;
 };
 
 // A RecursiveASTVisitor that traverses all children or all descendants of
@@ -424,7 +455,15 @@ public:
   bool TraverseType(QualType TypeNode, bool TraverseQualifier = true) {
     if (TypeNode.isNull())
       return true;
+    // Each type once where every descendant is matched, which a deeper or
+    // shallower path to it matches the same.
+    if (MaxDepth == INT_MAX && !Operands.shouldTraverseType(TypeNode))
+      return true;
     ScopedIncrement ScopedDepth(&CurrentDepth);
+    // And none deeper than what is matched, like the children of a type a
+    // matcher of children meets below them, which nothing in it can match.
+    if (CurrentDepth > MaxDepth)
+      return true;
     // Match the Type.
     if (!match(*TypeNode))
       return false;
@@ -781,13 +820,15 @@ public:
     const Type *TypeNode = DeclNode->getUnderlyingType().getTypePtr();
     const Type *CanonicalType =  // root of the typedef tree
         ActiveASTContext->getCanonicalType(TypeNode);
-    TypeAliases[CanonicalType].insert(DeclNode);
+    if (TypeAliases[CanonicalType].insert(DeclNode).second)
+      Operands.metAlias();
     return true;
   }
 
   bool VisitObjCCompatibleAliasDecl(ObjCCompatibleAliasDecl *CAD) {
     const ObjCInterfaceDecl *InterfaceDecl = CAD->getClassInterface();
-    CompatibleAliases[InterfaceDecl].insert(CAD);
+    if (CompatibleAliases[InterfaceDecl].insert(CAD).second)
+      Operands.metAlias();
     return true;
   }
 
@@ -1943,7 +1984,12 @@ bool MatchASTVisitor::TraverseStmt(Stmt *StmtNode, DataRecursionQueue *Queue) {
 }
 
 bool MatchASTVisitor::TraverseType(QualType TypeNode, bool TraverseQualifier) {
-  if (shouldSkipNode(TypeNode))
+  const bool ScopedTraversal = TraversingASTNodeNotSpelledInSource ||
+                               TraversingASTChildrenNotSpelledInSource;
+  if (shouldSkipNode(TypeNode) ||
+      !Operands.shouldTraverseType(TypeNode,
+                                   (TraversingASTNodeNotAsIs ? 1 : 0) |
+                                       (ScopedTraversal ? 2 : 0)))
     return true;
 
   match(TypeNode);
