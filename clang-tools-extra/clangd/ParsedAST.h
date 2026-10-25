@@ -119,6 +119,9 @@ public:
   /// AST. Might be std::nullopt if no Preamble is used.
   std::optional<llvm::StringRef> preambleVersion() const;
 
+  /// Returns the preamble this AST was built with, or nullptr if none was used.
+  const PreambleData *preamble() const { return Preamble.get(); }
+
   const HeuristicResolver *getHeuristicResolver() const {
     return Resolver.get();
   }

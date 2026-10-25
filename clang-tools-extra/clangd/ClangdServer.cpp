@@ -1284,18 +1284,39 @@ void ClangdServer::documentLinks(PathRef File,
                             Transient);
 }
 
-void ClangdServer::semanticHighlights(
-    PathRef File, Callback<std::vector<HighlightingToken>> CB) {
+void ClangdServer::semanticHighlights(PathRef File,
+                                      Callback<SemanticHighlightings> CB) {
 
   auto Action = [CB = std::move(CB),
                  PublishInactiveRegions = PublishInactiveRegions](
                     llvm::Expected<InputsAndAST> InpAST) mutable {
     if (!InpAST)
       return CB(InpAST.takeError());
+    SemanticHighlightings Result;
     // Include inactive regions in semantic highlighting tokens only if the
     // client doesn't support a dedicated protocol for being informed about
     // them.
-    CB(clangd::getSemanticHighlightings(InpAST->AST, !PublishInactiveRegions));
+    Result.Tokens =
+        clangd::getSemanticHighlightings(InpAST->AST, !PublishInactiveRegions);
+    // The highlightings are approximate when the AST lacks declarations and
+    // macros the file depends on, and clang's recovery from the unknown names
+    // gives wrong highlightings, such as a member declaration for an unknown
+    // type: when the file was parsed with a guessed command, such as a header
+    // opened before an including file is known, when a header parsed in the
+    // context of an including file was parsed without the preamble built from
+    // that file, or when the preamble misses changes to the files it depends
+    // on while a new one is built. Most are still right, so they're reported
+    // as approximate, which clients that know of it place below more accurate
+    // highlightings. Publishing the new preamble asks the client to request
+    // the highlightings again.
+    const ParseInputs &Inputs = InpAST->Inputs;
+    const PreambleData *Preamble = InpAST->AST.preamble();
+    Result.Approximate =
+        InpAST->PreambleStale ||
+        (Inputs.ProxyCompileCommand
+             ? !Preamble || !preambleContextMatches(*Preamble, Inputs)
+             : !Inputs.CompileCommand.Heuristic.empty());
+    CB(std::move(Result));
   };
   WorkScheduler->runWithAST("SemanticHighlights", File, std::move(Action),
                             Transient);

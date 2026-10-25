@@ -10,12 +10,15 @@
 #include "ClangdServer.h"
 #include "CodeComplete.h"
 #include "CompileCommands.h"
+#include "Config.h"
 #include "ConfigFragment.h"
 #include "GlobalCompilationDatabase.h"
 #include "Matchers.h"
+#include "SemanticHighlighting.h"
 #include "SyncAPI.h"
 #include "TestFS.h"
 #include "TestTU.h"
+#include "TUScheduler.h"
 #include "TidyProvider.h"
 #include "refactor/Tweak.h"
 #include "support/MemoryTree.h"
@@ -54,6 +57,7 @@ namespace {
 
 using ::testing::AllOf;
 using ::testing::ElementsAre;
+using ::testing::_;
 using ::testing::Field;
 using ::testing::IsEmpty;
 using ::testing::Pair;
@@ -366,6 +370,304 @@ TEST(ClangdServerTest, RespectsConfig) {
   ASSERT_TRUE(bool(Result)) << Result.takeError();
   ASSERT_THAT(*Result, SizeIs(1));
   EXPECT_NE(Result->front().PreferredDeclaration.range, Example.range());
+}
+
+// A header opened before the file that includes it is known is highlighted
+// approximately, as it's parsed without the types and macros it depends on,
+// until it's parsed in the context of that file.
+TEST(ClangdServerTest, HeaderInContextHighlightsApproximatelyWithoutContext) {
+  static std::string Main = testPath("main.cpp"), Types = testPath("types.h"),
+                     Header = testPath("header.h");
+  struct NoHeadersCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+
+  MockFS FS;
+  auto Opts = ClangdServer::optsForTest();
+  Opts.ContextProvider = [](PathRef) {
+    // Headers are compiled in the context of a file that includes them.
+    Config Cfg;
+    Cfg.CompileFlags.CompileHeadersInContext = true;
+    return Context::current().derive(Config::Key, std::move(Cfg));
+  };
+  ClangdServer Server(CDB, FS, Opts);
+
+  const char *MainContents = "#include \"types.h\"\n#include \"header.h\"\n";
+  Annotations HeaderContents("struct S { $type[[uint64]] $field[[m_Value]]; };");
+  FS.Files[Main] = MainContents;
+  FS.Files[Types] = "typedef unsigned long long uint64;";
+  FS.Files[Header] = HeaderContents.code();
+
+  auto Highlight = [&] {
+    std::optional<llvm::Expected<ClangdServer::SemanticHighlightings>> Result;
+    Notification Done;
+    Server.semanticHighlights(
+        Header,
+        [&](llvm::Expected<ClangdServer::SemanticHighlightings> Highlights) {
+          Result.emplace(std::move(Highlights));
+          Done.notify();
+        });
+    Done.wait();
+    return std::move(*Result);
+  };
+
+  runAddDocument(Server, Header, HeaderContents.code());
+  auto WithoutContext = Highlight();
+  ASSERT_TRUE(bool(WithoutContext)) << WithoutContext.takeError();
+  EXPECT_TRUE(WithoutContext->Approximate);
+
+  // Opening the including file reparses the header in its context.
+  runAddDocument(Server, Main, MainContents);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  auto InContext = Highlight();
+  ASSERT_TRUE(bool(InContext)) << InContext.takeError();
+  EXPECT_FALSE(InContext->Approximate);
+  std::vector<std::pair<HighlightingKind, Range>> Kinds;
+  for (const HighlightingToken &Token : InContext->Tokens)
+    Kinds.emplace_back(Token.Kind, Token.R);
+  EXPECT_THAT(Kinds, ElementsAre(Pair(HighlightingKind::Class, _),
+                                 Pair(HighlightingKind::Primitive,
+                                      HeaderContents.range("type")),
+                                 Pair(HighlightingKind::Field,
+                                      HeaderContents.range("field"))));
+}
+
+// A header parsed in context is highlighted approximately while its preamble
+// misses a change to a file it depends on, until the new preamble is built.
+TEST(ClangdServerTest, HeaderInContextHighlightsApproximatelyWithStalePreamble) {
+  static std::string Main = testPath("main.cpp"), Types = testPath("types.h"),
+                     Header = testPath("header.h");
+  struct NoHeadersCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+  // Builds every preamble right away, except the header's while held, which
+  // waits until it's let through.
+  struct HoldingThrottler : public PreambleThrottler {
+    std::mutex Mu;
+    RequestID NextID = 0;
+    bool Hold = false;
+    std::optional<RequestID> HeldID;
+    Callback Held;
+
+    RequestID acquire(llvm::StringRef Filename, Callback CB) override {
+      RequestID ID;
+      {
+        std::lock_guard<std::mutex> Lock(Mu);
+        ID = NextID++;
+        if (Hold && Filename == Header) {
+          HeldID = ID;
+          Held = std::move(CB);
+          return ID;
+        }
+      }
+      CB();
+      return ID;
+    }
+
+    void release(RequestID ID) override {
+      std::lock_guard<std::mutex> Lock(Mu);
+      if (HeldID == ID) {
+        HeldID.reset();
+        Held = nullptr;
+      }
+    }
+
+    void hold() {
+      std::lock_guard<std::mutex> Lock(Mu);
+      Hold = true;
+    }
+
+    void letThrough() {
+      Callback CB;
+      {
+        std::lock_guard<std::mutex> Lock(Mu);
+        Hold = false;
+        CB = std::move(Held);
+      }
+      if (CB)
+        CB();
+    }
+  } Throttler;
+
+  MockFS FS;
+  auto Opts = ClangdServer::optsForTest();
+  Opts.PreambleThrottler = &Throttler;
+  Opts.ContextProvider = [](PathRef) {
+    // Headers are compiled in the context of a file that includes them.
+    Config Cfg;
+    Cfg.CompileFlags.CompileHeadersInContext = true;
+    return Context::current().derive(Config::Key, std::move(Cfg));
+  };
+  ClangdServer Server(CDB, FS, Opts);
+
+  const char *MainContents = "#include \"types.h\"\n#include \"header.h\"\n";
+  FS.Files[Main] = MainContents;
+  FS.Files[Types] = "typedef unsigned long long uint64;";
+  FS.Timestamps[Types] = time_t(1);
+  FS.Files[Header] = "struct S { uint64 m_Value; };";
+
+  auto Highlight = [&] {
+    std::optional<llvm::Expected<ClangdServer::SemanticHighlightings>> Result;
+    Notification Done;
+    Server.semanticHighlights(
+        Header,
+        [&](llvm::Expected<ClangdServer::SemanticHighlightings> Highlights) {
+          Result.emplace(std::move(Highlights));
+          Done.notify();
+        });
+    Done.wait();
+    return std::move(*Result);
+  };
+
+  runAddDocument(Server, Main, MainContents);
+  runAddDocument(Server, Header, FS.Files[Header]);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  auto Fresh = Highlight();
+  ASSERT_TRUE(bool(Fresh)) << Fresh.takeError();
+  EXPECT_FALSE(Fresh->Approximate);
+
+  // A macro added to a header included before this one is missing from the
+  // preamble until it's rebuilt.
+  Throttler.hold();
+  FS.Files[Types] = "typedef unsigned long long uint64;\n#define ANNOTATE(X)";
+  FS.Timestamps[Types] = time_t(2);
+  FS.Files[Header] = "struct S { ANNOTATE(New) uint64 m_Value; };";
+  Server.addDocument(Header, FS.Files[Header]);
+  auto Stale = Highlight();
+  ASSERT_TRUE(bool(Stale)) << Stale.takeError();
+  EXPECT_TRUE(Stale->Approximate);
+
+  Throttler.letThrough();
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  auto Rebuilt = Highlight();
+  ASSERT_TRUE(bool(Rebuilt)) << Rebuilt.takeError();
+  EXPECT_FALSE(Rebuilt->Approximate);
+}
+
+// A preamble rebuilt for a reported change to a file it depends on includes
+// the change, so the highlightings with it aren't approximate.
+TEST(ClangdServerTest, HighlightsAccuratelyAfterReportedDependencyChange) {
+  static std::string Main = testPath("main.cpp"), Types = testPath("types.h");
+  struct MainOnlyCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      if (File != Main)
+        return std::nullopt;
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic.clear();
+      return Cmd;
+    }
+  } CDB;
+  MockFS FS;
+  ClangdServer Server(CDB, FS, ClangdServer::optsForTest());
+
+  const char *MainContents = "#include \"types.h\"\nuint64 Value;\n";
+  FS.Files[Main] = MainContents;
+  FS.Files[Types] = "typedef unsigned long long uint64;";
+  FS.Timestamps[Types] = time_t(1);
+
+  auto Highlight = [&] {
+    std::optional<llvm::Expected<ClangdServer::SemanticHighlightings>> Result;
+    Notification Done;
+    Server.semanticHighlights(
+        Main,
+        [&](llvm::Expected<ClangdServer::SemanticHighlightings> Highlights) {
+          Result.emplace(std::move(Highlights));
+          Done.notify();
+        });
+    Done.wait();
+    return std::move(*Result);
+  };
+
+  runAddDocument(Server, Main, MainContents);
+  auto Before = Highlight();
+  ASSERT_TRUE(bool(Before)) << Before.takeError();
+  EXPECT_FALSE(Before->Approximate);
+
+  FS.Files[Types] = "typedef unsigned long long uint64;\ntypedef int int32;";
+  FS.Timestamps[Types] = time_t(2);
+  DidChangeWatchedFilesParams Params;
+  Params.changes.push_back({URIForFile::canonicalize(Types, ""),
+                            FileChangeType::Changed});
+  Server.onFileEvent(Params);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  auto After = Highlight();
+  ASSERT_TRUE(bool(After)) << After.takeError();
+  EXPECT_FALSE(After->Approximate);
+}
+
+// When a compilation database lists the command that was guessed for a file,
+// its highlightings stop being approximate, and clients are asked to request
+// them again although the preamble is unchanged.
+TEST(ClangdServerTest, RefreshesHighlightingsWhenCommandIsNoLongerGuessed) {
+  static std::string Main = testPath("main.cpp");
+  struct GuessingCDB : public GlobalCompilationDatabase {
+    std::optional<tooling::CompileCommand>
+    getCompileCommand(PathRef File) const override {
+      auto Cmd = getFallbackCommand(File);
+      Cmd.Heuristic = Guessed ? "inferred from other.cpp" : "";
+      return Cmd;
+    }
+    std::atomic<bool> Guessed = true;
+  } CDB;
+  struct CountRefreshes : public ClangdServer::Callbacks {
+    void onSemanticsMaybeChanged(PathRef File) override {
+      if (File == Main)
+        ++Refreshes;
+    }
+    std::atomic<int> Refreshes = 0;
+  } Callbacks;
+  MockFS FS;
+  auto Opts = ClangdServer::optsForTest();
+  Opts.ContextProvider = [](PathRef) {
+    // Files are parsed with guessed commands.
+    Config Cfg;
+    Cfg.CompileFlags.CompileHeadersInContext = false;
+    return Context::current().derive(Config::Key, std::move(Cfg));
+  };
+  ClangdServer Server(CDB, FS, Opts, &Callbacks);
+
+  auto Highlight = [&] {
+    std::optional<llvm::Expected<ClangdServer::SemanticHighlightings>> Result;
+    Notification Done;
+    Server.semanticHighlights(
+        Main,
+        [&](llvm::Expected<ClangdServer::SemanticHighlightings> Highlights) {
+          Result.emplace(std::move(Highlights));
+          Done.notify();
+        });
+    Done.wait();
+    return std::move(*Result);
+  };
+
+  const char *Contents = "int Value;\n";
+  runAddDocument(Server, Main, Contents);
+  auto Guessed = Highlight();
+  ASSERT_TRUE(bool(Guessed)) << Guessed.takeError();
+  EXPECT_TRUE(Guessed->Approximate);
+
+  CDB.Guessed = false;
+  int Before = Callbacks.Refreshes;
+  runAddDocument(Server, Main, Contents);
+  ASSERT_TRUE(Server.blockUntilIdleForTest());
+  EXPECT_GT(Callbacks.Refreshes, Before);
+  auto Listed = Highlight();
+  ASSERT_TRUE(bool(Listed)) << Listed.takeError();
+  EXPECT_FALSE(Listed->Approximate);
 }
 
 TEST(ClangdServerTest, PropagatesVersion) {

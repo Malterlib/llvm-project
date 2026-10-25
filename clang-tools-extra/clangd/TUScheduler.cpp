@@ -529,9 +529,10 @@ public:
   /// are multiple update requests while building a preamble, only the last one
   /// will be built.
   void update(std::unique_ptr<CompilerInvocation> CI, ParseInputs PI,
-              std::vector<Diag> CIDiags, WantDiagnostics WantDiags) {
+              std::vector<Diag> CIDiags, WantDiagnostics WantDiags,
+              uint64_t Generation) {
     Request Req = {std::move(CI), std::move(PI), std::move(CIDiags), WantDiags,
-                   Context::current().clone()};
+                   Context::current().clone(), Generation};
     if (RunSync) {
       build(std::move(Req));
       Status.update([](TUStatus &Status) {
@@ -675,6 +676,8 @@ private:
     std::vector<Diag> CIDiags;
     WantDiagnostics WantDiags;
     Context Ctx;
+    /// The ASTWorker's generation of the update that requested the preamble.
+    uint64_t Generation;
   };
 
   bool isDone() {
@@ -806,7 +809,8 @@ public:
   /// the same order as update requests.
   void updatePreamble(std::unique_ptr<CompilerInvocation> CI, ParseInputs PI,
                       std::shared_ptr<const PreambleData> Preamble,
-                      std::vector<Diag> CIDiags, WantDiagnostics WantDiags);
+                      std::vector<Diag> CIDiags, WantDiagnostics WantDiags,
+                      uint64_t Generation);
 
   /// Returns compile command from the current file inputs.
   tooling::CompileCommand getCurrentCompileCommand() const;
@@ -940,6 +944,22 @@ private:
   /// std::nullopt means no builds yet, null means there was an error while
   /// building. Only written by ASTWorker's thread.
   std::optional<std::shared_ptr<const PreambleData>> LatestPreamble;
+  /// Updates are counted in generations, to tell whether LatestPreamble misses
+  /// changes to the files it depends on or to the compile command, which unlike
+  /// edits to this file can't be patched: it does while an update later than
+  /// the one it was built or reused for found such changes. Only accessed by
+  /// ASTWorker's thread.
+  uint64_t UpdateGeneration = 0;
+  /// The last update that found the files the preamble depends on, or the
+  /// compile command, changed.
+  uint64_t StaleGeneration = 0;
+  /// The update LatestPreamble was built or reused for.
+  uint64_t PreambleGeneration = 0;
+  /// The files updates reported changed, by the generation of the update,
+  /// until the preamble is built or reused for that update or a later one.
+  std::vector<std::pair<uint64_t, std::shared_ptr<const llvm::StringSet<>>>>
+      ReportedChanges;
+  bool isPreambleStale() const { return StaleGeneration > PreambleGeneration; }
   std::deque<Request> PreambleRequests; /* GUARDED_BY(Mutex) */
   /// Signaled whenever LatestPreamble changes state or there's a new
   /// PreambleRequest.
@@ -1199,9 +1219,19 @@ void ASTWorker::scheduleUpdate(ParseInputs Inputs, WantDiagnostics WantDiags,
       RanASTCallback = false;
     }
 
-    // Update current inputs so that subsequent reads can see them.
+    // Update current inputs so that subsequent reads can see them. A guessed
+    // command makes the semantic highlightings approximate, which can change
+    // without the preamble changing, such as when a compilation database lists
+    // the guessed command. Before the first preamble, its publication tells.
+    auto IsGuessed = [](const ParseInputs &Inputs) {
+      return !Inputs.ProxyCompileCommand &&
+             !Inputs.CompileCommand.Heuristic.empty();
+    };
+    bool GuessChanged;
     {
       std::lock_guard<std::mutex> Lock(Mutex);
+      GuessChanged = LatestPreamble.has_value() &&
+                     IsGuessed(FileInputs) != IsGuessed(Inputs);
       FileInputs = Inputs;
     }
 
@@ -1246,19 +1276,28 @@ void ASTWorker::scheduleUpdate(ParseInputs Inputs, WantDiagnostics WantDiags,
 
     // Inform preamble peer, before attempting to build diagnostics so that they
     // can be built concurrently.
+    uint64_t Generation = ++UpdateGeneration;
+    if (Inputs.ChangedFiles && !Inputs.ChangedFiles->empty())
+      ReportedChanges.emplace_back(Generation, Inputs.ChangedFiles);
     PreamblePeer.update(std::make_unique<CompilerInvocation>(*Invocation),
-                        Inputs, CompilerInvocationDiags, WantDiags);
+                        Inputs, CompilerInvocationDiags, WantDiags, Generation);
+
+    // With RunSync, the preamble was already rebuilt above. A change found
+    // here, such as one reported by a file event, keeps the preamble stale
+    // until one built or reused for this update or a later one is published,
+    // also when later updates don't report it again.
+    if (PreambleGeneration < Generation && LatestPreamble && *LatestPreamble &&
+        preambleDependenciesChanged(**LatestPreamble, Inputs, FileName,
+                                    *Invocation))
+      StaleGeneration = Generation;
 
     // Emit diagnostics from (possibly) stale preamble while waiting for a
     // rebuild. Newly built preamble cannot emit diagnostics before this call
     // finishes (ast callbacks are called from astpeer thread), hence we
     // guarantee eventual consistency.
     if (LatestPreamble && WantDiags != WantDiagnostics::No) {
-      // With RunSync, the preamble was already rebuilt above.
       if (!RunSync &&
-          (*LatestPreamble ? preambleDependenciesChanged(
-                                 **LatestPreamble, Inputs, FileName,
-                                 *Invocation)
+          (*LatestPreamble ? isPreambleStale()
                            // Without the preamble built from the including
                            // file, a header parsed in context has none of it.
                            : Inputs.ProxyCompileCommand.has_value())) {
@@ -1280,8 +1319,9 @@ void ASTWorker::scheduleUpdate(ParseInputs Inputs, WantDiagnostics WantDiags,
       }
     }
     // Semantics are otherwise only refreshed when the preamble changes, which
-    // a rebuild for changes outside the preamble doesn't.
-    if (RebuildAST)
+    // a rebuild for changes outside the preamble doesn't, and neither does a
+    // change of whether the command is guessed.
+    if (RebuildAST || GuessChanged)
       Callbacks.onPreamblePublished(FileName);
 
     std::unique_lock<std::mutex> Lock(Mutex);
@@ -1338,7 +1378,7 @@ void ASTWorker::runWithAST(
       return Action(error(llvm::errc::invalid_argument, "invalid AST"));
     vlog("ASTWorker running {0} on version {2} of {1}", Name, FileName,
          FileInputs.Version);
-    Action(InputsAndAST{FileInputs, **AST});
+    Action(InputsAndAST{FileInputs, **AST, isPreambleStale()});
   };
   startTask(Name, std::move(Task), /*Update=*/std::nullopt, Invalidation);
 }
@@ -1388,7 +1428,7 @@ void PreambleThread::build(Request Req) {
   llvm::scope_exit _([this, &Req, &ReusedPreamble] {
     ASTPeer.updatePreamble(std::move(Req.CI), std::move(Req.Inputs),
                            LatestBuild, std::move(Req.CIDiags),
-                           std::move(Req.WantDiags));
+                           std::move(Req.WantDiags), Req.Generation);
     if (!ReusedPreamble)
       Callbacks.onPreamblePublished(FileName);
   });
@@ -1443,16 +1483,18 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
                                ParseInputs PI,
                                std::shared_ptr<const PreambleData> Preamble,
                                std::vector<Diag> CIDiags,
-                               WantDiagnostics WantDiags) {
+                               WantDiagnostics WantDiags,
+                               uint64_t Generation) {
   llvm::StringLiteral TaskName = "Build AST";
   // Store preamble and build diagnostics with new preamble if requested.
   auto Task = [this, Preamble = std::move(Preamble), CI = std::move(CI),
-               CIDiags = std::move(CIDiags),
-               WantDiags = std::move(WantDiags)]() mutable {
+               CIDiags = std::move(CIDiags), WantDiags = std::move(WantDiags),
+               Generation]() mutable {
     // Update the preamble inside ASTWorker queue to ensure atomicity. As a task
     // running inside ASTWorker assumes internals won't change until it
     // finishes.
-    if (!LatestPreamble || Preamble != *LatestPreamble) {
+    bool Reused = LatestPreamble && Preamble == *LatestPreamble;
+    if (!Reused) {
       ++PreambleBuildCount;
       ++ParseGeneration;
       // Cached AST is no longer valid.
@@ -1466,6 +1508,30 @@ void ASTWorker::updatePreamble(std::unique_ptr<CompilerInvocation> CI,
       else
         LatestPreamble = std::move(Preamble);
     }
+    // The preamble has the changes the updates up to the one it was built or
+    // reused for found, but not those later updates found. Their checks were
+    // against the previous preamble, so it's checked against the changes they
+    // reported and the files on disk, also for files only it depends on.
+    bool WasStale = isPreambleStale();
+    PreambleGeneration = std::max(PreambleGeneration, Generation);
+    if (*LatestPreamble && UpdateGeneration > Generation) {
+      auto Reported = std::make_shared<llvm::StringSet<>>();
+      for (const auto &[ReportGeneration, Files] : ReportedChanges)
+        if (ReportGeneration > Generation)
+          for (const auto &File : *Files)
+            Reported->insert(File.getKey());
+      ParseInputs Latest = FileInputs;
+      Latest.ChangedFiles = std::move(Reported);
+      if (preambleDependenciesChanged(**LatestPreamble, Latest, FileName, *CI))
+        StaleGeneration = std::max(StaleGeneration, UpdateGeneration);
+    }
+    llvm::erase_if(ReportedChanges, [&](const auto &Report) {
+      return Report.first <= PreambleGeneration;
+    });
+    // Publishing a new preamble asks clients to request results again, which
+    // reusing one doesn't.
+    if (Reused && WasStale && !isPreambleStale())
+      Callbacks.onPreamblePublished(FileName);
     // Notify anyone waiting for a preamble.
     PreambleCV.notify_all();
     // Give up our ownership to old preamble before starting expensive AST
