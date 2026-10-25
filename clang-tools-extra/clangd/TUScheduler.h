@@ -42,6 +42,9 @@ unsigned getDefaultAsyncThreadsCount();
 struct InputsAndAST {
   const ParseInputs &Inputs;
   ParsedAST &AST;
+  /// Set when the AST was built with a preamble that misses changes to the
+  /// files it depends on or to the compile command, while a new one is built.
+  bool PreambleStale = false;
 };
 
 struct InputsAndPreamble {

@@ -177,6 +177,13 @@ bool isPreambleCompatible(const PreambleData &Preamble,
                           const ParseInputs &Inputs, PathRef FileName,
                           const CompilerInvocation &CI);
 
+/// Returns true if \p Preamble was built in the context \p Inputs are parsed in:
+/// for a header parsed in the context of an including file, from that file, and
+/// otherwise from the file itself. A header parsed with a preamble of another
+/// context, or with none, lacks the declarations and macros it depends on.
+bool preambleContextMatches(const PreambleData &Preamble,
+                            const ParseInputs &Inputs);
+
 /// Returns true if something \p Preamble was built from changed, other than the
 /// preamble region of the main file: the compile command, or files on disk such
 /// as included headers. Unlike edits to the main file, these changes can't be

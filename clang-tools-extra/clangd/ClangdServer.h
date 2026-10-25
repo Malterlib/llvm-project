@@ -443,8 +443,16 @@ public:
   /// Get all document links in a file.
   void documentLinks(PathRef File, Callback<std::vector<DocumentLink>> CB);
 
-  void semanticHighlights(PathRef File,
-                          Callback<std::vector<HighlightingToken>>);
+  /// The semantic highlightings of a file.
+  struct SemanticHighlightings {
+    std::vector<HighlightingToken> Tokens;
+    /// Set when the highlightings are approximate, as the AST may lack
+    /// declarations and macros the file depends on: when the file was parsed
+    /// with a guessed command, or when a header parsed in the context of an
+    /// including file was parsed without the preamble built from that file.
+    bool Approximate = false;
+  };
+  void semanticHighlights(PathRef File, Callback<SemanticHighlightings>);
 
   /// Describe the AST subtree for a piece of code.
   void getAST(PathRef File, std::optional<Range> R,

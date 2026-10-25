@@ -881,10 +881,8 @@ static bool dependsOnChangedFiles(const PreambleData &Preamble,
   return Depends;
 }
 
-// Whether the preamble was built from the including file that the inputs
-// borrow their command from, or like the inputs from the file itself.
-static bool preambleContextMatches(const PreambleData &Preamble,
-                                   const ParseInputs &Inputs) {
+bool preambleContextMatches(const PreambleData &Preamble,
+                            const ParseInputs &Inputs) {
   if (!Inputs.ProxyCompileCommand)
     return Preamble.ProxyFile.empty();
   return Preamble.ProxyFile == Inputs.ProxyCompileCommand->Filename;

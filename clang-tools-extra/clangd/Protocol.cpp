@@ -1349,8 +1349,11 @@ bool operator==(const SemanticToken &L, const SemanticToken &R) {
 }
 
 llvm::json::Value toJSON(const SemanticTokens &Tokens) {
-  return llvm::json::Object{{"resultId", Tokens.resultId},
+  llvm::json::Object Result{{"resultId", Tokens.resultId},
                             {"data", encodeTokens(Tokens.tokens)}};
+  if (Tokens.approximate)
+    Result["approximate"] = true;
+  return std::move(Result);
 }
 
 llvm::json::Value toJSON(const SemanticTokensEdit &Edit) {
@@ -1366,6 +1369,8 @@ llvm::json::Value toJSON(const SemanticTokensOrDelta &TE) {
     Result["edits"] = *TE.edits;
   if (TE.tokens)
     Result["data"] = encodeTokens(*TE.tokens);
+  if (TE.approximate)
+    Result["approximate"] = true;
   return std::move(Result);
 }
 
