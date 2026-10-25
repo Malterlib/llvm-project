@@ -1634,11 +1634,12 @@ void ClangdLSPServer::onSemanticTokens(const SemanticTokensParams &Params,
   Server->semanticHighlights(
       Params.textDocument.uri.file(),
       [this, File(File.str()), CB(std::move(CB)), Code(Server->getDraft(File))](
-          llvm::Expected<std::vector<HighlightingToken>> HT) mutable {
+          llvm::Expected<ClangdServer::SemanticHighlightings> HT) mutable {
         if (!HT)
           return CB(HT.takeError());
         SemanticTokens Result;
-        Result.tokens = toSemanticTokens(*HT, *Code);
+        Result.tokens = toSemanticTokens(HT->Tokens, *Code);
+        Result.approximate = HT->Approximate;
         {
           std::lock_guard<std::mutex> Lock(SemanticTokensMutex);
           auto &Last = LastSemanticTokens[File];
@@ -1659,12 +1660,13 @@ void ClangdLSPServer::onSemanticTokensDelta(
       Params.textDocument.uri.file(),
       [this, PrevResultID(Params.previousResultId), File(File.str()),
        CB(std::move(CB)), Code(Server->getDraft(File))](
-          llvm::Expected<std::vector<HighlightingToken>> HT) mutable {
+          llvm::Expected<ClangdServer::SemanticHighlightings> HT) mutable {
         if (!HT)
           return CB(HT.takeError());
-        std::vector<SemanticToken> Toks = toSemanticTokens(*HT, *Code);
+        std::vector<SemanticToken> Toks = toSemanticTokens(HT->Tokens, *Code);
 
         SemanticTokensOrDelta Result;
+        Result.approximate = HT->Approximate;
         {
           std::lock_guard<std::mutex> Lock(SemanticTokensMutex);
           auto &Last = LastSemanticTokens[File];
