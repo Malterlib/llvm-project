@@ -1937,6 +1937,10 @@ struct SemanticTokens {
 
   /// The actual tokens.
   std::vector<SemanticToken> tokens; // encoded as a flat integer array.
+
+  /// Whether the tokens are approximate, see
+  /// ClangdServer::SemanticHighlightings. This is a clangd extension.
+  bool approximate = false;
 };
 llvm::json::Value toJSON(const SemanticTokens &);
 
@@ -1978,6 +1982,9 @@ struct SemanticTokensOrDelta {
   std::optional<std::vector<SemanticTokensEdit>> edits;
   /// Set if we computed a fresh set of tokens.
   std::optional<std::vector<SemanticToken>> tokens; // encoded as integer array
+  /// Whether the tokens after the edits are approximate, see
+  /// ClangdServer::SemanticHighlightings. This is a clangd extension.
+  bool approximate = false;
 };
 llvm::json::Value toJSON(const SemanticTokensOrDelta &);
 

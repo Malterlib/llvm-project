@@ -2237,6 +2237,166 @@ TEST_F(TUSchedulerTests, PreservesLastActiveFile) {
   }
 }
 
+// Holds each preamble build after the first once it has parsed the files,
+// until it's released, so that files can change after it read them.
+class HoldPreambles : public ParsingCallbacks {
+public:
+  void onPreambleAST(
+      PathRef, llvm::StringRef, CapturedASTCtx,
+      std::shared_ptr<const include_cleaner::PragmaIncludes>) override {
+    std::unique_lock<std::mutex> Lock(Mu);
+    int Build = ++Built;
+    CV.notify_all();
+    CV.wait(Lock, [&] { return Build <= Released; });
+  }
+
+  // Waits until the given build has parsed the files.
+  bool waitBuilt(int Build) {
+    std::unique_lock<std::mutex> Lock(Mu);
+    return CV.wait_for(Lock, std::chrono::seconds(60),
+                       [&] { return Built >= Build; });
+  }
+
+  void onPreamblePublished(PathRef) override { ++Published; }
+
+  // Lets the builds up to the given one finish.
+  void release(int Build) {
+    {
+      std::lock_guard<std::mutex> Lock(Mu);
+      Released = Build;
+    }
+    CV.notify_all();
+  }
+
+  // How often clients were asked to request results again.
+  std::atomic<int> Published = 0;
+
+private:
+  std::mutex Mu;
+  std::condition_variable CV;
+  int Built = 0;
+  int Released = 1;
+};
+
+// Changes to the files a preamble depends on that keep their sizes and
+// modification times are only known from the reports of them. The preamble
+// misses such a change until one built after the report is published.
+class TUSchedulerReportedChangeTests : public TUSchedulerTests {
+protected:
+  TUSchedulerReportedChangeTests()
+      : Hold(new HoldPreambles), S(CDB, optsForTest(),
+                                   std::unique_ptr<HoldPreambles>(Hold)) {
+    FS.Files[Types] = "typedef int Foo;";
+    FS.Files[Extra] = "typedef int Bar;";
+  }
+  ~TUSchedulerReportedChangeTests() override { Hold->release(INT_MAX); }
+
+  // Changes a file, types.h by default, and reports it with an update.
+  void report(llvm::StringRef NewContents, llvm::StringRef File = "") {
+    std::string Path = File.empty() ? Types : File.str();
+    FS.Files[Path] = NewContents.str();
+    ParseInputs Inputs = getInputs(Main, Contents);
+    auto Changed = std::make_shared<llvm::StringSet<>>();
+    Changed->insert(Path);
+    Inputs.ChangedFiles = std::move(Changed);
+    S.update(Main, Inputs, WantDiagnostics::No);
+  }
+
+  bool isPreambleStale() {
+    bool Stale = false;
+    Notification Done;
+    S.runWithAST("Test", Main, [&](llvm::Expected<InputsAndAST> AST) {
+      EXPECT_TRUE(bool(AST)) << AST.takeError();
+      if (AST)
+        Stale = AST->PreambleStale;
+      Done.notify();
+    });
+    EXPECT_TRUE(Done.wait(timeoutSeconds(60)));
+    return Stale;
+  }
+
+  const std::string Main = testPath("main.cpp"), Types = testPath("types.h"),
+                    Extra = testPath("extra.h");
+  std::string Contents = "#include \"types.h\"\nFoo Value;\n";
+  HoldPreambles *Hold;
+  TUScheduler S;
+};
+
+TEST_F(TUSchedulerReportedChangeTests, EditsKeepThePreambleStale) {
+  S.update(Main, getInputs(Main, Contents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(isPreambleStale());
+
+  report("typedef int Bar;");
+  ASSERT_TRUE(Hold->waitBuilt(2));
+  EXPECT_TRUE(isPreambleStale());
+  // An edit doesn't report the change again.
+  S.update(Main, getInputs(Main, Contents + "int Other;\n"),
+           WantDiagnostics::No);
+  EXPECT_TRUE(isPreambleStale());
+
+  Hold->release(INT_MAX);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(isPreambleStale());
+}
+
+TEST_F(TUSchedulerReportedChangeTests, ChangesDuringABuildAreMissing) {
+  S.update(Main, getInputs(Main, Contents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  report("typedef int Bar;");
+  ASSERT_TRUE(Hold->waitBuilt(2));
+  // The second change to the same file comes after the build read it.
+  report("typedef int Baz;");
+  Hold->release(2);
+  ASSERT_TRUE(Hold->waitBuilt(3));
+  EXPECT_TRUE(isPreambleStale());
+
+  Hold->release(INT_MAX);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(isPreambleStale());
+}
+
+// When a preamble that's reused for an update ends its staleness, clients are
+// asked to request results again, like when a new one is published.
+TEST_F(TUSchedulerReportedChangeTests, ReuseThatEndsStalenessRefreshes) {
+  S.update(Main, getInputs(Main, Contents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  // A change of size, which an update finds on disk too.
+  report("typedef long long Foo;");
+  ASSERT_TRUE(Hold->waitBuilt(2));
+  // The edit finds the preamble stale, and its preamble is the rebuilt one,
+  // reused.
+  S.update(Main, getInputs(Main, Contents + "int Other;\n"),
+           WantDiagnostics::No);
+  EXPECT_TRUE(isPreambleStale());
+  int Before = Hold->Published;
+  Hold->release(INT_MAX);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(isPreambleStale());
+  EXPECT_EQ(Hold->Published - Before, 2);
+}
+
+// A change to a file only the preamble being built depends on, such as a newly
+// included one, leaves it stale when it's published.
+TEST_F(TUSchedulerReportedChangeTests, ChangesToNewDependenciesAreMissing) {
+  S.update(Main, getInputs(Main, Contents), WantDiagnostics::No);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+
+  Contents = "#include \"types.h\"\n#include \"extra.h\"\nFoo Value;\n";
+  S.update(Main, getInputs(Main, Contents), WantDiagnostics::No);
+  ASSERT_TRUE(Hold->waitBuilt(2));
+  report("typedef int Baz;", Extra);
+  Hold->release(2);
+  ASSERT_TRUE(Hold->waitBuilt(3));
+  EXPECT_TRUE(isPreambleStale());
+
+  Hold->release(INT_MAX);
+  ASSERT_TRUE(S.blockUntilIdle(timeoutSeconds(60)));
+  EXPECT_FALSE(isPreambleStale());
+}
+
 TEST_F(TUSchedulerTests, PreambleThrottle) {
   const int NumRequests = 4;
   // Silly throttler that waits for 4 requests, and services them in reverse.
