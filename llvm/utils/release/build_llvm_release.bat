@@ -10,7 +10,7 @@ goto begin
 echo Script for building the LLVM installer on Windows,
 echo used for the releases at https://github.com/llvm/llvm-project/releases
 echo.
-echo Usage: build_llvm_release.bat --version ^<version^> [--x86,--x64, --arm64] [--skip-checkout] [--local-python] [--force-msvc] [--asan] [--stage0-only] [--pgo-only] [--skip-stage0] [--final-stage-only]
+echo Usage: build_llvm_release.bat --version ^<version^> [--x86,--x64, --arm64] [--skip-checkout] [--local-python] [--force-msvc] [--asan] [--stage0-only] [--pgo-only] [--skip-stage0] [--final-stage-only] [--no-pgo]
 echo.
 echo Options:
 echo --version: [required] version to build
@@ -29,6 +29,7 @@ echo --stage0-only: build the stage0 compiler/dependencies and stop
 echo --pgo-only: reuse an existing stage0 compiler/dependencies, generate the PGO profile, and stop before the final stage
 echo --skip-stage0: reuse an existing stage0 compiler/dependencies, then run PGO training and the final stage
 echo --final-stage-only: build the final stage from an existing PGO profile
+echo --no-pgo: build the final stage without a PGO profile, skipping the instrumented build and its training (for iterating on LLVM)
 echo.
 echo Note: At least one variant to build is required.
 echo.
@@ -56,6 +57,7 @@ set stage0-only=
 set pgo-only=
 set skip-stage0=
 set final-stage-only=
+set no-pgo=
 call :parse_args %*
 
 if "%final-stage-only%" == "true" set skip-stage0=true
@@ -72,6 +74,16 @@ if "%version%" == "" (
 if "%arm64%" == "" if "%x64%" == "" if "%x86%" == "" (
     echo nothing to build!
     echo choose one or several variants from: --x86 --x64 --arm64
+    exit /b 1
+)
+
+if "%no-pgo%" == "true" if "%pgo-only%" == "true" (
+    echo --no-pgo can't be combined with --pgo-only.
+    exit /b 1
+)
+
+if "%no-pgo%" == "true" if "%final-stage-only%" == "true" (
+    echo --no-pgo can't be combined with --final-stage-only, which builds from a PGO profile. Use --skip-stage0 --no-pgo.
     exit /b 1
 )
 
@@ -488,7 +500,11 @@ set cmake_flags=%all_cmake_flags:\=/%
 
 if not exist build_%arch% mkdir build_%arch%
 cd build_%arch%
-if "%final-stage-only%" == "true" (
+if "%no-pgo%" == "true" (
+  REM Without a profile the final stage is configured from the common flags alone. -U drops a profile an earlier
+  REM PGO configure of this tree left in its cache.
+  set cmake_profile_flags=-ULLVM_PROFDATA_FILE
+) else if "%final-stage-only%" == "true" (
   if not exist "%build_dir%\build_%arch%\profile.profdata" (
     echo Final stage profile is missing: %build_dir%\build_%arch%\profile.profdata
     echo Run the PGO build first to generate the profile.
