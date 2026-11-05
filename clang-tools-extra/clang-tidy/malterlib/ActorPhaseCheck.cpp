@@ -422,8 +422,9 @@ void ActorPhaseCheck::check(const MatchFinder::MatchResult &Result) {
       Source = Value->IgnoreParenImpCasts();
     }
     const auto *Getter = dyn_cast<CXXMemberCallExpr>(Source);
-    const CXXMethodDecl *Method = Getter ? Getter->getMethodDecl() : nullptr;
-    const FunctionDecl *Definition = Method ? Method->getDefinition() : nullptr;
+    // Of the body that runs (calledDefinition).
+    const FunctionDecl *Definition =
+        Getter ? calledDefinition(Getter) : nullptr;
     const Stmt *Body = Definition ? Definition->getBody() : nullptr;
     // Each of its returns, also through a local reference to the member,
     // `bool const &Alias = m_bStopping; return Alias;`, gives the same one.
@@ -825,7 +826,8 @@ void ActorPhaseCheck::check(const MatchFinder::MatchResult &Result) {
     if (std::optional<unsigned> Phases =
             annotatedPhases(Method, AnnotationActorPhase)) {
       if (!isOwnActorObject(Member->isImplicitAccess() ? nullptr
-                                                  : Member->getBase())) {
+                                                       : Member->getBase(),
+                            &Context)) {
         diag(Member->getMemberLoc(),
              "%0 runs only in the %1 phase%s2 of its actor, but is used here "
              "on another object, which may not be in %select{that phase|those "
@@ -867,7 +869,7 @@ void ActorPhaseCheck::checkPhaseUse(const Expr *Use,
     if (Call && Call->getCallee()->IgnoreParenImpCasts() ==
                     Child->IgnoreParenImpCasts() &&
         Call->getNumArgs() >= 1) {
-      if (!isOwnActorObject(Call->getArg(0))) {
+      if (!isOwnActorObject(Call->getArg(0), &Context)) {
         diag(Use->getBeginLoc(),
              "%0 runs only in the %1 phase%s2 of its actor, but is used here "
              "on another object, which may not be in %select{that phase|those "
@@ -898,7 +900,7 @@ void ActorPhaseCheck::checkPhaseUse(const Expr *Use,
           << (llvm::popcount(Phases) > 1);
       return;
     }
-    if (!isOwnActorObject(Binary->getLHS())) {
+    if (!isOwnActorObject(Binary->getLHS(), &Context)) {
       diag(Use->getBeginLoc(),
            "%0 runs only in the %1 phase%s2 of its actor, but is used here on "
            "another object, which may not be in %select{that phase|those "
@@ -936,125 +938,41 @@ void ActorPhaseCheck::checkPhaseUse(const Expr *Use,
         return Record && isActorClass(Record) ? Record : nullptr;
       };
       // Also what is part of another actor, `&pOther->m_State`, which isn't
-      // in the phase either.
-      // Also through a local alias of it, `auto *pState = &pOther->m_State`,
-      // what it holds where it is given.
-      std::function<bool(const Expr *, int)> OfAnotherActorAt =
-          [&](const Expr *Argument, int Depth) {
-            if (Depth > 16)
-              return false;
-            const Expr *Inner = Argument->IgnoreParenImpCasts();
-            // Also cast, `static_cast<CState *>(&pOther->m_State)`, or either
-            // value of a conditional, `bOwn ? &m_State : &pOther->m_State`.
-            while (const auto *Cast = dyn_cast<ExplicitCastExpr>(Inner))
-              Inner = Cast->getSubExpr()->IgnoreParenImpCasts();
-            // Only the one a constant condition chooses, `true ? &m_State :
-            // &pOther->m_State`.
-            if (const auto *Conditional =
-                    dyn_cast<AbstractConditionalOperator>(Inner)) {
-              if (const Expr *Condition = Conditional->getCond();
-                  !Condition->isValueDependent())
-                if (std::optional<llvm::APSInt> Value =
-                        Condition->getIntegerConstantExpr(Context))
-                  return OfAnotherActorAt(Value->isZero()
-                                              ? Conditional->getFalseExpr()
-                                              : Conditional->getTrueExpr(),
-                                          Depth + 1);
-              return OfAnotherActorAt(Conditional->getTrueExpr(), Depth + 1) ||
-                     OfAnotherActorAt(Conditional->getFalseExpr(), Depth + 1);
-            }
-            if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner)) {
-              const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
-              if (!Local || !Local->hasLocalStorage() ||
-                  isa<ParmVarDecl>(Local))
-                return false;
-              if (Local->getType()->isReferenceType())
-                return Local->getInit() &&
-                       OfAnotherActorAt(Local->getInit(), Depth + 1);
-              if (const Expr *Value = assignedValueAt(Local, Ref))
-                return OfAnotherActorAt(Value, Depth + 1);
-              // Where what it holds there can't be told, `if (bOther) pState
-              // = &pOther->m_State;`, any of what it is made from and
-              // assigned.
-              if (!Local->getType()->isPointerType())
-                return false;
-              if (Local->getInit() &&
-                  OfAnotherActorAt(Local->getInit(), Depth + 1))
-                return true;
-              const auto *Function = dyn_cast_or_null<FunctionDecl>(
-                  Local->getParentFunctionOrMethod());
-              if (!Function || !Function->getBody())
-                return false;
-              for (const auto &Nodes : match(
-                       findAll(binaryOperator(
-                                   isAssignmentOperator(),
-                                   hasLHS(ignoringParenImpCasts(declRefExpr(
-                                       to(varDecl(equalsNode(Local)))))))
-                                   .bind("assign")),
-                       *Function->getBody(), Context))
-                if (OfAnotherActorAt(
-                        Nodes.getNodeAs<BinaryOperator>("assign")->getRHS(),
-                        Depth + 1))
-                  return true;
-              return false;
-            }
-            // Moved along, `&_pOther->m_State + 0`, it points into the same.
-            if (const auto *Offset = dyn_cast<BinaryOperator>(Inner);
-                Offset && Offset->isAdditiveOp() &&
-                Offset->getType()->isPointerType())
-              return OfAnotherActorAt(
-                  Offset->getLHS()->getType()->isPointerType()
-                      ? Offset->getLHS()
-                      : Offset->getRHS(),
-                  Depth + 1);
-            if (const auto *Address = dyn_cast<UnaryOperator>(Inner);
-                Address && Address->getOpcode() == UO_AddrOf) {
-              Inner = Address->getSubExpr()->IgnoreParenImpCasts();
-              // The address of what a pointer points to, `&*pState`, is the
-              // pointer, and of what a local reference refers to, `&State`,
-              // the address of that.
-              if (const auto *Deref = dyn_cast<UnaryOperator>(Inner);
-                  Deref && Deref->getOpcode() == UO_Deref)
-                return OfAnotherActorAt(Deref->getSubExpr(), Depth + 1);
-              if (const auto *Ref = dyn_cast<DeclRefExpr>(Inner))
-                if (const auto *Alias = dyn_cast<VarDecl>(Ref->getDecl());
-                    Alias && Alias->hasLocalStorage() &&
-                    Alias->getType()->isReferenceType() && Alias->getInit())
-                  Inner = Alias->getInit()->IgnoreParenImpCasts();
-            }
-            // What a member function of it gives back, a pointer or a
-            // reference into it, `_pOther->f_GetData()`.
-            if (const auto *Getter = dyn_cast<CXXMemberCallExpr>(Inner);
-                Getter && Getter->getImplicitObjectArgument() &&
-                (Getter->getType()->isPointerType() || Getter->isGLValue())) {
-              const Expr *Object = Getter->getImplicitObjectArgument();
-              if (ActorOf(Object->getType()))
-                return !isOwnActorObject(Object);
-              Inner = Object->IgnoreParenImpCasts();
-            }
-            // Also an element of an array member, `&_pOther->m_States[0]`.
-            for (int Level = 0; Level < 64; ++Level) {
-              if (const auto *Member = dyn_cast<MemberExpr>(Inner)) {
-                if (ActorOf(Member->getBase()->getType()))
-                  return !isOwnActorObject(Member->getBase());
-                Inner = Member->getBase()->IgnoreParenImpCasts();
-              } else if (const auto *Element =
-                             dyn_cast<ArraySubscriptExpr>(Inner);
-                         Element && Element->getBase()
-                                        ->IgnoreParenImpCasts()
-                                        ->getType()
-                                        ->isConstantArrayType())
-                Inner = Element->getBase()->IgnoreParenImpCasts();
-              else
-                break;
-            }
-            return false;
-          };
+      // in the phase either, also through a local alias of it, `auto *pState
+      // = &pOther->m_State`, a cast, a comma, either value of a conditional,
+      // or the one a constant condition chooses, and what a member function
+      // of it gives a pointer or reference to, `pOther->f_GetData()`: what
+      // is in an actor (objectRelation), held by value or within, not through
+      // a pointer it holds, that isn't in the own one.
+      // Not a local pointer to an actor, whose storage is the local's, not
+      // the actor's, `fg_Reset(&pLocal)`: what it points to is what it was
+      // pointed to, followed from its values.
+      // Of each alternative, through casts, commas, conditionals, also by a
+      // constant condition, local aliases and what helpers give back, as
+      // objectRelation follows them, relative to another actor only: an
+      // object of an actor that isn't the own one (isOwnActorObject), so
+      // that the own object and what is no actor's, `b ? &m_State : &Local`,
+      // aren't another's, also as `static_cast<CState *>(...)` or through
+      // `auto *pState = ...`.
       auto OfAnotherActor = [&](const Expr *Argument) {
-        return OfAnotherActorAt(Argument, 0);
+        const CObjectRelation OfOther = pointeeRelation(
+            Argument,
+            [&](const Expr *E) {
+              if (const auto *Ref = dyn_cast<DeclRefExpr>(E))
+                if (const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
+                    Local && Local->hasLocalStorage() &&
+                    !isa<ParmVarDecl>(Local) &&
+                    Local->getType()->isPointerType())
+                  return false;
+              return ActorOf(E->getType()) != nullptr &&
+                     !isOwnActorObject(E, &Context);
+            },
+            &Context);
+        return OfOther.Kind != EObjectRelation::Unrelated &&
+               !OfOther.bThroughPointer && !isCopyStorage(OfOther);
       };
       for (const Expr *Argument : Call->arguments()) {
-        if (ActorOf(Argument->getType()) ? isOwnActorObject(Argument)
+        if (ActorOf(Argument->getType()) ? isOwnActorObject(Argument, &Context)
                                          : !OfAnotherActor(Argument))
           continue;
         diag(Argument->getBeginLoc(),
@@ -3247,7 +3165,7 @@ void ActorPhaseCheck::checkChange(const Expr *Site, const Expr *Object,
       if (const auto *Member = Node.get<FieldDecl>()) {
         const auto *FieldClass = cast<CXXRecordDecl>(Field->getParent());
         const auto *Class = dyn_cast<CXXRecordDecl>(Member->getParent());
-        if (Class && isOwnActorObject(Object) && !Deferred &&
+        if (Class && isOwnActorObject(Object, &Context) && !Deferred &&
             (Class->getCanonicalDecl() == FieldClass->getCanonicalDecl() ||
              derivesFrom(Class, FieldClass) || isHeldByThis(Object)))
           return;
@@ -3270,10 +3188,11 @@ void ActorPhaseCheck::checkChange(const Expr *Site, const Expr *Object,
   // on the object being constructed or destroyed, also of a base of its
   // class, or of what it holds by value, `m_State.m_Items`, which are parts of
   // it.
-  if (const auto *Method = dyn_cast<CXXMethodDecl>(Enclosing);
+  // None outside a function, a default member initializer.
+  if (const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Enclosing);
       Method &&
       (isa<CXXConstructorDecl>(Method) || isa<CXXDestructorDecl>(Method)) &&
-      isOwnActorObject(Object) && !Deferred) {
+      isOwnActorObject(Object, &Context) && !Deferred) {
     const CXXRecordDecl *Class = Method->getParent();
     const auto *FieldClass = cast<CXXRecordDecl>(Field->getParent());
     if (Class->getCanonicalDecl() == FieldClass->getCanonicalDecl() ||
@@ -3282,7 +3201,8 @@ void ActorPhaseCheck::checkChange(const Expr *Site, const Expr *Object,
   }
   const unsigned EntryPhases = Phases & ~ActorPhase_Owner;
   const unsigned Current = contextPhases(Enclosing);
-  if (Current && !(Current & ~EntryPhases) && isOwnActorObject(Object))
+  if (Current && !(Current & ~EntryPhases) &&
+      isOwnActorObject(Object, &Context))
     return;
   // The call that added the entry with a fresh key removes it by that key.
   if ((Phases & ActorPhase_Owner) &&

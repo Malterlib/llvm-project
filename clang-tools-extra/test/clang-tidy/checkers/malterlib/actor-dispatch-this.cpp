@@ -2389,3 +2389,125 @@ struct CApp : CActor {
 #undef DChain
 #undef DLink
 }
+
+// What a copy of an entry holds by value is its own, not the actor's, also
+// when the entry holds a pointer.
+namespace NCopiedEntry
+{
+	template <typename t_CValue>
+	struct TCEntries
+	{
+		t_CValue &operator[](int _Key);
+		void f_Remove(int _Key);
+	};
+
+	struct CEntry
+	{
+		int m_Value;
+		int *m_pExternal;
+	};
+
+	struct CCopyActor : CActor
+	{
+		TCEntries<CEntry> mp_Items;
+		TCActor<> mp_Other;
+
+		TCFuture<int> f_Copy()
+		{
+			auto Copy = mp_Items[0];
+			co_return co_await (g_Dispatch(mp_Other) / [pValue = &Copy.m_Value] { return *pValue; });
+		}
+	};
+}
+
+// What a unique owning pointer member of the actor owns is the actor's own
+// internal object, also when the owner keeps its pointer in a class in it and
+// has a member that clears it, like `TCUniquePointer`, given to helpers as
+// the own object.
+namespace NOwnedInternal
+{
+	template <typename t_CType>
+	struct TCUniquePointer
+	{
+	public:
+		TCUniquePointer();
+		TCUniquePointer(TCUniquePointer &&_Other);
+		TCUniquePointer(TCUniquePointer const &_Other) = delete;
+		~TCUniquePointer();
+		t_CType &operator * () const
+		{
+			return *m_Data.m_pPointTo;
+		}
+		t_CType *operator -> () const
+		{
+			return m_Data.m_pPointTo;
+		}
+		void f_Clear();
+	private:
+		struct CData
+		{
+			t_CType *m_pPointTo;
+		};
+		CData m_Data;
+	};
+
+	struct CManagerInternal;
+
+	struct CConnection
+	{
+		void f_Destroy(char const *_pMessage, CManagerInternal &_This, int *_pPromise);
+		void f_Reset(bool _bClose, CManagerInternal &_This, char const *_pReason);
+	};
+
+	template <typename t_CValue>
+	struct TCList
+	{
+		t_CValue *begin();
+		t_CValue *end();
+		void f_Clear();
+	};
+
+	struct CManagerInternal : public CActorInternal
+	{
+		TCList<CConnection *> m_ClientConnections;
+		TCList<CConnection *> m_ServerConnections;
+		CConnection m_Connection;
+
+		static TCFuture<int> fs_Cleanup(CManagerInternal *_pThis, int _Count);
+	};
+
+	void fg_SetCloseData(void *_pHandle, CManagerInternal *_pData);
+
+	struct CManager : public CActor
+	{
+		~CManager()
+		{
+			auto &Internal = *mp_pInternal;
+
+			for (auto &pConnection : Internal.m_ClientConnections)
+				pConnection->f_Destroy("", Internal, nullptr);
+			for (auto &pConnection : Internal.m_ServerConnections)
+				pConnection->f_Destroy("", Internal, nullptr);
+		}
+
+		void f_Reconnect()
+		{
+			auto &Internal = *mp_pInternal;
+			Internal.m_Connection.f_Reset(false, Internal, "Reconnect");
+		}
+
+		TCFuture<int> f_Cleanup()
+		{
+			auto &Internal = *mp_pInternal;
+			co_return co_await CManagerInternal::fs_Cleanup(&Internal, 1);
+		}
+
+		void f_Open(void *_pHandle)
+		{
+			auto &Internal = *mp_pInternal;
+			fg_SetCloseData(_pHandle, &Internal);
+		}
+
+		TCUniquePointer<CManagerInternal> mp_pInternal;
+	};
+}

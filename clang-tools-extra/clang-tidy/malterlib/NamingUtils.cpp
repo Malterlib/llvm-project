@@ -3534,6 +3534,56 @@ bool isInDiscardedBranch(const DynTypedNode &Node, ASTContext &Context) {
   return false;
 }
 
+bool hasUnevaluatedOperands(const Stmt *S) {
+  if (!S)
+    return false;
+  // But the size of a variable length array, which is told at run time, not
+  // its alignment.
+  if (const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(S))
+    return Trait->getKind() != UETT_SizeOf || Trait->isArgumentType() ||
+           !Trait->getArgumentExpr()->getType()->isVariableArrayType();
+  if (isa<CXXNoexceptExpr, CXXUuidofExpr, TypeTraitExpr, ArrayTypeTraitExpr,
+          ExpressionTraitExpr, RequiresExpr, ConceptSpecializationExpr>(S))
+    return true;
+  if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S))
+    return !Typeid->isPotentiallyEvaluated();
+  // Not `__builtin_dynamic_object_size`, which clang marks so but whose
+  // operand is evaluated where the size is told at run time.
+  if (const auto *Call = dyn_cast<CallExpr>(S))
+    if (const unsigned Builtin = Call->getBuiltinCallee(); Builtin != 0)
+      return Builtin == Builtin::BI__builtin_assume ||
+             Builtin == Builtin::BI__assume ||
+             (Builtin != Builtin::BI__builtin_dynamic_object_size &&
+              Call->getCalleeDecl()->getASTContext().BuiltinInfo.isUnevaluated(
+                  Builtin));
+  return false;
+}
+
+bool isUnevaluatedOperandOf(const DynTypedNode &Current,
+                            const DynTypedNode &Parent) {
+  if (Parent.get<TypeLoc>())
+    return true;
+  const auto *E = Parent.get<Expr>();
+  if (!E)
+    return false;
+  const auto *Child = Current.get<Expr>();
+  // Not the callee of a builtin, which is no operand.
+  if (hasUnevaluatedOperands(E) &&
+      !(isa<CallExpr>(E) && Child == cast<CallExpr>(E)->getCallee()))
+    return true;
+  // An arm that isn't chosen, of `__builtin_choose_expr` or `_Generic`,
+  // and their conditions, which are told at compile time.
+  if (const auto *Choose = dyn_cast<ChooseExpr>(E);
+      Choose && !Choose->isConditionDependent() &&
+      Child != Choose->getChosenSubExpr())
+    return true;
+  if (const auto *Selection = dyn_cast<GenericSelectionExpr>(E);
+      Selection && !Selection->isResultDependent() &&
+      Child != Selection->getResultExpr())
+    return true;
+  return false;
+}
+
 bool isInUnevaluatedOperand(const DynTypedNode &Node, ASTContext &Context) {
   // Each path up, past nodes with several parents, like the expressions an
   // instantiation shares with its template, and a default argument its uses
@@ -3541,45 +3591,6 @@ bool isInUnevaluatedOperand(const DynTypedNode &Node, ASTContext &Context) {
   // of a default argument than one in a `decltype` evaluates it.
   llvm::SmallVector<DynTypedNode, 8> Work{Node};
   llvm::SmallPtrSet<const void *, 16> Seen;
-  // Whether the node a path is at is in an unevaluated operand as its parent.
-  auto Unevaluated = [&](const DynTypedNode &Current,
-                         const DynTypedNode &Parent) {
-    if (Parent.get<TypeLoc>())
-      return true;
-    const auto *E = Parent.get<Expr>();
-    if (!E)
-      return false;
-    if (isa<CXXNoexceptExpr, RequiresExpr>(E))
-      return true;
-    if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(E);
-        Typeid && !Typeid->isPotentiallyEvaluated())
-      return true;
-    if (const auto *Trait = dyn_cast<UnaryExprOrTypeTraitExpr>(E);
-        Trait &&
-        (Trait->getKind() == UETT_SizeOf || Trait->getKind() == UETT_AlignOf))
-      return true;
-    // An arm that isn't chosen, of `__builtin_choose_expr` or `_Generic`,
-    // and their conditions, which are told at compile time.
-    const auto *Child = Current.get<Expr>();
-    if (const auto *Choose = dyn_cast<ChooseExpr>(E);
-        Choose && !Choose->isConditionDependent() &&
-        Child != Choose->getChosenSubExpr())
-      return true;
-    if (const auto *Selection = dyn_cast<GenericSelectionExpr>(E);
-        Selection && !Selection->isResultDependent() &&
-        Child != Selection->getResultExpr())
-      return true;
-    // What a builtin only looks at the type or constness of,
-    // `__builtin_constant_p(Value)`, but not
-    // `__builtin_dynamic_object_size`, which can evaluate it.
-    if (const auto *Call = dyn_cast<CallExpr>(E);
-        Call &&
-        (Call->getBuiltinCallee() == Builtin::BI__builtin_constant_p ||
-         Call->getBuiltinCallee() == Builtin::BI__builtin_object_size) &&
-        Child != Call->getCallee())
-      return true;
-    return false;
-  };
   for (int Steps = 0; !Work.empty() && Steps < 4096; ++Steps) {
     const DynTypedNode Current = Work.pop_back_val();
     bool Continues = false;
@@ -3594,7 +3605,7 @@ bool isInUnevaluatedOperand(const DynTypedNode &Node, ASTContext &Context) {
           (Parameter->getDefaultArg() == Current.get<Expr>() ||
            Parameter->getInit() == Current.get<Expr>()))
         continue;
-      if (Unevaluated(Current, Parent)) {
+      if (isUnevaluatedOperandOf(Current, Parent)) {
         Ends = true;
         continue;
       }
@@ -3622,18 +3633,7 @@ hasOverloadedOperator(const CXXRecordDecl *Record,
   return hasOverloadedOperator(Record, Operators, Visited);
 }
 
-bool isUnevaluatedNode(const Stmt *S) {
-  if (isa_and_nonnull<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr, RequiresExpr>(
-          S))
-    return true;
-  if (const auto *Typeid = dyn_cast_or_null<CXXTypeidExpr>(S))
-    return !Typeid->isPotentiallyEvaluated();
-  const auto *Call = dyn_cast_or_null<CallExpr>(S);
-  return Call &&
-         (Call->getBuiltinCallee() == Builtin::BI__builtin_constant_p ||
-          Call->getBuiltinCallee() == Builtin::BI__builtin_object_size ||
-          Call->getBuiltinCallee() == Builtin::BI__builtin_dynamic_object_size);
-}
+bool isUnevaluatedNode(const Stmt *S) { return hasUnevaluatedOperands(S); }
 
 bool onlyReadsParameter(const FunctionDecl *Function, unsigned iParameter,
                         int Depth) {

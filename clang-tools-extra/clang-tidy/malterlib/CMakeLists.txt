@@ -15,6 +15,7 @@ add_clang_library(clangTidyMalterlibModule STATIC
   CoroutineLambdaCallCheck.cpp
   CoroutineReferenceCaptureCheck.cpp
   CoroutineReferenceParameterCheck.cpp
+  CoroutineThreadLocalReferenceCheck.cpp
   CoroutineUnsafeThisCheck.cpp
   CoroutineUtils.cpp
   FunctionNamingCheck.cpp
@@ -30,6 +31,8 @@ add_clang_library(clangTidyMalterlibModule STATIC
   RunsToCompletion.cpp
   RunsToCompletionCheck.cpp
   StructNotClassCheck.cpp
+  ThreadLocalStorageCheck.cpp
+  ThreadLocalUtils.cpp
   TypeNamingCheck.cpp
   UnusedParameterCastCheck.cpp
   VariableNamingCheck.cpp

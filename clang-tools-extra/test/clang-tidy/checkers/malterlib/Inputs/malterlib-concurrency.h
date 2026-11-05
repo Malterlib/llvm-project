@@ -93,7 +93,7 @@ namespace NMib::NConcurrency
 	template <typename t_CType, ECoroutineFlag t_Flags>
 	struct TCFutureWithFlags
 	{
-		struct promise_type
+		struct CPromise
 		{
 			TCFutureWithFlags get_return_object();
 			std::suspend_never initial_suspend();
@@ -126,7 +126,7 @@ namespace NMib::NConcurrency
 	template <typename t_CType>
 	struct TCFuture : TCFutureWithFlags<t_CType, ECoroutineFlag_None>
 	{
-		struct promise_type
+		struct CPromise
 		{
 			TCFuture get_return_object();
 			std::suspend_never initial_suspend();
@@ -166,6 +166,27 @@ namespace NMib::NConcurrency
 
 	template <typename t_CType>
 	using TCUnsafeFuture = TCFutureWithFlags<t_CType, ECoroutineFlag_AllowReferences>;
+}
+
+// Like the library's, whose futures have no promise_type of their own: the
+// promise comes from the specializations of std::coroutine_traits.
+namespace std
+{
+	template <typename t_CType, typename ...tp_CArgs>
+	struct coroutine_traits<NMib::NConcurrency::TCFuture<t_CType>, tp_CArgs...>
+	{
+		using promise_type = typename NMib::NConcurrency::TCFuture<t_CType>::CPromise;
+	};
+
+	template <typename t_CType, NMib::NConcurrency::ECoroutineFlag t_Flags, typename ...tp_CArgs>
+	struct coroutine_traits<NMib::NConcurrency::TCFutureWithFlags<t_CType, t_Flags>, tp_CArgs...>
+	{
+		using promise_type = typename NMib::NConcurrency::TCFutureWithFlags<t_CType, t_Flags>::CPromise;
+	};
+}
+
+namespace NMib::NConcurrency
+{
 
 	template <typename t_CActor>
 	struct TCActor;

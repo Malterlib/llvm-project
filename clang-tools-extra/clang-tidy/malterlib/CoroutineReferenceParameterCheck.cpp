@@ -224,7 +224,7 @@ void CoroutineReferenceParameterCheck::checkFunction(
     };
     bool Used = false;
     std::function<void(const Stmt *)> Visit = [&](const Stmt *S) {
-      if (!S || Used || isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+      if (!S || Used || hasUnevaluatedOperands(S))
         return;
       if (AssignedBy.isValid() &&
           SM.isBeforeInTranslationUnit(AssignedBy, S->getBeginLoc()))

@@ -268,7 +268,7 @@ void ActorDispatchThisCheck::reportHelperConstruction(
         Argument->isNullPointerConstant(Context,
                                         Expr::NPC_ValueDependentIsNotNull) ||
         refersToCurrentActorObject(Argument, &Context) ||
-        isOwnActorObject(Argument))
+        isOwnActorObject(Argument, &Context))
       continue;
     const SourceLocation Loc =
         Default ? reportLocationIn(Default->getUsedLocation(),
@@ -780,214 +780,17 @@ void ActorDispatchThisCheck::check(const MatchFinder::MatchResult &Result) {
 
 /// Whether \p E designates, or points to, the storage of the object itself,
 /// like `m_Value`, `&m_Values[0]` or an entry of a collection member,
-/// `m_Map[Key]`, but not what a pointer member points to, like the value of
-/// `mp_pInternal`, which can be of another actor.
-static bool isIntoObject(const Expr *E, const ASTContext *Context = nullptr,
-                         int Depth = 0) {
-  // Past as many steps as the code can have, it may be.
+/// `m_Map[Key]`, also what can't be told apart from them, but not what a
+/// pointer or reference member points to, like the value of `mp_pInternal`,
+/// which can be of another actor, nor a value a member function made from it
+/// (objectRelation).
+static bool isIntoObject(const Expr *E, ASTContext *Context = nullptr) {
   if (!E)
     return false;
-  if (Depth > 1024)
-    return true;
-  // Each read of a local, and each local reference, is followed to its value
-  // once while the outermost question is answered, so that values chosen by
-  // conditionals of copies, `pB = bChoose ? pA : pA`, or of references, `int
-  // &B = bChoose ? A : A`, don't make it exponential.
-  static thread_local llvm::SmallPtrSet<const Expr *, 16> *s_pFollowed =
-      nullptr;
-  std::optional<llvm::SmallPtrSet<const Expr *, 16>> Owned;
-  if (!s_pFollowed)
-    s_pFollowed = &Owned.emplace();
-  const llvm::scope_exit Release([&] {
-    if (Owned)
-      s_pFollowed = nullptr;
-  });
-  E = E->IgnoreParens();
-  if (const auto *Cleanups = dyn_cast<ExprWithCleanups>(E))
-    return isIntoObject(Cleanups->getSubExpr(), Context, Depth + 1);
-  // Either value of a conditional, `bChoose ? &m_Value : &s_Other`, or the
-  // one a constant condition chooses.
-  if (const auto *Conditional = dyn_cast<AbstractConditionalOperator>(E)) {
-    if (bool Chosen = false;
-        Context && !Conditional->getCond()->isValueDependent() &&
-        Conditional->getCond()->EvaluateAsBooleanCondition(Chosen, *Context))
-      return isIntoObject(Chosen ? Conditional->getTrueExpr()
-                                 : Conditional->getFalseExpr(),
-                          Context, Depth + 1);
-    return isIntoObject(Conditional->getTrueExpr(), Context, Depth + 1) ||
-           isIntoObject(Conditional->getFalseExpr(), Context, Depth + 1);
-  }
-  // The condition of `&m_Value ?: &s_Other`, which is its first value.
-  if (const auto *Opaque = dyn_cast<OpaqueValueExpr>(E))
-    return isIntoObject(Opaque->getSourceExpr(), Context, Depth + 1);
-  // Given by reference, like the value of `fg_Exchange(pValue, &m_Value)`.
-  if (const auto *Materialize = dyn_cast<MaterializeTemporaryExpr>(E))
-    return isIntoObject(Materialize->getSubExpr(), Context, Depth + 1);
-  if (const auto *Cast = dyn_cast<CastExpr>(E)) {
-    // The value of a pointer, unless it is a local pointer that is still what
-    // it was made from, `int *pAlias = pValue;`.
-    if (Cast->getCastKind() == CK_LValueToRValue) {
-      // Also what an assignment or a comma gives, `(pValue = &m_Value)`.
-      if (const auto *Binary =
-              dyn_cast<BinaryOperator>(Cast->getSubExpr()->IgnoreParens());
-          Binary &&
-          (Binary->isAssignmentOp() || Binary->getOpcode() == BO_Comma))
-        return isIntoObject(Binary, Context, Depth + 1);
-      const auto *Ref =
-          dyn_cast<DeclRefExpr>(Cast->getSubExpr()->IgnoreParenImpCasts());
-      const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
-      // What it was last assigned where it is read, also when it is changed
-      // after, `int *pCopy = pValue; pValue = nullptr;`.
-      if (!Local || !Local->hasLocalStorage() || isa<ParmVarDecl>(Local) ||
-          !Local->getType()->isPointerType())
-        return false;
-      if (!s_pFollowed->insert(Ref).second)
-        return false;
-      const Expr *Value = assignedValueAt(Local, Ref);
-      return Value && isIntoObject(Value, Context, Depth + 1);
-    }
-    return isIntoObject(Cast->getSubExpr(), Context, Depth + 1);
-  }
-  // A local reference to it, `auto &Value = m_Value;`.
-  if (const auto *Ref = dyn_cast<DeclRefExpr>(E)) {
-    const auto *Local = dyn_cast<VarDecl>(Ref->getDecl());
-    return Local && Local->hasLocalStorage() &&
-           Local->getType()->isReferenceType() && Local->getInit() &&
-           s_pFollowed->insert(Local->getInit()).second &&
-           isIntoObject(Local->getInit(), Context, Depth + 1);
-  }
-  // Its address, `std::addressof(m_Value)`.
-  if (const auto *Call = dyn_cast<CallExpr>(E); isAddressOfCall(Call))
-    return isIntoObject(Call->getArg(0), Context, Depth + 1);
-  // What a free function gives back as it is given it, `fg_Identity(&m_Value)`:
-  // when its body can be seen, what that returns, and else a reference to an
-  // argument of the type it returns, `fg_Const(m_Value)` of `t_CType const
-  // &fg_Const(t_CType const &_Value)`. Each argument is looked at once, which
-  // nested helpers, `fg_Id(fg_Id(...))`, would otherwise make exponential.
-  if (const auto *Free = dyn_cast<CallExpr>(E);
-      Free && !isa<CXXMemberCallExpr, CXXOperatorCallExpr>(Free) &&
-      Free->getDirectCallee()) {
-    const FunctionDecl *Definition = Free->getDirectCallee()->getDefinition();
-    if (Definition && Definition->getBody()) {
-      for (const Expr *Argument : returnedArguments(Free))
-        if (isIntoObject(Argument, Context, Depth + 1))
-          return true;
-      // Also the address of what it is given by reference, `fg_Address(
-      // m_Value)` of `return &_Value;`.
-      for (const Expr *Argument : returnedArguments(Free, /*Addressed=*/true))
-        if (isIntoObject(Argument, Context, Depth + 1))
-          return true;
-      return false;
-    }
-    if (Free->isGLValue())
-      for (unsigned iArgument = 0;
-           iArgument < Free->getNumArgs() &&
-           iArgument < Free->getDirectCallee()->getNumParams();
-           ++iArgument)
-        if (Free->getDirectCallee()
-                ->getParamDecl(iArgument)
-                ->getType()
-                ->isReferenceType() &&
-            Free->getArg(iArgument)->getType().getUnqualifiedType() ==
-                Free->getType().getUnqualifiedType() &&
-            isIntoObject(Free->getArg(iArgument), Context, Depth + 1))
-          return true;
-  }
-  if (isa<CXXThisExpr>(E))
-    return true;
-  // What a member function of it gives a pointer or reference to, like
-  // `mp_Items.f_FindEqual(Key)`.
-  if (const auto *Call = dyn_cast<CXXMemberCallExpr>(E);
-      Call && (Call->getType()->isPointerType() || Call->isGLValue()) &&
-      Call->getImplicitObjectArgument())
-    return isIntoObject(Call->getImplicitObjectArgument(), Context, Depth + 1);
-  // A member of it, also through an unchanged local pointer to it, `auto
-  // *pThis = this; &pThis->m_Value`.
-  // Not a static member, `&this->ms_Value`, which isn't in the object.
-  if (const auto *Member = dyn_cast<MemberExpr>(E))
-    return !isa<VarDecl>(Member->getMemberDecl()) &&
-           isIntoObject(Member->getBase(), Context, Depth + 1);
-  // The last of a comma, `(fg_Log(), &m_Value)`, and what an assignment
-  // gives: of a pointer, the value it assigns, `(pValue = &m_Value)`, or
-  // the one it steps, `(pValue += 1)`, and else what it assigns to, `(m_Value
-  // = 1)`.
-  if (const auto *Binary = dyn_cast<BinaryOperator>(E);
-      Binary && Binary->getOpcode() == BO_Comma)
-    return isIntoObject(Binary->getRHS(), Context, Depth + 1);
-  if (const auto *Binary = dyn_cast<BinaryOperator>(E);
-      Binary && Binary->isAssignmentOp())
-    return isIntoObject(Binary->getOpcode() == BO_Assign &&
-                                Binary->getType()->isPointerType()
-                            ? Binary->getRHS()
-                            : Binary->getLHS(),
-                        Context, Depth + 1);
-  // A member through a pointer to it, `this->*pMember`.
-  if (const auto *Binary = dyn_cast<BinaryOperator>(E);
-      Binary && Binary->isPtrMemOp())
-    return isIntoObject(Binary->getLHS(), Context, Depth + 1);
-  // Further into an array of it, `m_Values + 1`.
-  if (const auto *Binary = dyn_cast<BinaryOperator>(E);
-      Binary && Binary->isAdditiveOp())
-    return isIntoObject(Binary->getLHS()->getType()->isPointerType()
-                            ? Binary->getLHS()
-                            : Binary->getRHS(),
-                        Context, Depth + 1);
-  // Also what a pointer into it points to, `*mp_Items.f_FindEqual(1)`, and
-  // the pointer as it is, `+pValue`.
-  // Also what a prefix increment changes, which it refers to, `++m_Value`.
-  if (const auto *Unary = dyn_cast<UnaryOperator>(E);
-      Unary &&
-      (Unary->getOpcode() == UO_AddrOf || Unary->getOpcode() == UO_Deref ||
-       Unary->getOpcode() == UO_Plus || Unary->getOpcode() == UO_PreInc ||
-       Unary->getOpcode() == UO_PreDec))
-    return isIntoObject(Unary->getSubExpr(), Context, Depth + 1);
-  // And what a postfix one of a pointer gives, where it pointed before,
-  // `pValue++`, like a read of it, but not a copy of a number, `m_Value++`.
-  if (const auto *Unary = dyn_cast<UnaryOperator>(E);
-      Unary && Unary->isPostfix() && Unary->getType()->isPointerType()) {
-    const Expr *Operand = Unary->getSubExpr()->IgnoreParens();
-    const auto *Ref = dyn_cast<DeclRefExpr>(Operand);
-    const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
-    if (!Local || !Local->hasLocalStorage() || isa<ParmVarDecl>(Local) ||
-        !Local->getType()->isPointerType())
-      return isIntoObject(Operand, Context, Depth + 1);
-    if (!s_pFollowed->insert(Ref).second)
-      return false;
-    const Expr *Value = assignedValueAt(Local, Ref);
-    return Value && isIntoObject(Value, Context, Depth + 1);
-  }
-  // An element of an array of it, `m_Values[1]`, or through a pointer into
-  // it, `mp_Items.f_FindEqual(1)[0]`.
-  if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E))
-    return isIntoObject(Subscript->getBase()->IgnoreParenImpCasts(), Context,
-                        Depth + 1);
-  // What a lambda called gives back, also of what it is given, `[](int
-  // &_Value) { return &_Value; }(m_Value)`, not the closure.
-  if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
-      Call && Call->getOperator() == OO_Call && Call->getNumArgs() >= 1)
-    if (const LambdaExpr *Lambda = calledLambda(Call)) {
-      for (const bool Addressed : {false, true})
-        for (const Expr *Argument : returnedArguments(Call, Addressed))
-          if (isIntoObject(Argument, Context, Depth + 1))
-            return true;
-      // Each value it returns once too, also of a lambda called from two
-      // branches, `[&] { return b ? f0() : f0(); }`, which nested ones would
-      // otherwise follow once for each path.
-      for (const Expr *Value : returnedValues(Lambda->getCallOperator()))
-        if (s_pFollowed->insert(Value).second &&
-            isIntoObject(Value, Context, Depth + 1))
-          return true;
-      return false;
-    }
-  // Also what a member that owns or points to it gives, `mp_pInternal->m_Value`
-  // and `*mp_pInternal`, like a pointer member.
-  if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
-      Call && Call->getNumArgs() >= 1 &&
-      (Call->getOperator() == OO_Subscript || Call->getOperator() == OO_Call ||
-       Call->getOperator() == OO_Arrow ||
-       (Call->getOperator() == OO_Star && Call->getNumArgs() == 1)))
-    return isIntoObject(Call->getArg(0), Context, Depth + 1);
-  return false;
+  const CObjectRelation Of = objectRelation(
+      E, [](const Expr *Object) { return isa<CXXThisExpr>(Object); }, Context);
+  return Of.Kind != EObjectRelation::Unrelated && !Of.bThroughPointer &&
+         !isCopyStorage(Of);
 }
 
 /// What the pointer \p Variable that \p Lambda copies can be when it is
@@ -1332,12 +1135,23 @@ actorObjectRootOfUncached(const ValueDecl *Decl, int Depth,
   // member, like `[pInternal = mp_pInternal]`, which can be of another actor,
   // and otherwise, like a local, what its type points to, `[pActor =
   // fg_GetActor()]`.
-  if (Local && Local->isInitCapture())
-    return !isa<MemberExpr>(
-               skipWrappers(Local->getInit())->IgnoreParenImpCasts()) &&
-                   pointedActorClass(Decl->getType())
+  // Nor the address of a local held by value, `[pCopy = &Copy]` of `auto
+  // Copy = *this`, an object of the coroutine's own.
+  if (Local && Local->isInitCapture()) {
+    const Expr *Init = skipWrappers(Local->getInit())->IgnoreParenImpCasts();
+    if (const auto *Address = dyn_cast<UnaryOperator>(Init);
+        Address && Address->getOpcode() == UO_AddrOf)
+      if (const auto *Ref = dyn_cast<DeclRefExpr>(
+              Address->getSubExpr()->IgnoreParenImpCasts()))
+        if (const auto *Held = dyn_cast<VarDecl>(Ref->getDecl());
+            Held && Held->hasLocalStorage() && !isa<ParmVarDecl>(Held) &&
+            !Held->getType()->isReferenceType() &&
+            !Held->getType()->isPointerType())
+          return nullptr;
+    return !isa<MemberExpr>(Init) && pointedActorClass(Decl->getType())
                ? Decl
                : nullptr;
+  }
   // A local pointer assigned in its function, `pValue = &_pActor->m_Value`,
   // can be what any assignment makes it.
   if (Local && Local->hasLocalStorage() && !isa<ParmVarDecl>(Local) &&
@@ -1594,7 +1408,7 @@ void ActorDispatchThisCheck::reportGivenActorObjects(const CallExpr *Call,
     if (Argument->isNullPointerConstant(Context,
                                         Expr::NPC_ValueDependentIsNotNull) ||
         refersToCurrentActorObject(Argument, &Context) ||
-        isOwnActorObject(Argument))
+        isOwnActorObject(Argument, &Context))
       continue;
     const SourceLocation Loc =
         Default ? reportLocationIn(Call->getBeginLoc(), Call->getEndLoc(), SM)

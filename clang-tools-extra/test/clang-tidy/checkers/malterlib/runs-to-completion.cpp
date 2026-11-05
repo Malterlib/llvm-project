@@ -4252,9 +4252,9 @@ namespace std
 	template <>
 	struct coroutine_traits<TCFuture<int>, CRound94Tag>
 	{
-		struct promise_type : TCFuture<int>::promise_type
+		struct promise_type : TCFuture<int>::CPromise
 		{
-			using TCFuture<int>::promise_type::await_transform;
+			using TCFuture<int>::CPromise::await_transform;
 			CAwaiter await_transform(ECoroutineFlag _Flag)
 			{
 				throw 1;

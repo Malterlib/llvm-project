@@ -4509,3 +4509,101 @@ struct CApp : CActor {
   }
 };
 }
+
+// What a copy holds of its own isn't the object of the actor: a copy a
+// function makes of a collection of pointers, whose slots are its own.
+namespace NCopiedStorage
+{
+	template <typename t_CValue>
+	struct TCPointers
+	{
+		t_CValue *m_pData = nullptr;
+
+		TCPointers();
+		TCPointers(TCPointers const &_Other);
+		t_CValue &operator[](int _Index) const;
+		void f_Clear();
+		~TCPointers();
+	};
+
+	template <typename t_CValue>
+	TCPointers<t_CValue> fg_TempCopy(TCPointers<t_CValue> const &_Values);
+
+	struct CCopyActor : CActor
+	{
+		TCPointers<int *> mp_Items;
+		int m_Value = 0;
+
+		TCFuture<int> f_Switch()
+		{
+			auto const &Copy = fg_TempCopy(mp_Items);
+			auto BlockingActorCheckout = fg_BlockingActor();
+			co_await fg_ContinueRunningOnActor(BlockingActorCheckout);
+			co_return Copy[0] != nullptr;
+		}
+	};
+}
+
+// A borrowed member of a local holder given what isn't of the object before
+// it moves, `Holder.m_pValue = &Local`, is used as that.
+namespace NOverwrittenBorrowed
+{
+	struct CHolder
+	{
+		int *m_pValue;
+		int m_Count;
+	};
+
+	struct CHolderActor : CActor
+	{
+		int m_Value = 0;
+
+		TCFuture<int> f_Switch()
+		{
+			int Local = 0;
+			CHolder Holder{&m_Value, 0};
+			Holder.m_pValue = &Local;
+			auto BlockingActorCheckout = fg_BlockingActor();
+			co_await fg_ContinueRunningOnActor(BlockingActorCheckout);
+			co_return *Holder.m_pValue;
+		}
+
+		TCFuture<int> f_SwitchKept()
+		{
+			CHolder Holder{&m_Value, 0};
+			auto BlockingActorCheckout = fg_BlockingActor();
+			co_await fg_ContinueRunningOnActor(BlockingActorCheckout);
+			co_return *Holder.m_pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:14: warning: the object of the actor is used after 'fg_ContinueRunningOnActor' moved the coroutine to another actor, where using it races with its own actor [malterlib-continue-running-on-actor]
+		}
+
+		// Given back through an alias of the member made before, which the
+		// holder isn't named by.
+		TCFuture<int> f_SwitchAliasRestored()
+		{
+			int Local = 0;
+			CHolder Holder{&m_Value, 0};
+			int *&rpValue = Holder.m_pValue;
+			Holder.m_pValue = &Local;
+			rpValue = &m_Value;
+			auto BlockingActorCheckout = fg_BlockingActor();
+			co_await fg_ContinueRunningOnActor(BlockingActorCheckout);
+			co_return *Holder.m_pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:14: warning: the object of the actor is used after 'fg_ContinueRunningOnActor' moved the coroutine to another actor, where using it races with its own actor [malterlib-continue-running-on-actor]
+		}
+
+		// Also through an alias of the holder.
+		TCFuture<int> f_SwitchHolderAliasRestored()
+		{
+			int Local = 0;
+			CHolder Holder{&m_Value, 0};
+			auto &Alias = Holder;
+			Holder.m_pValue = &Local;
+			Alias.m_pValue = &m_Value;
+			auto BlockingActorCheckout = fg_BlockingActor();
+			co_await fg_ContinueRunningOnActor(BlockingActorCheckout);
+			co_return *Holder.m_pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:14: warning: the object of the actor is used after 'fg_ContinueRunningOnActor' moved the coroutine to another actor, where using it races with its own actor [malterlib-continue-running-on-actor]
+		}
+	};
+}

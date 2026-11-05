@@ -9,10 +9,11 @@
 #ifndef LLVM_CLANG_TOOLS_EXTRA_CLANG_TIDY_MALTERLIB_COROUTINEUTILS_H
 #define LLVM_CLANG_TOOLS_EXTRA_CLANG_TIDY_MALTERLIB_COROUTINEUTILS_H
 
+#include "NamingUtils.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
-#include "NamingUtils.h"
 #include "clang/AST/ExprCXX.h"
+#include "clang/Analysis/CFG.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -39,6 +40,42 @@ inline constexpr llvm::StringLiteral AsyncDestroyFunctions[] = {
 /// The blocks of \p Graph that can run: those reachable from its entry,
 /// indexed by block ID.
 llvm::BitVector reachableBlocks(const CFG &Graph);
+
+/// Whether \p S, in \p Body, the body of \p Owner when it is a function,
+/// can run: it is in a block of the control flow of \p Body that can be
+/// reached (reachableBlocks), past edges a constant condition never takes,
+/// also of a handler (addExceptionEdges), not after a return nor in a branch
+/// a constant condition leaves out, `if (false)`. What is in a statement that
+/// can run can, also the body of a lambda; each body is built once. Each can
+/// when the control flow can't be built.
+bool canRunIn(const Stmt *S, const Stmt *Body, const Decl *Owner,
+              ASTContext &Context);
+
+/// The member of the object of \p Function, a member function whose body
+/// can be seen, that \p Target is: a member of `this`, also through an
+/// unchanged local pointer to the object, `auto *pSelf = this;
+/// pSelf->m_pData`, or a local reference to a member, `auto &rpData =
+/// m_pData; rpData`. Null for any other.
+const FieldDecl *assignedMember(const Expr *Target,
+                                const FunctionDecl *Function);
+
+/// The values the local \p Local can hold where \p At is, in its function:
+/// of each definition of it that can reach there in the control flow of the
+/// function (canRunIn), what it is made with and what each assignment to it
+/// assigns, also through a local reference to it, `auto &rpData = pData;
+/// rpData = &t_Data`, each value of a conditional apart, `bFirst ? &First :
+/// &Second`. Of all its definitions when \p At isn't in the control flow, like
+/// in a lambda. None when that can't be told: changed otherwise, `++pData`,
+/// given to what can change it, or its address taken. Each function is
+/// worked out once, and each local in it once.
+std::optional<llvm::SmallVector<const Expr *, 4>>
+localValuesAt(const VarDecl *Local, const Stmt *At);
+
+/// The value a conditional, \p Conditional, can be seen to choose: of a
+/// constant condition, also one \p Context evaluates, as what can run is
+/// told (canRunIn). Null when it can be either.
+const Expr *chosenValue(const AbstractConditionalOperator *Conditional,
+                        ASTContext *Context);
 
 /// The blocks of \p Graph in the order the flow reaches them, each after the
 /// blocks before it that aren't through a back edge, so that propagating what
@@ -70,19 +107,6 @@ const Expr *returnedArgument(const CallExpr *Call);
 /// back something else.
 llvm::SmallVector<const Expr *, 2>
 returnedArgumentChoices(const CallExpr *Call);
-
-/// Whether \p E designates `this` or data reached from it through members,
-/// dereferences, subscripts and member calls, like `*mp_pInternal` or
-/// `mp_Items.f_FindEqual(_Key)`, also through local pointers and references
-/// that do. A new allocation that only reads members does not.
-bool isRootedInThis(const Expr *E);
-
-/// Whether \p E is rooted in `this`, like isRootedInThis, unless
-/// \p ThisIsRoot is false, or in a declaration that \p IsRoot accepts, like a
-/// pointer parameter to the object of an actor.
-bool isRootedIn(const Expr *E,
-                llvm::function_ref<bool(const ValueDecl *)> IsRoot,
-                bool ThisIsRoot = true);
 
 /// Whether \p Function is a coroutine: its body awaits, yields or returns with
 /// `co_return`. Also works for templates, whose bodies are not built as
@@ -140,6 +164,57 @@ inline bool isProtectedCoroutine(const FunctionDecl *Function) {
 /// Whether \p Record is an actor: it derives from `CActor` or
 /// `CActorInternal`.
 bool isActorClass(const CXXRecordDecl *Record);
+
+/// Adds to \p Graph, built without exception edges, which clang can't build
+/// in the condition of a range-based `for` of an iterator, `__begin !=
+/// __end`, an edge to the block that dispatches to the handlers of each
+/// `try` from each block with anything in its block, also in the block of a
+/// `try` in it: what can throw, and which handler catches it, isn't told.
+void addExceptionEdges(CFG &Graph, const ASTContext &Context);
+
+/// A value an aggregate initialization gives, with what it initializes: a
+/// base, \p Base, a member, \p Field, an array element or what fills the
+/// rest of an array, of the element type, or none of them, \p Type null,
+/// past the parts it initializes.
+struct CAggregatePart {
+  const Expr *Init;
+  QualType Type;
+  const FieldDecl *Field = nullptr;
+  bool Base = false;
+};
+
+/// The values the aggregate initialization \p Init gives, braces in their
+/// semantic form or parentheses, each with what it initializes: of an
+/// array, each element and what fills the rest; of a union, the member it
+/// initializes; of a class, its bases first and then its members, not an
+/// unnamed bit-field, which has none. Nothing of what isn't one.
+llvm::SmallVector<CAggregatePart, 4> aggregateParts(const Expr *Init);
+
+/// The value the aggregate initialization \p Init gives the member \p Field
+/// (aggregateParts), or null when it gives none, also of what initializes it
+/// by default, `int *m_pValue = nullptr;`.
+const Expr *aggregateMemberInit(const Expr *Init, const FieldDecl *Field);
+
+/// Whether \p Block dispatches to the handlers of a `try`
+/// (addExceptionEdges), which an exception thrown anywhere in its block
+/// reaches: the analyses join into it the states before and after each
+/// element of the blocks before it that is in that block (inHandlerTry),
+/// not their ends, so that a refresh after what throws doesn't hide what the
+/// throw leaves.
+bool isHandlerDispatch(const CFGBlock *Block);
+
+/// Whether \p Element, in \p Block, is in the block of the `try` of a
+/// handler after it (isHandlerDispatch): the states before and after it are
+/// what the handler gets.
+bool inHandlerTry(const CFGBlock *Block, const CFGElement &Element,
+                  const ASTContext &Context);
+
+/// The argument of \p Call for the parameter \p iParameter of \p Callee,
+/// what it calls: of an operator with an implicit object, after the object,
+/// which is its first argument; of one with an explicit object parameter,
+/// whose object is that parameter, at its index. Null when it has none.
+const Expr *argumentOf(const CallExpr *Call, const FunctionDecl *Callee,
+                       unsigned iParameter);
 
 /// The class whose `this` \p Lambda captures: the class of the member
 /// function it is in, looking through enclosing lambdas.
@@ -223,6 +298,10 @@ bool matchesTypeName(QualType Type, llvm::ArrayRef<StringRef> Patterns,
 /// Whether \p Type is one of the view types of the vocabulary, the types that
 /// refer to data without owning it, like `std::span` and Malterlib's `CStrPtr`.
 bool isDefaultViewType(QualType Type, const ASTContext &Context);
+
+/// Whether \p Type is an owning pointer whose copies share what it points to,
+/// counting references, of SharedPointerTypes, like `TCSharedPointer`.
+bool isSharedPointerType(QualType Type, const ASTContext &Context);
 
 /// The first statement in the body of the coroutine \p Function that
 /// \p IsUse accepts and that can run after the coroutine suspended. What the
@@ -542,15 +621,17 @@ bool hasJumps(const Stmt *S);
 
 /// The children of \p S that can run: of an `if constexpr` whose condition
 /// is known, not the branch it discards, of an `if`, a loop or a `?:` whose
-/// condition is constant, not what it never runs, `if (false)`, and of what
-/// isn't evaluated, like `sizeof(Value)` or `__builtin_constant_p(Value)`,
-/// none.
+/// condition is constant, not what it never runs, `if (false)`, of `&&` or
+/// `||` whose left side is constant and decides it, `false && ...`, not the
+/// right side, and of what isn't evaluated, like `sizeof(Value)`,
+/// `__builtin_constant_p(Value)` or `__builtin_assume(Value)`, none.
 llvm::SmallVector<const Stmt *, 4> evaluatedChildren(const Stmt *S,
                                                      const ASTContext &Context);
 
 /// The same without the context, by the value Sema keeps of the condition of
 /// an `if constexpr`.
 llvm::SmallVector<const Stmt *, 4> evaluatedChildren(const Stmt *S);
+
 
 /// The statements of \p Body, a compound statement, that run each time it
 /// runs: those before the first one that can return, jump or throw, also
@@ -616,7 +697,8 @@ bool isEmptyActor(const Expr *Actor, int Depth = 0);
 /// Whether \p E refers to the object of the code it is in, or the actor that
 /// owns it: `this`, `*this`, a member of a helper object that refers to its
 /// owner, which Malterlib names after `this`, like `m_pThis` or `&mp_This`, or
-/// an unchanged local alias of one of them.
+/// an unchanged local alias of one of them: the object itself by
+/// objectRelation.
 /// With \p Context, an alias that a lambda the use is in copies and changes
 /// is not one.
 bool refersToOwnObject(const Expr *E, ASTContext *Context = nullptr);
@@ -654,6 +736,200 @@ bool refersToCurrentActorObject(const Expr *E, ASTContext *Context = nullptr);
 /// The lambda that \p E is: a lambda expression, a local of its closure
 /// type, or `fg_Move` of one of them. Null otherwise.
 const LambdaExpr *asLambda(const Expr *E);
+
+/// What an expression is relative to an object (objectRelation).
+enum class EObjectRelation {
+  /// Another object, also what doesn't involve it.
+  Unrelated,
+  /// The object itself, also through parentheses, casts of any kind, its
+  /// address or a pointer to it, the temporaries and cleanups around it, both
+  /// values of a conditional that both are, the right of a comma, a move or
+  /// a forward of it, or a local reference or pointer to it.
+  SameObject,
+  /// A member of it, also of a member.
+  Subobject,
+  /// What is in it: an element, what a subscript or a member function of it
+  /// gives by reference or pointer, a local iterator made from it, and what
+  /// is reached from one of these.
+  Entry,
+  /// What is made of it in a way that can't be told.
+  Unknown,
+};
+
+/// What objectRelation tells of an expression.
+struct CObjectRelation {
+  EObjectRelation Kind = EObjectRelation::Unrelated;
+  /// Of a subobject or an entry, the member access that reaches the first
+  /// member from the object, `mp_Items` of `mp_Items[0].m_Value` relative to
+  /// `this`, when there is one.
+  const MemberExpr *Outermost = nullptr;
+  /// Whether it is reached through a pointer or a reference that the object,
+  /// or what is reached from it, holds: a pointer or reference member, or one
+  /// held in an entry, `m_pApp->m_Value` or `mp_Items[0]->m_Value`, or an
+  /// owning pointer to an actor, which has a life of its own. What that
+  /// points to can be another object, unlike what a local pointer or
+  /// reference to it, or a parameter, points to.
+  bool bThroughPointer = false;
+  /// Whether it is a value a member function made from it, which can refer
+  /// into it, like a view or a handle, or be a copy, `mp_Items.f_Copy()`.
+  bool bCopy = false;
+  /// Whether it is in a member of a union, at any depth, also through a local
+  /// alias, whose assignment can end the life of another member of it,
+  /// `int &Slot = mp_Items.m_Empty`.
+  bool bInUnion = false;
+  /// How many collections or owning pointers deep it is, of any kind: 1 for
+  /// an entry of a collection of the object, `mp_Items[0]`, or what an
+  /// owning pointer member owns, `*mp_pData`, 2 for an entry of a collection
+  /// in that, `mp_Items[0].m_Children.f_FindEqual(1)`, or what an owning
+  /// pointer in an entry owns, `*mp_Items[0].m_pData`. The most it can be,
+  /// kept however it is reached, like the flags.
+  unsigned EntryDepth = 0;
+  /// Of those, how many are steps into what is stored, by a reference or a
+  /// pointer, not a value made from what it is in, like a view, a handle or
+  /// an iterator, `mp_Items.f_View()`, which can refer to that itself: what
+  /// a change through it can change is no deeper. The least of what it can
+  /// be.
+  unsigned StoredDepth = 0;
+  /// Whether it is a value made from what it is in that can refer to that
+  /// itself, like a view or a handle, whose `operator->` gives that, not
+  /// what an owning pointer owns one deeper.
+  bool bMadeValue = false;
+  /// Whether, as a pointer, it can be null: a value of a conditional is,
+  /// `bKeep ? this : nullptr`, or it is a `dynamic_cast` to a pointer, which
+  /// gives null when the object isn't of the class, also through what keeps
+  /// what it is made of, like casts, local aliases, `*&pMaybe`, and helpers
+  /// that give back what they are given, `fg_Move(pMaybe)`. When any of what
+  /// it can be can.
+  bool bCanBeNull = false;
+  /// Whether it is what a copy of a shared owner points to, which the copy
+  /// keeps alive (SharedPointerTypes), `*pData` of `auto pData = mp_pData`:
+  /// using it isn't using what can be erased, though what is looked up in it
+  /// can be, and changing it changes what the source points to. When all of
+  /// what it can be are.
+  bool bKeptAlive = false;
+};
+
+/// Whether a value of \p Type can refer to what it was made from: a
+/// reference, a pointer, a view of ViewTypes, an iterator, or a class with
+/// one, also in a base or a member it holds by value, or one that isn't
+/// defined. Not a number, nor a value all its own, a copy.
+bool canReferBack(QualType Type, const ASTContext &Context);
+
+/// Whether \p Type, also of what a pointer or reference to it is, is a
+/// collection: a class, not an iterator, with a member function of
+/// RemovingMethods, also of a base.
+bool isCollectionType(QualType Type);
+
+/// What an owning pointer, \p Type, points to: a class like one, not an
+/// iterator, with `operator->` giving a pointer or `operator*` giving a
+/// reference, also inherited, also an instantiation of a member template,
+/// like a `TCUniquePointer<CItems>`. Null for another type.
+QualType ownedPointee(QualType Type);
+
+// The two levels of a copy. A copy is new at its own level: its storage,
+// its members held by value and its entries are its own (bCopy, isCopyStorage);
+// what its borrowed parts lead to, references, pointers that aren't storage it
+// owns, and what shared owners point to (isBorrowedField, SharedPointerTypes),
+// is what the source's lead to, one level down (objectRelation clears bCopy
+// when it follows one). A mixed object is both, by its fields.
+
+/// Whether pointer member \p Field is storage its object owns: of a
+/// collection that is a class template, not a view, pointing to what isn't a
+/// collection itself, its elements or its nodes, `t_CValue *m_pData`.
+bool isOwnedStoragePointer(const FieldDecl *Field);
+
+/// Whether member \p Field holds what its object only refers to: a
+/// reference, a pointer that isn't owned storage (isOwnedStoragePointer), or
+/// a pointer to a member.
+bool isBorrowedField(const FieldDecl *Field);
+
+/// Whether a value of \p Type has parts that lead to what it doesn't own,
+/// which a copy shares with its source: a reference or pointer, a borrowed
+/// member (isBorrowedField), a shared owner (SharedPointerTypes), a view, an
+/// iterator, a closure, what can't be looked into, a collection of elements
+/// that have such parts, or a class with any of these by value, as a member,
+/// a base or an array element at any depth. Not a unique owner of what has
+/// none, nor a value held inline, like an optional of one.
+bool hasBorrowedParts(QualType Type, const ASTContext &Context);
+
+/// Whether a value of \p Type is independent of what it is made from, so
+/// that a copy of it keeps nothing of that: it has no borrowed parts
+/// (hasBorrowedParts), plain value data, a uniquely owning pointer of what
+/// is independent, or a collection of independent elements, `TCVector<int>`.
+bool isIndependentType(QualType Type, const ASTContext &Context);
+
+/// Whether a copy of a value of \p Type is new at its own level, a copy of
+/// what it holds by value: a class with data of its own, also a mixed one or
+/// a shared owner, not one that only refers, a view of pointers, a view of
+/// ViewTypes or an iterator, which is what it refers to.
+bool isCopyAtOwnLevel(QualType Type, const ASTContext &Context);
+
+/// Whether \p Relation is of the own storage of a copy, none of what its
+/// source is (bCopy): what it points to through its borrowed parts is
+/// related again, as objectRelation tells.
+bool isCopyStorage(const CObjectRelation &Relation);
+
+/// Whether \p Relation is of the object itself or what it holds by value: the
+/// object, or a member of it, also of a member or an element of an array
+/// member, not reached through a pointer or a reference it holds, nor a value
+/// made from it.
+bool isHeldByValue(const CObjectRelation &Relation);
+
+/// What \p E, a pointer, can be seen to point to as an expression: what it
+/// is the address of, `&X` or `std::addressof(X)`, also through an unchanged
+/// local pointer made with that, `auto ppItems = &pItems`. Null otherwise.
+const Expr *addressedExpr(const Expr *E);
+
+/// What the member \p Member of an unchanged local made by an aggregate is
+/// made with, `Holder.m_ppValue` of `CHolder Holder{&t_pValue}`, also of a
+/// member of a member held by value, or null.
+const Expr *localMemberInit(const Expr *Member);
+
+/// Whether \p E is a pointer that is held in what it is reached from: a
+/// member, `m_pApp`, an element, `mp_Items[0]` of pointers, what a member
+/// function or an operator gives a reference to, or what a pointer to a
+/// pointer points to, `*ppItems`, not a local alias or a parameter, nor what
+/// an assignment, a comma or a conditional gives. objectRelation tells such a
+/// pointer as what holds it, its value as through a pointer.
+bool isStoredPointer(const Expr *E);
+
+/// What \p E, a pointer, points to relative to the object: objectRelation of
+/// it, through a pointer when it is held in what it is reached from
+/// (isStoredPointer), `m_pApp` given by reference to a pointer. Of anything
+/// else what objectRelation tells.
+CObjectRelation pointeeRelation(const Expr *E,
+                                llvm::function_ref<bool(const Expr *)> IsObject,
+                                ASTContext *Context = nullptr);
+
+/// Whether \p Type, also of what a pointer or reference to it is, holds its
+/// elements in it, fixed in number: a built-in array, or one of
+/// FixedArrayTypes, like `std::array`.
+bool isFixedArrayType(QualType Type, const ASTContext &Context);
+
+/// Whether \p Method gives a reference to the object it is called on: one
+/// that returns a reference to its own class, or a base of it, and whose body,
+/// when it can be seen, returns `*this` or its explicit object parameter,
+/// `CItems &f_Entries() { return *this; }`, also through a local alias or an
+/// address, `&*this`, or a pointer to it, `return this;` (returnedRelation).
+bool givesItsObject(const CXXMethodDecl *Method);
+
+/// What \p Method, whose body can be seen and which returns a reference or a
+/// pointer, gives of the object it is called on: what each value it returns
+/// is relative to `this` or its explicit object parameter (objectRelation),
+/// merged. None when its body can't be seen, or while it is worked out.
+std::optional<CObjectRelation> returnedRelation(const CXXMethodDecl *Method,
+                                                ASTContext *Context = nullptr);
+
+/// What \p E is relative to the object, what \p IsObject is true of, like
+/// `this`, a parameter or the object of an actor: one classifier, a switch
+/// over every class of expression, that tells the receiver of a call, what is
+/// moved, deleted, assigned or given on, what an alias, an iterator or a
+/// lookup refers to, and whether an expression is the object itself or
+/// reaches into it. With \p Context, a local alias that a lambda the use is
+/// in copies and changes isn't followed.
+CObjectRelation objectRelation(const Expr *E,
+                               llvm::function_ref<bool(const Expr *)> IsObject,
+                               ASTContext *Context = nullptr);
 
 /// Whether \p Method is one that \p Matches tells of, or one whose body calls
 /// such a member function of its object, `this` or its explicit object

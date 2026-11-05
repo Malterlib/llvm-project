@@ -2,7 +2,7 @@
 
 #include "malterlib-concurrency.h"
 
-// The annotations of Mib/Concurrency/TidyAnnotations.
+// The annotations of Mib/Core/TidyAnnotations.
 #define DMibRunsToCompletion [[clang::annotate("malterlib-runs-to-completion")]]
 #define DMibRunsToCompletionEntry [[clang::annotate("malterlib-runs-to-completion-entry")]]
 

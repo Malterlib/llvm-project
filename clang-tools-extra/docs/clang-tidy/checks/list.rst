@@ -271,6 +271,7 @@ Clang-Tidy Checks
    :doc:`malterlib-coroutine-lambda-call <malterlib/coroutine-lambda-call>`,
    :doc:`malterlib-coroutine-reference-capture <malterlib/coroutine-reference-capture>`,
    :doc:`malterlib-coroutine-reference-parameter <malterlib/coroutine-reference-parameter>`,
+   :doc:`malterlib-coroutine-thread-local-reference <malterlib/coroutine-thread-local-reference>`,
    :doc:`malterlib-coroutine-unsafe-this <malterlib/coroutine-unsafe-this>`,
    :doc:`malterlib-function-naming <malterlib/function-naming>`,
    :doc:`malterlib-header-declarations-only <malterlib/header-declarations-only>`,
@@ -280,6 +281,7 @@ Clang-Tidy Checks
    :doc:`malterlib-parameter-ownership <malterlib/parameter-ownership>`,
    :doc:`malterlib-runs-to-completion <malterlib/runs-to-completion>`,
    :doc:`malterlib-struct-not-class <malterlib/struct-not-class>`, "Yes"
+   :doc:`malterlib-thread-local-storage <malterlib/thread-local-storage>`,
    :doc:`malterlib-type-naming <malterlib/type-naming>`,
    :doc:`malterlib-unused-parameter-cast <malterlib/unused-parameter-cast>`, "Yes"
    :doc:`malterlib-variable-naming <malterlib/variable-naming>`,

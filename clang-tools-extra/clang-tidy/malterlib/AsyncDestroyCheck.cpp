@@ -1540,7 +1540,9 @@ void AsyncDestroyCheck::checkAsyncDestroy(const CallExpr *Call,
                 Done = true;
                 break;
               }
-              if (const auto *Again = dyn_cast<BinaryOperator>(
+              // A statement that isn't an expression, a declaration, is
+              // none.
+              if (const auto *Again = dyn_cast_or_null<BinaryOperator>(
                       isa<Expr>(Each) ? cast<Expr>(Each)->IgnoreImplicit()
                                       : nullptr);
                   Again && Again->getOpcode() == BO_Assign &&
@@ -1998,10 +2000,11 @@ void AsyncDestroyCheck::checkCleanup(const LambdaExpr *Cleanup,
     Body = CoroutineBody->getBody();
   CFG::BuildOptions Options;
   Options.setAllAlwaysAdd();
-  // Exceptions can reach handlers after a suspension.
-  Options.AddEHEdges = true;
   const std::unique_ptr<CFG> Graph =
       CFG::buildCFG(Function, Body, &Context, Options);
+  // Exceptions can reach handlers after a suspension (addExceptionEdges).
+  if (Graph)
+    addExceptionEdges(*Graph, Context);
   // Not accepted when its control flow can't be built, like through a long
   // chain of conditionals in default arguments that destroy temporaries.
   if (!Graph) {
@@ -2072,9 +2075,19 @@ void AsyncDestroyCheck::checkCleanup(const LambdaExpr *Cleanup,
     }
   }
   const unsigned nPointers = Storage.Pointers.size() + LambdaCopies.size();
-  auto Transfer = [&](const CFGBlock *Block, CState State, auto &&OnUse) {
+  // Also, in \p Thrown, each state an exception thrown in the block carries
+  // to the handlers it reaches: before and after each element in the block
+  // of their `try` (inHandlerTry).
+  auto Transfer = [&](const CFGBlock *Block, CState State, auto &&OnUse,
+                      CState *Thrown = nullptr) {
+    bool InTry = false;
     for (const CFGElement &Element : *Block) {
       const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>();
+      if (Thrown && InTry)
+        Thrown->merge(State);
+      InTry = Thrown && inHandlerTry(Block, Element, Context);
+      if (InTry)
+        Thrown->merge(State);
       if (!Statement)
         continue;
       const Stmt *S = Statement->getStmt();
@@ -2328,14 +2341,24 @@ void AsyncDestroyCheck::checkCleanup(const LambdaExpr *Cleanup,
         State.Stale |= State.Pointers;
       }
     }
+    if (InTry)
+      Thrown->merge(State);
     return State;
   };
+  auto Empty = [&] {
+    return CState{false, llvm::BitVector(nPointers),
+                  llvm::BitVector(nPointers)};
+  };
   llvm::DenseMap<const CFGBlock *, CState> StateAtEnd;
+  // Of the blocks with a handler after them, the states that exceptions
+  // thrown in them carry there.
+  llvm::DenseMap<const CFGBlock *, CState> StateThrown;
   auto Entry = [&](const CFGBlock *Block) {
-    CState State{false, llvm::BitVector(nPointers), llvm::BitVector(nPointers)};
+    CState State = Empty();
+    const auto &Ends = isHandlerDispatch(Block) ? StateThrown : StateAtEnd;
     for (const CFGBlock::AdjacentBlock &Predecessor : Block->preds()) {
       if (const CFGBlock *Pred = Predecessor.getReachableBlock()) {
-        if (auto It = StateAtEnd.find(Pred); It != StateAtEnd.end())
+        if (auto It = Ends.find(Pred); It != Ends.end())
           State.merge(It->second);
       }
     }
@@ -2350,16 +2373,26 @@ void AsyncDestroyCheck::checkCleanup(const LambdaExpr *Cleanup,
     for (const CFGBlock *Block : Order) {
       if (!Reachable.test(Block->getBlockID()))
         continue;
-      const CState End = Transfer(Block, Entry(Block),
-                                  [](SourceLocation, const ValueDecl *) {});
-      auto [It, Inserted] = StateAtEnd.try_emplace(
-          Block, CState{false, llvm::BitVector(nPointers),
-                        llvm::BitVector(nPointers)});
-      CState Merged = It->second;
-      Merged.merge(End);
-      if (Inserted || Merged != It->second) {
-        It->second = Merged;
-        Changed = true;
+      const bool Throws = llvm::any_of(
+          Block->succs(), [](const CFGBlock::AdjacentBlock &Successor) {
+            return isHandlerDispatch(Successor.getReachableBlock());
+          });
+      CState Thrown = Empty();
+      const CState End = Transfer(
+          Block, Entry(Block), [](SourceLocation, const ValueDecl *) {},
+          Throws ? &Thrown : nullptr);
+      for (auto [Ends, Value] :
+           {std::pair{&StateAtEnd, &End},
+            std::pair{&StateThrown, static_cast<const CState *>(&Thrown)}}) {
+        if (Ends == &StateThrown && !Throws)
+          continue;
+        auto [It, Inserted] = Ends->try_emplace(Block, Empty());
+        CState Merged = It->second;
+        Merged.merge(*Value);
+        if (Inserted || Merged != It->second) {
+          It->second = Merged;
+          Changed = true;
+        }
       }
     }
     if (Storage.Storage.size() != nBound)

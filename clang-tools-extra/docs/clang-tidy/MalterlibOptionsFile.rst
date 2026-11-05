@@ -80,8 +80,36 @@ check:
 - ``RemovingMethods``: the member functions that remove entries of a
   collection, also of ``malterlib-actor-phase``. Built in are those of the
   standard library's containers.
+- ``FixedArrayTypes``: the classes that hold their elements in them, fixed in
+  number, like a built-in array, whose elements are parts of what holds them,
+  not entries that can be removed. Built in is ``std::array``.
+- ``SharedPointerTypes``: the owning pointers whose copies share what they
+  point to, counting references, of
+  ``malterlib-coroutine-actor-reference``: a copy of one keeps what it
+  points to alive, though what is looked up in that can still be erased.
+  Built in are ``std::shared_ptr`` and ``std::weak_ptr``; Malterlib's
+  options file adds ``TCSharedPointer`` and ``TCWeakPointer``.
 - ``BuiltinTypes``: the types that the naming checks take as types of the
   language, like Malterlib's ``uint32``. Built in are those of the language.
+
+The options of the checks are in the file too, by a plain name for all
+checks that have one, or with the name of a check for that check only. None
+of their built-in lists names Malterlib; Malterlib's options file has its
+names:
+
+- ``CallbackLookupFunctions``, of ``malterlib-coroutine-actor-reference``:
+  the member functions whose calls look up again, ``f_FindEqual``. Built in
+  is ``operator[]``.
+- ``ThreadLocalFunctions``, ``ThreadLocalTypes``, ``ThreadLocalTemplates``,
+  ``ThreadLocalScopeTypes`` and ``ThreadLocalHandlerTypes``, of
+  ``malterlib-coroutine-thread-local-reference`` and
+  ``malterlib-thread-local-storage``: what is thread-local data, like
+  ``fg_ConcurrencyThreadLocal``, ``CConcurrencyThreadLocal`` and
+  ``TCThreadLocal``, the scopes that keep it, ``CCurrentActorScope``, and
+  the bases of those the coroutine runtime moves,
+  ``CCoroutineThreadLocalHandler``. None is built in.
+- ``ScopeExitHelpers``, of ``malterlib-thread-local-storage``: the helpers
+  that make a local guard of a closure, ``g_OnScopeExit``. None is built in.
 
 ``--dump-config`` gives each list as it is, ``-*;Name;...``, which takes the
 place of the one built in and of the options file when the configuration is

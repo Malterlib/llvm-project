@@ -26,8 +26,8 @@ namespace clang::tidy::malterlib {
 /// https://clang.llvm.org/extra/clang-tidy/checks/malterlib/coroutine-unsafe-this.html
 class CoroutineUnsafeThisCheck : public MalterlibCheck {
 public:
-  CoroutineUnsafeThisCheck(StringRef Name, ClangTidyContext *Context)
-      : MalterlibCheck(Name, Context) {}
+  CoroutineUnsafeThisCheck(StringRef Name, ClangTidyContext *Context);
+  void storeCheckOptions(ClangTidyOptions::OptionMap &Opts) override;
   bool isLanguageVersionSupported(const LangOptions &LangOpts) const override {
     return LangOpts.CPlusPlus20;
   }
@@ -43,6 +43,11 @@ public:
 
 private:
   void checkMethod(const CXXMethodDecl *Method, ASTContext &Context);
+  /// Whether the result of a call of a member function annotated to end
+  /// before its object is a local declared after the object, a local, in the
+  /// same block, which ends it first.
+  void checkResultEndsBeforeObject(const CallExpr *Call,
+                                   ASTContext &Context);
   /// Checks \p Lambda, whose call operator is \p Operator, the one it has or
   /// an instantiation of it, like that of a generic lambda.
   void checkLambda(const LambdaExpr *Lambda, const CXXMethodDecl *Operator,
@@ -50,6 +55,9 @@ private:
   void reportLambda(const LambdaExpr *Lambda, const LambdaCapture &Capture,
                     const CXXRecordDecl *Record, const SourceManager &SM);
   InstantiationIndex &Instantiations = sharedInstantiationIndex();
+  /// The futures, `TCFuture`, of the FutureTypes option.
+  const StringRef FutureTypes;
+  llvm::SmallVector<StringRef, 8> FutureTypeList;
   /// The nodes checked before in the translation unit.
   CRepeatedMatches Repeated;
 };

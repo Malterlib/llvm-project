@@ -221,189 +221,51 @@ unsigned contextPhases(const FunctionDecl *Function) {
   return Phases & ~ActorPhase_Owner;
 }
 
-/// Whether \p Record is an actor, derived from `CActor`, not the internals
-/// of one, `CActorInternal`.
-static bool derivesFromCActor(const CXXRecordDecl *Record) {
-  // Each class once, at any depth, which a hierarchy of shared bases reaches
-  // along many paths.
-  llvm::SmallVector<const CXXRecordDecl *, 8> Work{Record};
-  llvm::SmallPtrSet<const CXXRecordDecl *, 16> Visited;
-  while (!Work.empty()) {
-    const CXXRecordDecl *Current = Work.pop_back_val();
-    if (!Current || !Current->hasDefinition() ||
-        !Visited.insert(Current->getDefinition()).second)
-      continue;
-    if (Current->getIdentifier() && Current->getName() == "CActor")
-      return true;
-    for (const CXXBaseSpecifier &Base : Current->getDefinition()->bases())
-      Work.push_back(Base.getType()->getAsCXXRecordDecl());
-  }
-  return false;
-}
-
-/// Whether \p Object is the object of the actor whose phase the context is:
-/// `this`, or what is named for it, like the `pThis` of a static function or
-/// the `m_pThis` of a protocol, also through unchanged local copies, and what
-/// it holds by value or owns. A pointer to another actor, like a member
-/// `m_pApp`, isn't.
-static bool isOwnActorObjectUncached(const Expr *Object, int Depth);
-
-bool isOwnActorObject(const Expr *Object, int Depth) {
-  if (!Object)
-    return true;
-  // Each once in a question, which a chain of conditionals of the same
-  // aliases, `auto *pNext = bChoose ? pPrevious : pPrevious`, meets a number
-  // of times that doubles with each, within a budget of the steps of it.
-  static thread_local int s_StepsLeft = 0;
-  static thread_local bool s_Asking = false;
-  static thread_local llvm::DenseMap<const Expr *, bool> s_Results;
-  const bool First = !s_Asking;
-  if (First) {
-    s_Asking = true;
-    s_StepsLeft = 4096;
-    s_Results.clear();
-  }
-  const llvm::scope_exit Done([&] {
-    if (First)
-      s_Asking = false;
-  });
-  if (auto It = s_Results.find(Object); It != s_Results.end())
-    return It->second;
-  if (Depth > 1024 || --s_StepsLeft < 0)
-    return false;
-  // Taken not to be while it is told, which an alias of itself can't be.
-  s_Results[Object] = false;
-  const bool Own = isOwnActorObjectUncached(Object, Depth);
-  s_Results[Object] = Own;
-  return Own;
-}
-
-/// The value of \p Condition when it is written as a constant, `true`, also
-/// as the template argument it is instantiated with, `t_bUseOwn` of
-/// `f_Clear<true>()`, or a constant expression the compiler evaluated.
-static std::optional<bool> literalCondition(const Expr *Condition) {
-  for (int Depth = 0; Condition && Depth < 8; ++Depth) {
-    Condition = Condition->IgnoreParenImpCasts();
-    if (const auto *Bool = dyn_cast<CXXBoolLiteralExpr>(Condition))
-      return Bool->getValue();
-    if (const auto *Integer = dyn_cast<IntegerLiteral>(Condition))
-      return !Integer->getValue().isZero();
-    if (const auto *Constant = dyn_cast<ConstantExpr>(Condition);
-        Constant && Constant->hasAPValueResult() &&
-        Constant->getAPValueResult().isInt())
-      return !Constant->getAPValueResult().getInt().isZero();
-    if (const auto *Substituted =
-            dyn_cast<SubstNonTypeTemplateParmExpr>(Condition)) {
-      Condition = Substituted->getReplacement();
-      continue;
-    }
-    if (const auto *Not = dyn_cast<UnaryOperator>(Condition);
-        Not && Not->getOpcode() == UO_LNot) {
-      const std::optional<bool> Value = literalCondition(Not->getSubExpr());
-      return Value ? std::optional<bool>(!*Value) : std::nullopt;
-    }
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
-
-static bool isOwnActorObjectUncached(const Expr *Object, int Depth) {
-  const Expr *E = Object->IgnoreParenImpCasts();
-  if (isa<CXXThisExpr>(E))
-    return true;
-  // Either value of a conditional, `(bChoose ? this : pOwn)`, when both are,
-  // or the one a constant condition chooses, `(t_bUseOwn ? this :
-  // m_pOther)` of `f_Clear<true>()`.
-  if (const auto *Conditional = dyn_cast<AbstractConditionalOperator>(E)) {
-    if (const std::optional<bool> Chosen =
-            isa<ConditionalOperator>(Conditional)
-                ? literalCondition(Conditional->getCond())
-                : std::nullopt)
-      return isOwnActorObject(*Chosen ? Conditional->getTrueExpr()
-                                      : Conditional->getFalseExpr(),
-                              Depth + 1);
-    return isOwnActorObject(Conditional->getTrueExpr(), Depth + 1) &&
-           isOwnActorObject(Conditional->getFalseExpr(), Depth + 1);
-  }
-  // A cast between the classes of the object, like
-  // `static_cast<CActor *>(this)`, is of the same object.
-  if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
-      Cast && (Cast->getCastKind() == CK_DerivedToBase ||
-               Cast->getCastKind() == CK_UncheckedDerivedToBase ||
-               Cast->getCastKind() == CK_BaseToDerived ||
-               Cast->getCastKind() == CK_NoOp))
-    return isOwnActorObject(Cast->getSubExpr(), Depth + 1);
-  // Also through a pointer to it, `auto *pState = &mp_State`.
-  if (const auto *Unary = dyn_cast<UnaryOperator>(E);
-      Unary && (Unary->getOpcode() == UO_Deref ||
-                Unary->getOpcode() == UO_AddrOf))
-    return isOwnActorObject(Unary->getSubExpr(), Depth + 1);
-  // What an owning pointer member points to, unless that is an actor, like
-  // `m_pOther->f_Stop()` of a `TCSharedPointer<CApp>`, which is another one.
-  if (const auto *Call = dyn_cast<CXXOperatorCallExpr>(E);
-      Call && (Call->getOperator() == OO_Star ||
-               Call->getOperator() == OO_Arrow) &&
-      Call->getNumArgs() == 1) {
-    QualType Pointee = Call->getType().getNonReferenceType();
-    if (Pointee->isPointerType())
-      Pointee = Pointee->getPointeeType();
-    if (derivesFromCActor(Pointee->getAsCXXRecordDecl()))
+/// What \p Object, or what it points to when it is a pointer
+/// (pointeeRelation), is relative to the own object of the actor: what names
+/// it is
+/// `this`, or what is named for it, also a variable that isn't changed, also
+/// the copy a mutable lambda captured, or a parameter given the object of the
+/// current actor, `_pActor` of a static or free function, which its callers
+/// are checked to give it.
+static CObjectRelation relationToOwnActor(
+    const Expr *Object, ASTContext *Context, bool ThisIsOwn = true,
+    const llvm::SmallPtrSetImpl<const ParmVarDecl *> *Foreign = nullptr) {
+  auto NamesOwnObject = [ThisIsOwn, Foreign](const Expr *E) {
+    if (isa<CXXThisExpr>(E))
+      return ThisIsOwn;
+    if (const auto *Ref = dyn_cast<DeclRefExpr>(E);
+        Ref && Foreign && isa<ParmVarDecl>(Ref->getDecl()) &&
+        Foreign->contains(cast<ParmVarDecl>(Ref->getDecl())))
       return false;
-    return isOwnActorObject(Call->getArg(0), Depth + 1);
-  }
-  if (const auto *Call = dyn_cast<CXXMemberCallExpr>(E);
-      Call && Call->getMethodDecl() &&
-      Call->getMethodDecl()->getIdentifier() &&
-      Call->getMethodDecl()->getName() == "f_Get") {
-    // Also unless what it gives is another actor, like `mp_pOther.f_Get()`.
-    QualType Pointee = Call->getType().getNonReferenceType();
-    if (Pointee->isPointerType())
-      Pointee = Pointee->getPointeeType();
-    if (derivesFromCActor(Pointee->getAsCXXRecordDecl()))
+    const ValueDecl *Decl = nullptr;
+    if (const auto *Member = dyn_cast<MemberExpr>(E))
+      Decl = Member->getMemberDecl();
+    else if (const auto *Ref = dyn_cast<DeclRefExpr>(E))
+      Decl = Ref->getDecl();
+    if (!Decl || !Decl->getIdentifier())
       return false;
-    return isOwnActorObject(Call->getImplicitObjectArgument(), Depth + 1);
-  }
-  // An element of an array it holds, `mp_States[0]`.
-  if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(E);
-      Subscript &&
-      Subscript->getBase()->IgnoreParenImpCasts()->getType()->isArrayType())
-    return isOwnActorObject(Subscript->getBase()->IgnoreParenImpCasts(),
-                            Depth + 1);
-  const ValueDecl *Decl = nullptr;
-  if (const auto *Member = dyn_cast<MemberExpr>(E))
-    Decl = Member->getMemberDecl();
-  else if (const auto *Ref = dyn_cast<DeclRefExpr>(E))
-    Decl = Ref->getDecl();
-  if (!Decl || !Decl->getIdentifier())
-    return false;
-  // Named for the own object, unless a variable that may have been changed,
-  // also the copy a mutable lambda captured.
-  if (Decl->getName().ends_with("This"))
-    return !isa<DeclRefExpr>(E) || !isa<VarDecl>(Decl) ||
-           isUnchangedAt(cast<DeclRefExpr>(E));
-  // A parameter given the object of the current actor, `_pActor` of a static
-  // or free function, which its callers are checked to give it.
-  if (isa<DeclRefExpr>(E) && isActorObjectParameter(Decl))
-    return isUnchangedAt(cast<DeclRefExpr>(E));
-  // What the object holds by value, or owns, like `*mp_pInternal`.
-  if (const auto *Member = dyn_cast<MemberExpr>(E);
-      Member && isa<FieldDecl>(Decl) && !Decl->getType()->isPointerType() &&
-      !Decl->getType()->isReferenceType())
-    return isOwnActorObject(Member->getBase(), Depth + 1);
-  // A copy that a lambda captured of what a reference refers to, like
-  // `[State]` of `auto &State = mp_State`, is an object of its own.
-  if (const auto *Ref = dyn_cast<DeclRefExpr>(E);
-      Ref && Decl->getType()->isReferenceType() && isCapturedByCopyAt(Ref))
-    return false;
-  if (const auto *Variable = dyn_cast<VarDecl>(Decl);
-      Variable && Variable->hasLocalStorage() && !isa<ParmVarDecl>(Variable) &&
-      Variable->getInit() &&
-      (Variable->getType()->isReferenceType() ||
-       (!isChangedVariable(Variable) &&
-        // Also the copy a lambda captured, which a mutable lambda can change.
-        (!isa<DeclRefExpr>(E) || isUnchangedAt(cast<DeclRefExpr>(E))))))
-    return isOwnActorObject(Variable->getInit(), Depth + 1);
-  return false;
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    if (Decl->getName().ends_with("This"))
+      return !Ref || !isa<VarDecl>(Decl) || isUnchangedAt(Ref);
+    return Ref && isActorObjectParameter(Decl) && isUnchangedAt(Ref);
+  };
+  return pointeeRelation(Object, NamesOwnObject, Context);
+}
+
+bool isOwnActorObject(
+    const Expr *Object, ASTContext *Context, bool ThisIsOwn,
+    const llvm::SmallPtrSetImpl<const ParmVarDecl *> *Foreign) {
+  return !Object ||
+         isHeldByValue(relationToOwnActor(Object, Context, ThisIsOwn, Foreign));
+}
+
+bool reachesOwnActorObject(const Expr *E, ASTContext *Context) {
+  const CObjectRelation Of = relationToOwnActor(E, Context);
+  return (Of.Kind == EObjectRelation::SameObject ||
+          Of.Kind == EObjectRelation::Subobject ||
+          Of.Kind == EObjectRelation::Entry) &&
+         !Of.bThroughPointer && !isCopyStorage(Of);
 }
 
 unsigned testedPhaseFlags(const Expr *E) {
@@ -960,7 +822,33 @@ const FunctionDecl *calleeThroughPointer(const CallExpr *Call) {
   return Named ? dyn_cast<FunctionDecl>(Named->getDecl()) : nullptr;
 }
 
-unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
+/// Whether \p E is `this`, also through unchanged local aliases of it, `auto
+/// *pSelf = this` or `auto &Self = *this`, and `*` and `&`.
+static bool isThisThroughAliases(const Expr *E) {
+  for (int Depth = 0; E && Depth < 8; ++Depth) {
+    E = E->IgnoreParenImpCasts();
+    if (isa<CXXThisExpr>(E))
+      return true;
+    if (const auto *Unary = dyn_cast<UnaryOperator>(E);
+        Unary &&
+        (Unary->getOpcode() == UO_Deref || Unary->getOpcode() == UO_AddrOf)) {
+      E = Unary->getSubExpr();
+      continue;
+    }
+    const auto *Ref = dyn_cast<DeclRefExpr>(E);
+    const auto *Local = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!Local || isa<ParmVarDecl>(Local) || !Local->hasLocalStorage() ||
+        !Local->getInit() || isChangedVariable(Local) ||
+        !(Local->getType()->isPointerType() ||
+          Local->getType()->isReferenceType()))
+      return false;
+    E = Local->getInit();
+  }
+  return false;
+}
+
+unsigned startedPhases(const Stmt *S, const ASTContext &Context,
+                       bool ThisForeign) {
   unsigned Phases = 0;
   // The helpers followed, each with which of its parameters are given
   // another object, since a helper given another object first, `fs_Stop(
@@ -976,10 +864,11 @@ unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
   llvm::SmallPtrSet<const Expr *, 8> VisitedDefaults;
   // Whether what is looked into is of an object made or destroyed where it
   // is, `COther Other;`, whose `this` is that object, not the own, until a
-  // member function of the own one is called in it.
-  bool ThisForeign = false;
+  // member function of the own one is called in it; \p ThisForeign at
+  // first.
   auto Own = [&](const Expr *E) {
     const Expr *Bare = E ? E->IgnoreParenImpCasts() : nullptr;
+    // Nor what is reached from it, `fp_GetImpl()->f_Destroy()`.
     if (ThisForeign && isa_and_nonnull<CXXThisExpr>(
                            Bare ? Bare->IgnoreParenImpCasts() : nullptr))
       return false;
@@ -1004,7 +893,7 @@ unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
         Ref && isa<ParmVarDecl>(Ref->getDecl()) &&
         Foreign.contains(cast<ParmVarDecl>(Ref->getDecl())))
       return false;
-    return isOwnActorObject(E);
+    return isOwnActorObject(E, nullptr, !ThisForeign, &Foreign);
   };
   std::function<void(const Stmt *)> Started;
   // What destroying an object of \p Record runs: its destructor's body, and
@@ -1086,7 +975,7 @@ unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
   };
   Started = [&](const Stmt *S) {
     // Not what isn't evaluated, `noexcept(f_StopApp())`.
-    if (!S || isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+    if (!S || hasUnevaluatedOperands(S))
       return;
     if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
         Typeid && !Typeid->isPotentiallyEvaluated())
@@ -1238,9 +1127,19 @@ unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
       // static or free one given it, `fs_StopOther(Other)` with a
       // `TCActor<CApp> Other`, unless it is given the own object too,
       // `fs_Stop(this, pOther)`, which it is followed with.
+      // A member function of the object made or destroyed where it is,
+      // `this` of `~CStop() { f_Cleanup(); }`, is followed with `this`
+      // still of that object, for what it starts of the own one, not for
+      // its own phases.
+      bool ForeignReceiver = false;
       if (Callee && Member && Member->getImplicitObjectArgument() &&
-          !Own(Member->getImplicitObjectArgument()))
-        Callee = nullptr;
+          !Own(Member->getImplicitObjectArgument())) {
+        if (ThisForeign &&
+            isThisThroughAliases(Member->getImplicitObjectArgument()))
+          ForeignReceiver = true;
+        else
+          Callee = nullptr;
+      }
       if (Callee && !Member &&
           (!isa<CXXMethodDecl>(Callee) ||
            cast<CXXMethodDecl>(Callee)->isStatic()) &&
@@ -1260,6 +1159,15 @@ unsigned startedPhases(const Stmt *S, const ASTContext &Context) {
             annotatedPhases(Candidate, AnnotationActorPhaseEntry);
         if (!Runs)
           Runs = annotatedPhases(Candidate, AnnotationActorPhase);
+        if (ForeignReceiver) {
+          if (const FunctionDecl *Definition = Candidate->getDefinition();
+              !Runs && Definition && Definition->getBody())
+            Follow(Definition,
+                   llvm::ArrayRef<const Expr *>(Call->getArgs(),
+                                                Call->getNumArgs()),
+                   0, true);
+          continue;
+        }
         if (Runs)
           Phases |= *Runs;
         else if (const FunctionDecl *Definition = Candidate->getDefinition();
@@ -1340,7 +1248,8 @@ unsigned destructionStartedPhases(const CXXRecordDecl *Record,
     if (const CXXDestructorDecl *Destructor = Class->getDestructor())
       if (const FunctionDecl *Definition = Destructor->getDefinition();
           Definition && Definition->getBody())
-        Phases |= startedPhases(Definition->getBody(), Context);
+        Phases |= startedPhases(Definition->getBody(), Context,
+                                /*ThisForeign=*/true);
     for (const FieldDecl *Field : Class->fields())
       if (!Field->getType()->isReferenceType())
         Visit(
@@ -1394,6 +1303,18 @@ bool givenAnotherActor(const CallExpr *Call, ASTContext &Context) {
   return Other && !Own;
 }
 
+/// Whether \p Object, what a guard is called on or given as the own actor
+/// itself, not a member of it like a context, `b ? &m_Context : nullptr`,
+/// can be null (bCanBeNull of its relation to the own actor): a conditional
+/// with null, `bKeep ? this : nullptr`, or a `dynamic_cast` to a pointer, also
+/// through what keeps what it is made of, like casts, aliases and helpers that
+/// give back what they are given, `fg_Identity(pMaybe)`.
+static bool ownObjectCanBeNull(const Expr *Object) {
+  const CObjectRelation Of = relationToOwnActor(Object, nullptr);
+  return Of.Kind == EObjectRelation::SameObject && !Of.bThroughPointer &&
+         !isCopyStorage(Of) && Of.bCanBeNull;
+}
+
 static unsigned guardedPhasesOfCall(const Expr *Operand) {
   if (const auto *Call = dyn_cast<CallExpr>(Operand)) {
     if (const FunctionDecl *Callee = Call->getDirectCallee()) {
@@ -1406,6 +1327,20 @@ static unsigned guardedPhasesOfCall(const Expr *Operand) {
             Member && !isOwnActorObject(Member->getImplicitObjectArgument()))
           return 0;
         if (givenAnotherActor(Call, Callee->getASTContext()))
+          return 0;
+        // Nor one whose own object can be null, `fs_Guard(b ? this :
+        // nullptr)`, which guards nothing then: what it is called on, or
+        // what it is given of the actor, a pointer to a class
+        // (givenAnotherActor), not another argument, like a message,
+        // `f_Guard(nullptr)` of `f_Guard(char const *_pMessage)`.
+        if (const auto *Member = dyn_cast<CXXMemberCallExpr>(Call);
+            Member && ownObjectCanBeNull(Member->getImplicitObjectArgument()))
+          return 0;
+        if (llvm::any_of(Call->arguments(), [&](const Expr *Argument) {
+              return Argument->getType()->isPointerType() &&
+                     Argument->getType()->getPointeeCXXRecordDecl() &&
+                     ownObjectCanBeNull(Argument);
+            }))
           return 0;
         return *Phases & ~ActorPhase_Owner;
       }
@@ -1734,7 +1669,7 @@ static bool isKeyChanged(const VarDecl *Key, const FieldDecl *Field,
   bool Changed = false;
   std::function<void(const Stmt *)> Visit = [&](const Stmt *S) {
     // Not what isn't evaluated, `sizeof(mp_Items[fg_Move(Key)])`.
-    if (!S || Changed || isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+    if (!S || Changed || hasUnevaluatedOperands(S))
       return;
     if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
         Typeid && !Typeid->isPotentiallyEvaluated())

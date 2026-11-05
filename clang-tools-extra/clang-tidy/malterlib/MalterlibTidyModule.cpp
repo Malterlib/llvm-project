@@ -18,6 +18,7 @@
 #include "CoroutineLambdaCallCheck.h"
 #include "CoroutineReferenceCaptureCheck.h"
 #include "CoroutineReferenceParameterCheck.h"
+#include "CoroutineThreadLocalReferenceCheck.h"
 #include "CoroutineUnsafeThisCheck.h"
 #include "FunctionNamingCheck.h"
 #include "HeaderDeclarationsOnlyCheck.h"
@@ -27,6 +28,7 @@
 #include "ParameterOwnershipCheck.h"
 #include "RunsToCompletionCheck.h"
 #include "StructNotClassCheck.h"
+#include "ThreadLocalStorageCheck.h"
 #include "TypeNamingCheck.h"
 #include "UnusedParameterCastCheck.h"
 #include "VariableNamingCheck.h"
@@ -57,6 +59,8 @@ public:
         "malterlib-coroutine-reference-capture");
     CheckFactories.registerCheck<CoroutineReferenceParameterCheck>(
         "malterlib-coroutine-reference-parameter");
+    CheckFactories.registerCheck<CoroutineThreadLocalReferenceCheck>(
+        "malterlib-coroutine-thread-local-reference");
     CheckFactories.registerCheck<CoroutineUnsafeThisCheck>(
         "malterlib-coroutine-unsafe-this");
     CheckFactories.registerCheck<FunctionNamingCheck>(
@@ -74,6 +78,8 @@ public:
         "malterlib-runs-to-completion");
     CheckFactories.registerCheck<StructNotClassCheck>(
         "malterlib-struct-not-class");
+    CheckFactories.registerCheck<ThreadLocalStorageCheck>(
+        "malterlib-thread-local-storage");
     CheckFactories.registerCheck<TypeNamingCheck>("malterlib-type-naming");
     CheckFactories.registerCheck<UnusedParameterCastCheck>(
         "malterlib-unused-parameter-cast");

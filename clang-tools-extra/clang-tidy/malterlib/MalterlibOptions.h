@@ -108,6 +108,12 @@ struct CVocabulary {
   /// The member functions that remove entries of a collection,
   /// RemovingMethods.
   CNameList RemovingMethods;
+  /// The classes whose elements are held in them, fixed in number, like
+  /// those of a built-in array, FixedArrayTypes.
+  CNameList FixedArrayTypes;
+  /// The owning pointers whose copies share what they point to, counting
+  /// references, SharedPointerTypes.
+  CNameList SharedPointerTypes;
   /// The types that are named like a language's built-in types, which the
   /// naming checks take as such, BuiltinTypes.
   CNameList BuiltinTypes;

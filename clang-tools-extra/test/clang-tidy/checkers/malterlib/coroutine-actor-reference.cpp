@@ -45,6 +45,19 @@ TCFuture<int> fg_Suspend();
 void fg_Read(CValue const *_pValue);
 void fg_Throw();
 
+// A range of class iterators, whose loop conditions call a comparison.
+struct CRangeIterator
+{
+	int &operator*();
+	CRangeIterator &operator++();
+	bool operator!=(CRangeIterator const &_Other) const;
+};
+struct CIteratorRange
+{
+	CRangeIterator begin();
+	CRangeIterator end();
+};
+
 struct CInternal
 {
 	CMap m_Items;
@@ -495,6 +508,71 @@ struct CMyActor : CActor
 // CHECK-MESSAGES: :[[@LINE-1]]:14: warning: 'pValue' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
 		}
 		co_return 0;
+	}
+
+	// Also with a range loop over class iterators in the function.
+	TCFuture<int> f_HandlerWithRangeLoop(int _Key)
+	{
+		CValue *pValue = mp_Items.f_FindEqual(_Key);
+		try
+		{
+			co_await fg_Suspend();
+			fg_Throw();
+		}
+		catch (...)
+		{
+			co_return pValue->m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:14: warning: 'pValue' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+		}
+		CIteratorRange Range;
+		int Sum = 0;
+		for (int Value : Range)
+			Sum += Value;
+		co_return Sum;
+	}
+
+	// What a throw before a refresh in the same block leaves.
+	TCFuture<int> f_HandlerBeforeRefresh(int _Key)
+	{
+		CValue *pValue = mp_Items.f_FindEqual(_Key);
+		try
+		{
+			co_await fg_Suspend();
+			fg_Throw();
+			pValue = mp_Items.f_FindEqual(_Key);
+		}
+		catch (...)
+		{
+			co_return pValue->m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:14: warning: 'pValue' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+		}
+		co_return pValue->m_Value;
+	}
+
+	// A refresh before the `try` is what its handler gets.
+	TCFuture<int> f_RefreshBeforeTry(int _Key)
+	{
+		CValue *pValue = mp_Items.f_FindEqual(_Key);
+		co_await fg_Suspend();
+		pValue = mp_Items.f_FindEqual(_Key);
+		try
+		{
+			fg_Throw();
+		}
+		catch (...)
+		{
+			co_return pValue->m_Value;
+		}
+		co_return 0;
+	}
+
+	// A reference bound by braces.
+	TCFuture<int> f_BraceBound(int _Key)
+	{
+		CValue &Value{*mp_Items.f_FindEqual(_Key)};
+		co_await fg_Suspend();
+		co_return Value.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:13: warning: 'Value' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
 	}
 
 	TCFuture<int> f_RevalidationScope(int _Key)
@@ -1017,6 +1095,30 @@ struct CFlagResumeActor : CActor
 		;
 		co_await fg_Suspend();
 		co_return pEntry->m_Value;
+	}
+
+	CFlaggedMap mp_Entries;
+};
+
+// A flag test in a `try`, whose blocks also lead to its handler, leaves when
+// the entry is gone too.
+struct CFlagInTryActor : CActor
+{
+	TCFuture<int> f_FlagInTry(int _Key)
+	{
+		CFlaggedEntry *pEntry = mp_Entries.f_FindEqual(_Key);
+		auto pDestroyed = pEntry->m_pDestroyed;
+		co_await fg_Suspend();
+		try
+		{
+			if (*pDestroyed)
+				co_return 0;
+			co_return pEntry->m_Value;
+		}
+		catch (...)
+		{
+			co_return 0;
+		}
 	}
 
 	CFlaggedMap mp_Entries;
@@ -3489,9 +3591,48 @@ struct CMap {
 // A helper that moves the entries of what it is given, after it is looked up
 // again.
 void fg_Add(TCVector<int> &_Items) { _Items.f_Insert(42); }
+// Also through a pointer to it, whose type is that of the pointer.
+void fg_AddThroughPointer(TCVector<int> &_Items) {
+  auto *pItems = &_Items;
+  pItems->f_Insert(42);
+}
+void fg_AddToPointer(TCVector<int> *_pItems) { _pItems->f_Insert(42); }
 struct CApp : CActor {
   TCVector<int> mp_Items;
   CMap mp_Map;
+  TCFuture<int> f_RelocatedThroughPointer() {
+    int *pValue = &mp_Items[0];
+    auto OnResume = co_await fg_OnResume([&]() -> CExceptionPointer {
+      pValue = &mp_Items[0];
+      fg_AddThroughPointer(mp_Items);
+      return {};
+    });
+    co_await fg_Work();
+    co_return *pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:16: warning: {{.*}}
+  }
+  TCFuture<int> f_RelocatedToPointer() {
+    int *pValue = &mp_Items[0];
+    auto OnResume = co_await fg_OnResume([&]() -> CExceptionPointer {
+      pValue = &mp_Items[0];
+      fg_AddToPointer(&mp_Items);
+      return {};
+    });
+    co_await fg_Work();
+    co_return *pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:16: warning: {{.*}}
+  }
+  TCFuture<int> f_RelocatedDirectlyThroughPointer() {
+    int *pValue = &mp_Items[0];
+    auto OnResume = co_await fg_OnResume([&]() -> CExceptionPointer {
+      pValue = &mp_Items[0];
+      (&mp_Items)->f_Insert(42);
+      return {};
+    });
+    co_await fg_Work();
+    co_return *pValue;
+// CHECK-MESSAGES: :[[@LINE-1]]:16: warning: {{.*}}
+  }
   TCFuture<int> f_Relocated() {
     int *pValue = &mp_Items[0];
     auto OnResume = co_await fg_OnResume([&]() -> CExceptionPointer {

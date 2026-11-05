@@ -223,6 +223,8 @@ constexpr std::pair<llvm::StringLiteral, llvm::StringLiteral> BuiltInLists[] = {
     {"RemovingMethods",
      "erase;clear;pop_back;pop_front;swap;extract;resize;erase_after;remove;"
      "remove_if;unique;assign;splice;splice_after"},
+    {"FixedArrayTypes", "std::array"},
+    {"SharedPointerTypes", "std::shared_ptr;std::weak_ptr"},
     {"BuiltinTypes", "bool;void;char;char8_t;char16_t;char32_t;wchar_t;short;"
                      "int;long;float;double;signed;unsigned"},
 };
@@ -251,6 +253,9 @@ CVocabulary::CVocabulary(
       BlockingCallees(Resolve("BlockingCallees", builtIn("BlockingCallees"))),
       ViewTypes(Resolve("ViewTypes", builtIn("ViewTypes"))),
       RemovingMethods(Resolve("RemovingMethods", builtIn("RemovingMethods"))),
+      FixedArrayTypes(Resolve("FixedArrayTypes", builtIn("FixedArrayTypes"))),
+      SharedPointerTypes(
+          Resolve("SharedPointerTypes", builtIn("SharedPointerTypes"))),
       BuiltinTypes(Resolve("BuiltinTypes", builtIn("BuiltinTypes"))) {}
 
 void CVocabulary::forEachList(
@@ -265,6 +270,8 @@ void CVocabulary::forEachList(
   Each("BlockingCallees", BlockingCallees);
   Each("ViewTypes", ViewTypes);
   Each("RemovingMethods", RemovingMethods);
+  Each("FixedArrayTypes", FixedArrayTypes);
+  Each("SharedPointerTypes", SharedPointerTypes);
   Each("BuiltinTypes", BuiltinTypes);
 }
 

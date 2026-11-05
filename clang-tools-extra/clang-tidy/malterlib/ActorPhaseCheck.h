@@ -16,7 +16,7 @@
 
 namespace clang::tidy::malterlib {
 
-/// Verifies the phase contracts of `Mib/Concurrency/TidyAnnotations`: a
+/// Verifies the phase contracts of `Mib/Core/TidyAnnotations`: a
 /// `DMibActorPhase` function is only used where the actor is in one of its
 /// phases, a `DMibActorPhaseFlag` is only ever set to `true`, and a collection
 /// declared with `DMibActorEntries` only loses entries in the phases it names

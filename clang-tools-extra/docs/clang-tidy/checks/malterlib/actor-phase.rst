@@ -4,7 +4,7 @@ malterlib-actor-phase
 =====================
 
 Verifies the phase contracts that the annotations of
-``Mib/Concurrency/TidyAnnotations`` declare. A phase is a part of the life of
+``Mib/Core/TidyAnnotations`` declare. A phase is a part of the life of
 an actor that, once it begins, lasts until the actor is gone:
 
 - **Destroy**: the actor is destroyed. ``fp_DestroyInternal`` sets the flag
@@ -17,7 +17,17 @@ The flags are only ever set, not cleared, also not by an output of assembly,
 a lambda or a call of the actor itself, runs with the flag set. That lets
 ``malterlib-coroutine-actor-reference`` accept data that is only removed in a
 phase, when a guard of the phase, like ``fp_CheckStoppedOrDestroyedOnResume``,
-ends the coroutine on resume once the phase began.
+ends the coroutine on resume once the phase began; one called on the object
+or given it, ``fs_CheckDestroyedOnResume(pThis)``, only when that can't be
+null: ``fs_CheckDestroyedOnResume(bKeep ? this : nullptr)`` and
+``fs_CheckDestroyedOnResume(dynamic_cast<CApp *>(pBase))`` don't guard, also
+through casts, local aliases, ``*&pMaybe``, helpers that give back what they
+are given, ``fg_Move(pMaybe)``, and accessors, ``f_MaybeSelf(bKeep)``, as
+:doc:`malterlib-coroutine-actor-reference <coroutine-actor-reference>` tells
+what an expression is relative to the object. Another argument that can be
+null, like a message, ``f_Guard(nullptr)``, or a member of the actor,
+``fs_Guard(this, bKeep ? &m_Context : nullptr)``, doesn't change what it
+guards.
 
 The annotations:
 
@@ -44,6 +54,10 @@ The annotations:
 Each translation unit verifies what it uses, and the declarations are in the
 headers that each one sees, so together they verify the whole program:
 
+- What an object made where it is runs, its constructor and destructor, and
+  the member functions they call on it, ``~CStop() { f_Cleanup(); }``, can
+  start the phases of the own actor, through what it is given or keeps,
+  ``m_pThis->f_StopApp()``, not its own.
 - An override runs in its own phases and in those of each function it
   overrides. A pointer to a ``DMibActorPhase`` member function must be called
   right away on the own object, like ``(this->*&CApp::fp_DestroyAll)()``.
@@ -54,11 +68,20 @@ headers that each one sees, so together they verify the whole program:
   free function given the object of the actor it runs on, ``CApp *_pApp``
   (see :doc:`malterlib-actor-dispatch-this <actor-dispatch-this>`), also cast
   to another class of it, and either value of a conditional when both are,
-  ``(bChoose ? this : pOwn)``, and what that holds by value or owns. A static or free function of
+  ``(bChoose ? this : pOwn)``, the one a constant condition chooses, the right
+  of a comma, and what that holds by value or owns: a member, also of a
+  member, an element of an array member, or what an owning pointer member
+  points to, unless that is another actor, not what a pointer or reference
+  member points to, ``m_pOther``, also through a local alias of it, as
+  :doc:`malterlib-coroutine-actor-reference <coroutine-actor-reference>`
+  tells what an expression is relative to the object. A static or free function of
   phases that is given an actor, like ``fs_Clear(pThis)``, must be given the
   own object, also for what is part of an actor, like ``fg_Clear(&m_State)``
   and not ``fg_Clear(&pOther->m_State)``, also through a local pointer to it,
-  ``auto *pState = &pOther->m_State``, and called right away: a pointer to
+  ``auto *pState = &pOther->m_State``, each value it can be by itself, the
+  values of a conditional, also through a cast, a comma or a local alias,
+  ``CState *pState = bOwn ? &m_State : &Local``, where a local isn't
+  another actor's, and called right away: a pointer to
   it can be called by another actor. An override with phases, also one in
   an instantiation of a template, ``TCApp<CBase>::f_Clear``, also
   annotated on its definition or inherited from one of the functions it

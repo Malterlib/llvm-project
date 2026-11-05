@@ -59,6 +59,17 @@ void ContinueRunningOnActorCheck::registerMatchers(MatchFinder *Finder) {
       this);
 }
 
+/// Whether \p E is `this` or reaches into the object (objectRelation): a
+/// member, an entry, or what can't be told apart from them.
+static bool reachesThis(const Expr *E) {
+  // Not the own storage of a copy, `Copy[0]` of `auto const &Copy =
+  // fg_TempCopy(mp_Items)` (isCopyStorage), but what its borrowed parts lead
+  // to is.
+  const CObjectRelation Of =
+      objectRelation(E, [](const Expr *Of) { return isa<CXXThisExpr>(Of); });
+  return Of.Kind != EObjectRelation::Unrelated && !isCopyStorage(Of);
+}
+
 /// Whether a value of \p Type points or refers to the object of an actor,
 /// also through a reference to a pointer to it, `CApp *const &_pActor`.
 static bool refersToActorObject(QualType Type) {
@@ -573,7 +584,7 @@ public:
       if (!S || Assigned)
         return;
       // Not what doesn't run, in `sizeof` or a discarded branch.
-      if (isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+      if (hasUnevaluatedOperands(S))
         return;
       if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
           Typeid && !Typeid->isPotentiallyEvaluated())
@@ -841,9 +852,24 @@ private:
         return pointsIntoObject(Unary->getSubExpr(), Bits);
     }
     // Not a static member, `&this->ms_Value`, which isn't in the object.
-    if (const auto *Member = dyn_cast<MemberExpr>(E))
-      return !isa<VarDecl>(Member->getMemberDecl()) &&
-             pointsIntoObject(Member->getBase(), Bits);
+    // A borrowed member of what doesn't point into it, a pointer or a
+    // reference of a local copy, `*Copy.m_pValue` of `CMixedRef Copy{1,
+    // &m_Value}`, points where it was given to, also through a pointer the
+    // object holds, like that of the source (isBorrowedField,
+    // pointeeRelation), not into the copy's own storage (isCopyStorage).
+    if (const auto *Member = dyn_cast<MemberExpr>(E)) {
+      if (isa<VarDecl>(Member->getMemberDecl()))
+        return false;
+      if (pointsIntoObject(Member->getBase(), Bits))
+        return true;
+      const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+      if (!ThisIsObject || !Field || !isBorrowedField(Field))
+        return false;
+      const CObjectRelation Of = pointeeRelation(
+          Member, [](const Expr *Of) { return isa<CXXThisExpr>(Of); },
+          &Context);
+      return Of.Kind != EObjectRelation::Unrelated && !isCopyStorage(Of);
+    }
     // A pointer or reference cast to another type, like to a base,
     // `static_cast<CData *>(_pActor)`.
     if (const auto *Cast = dyn_cast<ExplicitCastExpr>(E);
@@ -951,7 +977,11 @@ private:
                  isIteratorType(Call->getType()))) {
       if (returnsOnlyStatic(Call->getMethodDecl()) && !callsOverride(Call))
         return false;
-      return pointsIntoObject(Call->getImplicitObjectArgument(), Bits);
+      // Also what a member function of what doesn't point into it gives
+      // that does, an accessor of a borrowed member of a local copy,
+      // `Copy.f_Items()` (reachesThis).
+      return pointsIntoObject(Call->getImplicitObjectArgument(), Bits) ||
+             (ThisIsObject && reachesThis(E));
     }
     if (const auto *Free = dyn_cast<CallExpr>(E);
         Free && !isa<CXXMemberCallExpr, CXXOperatorCallExpr>(Free) &&
@@ -977,8 +1007,9 @@ private:
         (Call->getOperator() == OO_Arrow || Call->getOperator() == OO_Star ||
          Call->getOperator() == OO_Subscript ||
          Call->getOperator() == OO_Call))
-      return pointsIntoObject(Call->getArg(0), Bits);
-    return ThisIsObject && isRootedInThis(E);
+      return pointsIntoObject(Call->getArg(0), Bits) ||
+             (ThisIsObject && reachesThis(E));
+    return ThisIsObject && reachesThis(E);
   }
 
 public:
@@ -1543,6 +1574,118 @@ public:
     return false;
   }
 
+  /// Whether the borrowed member \p Member of a local holder,
+  /// `Holder.m_pValue`, is given before \p Use what doesn't point into the
+  /// object, `Holder. m_pValue = &Local`, last, by a statement of a block that
+  /// \p Use is in, which always runs before it.
+  bool overwrittenAwayFrom(const MemberExpr *Member, const Stmt *Use,
+                           const llvm::BitVector &Bits) const {
+    const auto *Ref =
+        dyn_cast<DeclRefExpr>(Member->getBase()->IgnoreParenImpCasts());
+    const auto *Holder = Ref ? dyn_cast<VarDecl>(Ref->getDecl()) : nullptr;
+    if (!Holder || !Holder->hasLocalStorage() || isa<ParmVarDecl>(Holder) ||
+        Holder->getType()->isReferenceType() || Member->isArrow())
+      return false;
+    ASTContext &Context = Holder->getASTContext();
+    const SourceManager &SM = Context.getSourceManager();
+    // The statements of blocks around it, before it.
+    DynTypedNode Node = DynTypedNode::create(*Use);
+    const BinaryOperator *Last = nullptr;
+    for (int Step = 0; Step < 64; ++Step) {
+      const auto Parents = Context.getParents(Node);
+      if (Parents.empty())
+        break;
+      if (const auto *Block = Parents[0].get<CompoundStmt>()) {
+        const Stmt *Here = Node.get<Stmt>();
+        for (const Stmt *Each : Block->body()) {
+          if (Each == Here)
+            break;
+          const auto *Assign = dyn_cast<BinaryOperator>(Each);
+          const auto *Target =
+              Assign && Assign->getOpcode() == BO_Assign
+                  ? dyn_cast<MemberExpr>(
+                        Assign->getLHS()->IgnoreParenImpCasts())
+                  : nullptr;
+          const auto *Base = Target
+                                 ? dyn_cast<DeclRefExpr>(
+                                       Target->getBase()->IgnoreParenImpCasts())
+                                 : nullptr;
+          if (Base && Base->getDecl() == Holder &&
+              Target->getMemberDecl() == Member->getMemberDecl() &&
+              (!Last || SM.isBeforeInTranslationUnit(Last->getBeginLoc(),
+                                                     Assign->getBeginLoc())))
+            Last = Assign;
+        }
+      }
+      if (Parents[0].get<LambdaExpr>() || Parents[0].get<FunctionDecl>())
+        break;
+      Node = Parents[0];
+    }
+    if (!Last || pointsIntoObject(Last->getRHS(), Bits))
+      return false;
+    // Nor given again between, in a branch or a loop, also through what can
+    // change it otherwise.
+    const auto *Function =
+        dyn_cast_or_null<FunctionDecl>(Holder->getParentFunctionOrMethod());
+    if (!Function || !Function->getBody())
+      return false;
+    // Nor once anything else can name the member: what refers to it, or to
+    // the holder, `int *&rpValue = Holder.m_pValue`, can give it anew where
+    // the holder isn't named; only reading it and assigning it are seen.
+    bool Escapes =
+        Member->getMemberDecl()->getDeclContext()->isRecord() &&
+        cast<RecordDecl>(Member->getMemberDecl()->getDeclContext())->isUnion();
+    std::function<void(const Stmt *, const Stmt *, bool)> Find =
+        [&](const Stmt *S, const Stmt *Parent, bool InLambda) {
+          if (!S || Escapes)
+            return;
+          if (const auto *Named = dyn_cast<DeclRefExpr>(S);
+              Named && Named->getDecl() == Holder) {
+            const auto *Part = dyn_cast_or_null<MemberExpr>(Parent);
+            if (InLambda || !Part || Part->isArrow() ||
+                !isa<FieldDecl>(Part->getMemberDecl()))
+              Escapes = true;
+            return;
+          }
+          if (const auto *Part = dyn_cast<MemberExpr>(S);
+              Part && !Part->isArrow() &&
+              Part->getMemberDecl() == Member->getMemberDecl()) {
+            const auto *Base =
+                dyn_cast<DeclRefExpr>(Part->getBase()->IgnoreParens());
+            if (Base && Base->getDecl() == Holder) {
+              const auto *Read = dyn_cast_or_null<ImplicitCastExpr>(Parent);
+              const auto *Assign = dyn_cast_or_null<BinaryOperator>(Parent);
+              if (!(Read && Read->getCastKind() == CK_LValueToRValue) &&
+                  !(Assign && Assign->getOpcode() == BO_Assign &&
+                    Assign->getLHS()->IgnoreParens() == Part))
+                Escapes = true;
+            }
+          }
+          const bool Inside = InLambda || isa<LambdaExpr>(S);
+          for (const Stmt *Child : S->children())
+            Find(Child, isa<ParenExpr>(S) ? Parent : S, Inside);
+        };
+    Find(Function->getBody(), nullptr, false);
+    if (Escapes)
+      return false;
+    bool Again = false;
+    llvm::SmallVector<const Stmt *, 32> Work{Function->getBody()};
+    while (!Work.empty() && !Again) {
+      const Stmt *Each = Work.pop_back_val();
+      if (!Each)
+        continue;
+      if (const auto *Named = dyn_cast<DeclRefExpr>(Each);
+          Named && Named->getDecl() == Holder &&
+          SM.isBeforeInTranslationUnit(Last->getEndLoc(),
+                                       Named->getBeginLoc()) &&
+          SM.isBeforeInTranslationUnit(Named->getBeginLoc(),
+                                       Use->getBeginLoc()))
+        Again = true;
+      llvm::append_range(Work, Each->children());
+    }
+    return !Again;
+  }
+
   /// Whether \p S uses the object of the own actor: accesses a member of
   /// `this`, dereferences it, or uses a local that refers into the object.
   bool usesObject(const Stmt *S, const llvm::BitVector &Bits) const {
@@ -1760,8 +1903,45 @@ public:
           return true;
       }
     }
+    // What a borrowed member of what isn't of the object leads into it,
+    // `*Copy.m_pValue`, `Copy.m_pValue[0]`, `Copy.m_pValue->m_Value` or a
+    // reference member, of `CMixedRef Copy{1, &m_Value}` (pointsIntoObject).
+    // Also what an accessor of one gives, `Copy.f_Items().m_Count`, or an
+    // operator, `Copy->m_Count` of a shared owner, of what doesn't point into
+    // the object itself, which is used where it is.
+    auto ThroughBorrowed = [&](const Expr *Pointer) {
+      const Expr *Bare = StripCasts(Pointer);
+      if (const auto *Address = dyn_cast<UnaryOperator>(Bare);
+          Address && Address->getOpcode() == UO_AddrOf)
+        Bare = StripCasts(Address->getSubExpr());
+      const Expr *Object = nullptr;
+      if (const auto *Member = dyn_cast<MemberExpr>(Bare)) {
+        const auto *Field = dyn_cast<FieldDecl>(Member->getMemberDecl());
+        if (!Field || !isBorrowedField(Field) ||
+            overwrittenAwayFrom(Member, S, Bits))
+          return false;
+        Object = Member->getBase();
+      } else if (const auto *Call = dyn_cast<CXXMemberCallExpr>(Bare)) {
+        Object = Call->getImplicitObjectArgument();
+      } else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Bare);
+                 Operator && Operator->getNumArgs() >= 1 &&
+                 (Operator->getOperator() == OO_Arrow ||
+                  Operator->getOperator() == OO_Star ||
+                  Operator->getOperator() == OO_Subscript)) {
+        Object = Operator->getArg(0);
+      }
+      return Object && !isa<CXXThisExpr>(StripCasts(Object)) &&
+             !pointsIntoObject(Object, Bits) && pointsIntoObject(Bare, Bits);
+    };
+    if (const auto *Subscript = dyn_cast<ArraySubscriptExpr>(S);
+        Subscript && ThroughBorrowed(Subscript->getBase()))
+      return true;
     if (const auto *Member = dyn_cast<MemberExpr>(S)) {
       const Expr *Base = StripCasts(Member->getBase());
+      if (ThroughBorrowed(Member->getBase()) ||
+          (Member->getMemberDecl()->getType()->isReferenceType() &&
+           ThroughBorrowed(Member)))
+        return !isAllowedMember(Member);
       if (const auto *Ref = dyn_cast<DeclRefExpr>(Base)) {
         if (!RefersToObject(Ref->getDecl()))
           return false;
@@ -1952,6 +2132,9 @@ public:
       return true;
     }
     if (const auto *Unary = dyn_cast<UnaryOperator>(S)) {
+      if (Unary->getOpcode() == UO_Deref &&
+          ThroughBorrowed(Unary->getSubExpr()))
+        return true;
       if (!ThisIsObject || Unary->getOpcode() != UO_Deref ||
           !isa<CXXThisExpr>(StripCasts(Unary->getSubExpr())))
         return false;
@@ -2585,7 +2768,7 @@ private:
           Variable->getType()->isReferenceType()) ||
         isHandleReference(Variable))
       return false;
-    return ThisIsObject && isRootedInThis(Variable->getInit());
+    return ThisIsObject && reachesThis(Variable->getInit());
   }
 
   ASTContext &Context;
@@ -2599,14 +2782,18 @@ llvm::DenseMap<const CFGBlock *, llvm::BitVector>
 pointerStates(const ActorFlow &Flow, const CFG &Graph,
               const llvm::BitVector &Reachable) {
   const unsigned nPointers = Flow.bitCount();
+  // At the end of each block, and anywhere in it, which an exception carries
+  // to a handler (isHandlerDispatch).
   llvm::DenseMap<const CFGBlock *, llvm::BitVector> AtEnd;
+  llvm::DenseMap<const CFGBlock *, llvm::BitVector> Thrown;
   auto Entry = [&](const CFGBlock *Block) {
     // What the parameters and captures point to when the function starts.
     llvm::BitVector Bits =
         Block == &Graph.getEntry() ? Flow.entryBits() : llvm::BitVector(nPointers);
+    const auto &Ends = isHandlerDispatch(Block) ? Thrown : AtEnd;
     for (const CFGBlock::AdjacentBlock &Predecessor : Block->preds()) {
       if (const CFGBlock *Pred = Predecessor.getReachableBlock()) {
-        if (auto It = AtEnd.find(Pred); It != AtEnd.end())
+        if (auto It = Ends.find(Pred); It != Ends.end())
           Bits |= It->second;
       }
     }
@@ -2619,16 +2806,26 @@ pointerStates(const ActorFlow &Flow, const CFG &Graph,
       if (!Reachable.test(Block->getBlockID()))
         continue;
       llvm::BitVector Bits = Entry(Block);
+      llvm::BitVector Anywhere(nPointers);
       for (const CFGElement &Element : *Block) {
+        const bool InTry = inHandlerTry(Block, Element, Flow.context());
+        if (InTry)
+          Anywhere |= Bits;
         if (const std::optional<CFGStmt> Statement = Element.getAs<CFGStmt>())
           Flow.updatePointers(Statement->getStmt(), Bits);
+        if (InTry)
+          Anywhere |= Bits;
       }
-      auto [It, Inserted] = AtEnd.try_emplace(Block, llvm::BitVector(nPointers));
-      llvm::BitVector Merged = It->second;
-      Merged |= Bits;
-      if (Inserted || Merged != It->second) {
-        It->second = Merged;
-        Changed = true;
+      for (auto [Ends, Value] :
+           {std::pair{&AtEnd, &Bits}, std::pair{&Thrown, &Anywhere}}) {
+        auto [It, Inserted] =
+            Ends->try_emplace(Block, llvm::BitVector(nPointers));
+        llvm::BitVector Merged = It->second;
+        Merged |= *Value;
+        if (Inserted || Merged != It->second) {
+          It->second = Merged;
+          Changed = true;
+        }
       }
     }
   }
@@ -2693,9 +2890,10 @@ std::optional<bool> pointsIntoObjectAtCaptureUncached(
     Body = CoroutineBody->getBody();
   CFG::BuildOptions Options;
   Options.setAllAlwaysAdd();
-  Options.AddEHEdges = true;
   const std::unique_ptr<CFG> Graph =
       CFG::buildCFG(Outer, Body, &Context, Options);
+  if (Graph)
+    addExceptionEdges(*Graph, Context);
   if (!Graph)
     return std::nullopt;
   // The object is the same where the lambda is made: what `this` is, or what
@@ -2884,8 +3082,18 @@ static void analyzeFlow(const ActorFlow &Flow, const CFG &Graph,
               TemporaryExit(Lambda))
             ExitsAtEnd[fullExpressionOf(Lambda, Flow.context())].push_back(
                 Lambda);
-  auto Transfer = [&](const CFGBlock *Block, CState State, auto &&OnElement) {
+  // Also, in \p Thrown, each state an exception thrown in the block carries
+  // to the handlers it reaches: before and after each element in the block
+  // of their `try` (inHandlerTry).
+  auto Transfer = [&](const CFGBlock *Block, CState State, auto &&OnElement,
+                      CState *Thrown = nullptr) {
+    bool InTry = false;
     for (const CFGElement &Element : *Block) {
+      if (Thrown && InTry)
+        Thrown->merge(State);
+      InTry = Thrown && inHandlerTry(Block, Element, Flow.context());
+      if (InTry)
+        Thrown->merge(State);
       // A scope exit, like `g_OnScopeExit / [this] { ... }`, runs its lambda
       // where its holder is destroyed, on the actor the coroutine is on then.
       // So does the cleanup of `fg_AsyncDestroy`, which it starts there,
@@ -2977,18 +3185,27 @@ static void analyzeFlow(const ActorFlow &Flow, const CFG &Graph,
           if (RegistrationEnds.lookup(Lambda) == S)
             State.TemporaryResumes.erase(Lambda);
     }
+    if (InTry)
+      Thrown->merge(State);
     return State;
   };
   llvm::DenseMap<const CFGBlock *, CState> StateAtEnd;
+  // Of the blocks with a handler after them, the states that exceptions
+  // thrown in them carry there.
+  llvm::DenseMap<const CFGBlock *, CState> StateThrown;
+  auto Empty = [&] {
+    return CState{false, llvm::BitVector(nPointers), {}, {}};
+  };
   auto Entry = [&](const CFGBlock *Block) {
     CState State{false,
                  Block == &Graph.getEntry() ? Flow.entryBits()
                                             : llvm::BitVector(nPointers),
                  {},
                  {}};
+    const auto &Ends = isHandlerDispatch(Block) ? StateThrown : StateAtEnd;
     for (const CFGBlock::AdjacentBlock &Predecessor : Block->preds()) {
       if (const CFGBlock *Pred = Predecessor.getReachableBlock()) {
-        if (auto It = StateAtEnd.find(Pred); It != StateAtEnd.end())
+        if (auto It = Ends.find(Pred); It != Ends.end())
           State.merge(It->second);
       }
     }
@@ -3009,16 +3226,31 @@ static void analyzeFlow(const ActorFlow &Flow, const CFG &Graph,
     const CFGBlock *Block = Work.front();
     Work.pop_front();
     Queued.reset(Block->getBlockID());
-    const CState End =
-        Transfer(Block, Entry(Block),
-                 [](const Stmt *, const CState &, const VarDecl *) {});
-    auto [It, Inserted] = StateAtEnd.try_emplace(
-        Block, CState{false, llvm::BitVector(nPointers), {}, {}});
-    CState Merged = It->second;
-    Merged.merge(End);
-    if (!Inserted && !(Merged != It->second))
+    const bool Throws = llvm::any_of(
+        Block->succs(), [](const CFGBlock::AdjacentBlock &Successor) {
+          return isHandlerDispatch(Successor.getReachableBlock());
+        });
+    CState Thrown = Empty();
+    const CState End = Transfer(
+        Block, Entry(Block),
+        [](const Stmt *, const CState &, const VarDecl *) {},
+        Throws ? &Thrown : nullptr);
+    bool Changed = false;
+    for (auto [Ends, Value] :
+         {std::pair{&StateAtEnd, &End},
+          std::pair{&StateThrown, static_cast<const CState *>(&Thrown)}}) {
+      if (Ends == &StateThrown && !Throws)
+        continue;
+      auto [It, Inserted] = Ends->try_emplace(Block, Empty());
+      CState Merged = It->second;
+      Merged.merge(*Value);
+      if (!Inserted && !(Merged != It->second))
+        continue;
+      It->second = Merged;
+      Changed = true;
+    }
+    if (!Changed)
       continue;
-    It->second = Merged;
     for (const CFGBlock *Successor : Block->succs())
       if (Successor && Reachable.test(Successor->getBlockID()) &&
           !Queued.test(Successor->getBlockID())) {
@@ -3071,12 +3303,13 @@ void ContinueRunningOnActorCheck::checkFunction(const FunctionDecl *Function,
 
   CFG::BuildOptions Options;
   Options.setAllAlwaysAdd();
-  // Exceptions can reach handlers after a suspension.
-  Options.AddEHEdges = true;
   // Where scope exits run.
   Options.AddImplicitDtors = true;
   const std::unique_ptr<CFG> Graph =
       CFG::buildCFG(Function, Body, &Context, Options);
+  // Exceptions can reach handlers after a suspension (addExceptionEdges).
+  if (Graph)
+    addExceptionEdges(*Graph, Context);
   // Not accepted when its control flow can't be built, like through a long
   // chain of conditionals in default arguments that destroy temporaries.
   if (!Graph) {

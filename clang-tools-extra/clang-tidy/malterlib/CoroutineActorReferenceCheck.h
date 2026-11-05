@@ -43,7 +43,6 @@ public:
     return TK_IgnoreUnlessSpelledInSource;
   }
 
-private:
   /// What the local \p Local is made from: its initializer and what its
   /// function assigns to it, `p = &_pActor->mp_Items[1]` after `int *p =
   /// nullptr`.
@@ -72,8 +71,13 @@ private:
   InstantiationIndex &Instantiations = sharedInstantiationIndex();
   const std::string FreshKeyFunctions;
   const std::string NodeStableContainers;
+  /// The member functions whose calls on a member of the object an
+  /// fg_OnResume callback's local is made by to be looked up again each time
+  /// the callback runs.
+  const std::string CallbackLookupFunctions;
   llvm::SmallVector<StringRef, 4> FreshKeyFunctionList;
   llvm::SmallVector<StringRef, 16> NodeStableContainerList;
+  llvm::SmallVector<StringRef, 8> CallbackLookupFunctionList;
   /// The nodes checked before in the translation unit.
   CRepeatedMatches Repeated;
 };

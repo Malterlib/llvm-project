@@ -128,6 +128,11 @@ NodeStableContainers:
   - TCMapWithPool
   - TCSetWithPool
   - TCLinkedList
+# The futures, whose destruction doesn't end what makes their results.
+FutureTypes:
+  - TCFuture
+  - TCFutureWithFlags
+  - TCUnsafeFuture
 
 # The smart pointers, function objects and iterators, which the conceptual
 # prefixes p, f and i are for.
@@ -351,3 +356,100 @@ malterlib-no-zero-bit-scan.CheckMacros:
   - DMibRequire
 malterlib-no-zero-bit-scan.AssumeMacros:
   - DMibAnalyzerAssume
+
+# The owning pointers whose copies share what they point to, counting
+# references.
+SharedPointerTypes:
+  - TCSharedPointer
+  - TCWeakPointer
+
+# The member functions whose calls on a member of the object look up again
+# each time an fg_OnResume callback runs.
+CallbackLookupFunctions:
+  - f_FindEqual
+
+# The functions that give the thread-local data of the thread that calls them,
+# also a part of it, by name, also after the names of the classes and
+# namespaces they are in, and of an operator or a conversion of a class.
+ThreadLocalFunctions:
+  - fg_ConcurrencyThreadLocal
+  - fg_SystemThreadLocal
+  - fg_DistributedAppThreadLocal
+  - CPromiseThreadLocal::f_ConcurrencyThreadLocal
+  - TCThreadLocal::f_Get
+  - TCThreadLocal::f_TryGet
+  - TCThreadLocal::operator->
+  - TCThreadLocal::operator&
+  - TCThreadLocal::operator t_CData *
+  - TCThreadLocalDynamic::f_Get
+  - TCThreadLocalDynamic::f_TryGet
+  - TCThreadLocalDynamic::operator->
+  - TCThreadLocalDynamic::operator&
+  - TCThreadLocalDynamic::operator t_CData *
+  - fg_NoResultException
+  - CAsyncResult::fs_ResultWasNotSetException
+  - CAsyncResult::fs_ActorCalledDeletedException
+  - CAsyncResult::fs_ActorAlreadyDestroyedException
+  - fg_RandomThreadLocal
+  - fg_SecureRandomThreadLocal
+  - fg_Random
+  - CActorDistributionManager::fs_GetCallingHostInfo
+  - fg_GetCallingHostInfo
+
+# The classes of thread-local data, every class a TCThreadLocal or
+# TCThreadLocalDynamic holds, by name, or qualified by the namespaces and
+# classes they are in, anonymous and inline namespaces aside, up to a function
+# a class is local to. Only these are thread-local types.
+ThreadLocalTypes:
+  - NMib::CSystemThreadLocal
+  - NMib::CPromiseThreadLocal
+  - NMib::NConcurrency::CConcurrencyThreadLocal
+  - NMib::NConcurrency::CDistributedAppThreadLocal
+  - NMib::NConcurrency::NPrivate::CSubSystem_Concurrency_DistributedActor::CThreadLocal
+  - NMib::NBuildSystem::NNinja::CGeneratorThreadLocal
+  - NMib::NDatabase::CDatabaseThreadLocal
+  - NMib::NContainer::CThreadLocal
+  - NMib::NContract::CContractLoggerThreadLocal
+  - NMib::NContract::CSafeCheckThrowsExcetionThreadLocal
+  - NMib::NException::CEnableExceptionTraceThreadLocal
+  - NMib::NFile::CSubSystem_File::CThreadLocal
+  - NMib::NLog::CLogger::CDetails::CThreadInfo
+  - NMib::NMisc::CRandomThreadLocal
+  - NMib::NSys::CSubSystem_Core_Signal::CThreadLocal
+  - NMib::NMemory::CLocalNumaNode
+  - NMib::NMemory::CMemoryReportThreadInfo
+  - NMib::NMemory::NPrivate::CThreadLocal
+  - NMib::NMemory::CCategoriesMemoryReporter::CThreadLocal
+  - NMib::NMemory::CStatsMemoryReporter::CThreadLocal
+  - NMib::NTime::CSubSystem_Time::CThreadLocal
+  - NMib::NTest::NPrivate::CTestManager::CThreadLocal
+  - CInvalidRegionCacheThreadLocal
+  # Tests
+  - CThread_Tests::CTemp
+  - CThread_Tests::CTemp35
+  - CTestThread::CThreadLocal
+  - CThreadLocalTest
+
+# The class templates that hold a value for each thread, whose first argument,
+# a class that isn't a template's, must be one of ThreadLocalTypes.
+ThreadLocalTemplates:
+  - TCThreadLocal
+  - TCThreadLocalDynamic
+
+# The scopes that keep a reference to thread-local data and that the coroutine
+# runtime doesn't move with the coroutine.
+ThreadLocalScopeTypes:
+  - CCurrentActorScope
+  - CCurrentlyProcessingActorScope
+
+# The bases of the scopes that the coroutine runtime suspends and resumes with
+# the coroutine, on the thread it resumes on.
+ThreadLocalHandlerTypes:
+  - CCoroutineThreadLocalHandler
+
+# The variables whose operator / makes a guard that runs the closure it is
+# given where the guard ends, by name.
+ScopeExitHelpers:
+  - g_OnScopeExit
+  - g_OnScopeExitWithException
+  - g_OnScopeExitCatch

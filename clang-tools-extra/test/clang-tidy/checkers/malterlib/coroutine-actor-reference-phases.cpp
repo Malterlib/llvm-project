@@ -847,6 +847,16 @@ struct CRound33 : CPhaseActor
 		co_return pEntry->m_Value;
 	}
 
+	// Nor one given what can be null, which guards nothing then.
+	TCFuture<int> f_NullableStaticGuard(bool _bKeep)
+	{
+		auto Guard = co_await fs_Guard(_bKeep ? this : nullptr);
+		auto *pEntry = mp_Items.f_FindEqual("Key");
+		co_await fg_Suspend();
+		co_return pEntry->m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:13: warning: {{.*}}
+	}
+
 	// Both branches return an error, and the current exception may be none.
 	TCFuture<int> f_BranchErrors(bool _bFirst)
 	{
@@ -5557,6 +5567,36 @@ struct CRound100Alias : CDistributedAppActor
 	}
 };
 
+// Also through what an expression of it is, `((void)0, _pThis)`.
+struct CRound72Comma : CDistributedAppActor
+{
+	DMibActorEntries(StopApp) TCMap<int, int> mp_Items;
+
+	static void fs_Tick(CRound100ForeignState *_pThis, CRound72Comma *_pKeepThis)
+	{
+		if (!_pKeepThis->f_IsDestroyed())
+			((void)0, _pThis)->f_Stop();
+	}
+
+	TCFuture<int> f_Run()
+	{
+		CRound100ForeignState Other;
+		auto Guard = co_await fp_CheckStoppedOrDestroyedOnResume();
+		auto Tick = co_await fg_OnResume
+			(
+				[this, &Other]() -> CExceptionPointer
+				{
+					fs_Tick(&Other, this);
+					return {};
+				}
+			)
+		;
+		int &Value = mp_Items[1];
+		co_await fg_Suspend();
+		co_return Value;
+	}
+};
+
 // Through a local reference made of a conditional or a comma.
 struct CRound100Conditional : CActor
 {
@@ -6214,6 +6254,49 @@ struct CRound111App : CDistributedAppActor
 // CHECK-MESSAGES: :[[@LINE-1]]:13: warning: 'Value' refers into the data of the actor and is used after a suspension; 'mp_Items' loses entries only in StopApp, so a guard of that phase that is alive at the use, like fp_CheckStoppedOrDestroyedOnResume, makes it safe [malterlib-coroutine-actor-reference]
 	}
 };
+
+// But not one whose destructor starts the phase of another object it holds
+// by value, also through accessors that give members, which isn't the own
+// actor.
+struct CRound69App : CDistributedAppActor
+{
+	DMibActorEntries(StopApp) TCMap<int, int> mp_Items;
+
+	DMibActorPhaseEntry(StopApp) void f_StopNow()
+	{
+		mp_State.m_bStoppingApp = true;
+		mp_Items.f_Clear();
+	}
+
+	TCFuture<int> f_Run();
+};
+struct CRound69Held
+{
+	CRound69App m_App;
+	CRound69App &f_App()
+	{
+		return m_App;
+	}
+};
+struct CRound69Stopper
+{
+	CRound69Held m_Held;
+	CRound69Held &f_Held()
+	{
+		return m_Held;
+	}
+	~CRound69Stopper()
+	{
+		f_Held().f_App().f_StopNow();
+	}
+};
+TCFuture<int> CRound69App::f_Run()
+{
+	auto Guard = co_await fp_CheckStoppedOrDestroyedOnResume();
+	int &Value = mp_Items[1];
+	(void)CRound69Stopper{};
+	co_return Value;
+}
 
 // Braced arguments are evaluated in order, so one after the suspension is
 // looked up after it.
@@ -10504,4 +10587,1130 @@ struct CApp : CActor {
     co_return *pCopy;
   }
 };
+}
+
+namespace NMayFreeConsteval {
+// What only runs while compiling can't free what is used after the call: the
+// constructor of a literal zero that calls a function without a body, as the
+// Microsoft STL's `_Literal_zero` does.
+void fg_LiteralZeroIsExpected();
+struct CLiteralZero {
+  consteval CLiteralZero(int _Zero) {
+    if (_Zero != 0)
+      fg_LiteralZeroIsExpected();
+  }
+};
+inline bool fg_LessThanZero(CLiteralZero _Zero) { return false; }
+void fg_Unknown();
+struct CEntry {
+  TCSharedPointer<bool> m_pDeleted;
+  int m_Value = 0;
+};
+struct CApp : CActor {
+  TCMap<int, CEntry> mp_Items;
+  bool f_Compare() { return fg_LessThanZero(0); }
+  void f_Unknown() { fg_Unknown(); }
+  TCFuture<int> f_Consteval() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_Compare();
+    co_return Entry.m_Value;
+  }
+  // A function without a body can.
+  TCFuture<int> f_WithoutBody() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_Unknown();
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+};
+}
+
+// A type that decomposes like a tuple, whose bindings are each made by a
+// variable of their own that calls `get<...>()`.
+namespace std {
+template <typename t_CType> struct tuple_size;
+template <decltype(sizeof(0)) t_Index, typename t_CType> struct tuple_element;
+}
+struct CTupleNames {
+  char const *m_pName;
+  template <decltype(sizeof(0)) t_Index> char const *get() const;
+};
+template <> struct std::tuple_size<CTupleNames> {
+  static constexpr decltype(sizeof(0)) value = 1;
+};
+template <> struct std::tuple_element<0, CTupleNames> {
+  using type = char const *;
+};
+namespace NMayFreeNoReturnBlock {
+// A block that ends in what the analyzer takes as not returning doesn't go on,
+// so what it calls before can't free what is used after the call: only one in
+// which each statement before it is a call of what is known not to throw with
+// plain arguments, as in the failure branch of `DMibFastCheck`, which breaks
+// into the debugger through a noexcept function without a body and then has a
+// `CNoReturn`, whose constructor does nothing.
+void fg_OutputDebugBreakFileLine(char const *_pFile, int _Line) noexcept;
+void fg_OutputDebugBreakThrows(char const *_pFile, int _Line);
+struct CNoReturn {
+  constexpr CNoReturn() __attribute__((analyzer_noreturn));
+  constexpr ~CNoReturn();
+};
+constexpr CNoReturn::CNoReturn() {}
+constexpr CNoReturn::~CNoReturn() {}
+struct CThrowingDestructor {
+  CThrowingDestructor() noexcept;
+  ~CThrowingDestructor() noexcept(false);
+};
+bool fg_SafeCheck(char const *_pExpression) __attribute__((analyzer_noreturn));
+bool fg_NoThrowStop(char const *_pExpression) noexcept __attribute__((analyzer_noreturn));
+char const *fg_MakeThreadName();
+thread_local char const *gt_pDynamicThreadName = fg_MakeThreadName();
+thread_local char const *gt_pConstantThreadName = "Thread";
+struct CThreadNames
+{
+  char const *m_pName;
+};
+CThreadNames fg_MakeThreadNames();
+thread_local auto [gt_pBoundThreadName] = fg_MakeThreadNames();
+thread_local auto [gt_pTupleThreadName] = CTupleNames{"Thread"};
+char const *fg_BreakThrows();
+void fg_NoThrowDefault(char const *_pFile = fg_BreakThrows()) noexcept;
+void fg_NoThrowDefaultPlain(char const *_pFile = "File") noexcept;
+void fg_Throw() { throw 1; }
+void fg_NoThrowBreak(char const *_pFile, int _Line) noexcept;
+struct CEntry {
+  TCSharedPointer<bool> m_pDeleted;
+  int m_Value = 0;
+};
+struct CApp : CActor {
+  TCMap<int, CEntry> mp_Items;
+  // The failure branch of `DMibFastCheck` as the macro expands, with
+  // `DMibFileLineOnDebugBreak`.
+  void f_FastCheck(bool _bValid) {
+    if (!_bValid) {
+      do {
+        fg_OutputDebugBreakFileLine(__FILE__, __LINE__);
+        __builtin_debugtrap();
+      } while (false);
+      CNoReturn NoReturn;
+      [[maybe_unused]] int Dummy = 0;
+      Dummy = 1;
+      ++Dummy;
+    }
+  }
+  // Also with the trap of x86, an assembler statement.
+  void f_FastCheckAsm(bool _bValid) {
+    if (!_bValid) {
+      do {
+        fg_OutputDebugBreakFileLine(__FILE__, __LINE__);
+        __asm__("nop");
+      } while (false);
+      CNoReturn NoReturn;
+    }
+  }
+  TCFuture<int> f_AfterFastCheckAsm() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_FastCheckAsm(true);
+    co_return Entry.m_Value;
+  }
+  // Also a call of a function that doesn't return and is known not to throw,
+  // and a default argument that is a constant.
+  void f_NoThrowStop(bool _bValid) {
+    if (!_bValid) {
+      fg_OutputDebugBreakFileLine("File", 1);
+      fg_NoThrowDefaultPlain();
+      fg_NoThrowStop("_bValid");
+    }
+  }
+  // Also in a `try`.
+  void f_TryNoThrowBefore(bool _bValid) {
+    try {
+      fg_NoThrowBreak("File", 1);
+      CNoReturn NoReturn;
+    } catch (...) {
+    }
+  }
+  // Without what doesn't return the block goes on.
+  void f_Breaks(bool _bValid) {
+    if (!_bValid)
+      fg_OutputDebugBreakFileLine("File", 1);
+  }
+  // Any other block can go on: one whose call that doesn't return can throw,
+  // like `fg_MibSafeCheck` when safe checks throw,
+  void f_SafeCheck(bool _bValid) {
+    if (!_bValid) {
+      fg_OutputDebugBreakFileLine("File", 1);
+      fg_SafeCheck("_bValid");
+    }
+  }
+  // one that can return before it,
+  void f_ReturnsBefore(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    if (_bValid)
+      return;
+    fg_NoThrowStop("_bValid");
+  }
+  // one that calls what isn't known not to throw before it, also in a `try`,
+  void f_ThrowsBefore(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_Throw();
+    CNoReturn NoReturn;
+  }
+  void f_TryBefore(bool _bValid) {
+    try {
+      fg_OutputDebugBreakThrows("File", 1);
+      CNoReturn NoReturn;
+    } catch (...) {
+    }
+  }
+  // or through an argument, also one of what doesn't return, or a default
+  // argument,
+  void f_ArgumentThrows(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowStop(fg_BreakThrows());
+  }
+  void f_DefaultArgumentThrows(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowDefault();
+    CNoReturn NoReturn;
+  }
+  // or through a `thread_local` argument made at run time, whose initializer
+  // the first use in a thread runs, which can throw,
+  void f_ThreadLocalArgument(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowStop(gt_pDynamicThreadName);
+  }
+  TCFuture<int> f_AfterThreadLocalArgument() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ThreadLocalArgument(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // also a binding of a structured binding made so,
+  void f_BoundThreadLocalArgument(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowStop(gt_pBoundThreadName);
+  }
+  TCFuture<int> f_AfterBoundThreadLocalArgument() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_BoundThreadLocalArgument(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // also a binding of one of a tuple-like type, whose own variable calls
+  // `get<...>()`, also when what it decomposes is a constant,
+  void f_TupleThreadLocalArgument(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowStop(gt_pTupleThreadName);
+  }
+  TCFuture<int> f_AfterTupleThreadLocalArgument() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_TupleThreadLocalArgument(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // but not one initialized with a constant,
+  void f_ConstantThreadLocalArgument(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    fg_NoThrowStop(gt_pConstantThreadName);
+  }
+  TCFuture<int> f_AfterConstantThreadLocalArgument() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ConstantThreadLocalArgument(true);
+    co_return Entry.m_Value;
+  }
+  // or an `asm goto`, which can jump past it,
+  void f_AsmGotoBefore(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    asm goto("" : : : : Out);
+    fg_NoThrowStop("_bValid");
+  Out:
+    return;
+  }
+  TCFuture<int> f_AfterAsmGotoBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_AsmGotoBefore(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // or one that can be entered after it, at a label,
+  void f_JumpsPastStop(bool _bValid) {
+    if (_bValid)
+      goto Erase;
+    {
+      fg_NoThrowStop("_bValid");
+    Erase:
+      fg_OutputDebugBreakFileLine("File", 1);
+    }
+  }
+  TCFuture<int> f_AfterJumpsPastStop() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_JumpsPastStop(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // or a static or constexpr variable of what doesn't return, which isn't made
+  // there,
+  void f_StaticNoReturn(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    static constexpr CNoReturn Stop;
+  }
+  TCFuture<int> f_AfterStaticNoReturn() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_StaticNoReturn(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // or an array of what doesn't return without elements, which constructs
+  // none,
+  void f_EmptyNoReturn(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    CNoReturn Stops[0];
+  }
+  TCFuture<int> f_AfterEmptyNoReturn() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_EmptyNoReturn(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // or a call of what an expression gives, which it evaluates first,
+  struct CStopper {
+    static void fs_Noop() noexcept;
+  };
+  CStopper f_GetStopper();
+  void f_ExpressionCallee(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    f_GetStopper().fs_Noop();
+    CNoReturn NoReturn;
+  }
+  TCFuture<int> f_AfterExpressionCallee() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ExpressionCallee(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  // or that makes and destroys an object, whose destructor can throw,
+  void f_DestructorThrows(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    {
+      CThrowingDestructor Local;
+    }
+    CNoReturn NoReturn;
+  }
+  // or a lambda, also when only its body would throw,
+  void f_CaptureThrows(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    auto fUnused = [pValue = fg_BreakThrows()] {};
+    CNoReturn NoReturn;
+  }
+  void f_LambdaBodyThrows(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    auto fUnused = [] { fg_BreakThrows(); };
+    CNoReturn NoReturn;
+  }
+  // or has anything else before it, like a loop.
+  void f_LoopBreaksBefore(bool _bValid) {
+    fg_OutputDebugBreakFileLine("File", 1);
+    for (int i = 0; i < 2; ++i) {
+      if (i)
+        break;
+    }
+    CNoReturn NoReturn;
+  }
+  TCFuture<int> f_AfterFastCheck() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_FastCheck(true);
+    co_return Entry.m_Value;
+  }
+  TCFuture<int> f_AfterNoThrowStop() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_NoThrowStop(true);
+    co_return Entry.m_Value;
+  }
+  TCFuture<int> f_AfterTryNoThrowBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_TryNoThrowBefore(true);
+    co_return Entry.m_Value;
+  }
+  TCFuture<int> f_AfterBreaks() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_Breaks(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterSafeCheck() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_SafeCheck(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterReturnsBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ReturnsBefore(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterThrowsBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ThrowsBefore(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterTryBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_TryBefore(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterArgumentThrows() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_ArgumentThrows(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterDefaultArgumentThrows() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_DefaultArgumentThrows(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterDestructorThrows() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_DestructorThrows(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterCaptureThrows() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_CaptureThrows(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterLambdaBodyThrows() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_LambdaBodyThrows(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_AfterLoopBreaksBefore() {
+    auto &Entry = mp_Items[0];
+    auto pDeleted = Entry.m_pDeleted;
+    co_await fg_Suspend();
+    if (*pDeleted)
+      co_return 0;
+    f_LoopBreaksBefore(true);
+    co_return Entry.m_Value;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'Entry' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+};
+}
+
+namespace NOnResumeLocals {
+// What a re-validating callback declares and looks up itself is looked up each
+// time it runs, not kept from before the suspension, also read after a test
+// for null.
+TCFuture<int> fg_Work();
+template <typename t_CType>
+void fg_Reseat(t_CType **_ppValue);
+TCFuture<int> fg_PassOn(int _Value);
+template <typename t_CType>
+void fg_Touch(t_CType *const &_pValue);
+template <typename t_CType>
+t_CType const &fg_Const(t_CType const &_Value) {
+  return _Value;
+}
+template <typename t_CType>
+t_CType *fg_Identity(t_CType *_pValue) {
+  return _pValue;
+}
+struct CVersion {
+  int m_Value = 0;
+};
+struct CApplication {
+  TCMap<int, CVersion> m_Versions;
+};
+struct CApp : CActor {
+  TCMap<int, CApplication> mp_Applications;
+  TCFuture<int> f_CallbackLocal() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      pVersion = pApplication ? pApplication->m_Versions.f_FindEqual(1) : nullptr;
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalTested() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> CExceptionPointer {
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      if (!pApplication)
+        return fg_MakeError("Gone");
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+      if (!pVersion)
+        return fg_MakeError("Gone");
+      return nullptr;
+    });
+    co_await fg_Work();
+    co_return pVersion->m_Value;
+  }
+  // Nor one that copies a pointer of the coroutine looked up before the
+  // suspension.
+  TCFuture<int> f_CallbackLocalAlias() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Also through other locals of the callback, or assigned one.
+  TCFuture<int> f_CallbackLocalAliasChain() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pFirst = pSaved;
+      auto *pApplication = pFirst;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalAssigned() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      CApplication *pApplication = nullptr;
+      pApplication = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Also through arithmetic, a move, or a copy of one from outside that is
+  // looked up again only on some paths, and one changed after it is made.
+  TCFuture<int> f_CallbackLocalArithmetic(bool _bRefresh) {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = pSaved + 0;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalMoved(bool _bRefresh) {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = fg_Move(pSaved);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalRefreshedOnSomePaths(bool _bRefresh) {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      if (_bRefresh)
+        pSaved = mp_Applications.f_FindEqual(0);
+      auto *pApplication = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalIncremented(bool _bRefresh) {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      pApplication += 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalAddressTaken(bool _bRefresh) {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      fg_Reseat(&pApplication);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor what another function gives, a value the callback assigns over a
+  // fresh one, or a fresh local changed through a cast.
+  TCFuture<int> f_CallbackLocalIdentity() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    auto *pOld = mp_Applications.f_FindEqual(1);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = fg_Identity(pSaved);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalOverwritten() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    auto *pOld = mp_Applications.f_FindEqual(1);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      pSaved = mp_Applications.f_FindEqual(0);
+      pSaved = pOld;
+      auto *pApplication = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalCastWritten() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    auto *pOld = mp_Applications.f_FindEqual(1);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      static_cast<CApplication *&>(pApplication) = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Also when what changes it has it in parentheses.
+  TCFuture<int> f_CallbackLocalParenWritten() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      (pApplication) = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalParenIncremented() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      ++(pApplication);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor one bound to a reference, also to const, which can change it.
+  TCFuture<int> f_CallbackLocalReferenced() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      CApplication *const &Alias = pApplication;
+      const_cast<CApplication *&>(Alias) = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Each node of the callback once, also through nested awaits of a lambda in
+  // it.
+  TCFuture<int> f_CallbackNestedAwaits() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      auto fUnused = []() -> TCFuture<int> {
+        co_return co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_PassOn(co_await fg_Work()))))))))))))))))))))))))));
+      };
+      pVersion = pApplication ? pApplication->m_Versions.f_FindEqual(1) : nullptr;
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor one given to what can give it back as a reference.
+  TCFuture<int> f_CallbackLocalReturnedAlias() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      auto const &Alias = fg_Const(pApplication);
+      const_cast<CApplication *&>(Alias) = pSaved;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor what a member function of a member gives back of what it is given.
+  struct CPassThrough {
+    template <typename t_CType>
+    t_CType *f_Identity(t_CType *_pValue) {
+      return _pValue;
+    }
+  };
+  CPassThrough mp_Lookup;
+  CApplication *mp_pSaved = nullptr;
+  TCMap<int, CApplication> *mp_pCachedApplications = nullptr;
+  TCMap<int, CApplication> &mp_rCachedApplications = mp_Applications;
+  CApplication *f_GetSaved();
+  // Nor given a pointer member or what a call gives, nor through a pointer
+  // member, nor given by a reference to a function.
+  TCFuture<int> f_CallbackLocalMemberArgument() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Lookup.f_Identity(mp_pSaved);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalCallArgument() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Lookup.f_Identity(f_GetSaved());
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:26: warning: 'pVersion' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_CallbackLocalThroughPointerMember() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_pCachedApplications->f_FindEqual(0);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor through a reference member, which looking through doesn't look up
+  // again.
+  TCFuture<int> f_CallbackLocalThroughReferenceMember() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_rCachedApplications.f_FindEqual(0);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalByReference() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Applications.f_FindEqual(0);
+      fg_Touch(pApplication);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:26: warning: 'pVersion' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+  }
+  TCFuture<int> f_CallbackLocalPassThrough() {
+    auto *pSaved = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pApplication = mp_Lookup.f_Identity(pSaved);
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Nor a copy, also of one the callback looks up again, nor of a fresh local:
+  // only a lookup of the object itself is.
+  TCFuture<int> f_CallbackLocalOfRevalidated() {
+    auto *pApplication = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      pApplication = mp_Applications.f_FindEqual(0);
+      auto *pCopy = pApplication;
+      pVersion = pCopy ? pCopy->m_Versions.f_FindEqual(1) : nullptr;
+// CHECK-MESSAGES: :[[@LINE-1]]:26: warning: 'pCopy' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackLocalFreshChain() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      auto *pFirst = mp_Applications.f_FindEqual(0);
+      auto *pApplication = pFirst;
+      pVersion = pApplication ? pApplication->m_Versions.f_FindEqual(1) : nullptr;
+// CHECK-MESSAGES: :[[@LINE-1]]:33: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // Not a static or thread_local one, whose initializer runs once.
+  TCFuture<int> f_CallbackStatic() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      static auto *pCachedApplication = mp_Applications.f_FindEqual(0);
+      pVersion = pCachedApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pCachedApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  TCFuture<int> f_CallbackThreadLocal() {
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      thread_local auto *pCachedApplication = mp_Applications.f_FindEqual(0);
+      pVersion = pCachedApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pCachedApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      if (!pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+  // A pointer of the coroutine that the callback reads before it looks it up
+  // again is kept from before the suspension.
+  TCFuture<int> f_ReadBeforeLookup() {
+    auto *pApplication = mp_Applications.f_FindEqual(0);
+    CVersion *pVersion = nullptr;
+    auto OnResume = co_await fg_OnResume([&]() -> TCAsyncResult<int> {
+      TCAsyncResult<int> Result;
+      pVersion = pApplication->m_Versions.f_FindEqual(1);
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'pApplication' refers into the data of the actor and is used after a suspension, during which other calls of the actor can change or erase the data; look it up again, or re-validate it with fg_OnResume [malterlib-coroutine-actor-reference]
+      pApplication = mp_Applications.f_FindEqual(0);
+      if (!pApplication || !pVersion)
+        Result.f_SetResult(0);
+      return Result;
+    });
+    co_await fg_Work();
+    co_return pVersion ? pVersion->m_Value : 0;
+  }
+};
+}
+
+// A teardown helper run where an object made in the callback goes, through
+// a member function of it, can start a phase of the own actor.
+namespace NTeardownHelper
+{
+	struct CApp;
+	struct CDirectStop
+	{
+		CApp *m_pThis;
+		~CDirectStop();
+	};
+	struct CIndirectStop
+	{
+		CApp *m_pThis;
+		~CIndirectStop()
+		{
+			f_Cleanup();
+		}
+		void f_Cleanup();
+	};
+	struct CAliasStop
+	{
+		CApp *m_pThis;
+		~CAliasStop()
+		{
+			auto *pSelf = this;
+			pSelf->f_Cleanup();
+		}
+		void f_Cleanup();
+	};
+	struct CApp : CDistributedAppActor
+	{
+		DMibActorEntries(StopApp) TCMap<int, int> m_Items;
+
+		TCFuture<int> f_Direct()
+		{
+			auto PhaseGuard = co_await fp_CheckStoppedOrDestroyedOnResume();
+			int *pEntry = m_Items.f_FindEqual(1);
+			auto OnResume = co_await fg_OnResume
+				(
+					[this]() -> CExceptionPointer
+					{
+						CDirectStop Cleanup{this};
+						return {};
+					}
+				)
+			;
+			co_await fg_Suspend();
+			co_return *pEntry;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'pEntry' refers into the data of the actor and is used after a suspension; {{.*}}
+		}
+
+		TCFuture<int> f_Indirect()
+		{
+			auto PhaseGuard = co_await fp_CheckStoppedOrDestroyedOnResume();
+			int *pEntry = m_Items.f_FindEqual(1);
+			auto OnResume = co_await fg_OnResume
+				(
+					[this]() -> CExceptionPointer
+					{
+						CIndirectStop Cleanup{this};
+						return {};
+					}
+				)
+			;
+			co_await fg_Suspend();
+			co_return *pEntry;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'pEntry' refers into the data of the actor and is used after a suspension; {{.*}}
+		}
+
+		TCFuture<int> f_Alias()
+		{
+			auto PhaseGuard = co_await fp_CheckStoppedOrDestroyedOnResume();
+			int *pEntry = m_Items.f_FindEqual(1);
+			auto OnResume = co_await fg_OnResume
+				(
+					[this]() -> CExceptionPointer
+					{
+						CAliasStop Cleanup{this};
+						return {};
+					}
+				)
+			;
+			co_await fg_Suspend();
+			co_return *pEntry;
+// CHECK-MESSAGES: :[[@LINE-1]]:15: warning: 'pEntry' refers into the data of the actor and is used after a suspension; {{.*}}
+		}
+	};
+	CDirectStop::~CDirectStop()
+	{
+		(void)m_pThis->f_StopApp();
+	}
+	void CAliasStop::f_Cleanup()
+	{
+		(void)m_pThis->f_StopApp();
+	}
+	void CIndirectStop::f_Cleanup()
+	{
+		(void)m_pThis->f_StopApp();
+	}
 }

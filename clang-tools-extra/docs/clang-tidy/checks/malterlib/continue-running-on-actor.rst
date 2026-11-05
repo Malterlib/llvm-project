@@ -156,10 +156,13 @@ reference or pointer, ``CCopy{m_Value, (co_await ...)}``. What an exchange of
 a local pointer returns, the value it had,
 ``fg_Exchange(pValue, nullptr)``, points where it pointed, and what an
 assignment gives, ``pSecond = (pFirst = &m_Value)``, where what it assigns
-does. A pointer into the
-object held inside another object, like a member of a struct, ``CHolder
-Copy{&m_Value}``, or a view, is not followed, and neither is a pointer
-converted to an integer and back, ``reinterpret_cast<int *>(Address)``. A
+does. A pointer or reference into the object held inside a local, a
+borrowed member of a struct or a view, ``*Copy.m_pValue`` of ``CMixedRef
+Copy{1, &m_Value}``, also of a copy of one, and what an accessor of one gives,
+``Copy.f_Items()``, or an operator of a copy of a shared owner,
+``pCopy->m_Count``, is the object, as what the source's leads to is, but not
+the copy's own storage, ``Copy.m_Value``. A pointer converted to an integer
+and back, ``reinterpret_cast<int *>(Address)``, is not followed. A
 function whose control flow is too complex to build, like through a long
 chain of default arguments that are conditionals of calls that destroy
 temporaries, is reported, since what it uses after it switches can't be

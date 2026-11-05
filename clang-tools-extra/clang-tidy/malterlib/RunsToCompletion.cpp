@@ -190,7 +190,7 @@ static bool hasSuspension(const Stmt *S, ASTContext &Context,
     return hasSuspension(Child, Context, Shared);
   };
   // What isn't evaluated, like `sizeof(co_await ...)`, doesn't run.
-  if (isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+  if (hasUnevaluatedOperands(S))
     return false;
   if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
       Typeid && !Typeid->isPotentiallyEvaluated())
@@ -2072,7 +2072,7 @@ static bool canLeave(const Stmt *S, const CompoundStmt *Scope,
   const llvm::scope_exit Leave([] { --s_Depth; });
   // What isn't evaluated, like `noexcept(co_await ...)` or `sizeof`, doesn't
   // run.
-  if (isa<UnaryExprOrTypeTraitExpr, CXXNoexceptExpr>(S))
+  if (hasUnevaluatedOperands(S))
     return false;
   if (const auto *Typeid = dyn_cast<CXXTypeidExpr>(S);
       Typeid && !Typeid->isPotentiallyEvaluated())

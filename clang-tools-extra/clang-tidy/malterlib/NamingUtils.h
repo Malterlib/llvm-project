@@ -199,6 +199,25 @@ AST_MATCHER(Expr, isUnevaluatedTypeid) {
 /// `hasAncestor`, whose results the match finder memoizes for each node.
 bool isInUnevaluatedOperand(const DynTypedNode &Node, ASTContext &Context);
 
+/// Whether the operands of \p S aren't evaluated, so that what is written in
+/// them neither runs nor changes anything: every kind of `sizeof`-like trait,
+/// `sizeof`, `alignof`, `__datasizeof` and the others, but the size of a
+/// variable length array, `noexcept`, a `typeid` that doesn't look at the
+/// dynamic type, `__uuidof`, the traits of types and expressions,
+/// `__is_lvalue_expr(...)`, a requires expression and a concept, and what a
+/// builtin doesn't evaluate, as clang marks its arguments,
+/// `__builtin_constant_p(Value)`, `__builtin_object_size(...)` or
+/// `__builtin_classify_type(...)`, also what `__builtin_assume(...)` or
+/// `__assume(...)` is given. The one classifier of what isn't evaluated.
+bool hasUnevaluatedOperands(const Stmt *S);
+
+/// Whether \p Current is in an unevaluated operand of \p Parent, its parent:
+/// a type, what hasUnevaluatedOperands tells of, not the callee of a builtin,
+/// or an arm, or the condition, of `__builtin_choose_expr` or `_Generic` that
+/// isn't chosen. Each step up of isInUnevaluatedOperand.
+bool isUnevaluatedOperandOf(const DynTypedNode &Current,
+                            const DynTypedNode &Parent);
+
 /// Whether \p Node is in a branch of an `if constexpr` that is discarded,
 /// which never runs.
 bool isInDiscardedBranch(const DynTypedNode &Node, ASTContext &Context);
@@ -605,15 +624,28 @@ inline bool hasConstObject(const CXXMethodDecl *Method) {
 /// the one seen: of a virtual member function that isn't final, not called
 /// by its name, `Reset.CReset::f_Reset(...)`, nor on an object whose type is
 /// what it is declared as, a variable or a member that isn't a reference,
-/// `Value.f_Get()`.
+/// `Value.f_Get()`, or of a final class, whose override of it is the one it
+/// names. Of one named through a `using` of a base's, `using
+/// CBase::f_Selected;`, whose class or a base between overrides it, the
+/// override runs, not the body seen.
 inline bool callsOverride(const CallExpr *Call) {
   const auto *Method = dyn_cast_or_null<CXXMethodDecl>(Call->getDirectCallee());
-  if (!Method || !Method->isVirtual() || Method->hasAttr<FinalAttr>() ||
-      Method->getParent()->hasAttr<FinalAttr>())
+  if (!Method || !Method->isVirtual())
     return false;
   const auto *Member =
       dyn_cast<MemberExpr>(Call->getCallee()->IgnoreParenImpCasts());
   if (Member && Member->hasQualifier())
+    return false;
+  // Whether what runs on an object of \p Class, which is what it is, is
+  // \p Method itself: its final overrider there.
+  auto Runs = [&](const CXXRecordDecl *Class) {
+    if (!Class || !Class->hasDefinition())
+      return false;
+    const CXXMethodDecl *Final =
+        Method->getCorrespondingMethodInClass(Class->getDefinition());
+    return Final && Final->getCanonicalDecl() == Method->getCanonicalDecl();
+  };
+  if (Method->hasAttr<FinalAttr>() || Method->getParent()->hasAttr<FinalAttr>())
     return false;
   // Nor on an object of a final class, also through a pointer or reference,
   // whose type is what it is.
@@ -621,18 +653,43 @@ inline bool callsOverride(const CallExpr *Call) {
     if (const CXXRecordDecl *Object = MemberCall->getRecordDecl();
         Object && Object->hasDefinition() &&
         Object->getDefinition()->hasAttr<FinalAttr>())
-      return false;
-  if (Member && !Member->isArrow()) {
-    const Expr *Object = Member->getBase()->IgnoreParenImpCasts();
+      return !Runs(Object);
+  // Also of a member operator, whose object is its first argument,
+  // `mp_Items()`.
+  const Expr *Receiver = nullptr;
+  if (Member && !Member->isArrow())
+    Receiver = Member->getBase();
+  else if (const auto *Operator = dyn_cast<CXXOperatorCallExpr>(Call);
+           Operator && Operator->getNumArgs() >= 1 &&
+           !Method->isExplicitObjectMemberFunction())
+    Receiver = Operator->getArg(0);
+  if (Receiver) {
+    const Expr *Object = Receiver->IgnoreParenImpCasts();
+    const CXXRecordDecl *Record = Object->getType()->getAsCXXRecordDecl();
+    if (Record && Record->hasDefinition() &&
+        Record->getDefinition()->hasAttr<FinalAttr>())
+      return !Runs(Record);
     const ValueDecl *Named = nullptr;
     if (const auto *Ref = dyn_cast<DeclRefExpr>(Object))
       Named = dyn_cast<VarDecl>(Ref->getDecl());
     else if (const auto *Field = dyn_cast<MemberExpr>(Object))
       Named = dyn_cast<FieldDecl>(Field->getMemberDecl());
     if (Named && !Named->getType()->isReferenceType())
-      return false;
+      return !Runs(Record);
   }
   return true;
+}
+
+/// The definition whose body \p Call runs, when that can be trusted: of its
+/// callee, unless an override can run instead (callsOverride). Null when it
+/// has none with a body, or what runs can't be told, which is then as one
+/// that can't be seen.
+inline const FunctionDecl *calledDefinition(const CallExpr *Call) {
+  const FunctionDecl *Callee = Call->getDirectCallee();
+  if (!Callee || callsOverride(Call))
+    return nullptr;
+  const FunctionDecl *Definition = Callee->getDefinition();
+  return Definition && Definition->getBody() ? Definition : nullptr;
 }
 
 /// The nodes a check was given in a translation unit, which the matchers

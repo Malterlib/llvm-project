@@ -4,7 +4,7 @@ malterlib-runs-to-completion
 ============================
 
 Verifies the contract of ``DMibRunsToCompletion`` from
-``Mib/Concurrency/TidyAnnotations``. Code that runs to completion only ends by
+``Mib/Core/TidyAnnotations``. Code that runs to completion only ends by
 finishing, never by being aborted: it only suspends on actors that are not
 destroyed while it runs, like the concurrent and blocking actors, and whoever
 starts it joins it before what it refers to is gone. That lets it refer to the

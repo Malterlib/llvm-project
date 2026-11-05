@@ -22,7 +22,7 @@
 namespace clang::tidy::malterlib {
 
 /// The phases of the life of an actor that the annotations of
-/// `Mib/Concurrency/TidyAnnotations` name. Once an actor is in a phase, it
+/// `Mib/Core/TidyAnnotations` name. Once an actor is in a phase, it
 /// stays in it: the flags that tell are only ever set.
 enum EActorPhase : unsigned {
   /// The actor is destroyed: `fp_DestroyInternal` has set the flag that
@@ -89,9 +89,23 @@ unsigned contextPhases(const FunctionDecl *Function);
 /// Whether \p Object is the object of the actor whose phase the context is:
 /// `this`, or what is named for it, like the `pThis` of a static function or
 /// the `m_pThis` of a protocol, also through unchanged local copies, and what
-/// it holds by value or owns. A pointer to another actor, like a member
-/// `m_pApp`, isn't. Null is the own object.
-bool isOwnActorObject(const Expr *Object, int Depth = 0);
+/// it holds by value or owns (objectRelation, isHeldByValue). Not what a
+/// pointer or reference member points to, which can be another actor, like a
+/// member `m_pApp`, nor an actor an owning pointer points to. Null is the own
+/// object. With \p Context, constant conditions are evaluated.
+/// Without \p ThisIsOwn, `this` is another object, like in the destructor of
+/// an object destroyed where it is, and so is what is reached from it.
+/// The parameters in \p Foreign are given another object than the own, and
+/// so is what is reached from them.
+bool isOwnActorObject(
+    const Expr *Object, ASTContext *Context = nullptr, bool ThisIsOwn = true,
+    const llvm::SmallPtrSetImpl<const ParmVarDecl *> *Foreign = nullptr);
+
+/// Whether \p E is the own object of the actor, as isOwnActorObject tells, or
+/// what is in it, also an entry of a collection it holds, or what a member
+/// function of it gives a pointer or reference to, `this->f_GetData()`, not
+/// through a pointer or reference it holds.
+bool reachesOwnActorObject(const Expr *E, ASTContext *Context = nullptr);
 
 /// Whether \p Call, of a static or free function, is given another actor
 /// than the own: an object of one, `fs_Stop(pOther)`, or a handle to one,
@@ -123,8 +137,11 @@ const FunctionDecl *calleeThroughPointer(const CallExpr *Call);
 /// The phases that \p S starts or runs: the phase entries and the functions
 /// of phases it calls, also in the lambdas it makes, which it can call, and
 /// through the functions it calls, like a `f_StopWrapper()` that calls
-/// `f_StopApp()`. Not in the branch an `if constexpr` discards.
-unsigned startedPhases(const Stmt *S, const ASTContext &Context);
+/// `f_StopApp()`. Not in the branch an `if constexpr` discards. With
+/// \p ThisForeign, `this` in \p S is another object than the own, like in
+/// the destructor of what is destroyed.
+unsigned startedPhases(const Stmt *S, const ASTContext &Context,
+                       bool ThisForeign = false);
 
 /// The phases that destroying an object of \p Record starts or runs, like
 /// `startedPhases` of its destructor's body, also of the destructors of its

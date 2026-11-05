@@ -38,9 +38,13 @@ and structured bindings, ``auto &[Value] = m_State``, what a member function of
 it gives a pointer or reference to, like ``mp_Items.f_FindEqual(Key)``, a copy
 of a pointer through a reference to it, a pointer captured by reference that
 is pointed into it anywhere, and a local pointer that
-isn't pointed elsewhere before the lambda copies it (but not the value of a
-pointer member, like
-``[pInternal = mp_pInternal]``, which points to what isn't the object), and an
+isn't pointed elsewhere before the lambda copies it, also through a cast, a
+conditional, of which any value that is counts, or a comma (but not the value
+of a pointer or reference member, like ``[pInternal = mp_pInternal]``, which
+points to what isn't the object, also what is reached through one,
+``&m_pOther->m_Value``, nor a value a member function makes, as
+:doc:`malterlib-coroutine-actor-reference <coroutine-actor-reference>` tells
+what an expression is relative to the object), and an
 init capture of a pointer to an actor that is made of what can't be told,
 ``[pActor = fg_GetActor()]``, like a local of it. So are the cleanups of
 subscriptions that run on another actor, ``g_ActorSubscription(Actor) /`` and

@@ -2,7 +2,7 @@
 
 #include "malterlib-concurrency.h"
 
-// The annotations of Mib/Concurrency/TidyAnnotations.
+// The annotations of Mib/Core/TidyAnnotations.
 #define DMibActorEntries(...) [[clang::annotate("malterlib-actor-entries", #__VA_ARGS__)]]
 #define DMibActorPhase(...) [[clang::annotate("malterlib-actor-phase", #__VA_ARGS__)]]
 #define DMibActorPhaseEntry(...) [[clang::annotate("malterlib-actor-phase-entry", #__VA_ARGS__)]]
