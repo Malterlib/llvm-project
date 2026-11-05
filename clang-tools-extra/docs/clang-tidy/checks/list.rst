@@ -276,6 +276,7 @@ Clang-Tidy Checks
    :doc:`malterlib-function-naming <malterlib/function-naming>`,
    :doc:`malterlib-header-declarations-only <malterlib/header-declarations-only>`,
    :doc:`malterlib-macro-naming <malterlib/macro-naming>`,
+   :doc:`malterlib-member-order <malterlib/member-order>`,
    :doc:`malterlib-no-zero-bit-scan <malterlib/no-zero-bit-scan>`,
    :doc:`malterlib-parameter-naming <malterlib/parameter-naming>`,
    :doc:`malterlib-parameter-ownership <malterlib/parameter-ownership>`,

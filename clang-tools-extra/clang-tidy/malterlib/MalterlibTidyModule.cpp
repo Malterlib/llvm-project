@@ -23,6 +23,7 @@
 #include "FunctionNamingCheck.h"
 #include "HeaderDeclarationsOnlyCheck.h"
 #include "MacroNamingCheck.h"
+#include "MemberOrderCheck.h"
 #include "NoZeroBitScanCheck.h"
 #include "ParameterNamingCheck.h"
 #include "ParameterOwnershipCheck.h"
@@ -68,6 +69,7 @@ public:
     CheckFactories.registerCheck<HeaderDeclarationsOnlyCheck>(
         "malterlib-header-declarations-only");
     CheckFactories.registerCheck<MacroNamingCheck>("malterlib-macro-naming");
+    CheckFactories.registerCheck<MemberOrderCheck>("malterlib-member-order");
     CheckFactories.registerCheck<NoZeroBitScanCheck>(
         "malterlib-no-zero-bit-scan");
     CheckFactories.registerCheck<ParameterNamingCheck>(
