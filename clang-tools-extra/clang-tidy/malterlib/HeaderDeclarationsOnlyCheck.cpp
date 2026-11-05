@@ -22,12 +22,16 @@ HeaderDeclarationsOnlyCheck::HeaderDeclarationsOnlyCheck(
     StringRef Name, ClangTidyContext *Context)
     : MalterlibCheck(Name, Context),
       DeclarationFileExtensions(utils::options::parseStringList(
-          listOption("DeclarationFileExtensions", "h"))) {}
+          listOption("DeclarationFileExtensions", "h"))),
+      OutOfClassFileExtensions(utils::options::parseStringList(
+          listOption("OutOfClassFileExtensions", "cpp;cc;cxx;mm"))) {}
 
 void HeaderDeclarationsOnlyCheck::storeCheckOptions(
     ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "DeclarationFileExtensions",
                 utils::options::serializeStringList(DeclarationFileExtensions));
+  Options.store(Opts, "OutOfClassFileExtensions",
+                utils::options::serializeStringList(OutOfClassFileExtensions));
 }
 
 void HeaderDeclarationsOnlyCheck::registerMatchers(MatchFinder *Finder) {
@@ -154,8 +158,6 @@ void HeaderDeclarationsOnlyCheck::check(
       if (Written)
         break;
     }
-  if (BodyLoc.isInvalid() || BodyLoc.isMacroID() || SM.isInSystemHeader(BodyLoc))
-    return;
   auto IsDeclarationFile = [&](SourceLocation Loc) {
     auto [Cached, Inserted] =
         DeclarationFiles.try_emplace(SM.getFileID(Loc), false);
@@ -165,6 +167,73 @@ void HeaderDeclarationsOnlyCheck::check(
           llvm::sys::path::extension(SM.getFilename(Loc)).ltrim('.'));
     return Cached->second;
   };
+  // In a source, a class declares its members and the bodies follow it, like
+  // a header and its `.hpp`: a member function, or a friend, defined in the
+  // class definition is reported, but not one of a class local to a
+  // function, also an Objective-C method or a block, whose members can't be
+  // defined out of it, nor one defaulted or deleted. The source is the one
+  // the body is in, also one a class includes its members from, and the body
+  // is where it is reported unless its name is in the same file.
+  // The body is in a source by where its braces are only: its opening brace,
+  // or, when an include gives that, `#include "Opening.hpp"`, its closing
+  // brace, of the last handler of a function try block; not by what is
+  // written between them.
+  // A file that is also one of the declaration files is left to that rule,
+  // which wants no definitions in it at all.
+  auto InSource = [&](SourceLocation Loc) {
+    return Loc.isValid() && !SM.isInSystemHeader(Loc) &&
+           !IsDeclarationFile(Loc) &&
+           llvm::is_contained(
+               OutOfClassFileExtensions,
+               llvm::sys::path::extension(SM.getFilename(Loc)).ltrim('.'));
+  };
+  // The braces of the body as written, of a coroutine too, and of a function
+  // try block those of its block and of its last handler, not its `try`.
+  // Those written where they are used, also in an argument of a macro, not
+  // what a macro's definition gives, `#define DClose }`.
+  // Before what the rule of the declaration files looks at, which leaves out
+  // a body a macro gives and one of a system header.
+  SourceLocation Opening;
+  SourceLocation Closing;
+  if (const auto *Block = dyn_cast<CompoundStmt>(Written)) {
+    Opening = Block->getLBracLoc();
+    Closing = Block->getRBracLoc();
+  } else if (const auto *Try = dyn_cast<CXXTryStmt>(Written)) {
+    Opening = Try->getTryBlock()->getLBracLoc();
+    if (const unsigned Handlers = Try->getNumHandlers())
+      if (const auto *Last = dyn_cast_or_null<CompoundStmt>(
+              Try->getHandler(Handlers - 1)->getHandlerBlock()))
+        Closing = Last->getRBracLoc();
+  }
+  SourceLocation SourceLoc;
+  if (WrittenWhereUsed(Opening) && InSource(SM.getFileLoc(Opening)))
+    SourceLoc = SM.getFileLoc(Opening);
+  else if (WrittenWhereUsed(Closing) && InSource(SM.getFileLoc(Closing)))
+    SourceLoc = SM.getFileLoc(Closing);
+  if (const auto *Record =
+          dyn_cast<CXXRecordDecl>(Function->getLexicalDeclContext());
+      Record && !Record->isLambda() && SourceLoc.isValid()) {
+    bool Local = false;
+    for (const DeclContext *Context = Record->getDeclContext(); Context;
+         Context = Context->getParent())
+      Local |= Context->isFunctionOrMethod();
+    if (!Local) {
+      const SourceLocation Loc =
+          Function->getLocation().isFileID() &&
+                  SM.getFileID(Function->getLocation()) ==
+                      SM.getFileID(SourceLoc)
+              ? Function->getLocation()
+              : SourceLoc;
+      diag(Loc, "%0 is defined in its class in a '.%1' file; declare it in the "
+                "class and define it after it")
+          << Function
+          << llvm::sys::path::extension(SM.getFilename(SourceLoc)).ltrim('.');
+      // And still what of it a declaration file has, which defining it
+      // after the class would leave there.
+    }
+  }
+  if (BodyLoc.isInvalid() || BodyLoc.isMacroID() || SM.isInSystemHeader(BodyLoc))
+    return;
   // Also what is written of it in another file than where it opens, like the
   // statements and the closing brace in a `.h` that a body opened in a
   // `.hpp` includes.

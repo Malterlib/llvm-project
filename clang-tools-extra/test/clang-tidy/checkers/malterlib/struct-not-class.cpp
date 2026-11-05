@@ -101,17 +101,22 @@ class CExternal;
 struct CPublicFirst
 {
 public:
-// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'CPublicFirst' starts with a 'public:' section, which is the default of a struct [malterlib-struct-not-class]
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'CPublicFirst', the default of a struct [malterlib-struct-not-class]
 	int m_Value;
 };
 
+// Also after members, `struct CActor { using CType = int; public: ...`.
 struct CPrivateSection
 {
 	int m_Value;
 
 public:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'CPrivateSection', the default of a struct [malterlib-struct-not-class]
 	int m_Other;
 };
+// CHECK-FIXES: {{^}}struct CPrivateSection{{$}}
+// CHECK-FIXES-NOT: {{^}}public:
+// CHECK-FIXES: {{^}}	int m_Other;{{$}}
 
 template <template <typename> class t_TCTemplate>
 struct TCTemplateTemplate;
@@ -231,7 +236,7 @@ public:
 struct
 {
 public:
-// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: {{.*}} starts with a 'public:' section, which is the default of a struct [malterlib-struct-not-class]
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in {{.*}}, the default of a struct [malterlib-struct-not-class]
 	int m_Value;
 } g_Round35Unnamed;
 
@@ -783,7 +788,7 @@ template <>
 struct TCSystemExternal<CRound166Value>
 {
 public:
-// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'TCSystemExternal<CRound166Value>' starts with a 'public:' section, which is the default of a struct [malterlib-struct-not-class]
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'TCSystemExternal<CRound166Value>', the default of a struct [malterlib-struct-not-class]
 	void f_Run();
 };
 template <>
@@ -816,4 +821,338 @@ struct CRound354Holder
 	template <typename t_CData2> friend class TCRound354Node;
 // CHECK-MESSAGES: :[[@LINE-1]]:38: warning: 'TCRound354Node' is a struct, but is named with 'class' here; name it with 'struct' [malterlib-struct-not-class]
 // CHECK-FIXES: template <typename t_CData2> friend struct TCRound354Node;
+};
+
+struct CRound9Value
+{
+};
+template <>
+class TCSystemExternalClass<CRound9Value>
+{
+private:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'private:' repeats the access in effect in 'TCSystemExternalClass<CRound9Value>', the default of a class [malterlib-struct-not-class]
+	int mp_Value;
+
+public:
+	void f_Run();
+};
+
+// A label that repeats the access in effect is redundant: also that of the
+// label before it, of a struct, a union or a class, and the default of a union,
+// or of a class kept as one, an external type's.
+namespace NRepeatedAccess {
+struct CRepeated
+{
+	void f_Run();
+
+private:
+	void fp_Run();
+private:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'private:' repeats the access in effect in 'CRepeated', that of the label before it [malterlib-struct-not-class]
+	int mp_Value;
+};
+union URepeated
+{
+public:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'URepeated', the default of a union [malterlib-struct-not-class]
+	int m_Integer;
+	float m_Float;
+};
+class CClassRepeated
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'CClassRepeated' should be declared with 'struct', like Malterlib types are [malterlib-struct-not-class]
+{
+private:
+	int mp_Value;
+protected:
+	int mp_Protected;
+protected:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'protected:' repeats the access in effect in 'CClassRepeated', that of the label before it [malterlib-struct-not-class]
+	int mp_Other;
+};
+// Of a class template as written, not its instantiations.
+template <typename t_CType>
+struct TCRepeated
+{
+	t_CType m_Value;
+public:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'TCRepeated', the default of a struct [malterlib-struct-not-class]
+	void f_Run();
+};
+template struct TCRepeated<int>;
+
+// Not after conditional preprocessing since the label before it, which
+// another configuration needs, nor after what the AST doesn't have, a macro
+// that expands to nothing here, nor after members from a macro, also
+// only their type or what is before it, nor a label
+// from a macro, nor one after it.
+struct CConditional
+{
+private:
+	int mp_Value;
+#if DPrivateLayout
+public:
+	int m_Public;
+#endif
+private:
+	int mp_Other;
+};
+#ifdef DRepeatedPublic
+#define DRepeatedMembers public: int m_Public;
+#define DRepeatedMember int m_Public;
+#define DRepeatedLabel public:
+#else
+#define DRepeatedMembers
+#define DRepeatedMember int mp_Hidden;
+#define DRepeatedLabel private:
+#endif
+struct CEmptyMacro
+{
+private:
+	int mp_Value;
+	DRepeatedMembers
+private:
+	int mp_Other;
+};
+struct CMacroMember
+{
+private:
+	DRepeatedMember
+private:
+	int mp_Other;
+};
+#ifdef DRepeatedPublic
+#define DRepeatedType public: int
+#define DRepeatedPrefix public:
+#else
+#define DRepeatedType int
+#define DRepeatedPrefix
+#endif
+struct CMacroType
+{
+private:
+	DRepeatedType mp_First;
+private:
+	int mp_Secret;
+};
+struct CMacroPrefix
+{
+private:
+	DRepeatedPrefix int mp_First;
+private:
+	int mp_Secret;
+};
+// Any use of a macro between them is: also inside a member, after its name,
+// in an alias, a member template or an initializer, and a colon from a macro.
+#define DRepeatedNothing
+#define DRepeatedSuffix
+#define DRepeatedValue 1
+#define DRepeatedColon :
+struct CMacroInside
+{
+private:
+	int DRepeatedNothing mp_First;
+private:
+	int mp_Secret;
+};
+struct CMacroSuffix
+{
+private:
+	int mp_First DRepeatedSuffix;
+private:
+	int mp_Secret;
+};
+struct CMacroAlias
+{
+private:
+	using CType = DRepeatedType;
+private:
+	int mp_Secret;
+};
+struct CMacroTemplate
+{
+private:
+	template <typename t_CType>
+	DRepeatedType fp_Run(t_CType _Value);
+private:
+	int mp_Secret;
+};
+struct CMacroInitializer
+{
+private:
+	int mp_First = DRepeatedValue;
+private:
+	int mp_Secret;
+};
+struct CMacroColon
+{
+private:
+	int mp_First;
+private DRepeatedColon
+	int mp_Secret;
+};
+// Also a macro between the label and its colon, which the fix removes too,
+// and an include, also one a guard skips, which another configuration can
+// make give another access.
+#define DRepeatedLayout
+struct CMacroBeforeColon
+{
+private:
+	int mp_First;
+private DRepeatedLayout:
+	int mp_Last;
+};
+struct CFragmentIncluder
+{
+	int m_First;
+#include "struct-not-class-fragment.h"
+	int m_Last;
+};
+struct CSkippedInclude
+{
+private:
+	int mp_First;
+#include "struct-not-class-fragment.h"
+private:
+	int mp_Last;
+};
+struct CMacroLabel
+{
+private:
+	int mp_Value;
+	DRepeatedLabel
+	int mp_Other;
+private:
+	int mp_Last;
+};
+}
+
+// Repeated labels of a class whose keyword a macro gives, which isn't
+// reported to be a struct, are reported too.
+#define DRoundTwelveTag(a, b) a##b
+DRoundTwelveTag(cl, ass) CRoundTwelvePasted
+{
+private:
+	int mp_First;
+private:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'private:' repeats the access in effect in 'CRoundTwelvePasted', that of the label before it [malterlib-struct-not-class]
+	int mp_Second;
+};
+
+// Not the default of one whose tag a macro gives, which can be `struct` or
+// `class` in another configuration, also of an external template's
+// specialization.
+#define DRoundFourteenTag struct
+DRoundFourteenTag CRoundFourteenTagged
+{
+	int m_First;
+public:
+	void f_Run();
+};
+#define DRoundFourteenClass class
+struct CRoundFourteenValue
+{
+};
+template <>
+DRoundFourteenClass TCSystemExternalClass<CRoundFourteenValue>
+{
+private:
+	int mp_Value;
+
+public:
+	void f_Run();
+};
+
+// A label with an annotation of its section is a barrier: neither it nor the
+// label after it, which ends that section, is compared with what is before it.
+struct CAnnotatedLabels
+{
+private:
+	int mp_AnnotatedFirst;
+private __attribute__((annotate("Section"))):
+	int mp_AnnotatedSecond;
+private:
+	int mp_AnnotatedThird;
+};
+// A label is reported but not removed when a comment follows it.
+struct CCommentedLabels
+{
+private:
+	int mp_CommentedFirst;
+private: // The rest of the state.
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'private:' repeats the access in effect in 'CCommentedLabels', that of the label before it [malterlib-struct-not-class]
+	int mp_CommentedSecond;
+};
+// CHECK-FIXES: {{^}}	int mp_CommentedFirst;{{$}}
+// CHECK-FIXES-NEXT: {{^}}private: // The rest of the state.{{$}}
+struct CInsideCommentLabels
+{
+private:
+	int mp_InsideFirst;
+private /* The rest of the state. */ :
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'private:' repeats the access in effect in 'CInsideCommentLabels', that of the label before it [malterlib-struct-not-class]
+	int mp_InsideSecond;
+};
+// CHECK-FIXES: {{^}}	int mp_InsideFirst;{{$}}
+// CHECK-FIXES-NEXT: {{^}}private /* The rest of the state. */ :{{$}}
+// Also a comment whose opening a line splice divides.
+struct CSplicedCommentLabels
+{
+private:
+	int mp_SplicedFirst;
+private /\
+* The rest. */ :
+// CHECK-MESSAGES: :[[@LINE-2]]:1: warning: 'private:' repeats the access in effect in 'CSplicedCommentLabels', that of the label before it [malterlib-struct-not-class]
+	int mp_SplicedSecond;
+};
+// CHECK-FIXES: {{^}}	int mp_SplicedFirst;{{$}}
+// CHECK-FIXES-NEXT: {{^}}private /\{{$}}
+// Nor when a preprocessing directive is in it, which removing it would remove.
+struct CDirectiveLabel
+{
+private:
+	int mp_DirectiveFirst;
+private
+#define DRoundTwentyValue 42
+:
+// CHECK-MESSAGES: :[[@LINE-3]]:1: warning: 'private:' repeats the access in effect in 'CDirectiveLabel', that of the label before it [malterlib-struct-not-class]
+	int mp_DirectiveSecond = DRoundTwentyValue;
+};
+// CHECK-FIXES: {{^}}#define DRoundTwentyValue 42{{$}}
+// Nor the default of one whose tag conditional preprocessing chooses, which
+// can be `struct` or `class` in another configuration.
+#ifdef DRoundTwentyThreeClass
+class CChosenTag
+#else
+struct CChosenTag
+#endif
+{
+	using CType = int;
+public:
+	void f_Run();
+};
+// Nor of one with a macro between its keyword and its brace, which can end the
+// class and start another in another configuration, `CForward; class
+// CSelected`, also one that only gives its name, but not one before the
+// keyword.
+#define DRoundTwentyNineName CRoundTwentyNineSelected
+struct DRoundTwentyNineName
+{
+	using CType = int;
+public:
+	void f_Run();
+};
+#define DRoundTwentyNineAttribute alignas(8)
+struct DRoundTwentyNineAttribute CRoundTwentyNineAligned
+{
+	using CType = int;
+public:
+	void f_Run();
+};
+#define DRoundTwentyNineExport
+DRoundTwentyNineExport struct CRoundTwentyNineExported
+{
+	using CType = int;
+public:
+// CHECK-MESSAGES: :[[@LINE-1]]:1: warning: 'public:' repeats the access in effect in 'CRoundTwentyNineExported', the default of a struct [malterlib-struct-not-class]
+	void f_Run();
 };

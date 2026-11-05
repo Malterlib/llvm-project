@@ -36,6 +36,9 @@ public:
 
 private:
   const std::vector<StringRef> DeclarationFileExtensions;
+  /// The files whose classes define no member functions in their
+  /// definition, which are defined after the class instead.
+  const std::vector<StringRef> OutOfClassFileExtensions;
   /// Whether each file that a function body is in holds declarations only.
   llvm::DenseMap<FileID, bool> DeclarationFiles;
   /// The nodes checked before in the translation unit.

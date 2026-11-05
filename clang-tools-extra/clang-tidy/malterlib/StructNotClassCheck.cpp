@@ -21,13 +21,32 @@ using namespace clang::ast_matchers;
 namespace clang::tidy::malterlib {
 
 namespace {
-/// Records the text the preprocessor skips, and where the conditional
-/// directives are.
+/// Records the text the preprocessor skips, where the conditional directives
+/// are, and where macros are used in files.
 class SkippedRangeCollector : public PPCallbacks {
 public:
   SkippedRangeCollector(llvm::SmallVectorImpl<SourceRange> &Ranges,
-                        llvm::SmallVectorImpl<SourceLocation> &Directives)
-      : Ranges(Ranges), Directives(Directives) {}
+                        llvm::SmallVectorImpl<SourceLocation> &Directives,
+                        llvm::SmallVectorImpl<SourceLocation> &Expansions,
+                        llvm::SmallVectorImpl<SourceLocation> &Includes)
+      : Ranges(Ranges), Directives(Directives), Expansions(Expansions),
+        Includes(Includes) {}
+  void MacroExpands(const Token &Name, const MacroDefinition &, SourceRange,
+                    const MacroArgs *) override {
+    if (Name.getLocation().isFileID())
+      Expansions.push_back(Name.getLocation());
+  }
+  // Also an include, which in another configuration can give what a guard
+  // skips here.
+  void InclusionDirective(SourceLocation Hash, const Token &, StringRef, bool,
+                          CharSourceRange, OptionalFileEntryRef, StringRef,
+                          StringRef, const Module *, bool,
+                          SrcMgr::CharacteristicKind) override {
+    if (!Hash.isFileID())
+      return;
+    Expansions.push_back(Hash);
+    Includes.push_back(Hash);
+  }
   void SourceRangeSkipped(SourceRange Range, SourceLocation) override {
     Ranges.push_back(Range);
   }
@@ -70,6 +89,8 @@ public:
 private:
   llvm::SmallVectorImpl<SourceRange> &Ranges;
   llvm::SmallVectorImpl<SourceLocation> &Directives;
+  llvm::SmallVectorImpl<SourceLocation> &Expansions;
+  llvm::SmallVectorImpl<SourceLocation> &Includes;
 };
 } // namespace
 
@@ -77,11 +98,11 @@ void StructNotClassCheck::registerPPCallbacks(const SourceManager &,
                                               Preprocessor *PP,
                                               Preprocessor *) {
   PP->addPPCallbacks(std::make_unique<SkippedRangeCollector>(
-      SkippedRanges, ConditionalDirectives));
+      SkippedRanges, ConditionalDirectives, MacroExpansions, Includes));
 }
 
-/// Whether a conditional directive of \p Directives is between \p Begin and
-/// \p End. The preprocessor reports them in the order of the translation
+/// Whether a conditional directive, or another location, of \p Directives is
+/// between \p Begin and \p End. The preprocessor reports them in the order of the translation
 /// unit, which a binary search finds the first after \p Begin in.
 static bool hasConditionalDirective(llvm::ArrayRef<SourceLocation> Directives,
                                     SourceLocation Begin, SourceLocation End,
@@ -608,9 +629,12 @@ void StructNotClassCheck::check(const MatchFinder::MatchResult &Result) {
   if (Record->isClass()) {
     // The tag of an external type, also of a specialization of an external
     // template, `template <> class std::hash<CValue>`, matches its other
-    // declarations.
-    if (isExternalType(Record, SM))
+    // declarations. Its labels are checked as those of a class.
+    if (isExternalType(Record, SM)) {
+      if (Definition)
+        reportRepeatedAccess(Record, true, SM);
       return;
+    }
     // A declaration of a type that is not defined here may be of an
     // external type, whose tag has to match its definition.
     const CXXRecordDecl *TypeDefinition = Record->getDefinition();
@@ -618,6 +642,11 @@ void StructNotClassCheck::check(const MatchFinder::MatchResult &Result) {
       return;
     const SourceLocation KeywordLoc = Record->getInnerLocStart();
     const SourceLocation Loc = reportLocation(KeywordLoc, SM);
+    // Its labels that repeat the label before them, whatever its keyword,
+    // also one a macro gives, not the default of a class, which a struct, as
+    // it is reported to be or a macro can make it elsewhere, needs.
+    if (Definition)
+      reportRepeatedAccess(Record, false, SM);
     if (Loc.isInvalid())
       return;
     // A class definition is reported once its friends are known, and its
@@ -632,33 +661,140 @@ void StructNotClassCheck::check(const MatchFinder::MatchResult &Result) {
     return;
   }
 
-  // A leading `public:` is redundant in a struct written here, also one that
-  // specializes an external template, but not in one of a system header.
-  if (!Record->isStruct() || !Definition ||
-      SM.isInSystemHeader(Record->getLocation()))
+  if (Definition)
+    reportRepeatedAccess(Record, true, SM);
+}
+
+void StructNotClassCheck::reportRepeatedAccess(const CXXRecordDecl *Definition,
+                                               bool WithDefault,
+                                               const SourceManager &SM) {
+  // An access label that repeats the access in effect is redundant: the
+  // default of a struct or union, public, or of a class, private, also after
+  // members, `struct CActor { using CType = int; public: ...`, or that of the
+  // label before it, `private: ... private:`. Of a type written here, also
+  // one that specializes an external template, but not of a system header,
+  // nor what a template is instantiated as, which is checked as written.
+  // Nor of one that comes from a precompiled header or a module, whose
+  // preprocessing this translation unit didn't see.
+  if (SM.isInSystemHeader(Definition->getLocation()) ||
+      Definition->getTemplateInstantiationPattern() ||
+      Definition->isFromASTFile())
     return;
-  const auto *Access =
-      dyn_cast_or_null<AccessSpecDecl>(firstWrittenMember(Record));
-  if (!Access || Access->getAccess() != AS_public)
+  // Only of one whose braces are written in one file, not from a macro,
+  // whose body can be gone through.
+  const SourceLocation Brace = Definition->getBraceRange().getBegin();
+  const SourceLocation End = Definition->getBraceRange().getEnd();
+  if (Brace.isInvalid() || End.isInvalid() || !Brace.isFileID() ||
+      !End.isFileID() || SM.getFileID(Brace) != SM.getFileID(End))
     return;
-  // Not one after conditional preprocessing, `#if DPrivateLayout private:
-  // #endif`, which another configuration needs.
-  if (hasConditionalDirective(ConditionalDirectives,
-                              Record->getBraceRange().getBegin(),
-                              Access->getAccessSpecifierLoc(), SM))
+  const FileID ClassFile = SM.getFileID(Brace);
+  const LangOptions &LangOpts = Definition->getASTContext().getLangOpts();
+  // Nor of one whose body includes a file. Nor in Microsoft mode, where a
+  // block of `__if_exists` or `__if_not_exists`, whose access labels are only
+  // there when what it names is, can be in any class, also through macros.
+  if (LangOpts.MicrosoftExt ||
+      hasConditionalDirective(Includes, Brace, End, SM))
     return;
-  // Nor one after what expands to nothing here but can declare members of
-  // another access elsewhere, a macro like `DPrivateMembers`.
-  if (writtenBefore(Record, Access->getAccessSpecifierLoc(), SM))
-    return;
-  const SourceLocation Loc = reportLocation(Access->getAccessSpecifierLoc(), SM);
-  if (Loc.isInvalid())
-    return;
-  auto Diag = diag(Loc, "%0 starts with a 'public:' section, which is the "
-                        "default of a struct")
-              << Record;
-  if (Loc.isFileID())
-    Diag << FixItHint::CreateRemoval(accessRange(Access));
+  // Not the default of one whose tag a macro gives, which can be `struct` or
+  // `class` in another configuration: the default is known only of one whose
+  // keyword is written in the file of its opening brace, not by a macro nor
+  // an include, with no preprocessing between them, which can choose it, `#if
+  // DPublic struct #else class #endif CExample {`, `#include DTagFile`, nor a
+  // macro, which can end the class and start another, `struct DTypeName {` of
+  // `#define DTypeName CForward; class CSelected`.
+  if (const SourceLocation Keyword = Definition->getInnerLocStart();
+      !Keyword.isFileID() || SM.getFileID(Keyword) != ClassFile ||
+      hasConditionalDirective(ConditionalDirectives, Keyword, Brace, SM) ||
+      hasConditionalDirective(MacroExpansions, Keyword, Brace, SM))
+    WithDefault = false;
+  // Since the brace or the label before it.
+  SourceLocation From = Brace;
+  const AccessSpecDecl *Previous = nullptr;
+  bool FromLabel = false;
+  AccessSpecifier InEffect = Definition->isClass() ? AS_private : AS_public;
+  for (const Decl *Member : Definition->decls()) {
+    const auto *Access = dyn_cast<AccessSpecDecl>(Member);
+    if (!Access)
+      continue;
+    const SourceLocation Label = Access->getAccessSpecifierLoc();
+    // Of a label written in the file of the braces, also its colon, and after
+    // the brace or a label written there: one of an included fragment of the
+    // body isn't compared, nor the label after it with it.
+    // Not one with attributes, like an annotation of its section, `private
+    // __attribute__((annotate("..."))):`, nor the one after it, which ends
+    // that section: an annotated label is a barrier.
+    const bool Repeats = Access->getAccess() == InEffect &&
+                         (FromLabel || WithDefault) && !Access->hasAttrs() &&
+                         !(Previous && Previous->hasAttrs()) &&
+                         Label.isFileID() &&
+                         Access->getColonLoc().isFileID() && From.isFileID() &&
+                         SM.getFileID(Label) == ClassFile &&
+                         SM.getFileID(From) == ClassFile;
+    // Not after conditional preprocessing, `#if DPrivateLayout private:
+    // #endif`, which another configuration needs, nor after any use of a
+    // macro, also one that expands to nothing here, `DPrivateMembers`, or
+    // gives only part of a member, `DMemberType mp_Value;`, or an include,
+    // which can give another access in another configuration; up to the end
+    // of its colon, which the fix removes too, `private DLayout:`.
+    const SourceLocation Through = Access->getColonLoc().getLocWithOffset(1);
+    // The text of the label, through its colon, in its file.
+    StringRef Written;
+    if (Repeats) {
+      bool Invalid = false;
+      const StringRef Buffer = SM.getBufferData(SM.getFileID(Label), &Invalid);
+      const unsigned At = SM.getFileOffset(Label);
+      const unsigned End = SM.getFileOffset(Through);
+      if (!Invalid && At <= End && End <= Buffer.size())
+        Written = Buffer.slice(At, End);
+    }
+    if (Repeats && !Written.empty() &&
+        !hasConditionalDirective(ConditionalDirectives, From, Through, SM) &&
+        !hasConditionalDirective(MacroExpansions, From, Through, SM)) {
+      static constexpr const char *Defaults[] = {"struct", "class", "union"};
+      auto Diag =
+          diag(Label, "'%0:' repeats the access in effect in %1, %select{the "
+                      "default of a %3|that of the label before it}2")
+          << (InEffect == AS_public
+                  ? "public"
+                  : (InEffect == AS_protected ? "protected" : "private"))
+          << Definition << (FromLabel ? 1u : 0u)
+          << Defaults[Definition->isClass() ? 1 : (Definition->isUnion() ? 2
+                                                                         : 0)];
+      // Not removed when a comment is in it, `private /* ... */ :`, or
+      // follows it on its line, which tells of its section: by the tokens
+      // with comments, also one whose opening a line splice divides; nor
+      // when a preprocessing directive is in it, `private #define ... :`,
+      // which removing it would remove.
+      bool Commented = false;
+      {
+        const StringRef Buffer = SM.getBufferData(ClassFile);
+        Lexer Raw(SM.getLocForStartOfFile(ClassFile), LangOpts,
+                  Buffer.begin(), Buffer.begin() + SM.getFileOffset(Label),
+                  Buffer.end());
+        Raw.SetCommentRetentionState(true);
+        const unsigned ThroughOffset = SM.getFileOffset(Through);
+        Token Next;
+        while (!Commented) {
+          const bool Last = Raw.LexFromRawLexer(Next);
+          const unsigned At = SM.getFileOffset(Next.getLocation());
+          if (At >= ThroughOffset) {
+            Commented = Next.is(tok::comment) && !Next.isAtStartOfLine();
+            break;
+          }
+          Commented = Next.is(tok::comment) ||
+                      (Next.is(tok::hash) && Next.isAtStartOfLine());
+          if (Last)
+            break;
+        }
+      }
+      if (!Commented)
+        Diag << FixItHint::CreateRemoval(accessRange(Access));
+    }
+    InEffect = Access->getAccess();
+    From = Label;
+    Previous = Access;
+    FromLabel = true;
+  }
 }
 
 void StructNotClassCheck::onEndOfTranslationUnit() {

@@ -37,6 +37,23 @@ what it defines, ``DErrorClass(CError, CParent)``, also where they qualify
 what its bodies call, ``d_CParent::f_Value()``: only what is written from its
 first to its last token in an argument is.
 
+In a source, a class declares its members and their bodies follow it, as a
+header and its ``.hpp`` do: a member function or a friend that is defined in
+its class definition in one of :option:`OutOfClassFileExtensions` is reported,
+also of a nested class or a class template, but not one that is defaulted or
+deleted, nor those of a class local to a function, also an Objective-C method
+or a block, nor lambdas. The source is the one the body is in, also one the
+class includes its members from, and it is reported there unless its name is
+in the same file. A body is in a source by where its braces are only: its
+opening brace, or, when an include gives that, its closing brace, of a
+function try block those of its block and of its last handler, not its
+``try``, of the braces written where they are used, also in an argument of a
+macro, not those a macro's definition gives, also when a macro gives the rest
+of the body; not by statements written between them. A file whose extension is also one of
+:option:`DeclarationFileExtensions` is left to that rule, which reports any
+definition in it. What of such a body a declaration file has is reported too,
+which defining it after the class would leave there.
+
 Options
 -------
 
@@ -44,3 +61,9 @@ Options
 
    Semicolon-separated list of the extensions of files that hold declarations
    only, without the dot. Default is `h`.
+
+.. option:: OutOfClassFileExtensions
+
+   Semicolon-separated list of the extensions of the sources whose classes
+   define no member functions in their definition. Default is
+   ``cpp;cc;cxx;mm``.

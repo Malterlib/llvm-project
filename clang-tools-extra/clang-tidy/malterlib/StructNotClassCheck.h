@@ -41,6 +41,10 @@ public:
 private:
   /// Reports `class` naming \p Record, a struct, at \p Keyword.
   void reportElaborated(const CXXRecordDecl *Record, SourceLocation Keyword);
+  /// Reports the access labels of \p Definition that repeat the access in
+  /// effect, also its default unless \p WithDefault is false.
+  void reportRepeatedAccess(const CXXRecordDecl *Definition, bool WithDefault,
+                            const SourceManager &SM);
   /// The class definitions to report, which are reported at the end of the
   /// translation unit, with fixes of the tags of every declaration and
   /// friend declaration of them.
@@ -62,6 +66,13 @@ private:
   /// Where the conditional preprocessing directives are, like `#ifdef`, also
   /// after a comment, `/* Layout */ #ifdef`.
   llvm::SmallVector<SourceLocation, 8> ConditionalDirectives;
+  /// Where macros are used in files, also those that expand to nothing, and
+  /// where files are included, also those a guard skips, in the order of the
+  /// translation unit.
+  llvm::SmallVector<SourceLocation, 64> MacroExpansions;
+  /// Where files are included, in files, in the order of the translation
+  /// unit.
+  llvm::SmallVector<SourceLocation, 16> Includes;
   /// The nodes checked before in the translation unit.
   CRepeatedMatches Repeated;
 };
