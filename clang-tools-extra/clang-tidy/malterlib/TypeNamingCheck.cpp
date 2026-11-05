@@ -116,59 +116,9 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
           isInExternalSpecialization(Alias->getTemplatedDecl(), SM))
         return;
       const QualType Canonical = Aliased.getCanonicalType();
-      // One of a member of what depends on its parameters, `using TCCallback =
-      // typename t_CTraits::FSignature;`, also of what an expression that
-      // depends on them is, `decltype(t_CTraits::fs_Run)`, is a function type
-      // when each use makes one, which is told at the end of the translation
-      // unit.
-      // Also through another alias template, `TCIdentity<typename
-      // t_CTraits::FSignature>`, what it is an alias of, and through another
-      // alias that depends on them, `using TCCallback = FSignature;`.
-      const clang::Type *Pattern =
-          Alias->getTemplatedDecl()->getUnderlyingType().getTypePtr();
-      for (int Depth = 0; Depth < 16; ++Depth)
-        if (const auto *Attributed = dyn_cast<AttributedType>(Pattern))
-          Pattern = Attributed->getModifiedType().getTypePtr();
-        else if (const auto *Other = dyn_cast<TypedefType>(Pattern);
-                 Other && Other->isDependentType())
-          Pattern = Other->desugar().getTypePtr();
-        else if (const auto *Wrapper =
-                     dyn_cast<TemplateSpecializationType>(Pattern);
-                 Wrapper && Wrapper->isTypeAlias())
-          Pattern = Wrapper->getAliasedType().getTypePtr();
-        else if (const auto *Substituted =
-                     dyn_cast<SubstTemplateTypeParmType>(Pattern))
-          Pattern = Substituted->getReplacementType().getTypePtr();
-        else
-          break;
-      const auto *MemberTemplate =
-          dyn_cast<TemplateSpecializationType>(Pattern);
-      // Also a transformation of what depends on them,
-      // `std::remove_reference_t< typename t_CTraits::FSignature>`, but not of
-      // a parameter, also not the `type` of a template given one, `typename
-      // std::enable_if<t_bEnable, t_CType>::type`, which is generic, whatever
-      // it is given.
-      const auto *Transform = dyn_cast<UnaryTransformType>(Pattern);
-      if (!isTypeOfGivenParameter(Pattern, /*Nested=*/true) &&
-          (isa<DependentNameType, UnresolvedUsingType>(Pattern) ||
-           (isa<DecltypeType, TypeOfExprType, TypeOfType>(Pattern) &&
-            Pattern->isDependentType()) ||
-           (Transform && Transform->isDependentType() &&
-            !givesParameter(Transform->getBaseType(), /*Nested=*/true)) ||
-           (MemberTemplate &&
-            MemberTemplate->getTemplateName().getAsDependentTemplateName()))) {
-        // A use where a member of what a parameter is given gives what that
-        // is given in turn, `TCMapKey<TCMap<EMode, int>>` of `typename
-        // t_CMap::CKey`, is generic, like that of a member alias, which keeps
-        // it from being named as what the others are.
-        CAliasUses &Uses = MemberAliasUses[Alias];
-        (isMemberOfGivenParameter(Pattern) && forwardsArgument(Aliased)
-             ? Uses.Others
-         : Canonical->isFunctionType() ? Uses.Functions
-         : Canonical->isEnumeralType() ? Uses.Enums
-                                       : Uses.Others) = true;
-        Uses.SM = &SM;
-      }
+      // One of what depends on its parameters, `using TCCallback = typename
+      // t_CTraits::FSignature;`, is generic: its generic name is always
+      // allowed, and its uses only exclude what is wrong in them.
       // Of `TF`, which an alias template of a function type has: one with
       // the `F` of an alias is reported where it is declared.
       const bool WrongFunction = hasTypePrefix(Alias->getName(), {"TF"}) &&
@@ -199,10 +149,10 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
     // default given `TCFunction<void ()>`, and in what an alias stands for,
     // `TCCallback<CTraits>` of `using TCCallback =
     // TCFunction<TCSignature<t_CTraits>>`.
-    // Each pair once, as deep as it is met, which one given the same
-    // arguments, `TCPart<TCOne<T>, TCOne<T>>`, would otherwise meet once for
-    // each path to it.
-    llvm::DenseMap<std::pair<void *, void *>, int> Checked;
+    // Each pair once in the translation unit, as deep as it is met, which one
+    // given the same arguments, `TCPart<TCOne<T>, TCOne<T>>`, would otherwise
+    // meet once for each path to it, and each use in each instantiation again.
+    auto &Checked = CheckedAliasUses;
     std::function<void(QualType, QualType, int)> CheckNested =
         [&](QualType Written, QualType Given, int Depth) {
           if (Written.isNull() || Given.isNull() || Depth > 16 ||
@@ -436,8 +386,14 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
   // A type of a C library that this code only declares, in `extern "C"`,
   // `extern "C" { struct x509_store_st; }`, which the library defines
   // elsewhere, has the library's name, whichever header declares it first.
-  auto OfCLibrary = [](const TagDecl *Tag) {
-    return Tag && !Tag->getDefinition() &&
+  // Also when the library's header, a system header, defines it in the same
+  // translation unit, as libdbus defines `DBusMessageIter`, which callers
+  // allocate.
+  auto OfCLibrary = [&SM](const TagDecl *Tag) {
+    if (!Tag)
+      return false;
+    const TagDecl *Definition = Tag->getDefinition();
+    return (!Definition || SM.isInSystemHeader(Definition->getLocation())) &&
            llvm::any_of(Tag->redecls(), [](const TagDecl *Redecl) {
              return Redecl->getLexicalDeclContext()->isExternCContext();
            });
@@ -535,15 +491,14 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
     }
     // The name of an enumerator is the name of its enum, an underscore and
     // upper camel case, `EMode_Read` of `EMode`, also of one named by a
-    // typedef, `typedef enum { ... } EMode;`.
+    // typedef, `typedef enum { ... } EMode;`. Like any group, the one after the
+    // enum's name can be a built-in type of Malterlib, `EResultDataType_fp64`.
     const StringRef EnumName =
         Enum->getIdentifier() ? Enum->getName() : Typedef->getName();
     const StringRef Name = Type->getName();
     if (Name.size() > EnumName.size() + 1 && Name.starts_with(EnumName) &&
         Name[EnumName.size()] == '_' &&
-        (llvm::isUpper(Name[EnumName.size() + 1]) ||
-         llvm::isDigit(Name[EnumName.size() + 1])) &&
-        hasUpperGroups(Name.drop_front(EnumName.size() + 1)))
+        hasUpperGroups(Name.drop_front(EnumName.size())))
       return;
     const SourceLocation Loc = nameLocation(Type, SM);
     if (Loc.isValid())
@@ -575,10 +530,21 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
     if (!Typedef->isFirstDecl())
       return;
     // Also a name it gives such a type in `extern "C"`, `typedef struct
-    // x509_store_st X509_STORE;`.
-    if (Typedef->getLexicalDeclContext()->isExternCContext() &&
-        OfCLibrary(Typedef->getUnderlyingType()->getAsTagDecl()))
-      return;
+    // x509_store_st X509_STORE;`, and one that gives a type of `extern "C"`
+    // its own name, `typedef struct DBusError DBusError;`, which is named by
+    // the type, checked where it is declared: also when a header that isn't a
+    // system header defines it, like libdbus's through a search path.
+    if (Typedef->getLexicalDeclContext()->isExternCContext()) {
+      const TagDecl *Tag = Typedef->getUnderlyingType()->getAsTagDecl();
+      if (OfCLibrary(Tag))
+        return;
+      if (Tag && Tag->getIdentifier() &&
+          Tag->getName() == Typedef->getName() &&
+          llvm::any_of(Tag->redecls(), [](const TagDecl *Redecl) {
+            return Redecl->getLexicalDeclContext()->isExternCContext();
+          }))
+        return;
+    }
     const auto *Alias = dyn_cast<TypeAliasDecl>(Typedef);
     const bool Template = Alias && Alias->getDescribedAliasTemplate();
     // `F` is for function types, like `using FTest = void ();`, which take
@@ -668,87 +634,13 @@ void TypeNamingCheck::check(const MatchFinder::MatchResult &Result) {
           return;
         }
       }
-    // And one of a member of what depends on template parameters that each
-    // instantiation makes a function type, `using CCallback = typename
-    // t_CTraits::FSignature;`, which the traits it is given decide, also
-    // what is computed from them, `decltype(t_CTraits::fs_Run)`, is named as
-    // one, also a local one, but not one of a parameter, `using CValue =
-    // t_CType;`, which is generic, whatever it is instantiated with.
-    // Also one a using declaration brings in from a base that depends on
-    // them, `using typename TCParent<t_CType>::FSignature`, and one annotated,
-    // `[[clang::annotate_type("...")]]`.
-    // Also through an alias template, `TCIdentity<typename
-    // t_CTraits::FSignature>`, what it is an alias of, and through another
-    // alias that depends on them, `using CCallback = FSignature;`, and in
-    // parentheses, `typedef typename t_CTraits::FSignature (CCallback);`.
-    const clang::Type *Written = Underlying.getTypePtr();
-    for (int Depth = 0; Depth < 16; ++Depth)
-      if (const auto *Attributed = dyn_cast<AttributedType>(Written))
-        Written = Attributed->getModifiedType().getTypePtr();
-      else if (const auto *Parens = dyn_cast<ParenType>(Written))
-        Written = Parens->getInnerType().getTypePtr();
-      else if (const auto *Other = dyn_cast<TypedefType>(Written);
-               Other && Other->isDependentType())
-        Written = Other->desugar().getTypePtr();
-      else if (const auto *Alias =
-                   dyn_cast<TemplateSpecializationType>(Written);
-               Alias && Alias->isTypeAlias())
-        Written = Alias->getAliasedType().getTypePtr();
-      else if (const auto *Substituted =
-                   dyn_cast<SubstTemplateTypeParmType>(Written))
-        Written = Substituted->getReplacementType().getTypePtr();
-      else
-        break;
-    // The declared type of what it names, `decltype(_Value)` of `tf_CType
-    // _Value`, which is what that is, also generic, not of an expression in
-    // parentheses, `decltype((_Value))`, which is computed.
-    if (const auto *Decltype = dyn_cast<DecltypeType>(Written))
-      if (const auto *Named =
-              dyn_cast<DeclRefExpr>(Decltype->getUnderlyingExpr());
-          Named && isa<VarDecl>(Named->getDecl()))
-        Written = Named->getDecl()->getType().getTypePtr();
-    const auto *MemberTemplate = dyn_cast<TemplateSpecializationType>(Written);
-    // Also a transformation of what depends on them, `std::remove_reference_t<
-    // typename t_CTraits::FSignature>`, but not of a parameter, which is
-    // generic.
-    const auto *Transform = dyn_cast<UnaryTransformType>(Written);
-    if (!isTypeOfGivenParameter(Written, /*Nested=*/true) &&
-        (isa<DependentNameType, UnresolvedUsingType>(Written) ||
-         (isa<DecltypeType, TypeOfExprType, TypeOfType>(Written) &&
-          Written->isDependentType()) ||
-         (Transform && Transform->isDependentType() &&
-          !givesParameter(Transform->getBaseType(), /*Nested=*/true)) ||
-         (MemberTemplate &&
-          MemberTemplate->getTemplateName().getAsDependentTemplateName())) &&
-        !hasTypePrefix(Typedef->getName(), {"F", "TF"})) {
-      bool Functions = false;
-      bool Enums = false;
-      bool Others = false;
-      // A member of what a parameter is given, `typename t_CMap::CKey`, is
-      // what that defines it as, `typename t_CTraits::EState`, unless it
-      // gives what it is given in turn, `TCMap<EMode, int>::CKey`.
-      const bool OfParameter = isMemberOfGivenParameter(Written);
-      // One that gives what it is given in turn is generic, which keeps it
-      // from being named as what the others are.
-      for (const TypedefNameDecl *Instantiated : InstantiatedAliases)
-        if (const QualType Made = Instantiated->getUnderlyingType();
-            !Made->isDependentType())
-          (OfParameter && forwardsArgument(Made) ? Others
-           : Made->isFunctionType()              ? Functions
-           : Made->isEnumeralType()              ? Enums
-                                                 : Others) = true;
-      if (Functions && !Enums && !Others) {
-        checkName(Typedef, SM, "function type alias",
-                  Template ? llvm::ArrayRef<StringRef>{"TF"}
-                           : llvm::ArrayRef<StringRef>{"F"});
-        return;
-      }
-      // And an enum, `using CState = typename t_CTraits::EState;`.
-      if (Enums && !Functions && !Others) {
-        checkName(Typedef, SM, "enum type alias", {"E"});
-        return;
-      }
-    }
+    // One of what depends on template parameters, also a member of what a
+    // parameter is given, `using CCallback = typename t_CTraits::FSignature;`,
+    // or what is computed from them, `TCConditional<..., typename
+    // t_CMap::CUserData, CKey const>`, is generic: its generic name, `C`, is
+    // always allowed, also when every instantiation of the translation unit
+    // makes it a function type or an enum, and the instantiations only
+    // exclude what is wrong in them, `F` or `E`, above.
     if (!Underlying->isDependentType()) {
       const QualType Canonical = Underlying.getCanonicalType();
       const bool Function = Canonical->isFunctionType();
@@ -842,21 +734,6 @@ void TypeNamingCheck::checkName(const NamedDecl *Type, const SourceManager &SM,
     return;
   diag(Loc, "%0 %1 should have the %2 prefix followed by upper camel case")
       << Kind << Type << quotedList(Expected);
-}
-
-void TypeNamingCheck::onEndOfTranslationUnit() {
-  // Also one that each use makes an enum, `template <typename t_CTraits> using
-  // EState = typename t_CTraits::EState;`.
-  for (const auto &[Alias, Uses] : MemberAliasUses) {
-    if (!Uses.SM || Uses.Others)
-      continue;
-    if (Uses.Functions && !Uses.Enums)
-      checkName(Alias->getTemplatedDecl(), *Uses.SM, "function type alias",
-                {"TF"});
-    else if (Uses.Enums && !Uses.Functions)
-      checkName(Alias->getTemplatedDecl(), *Uses.SM, "enum type alias", {"E"});
-  }
-  MemberAliasUses.clear();
 }
 
 } // namespace clang::tidy::malterlib

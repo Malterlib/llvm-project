@@ -17,3 +17,21 @@ void fg_ConstexprBindings()
 // CHECK-MESSAGES: :[[@LINE-1]]:25: warning: static structured binding 's_First' should have the 'c_' prefix [malterlib-variable-naming]
 // CHECK-MESSAGES: :[[@LINE-2]]:34: warning: static structured binding 's_Second' should have the 'c_' prefix [malterlib-variable-naming]
 }
+
+// The placeholder of what is ignored is no name, also repeated.
+struct CPlaceholderTriple
+{
+	int m_First;
+	int m_Second;
+	int m_Third;
+};
+
+void fg_Placeholders(CPlaceholderTriple const &_Triple)
+{
+	auto [First, _, _] = _Triple;
+	auto _ = First;
+	int _ = 0;
+	auto [Other, Second, _] = _Triple;
+	(void)Other;
+	(void)Second;
+}

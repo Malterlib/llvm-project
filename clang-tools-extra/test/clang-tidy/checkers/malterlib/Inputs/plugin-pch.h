@@ -177,3 +177,28 @@ struct TCPchExternField
 {
 	typename t_CTraits::CNumber m_pValue;
 };
+
+// And the member functions of a class with a base that depends on them, whose
+// names its bases tell.
+struct CPchPlainBase
+{
+};
+template <typename t_CBase>
+struct TCPchAdapter : t_CBase
+{
+	static void f_Run();
+	template <typename tf_CValue>
+	static void f_RunTemplate();
+};
+
+// And of a member class of a specialization the precompiled header makes,
+// which the compile completes.
+template <typename t_CBase>
+struct TCPchOuterAdapter
+{
+	struct CInner : t_CBase
+	{
+		static void f_RunInner();
+	};
+};
+inline TCPchOuterAdapter<CPchPlainBase> g_PchOuterAdapter;

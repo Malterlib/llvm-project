@@ -83,6 +83,7 @@ void fg_TemplateBad();
 
 template <template <typename t_CInner, typename Inner> class t_TCTemplate>
 // CHECK-MESSAGES: :[[@LINE-1]]:49: warning: template parameter 'Inner' should have the 't_' prefix [malterlib-parameter-naming]
+// CHECK-MESSAGES: :[[@LINE-2]]:49: warning: type template parameter 'Inner' should have a type prefix after 't_', like 't_C' or 't_F' [malterlib-parameter-naming]
 struct TCNested;
 
 template <typename tf_CType>
@@ -104,7 +105,11 @@ using TCAlias = t_CType;
 template <typename t_CType>
 constexpr bool gc_bVariable = true;
 
+// The parameters of a function with C linkage are named like any other.
 extern "C" void c_function(int value);
+// CHECK-MESSAGES: :[[@LINE-1]]:32: warning: parameter 'value' should be upper camel case after its prefix [malterlib-parameter-naming]
+// CHECK-MESSAGES: :[[@LINE-2]]:32: warning: parameter 'value' should have the '_' prefix [malterlib-parameter-naming]
+extern "C" void c_named(int _Value);
 
 void fg_NoLint(int Value); // NOLINT(malterlib-parameter-naming)
 
@@ -468,6 +473,11 @@ void fg_Read() {
 // RUN: printf '@interface CObject { @public int m_Value; }\n@end\nvoid fg_Set(CObject *const &o_pObject) { o_pObject->m_Value = 1; }\n' > %t.objcref.mm
 // RUN: clang-tidy --config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}" --checks='-*,malterlib-parameter-naming' %t.objcref.mm -- -x objective-c++ 2>&1 | FileCheck --check-prefix=CHECK-OBJC-REF --allow-empty %s
 // CHECK-OBJC-REF-NOT: warning:
+// An explicit instantiation with a calling convention names a specialization
+// that exists too, whose parameters aren't checked.
+// RUN: printf 'template <typename tf_CType>\nvoid __cdecl fg_Run(tf_CType _Value) {}\ntemplate void __cdecl fg_Run<int>(int);\n' > %t.cdecl.cpp
+// RUN: clang-tidy --config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}" --checks='-*,malterlib-parameter-naming' %t.cdecl.cpp -- --target=i686-pc-windows-msvc -std=c++20 2>&1 | FileCheck --check-prefix=CHECK-CDECL --allow-empty %s
+// CHECK-CDECL-NOT: warning:
 
 namespace NRound150 {
 // A const atomic pointer to what can be written.
@@ -936,3 +946,241 @@ void fg_ReadPointer(CData const *o_pData);
 void fg_Control(int const (&o_Data)[4]);
 // CHECK-MESSAGES: :[[@LINE-1]]:29: warning: parameter 'o_Data' has the 'o_' prefix of an output, but can't be written through, being a value or const; name it with the '_' prefix [malterlib-parameter-naming]
 }
+
+// An explicit instantiation only names a specialization that exists, so its
+// parameters need no names, also with `extern`. The parameters of a function
+// type among its template arguments are named like any other.
+template <typename t_CType>
+struct TCExplicitValue
+{
+	TCExplicitValue(t_CType &&_Value) {}
+	template <typename tf_CType>
+	void f_Set(tf_CType const &_Value) {}
+	void f_Plain(int _Value) {}
+};
+
+template <typename tf_CType>
+void fg_ExplicitFunction(tf_CType _Value) {}
+
+template TCExplicitValue<long>::TCExplicitValue(long &&);
+extern template TCExplicitValue<char>::TCExplicitValue(char &&);
+template void TCExplicitValue<long>::f_Set<int>(int const &);
+template void TCExplicitValue<long>::f_Plain(int);
+template void fg_ExplicitFunction<int>(int);
+extern template void fg_ExplicitFunction<long>(long);
+
+template <typename t_CFunction>
+struct TCExplicitFunction {};
+template struct TCExplicitFunction<void (int _Value)>;
+template struct TCExplicitFunction<void (long Bad)>;
+// CHECK-MESSAGES: :[[@LINE-1]]:47: warning: parameter 'Bad' should have the '_' prefix [malterlib-parameter-naming]
+template struct TCExplicitFunction<void (char)>;
+// CHECK-MESSAGES: :[[@LINE-1]]:46: warning: parameter should be named, also when it is unused, so that what it is can be told [malterlib-parameter-naming]
+
+// An explicit specialization is a declaration of its own, whose parameters are named.
+template <> void fg_ExplicitFunction<char>(char) {}
+// CHECK-MESSAGES: :[[@LINE-1]]:48: warning: parameter should be named, also when it is unused, so that what it is can be told [malterlib-parameter-naming]
+// Also an explicit specialization of a member of a class template, and a
+// member of an explicitly specialized member class, though the class they are
+// in is instantiated.
+template <typename t_CType>
+struct TCExplicitMembers
+{
+	void f_Run(t_CType _Value);
+	struct CInner;
+	template <typename tf_CValue>
+	void f_Template(tf_CValue _Value);
+	template <typename t_CValue>
+	struct TCInner;
+	static int ms_Value;
+	static int ms_Captured;
+	template <typename t_CValue>
+	static int ms_Template;
+};
+template <>
+void TCExplicitMembers<int>::f_Run(int BadName) {}
+// CHECK-MESSAGES: :[[@LINE-1]]:40: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+template <>
+struct TCExplicitMembers<int>::CInner
+{
+	void f_Run(int BadName);
+// CHECK-MESSAGES: :[[@LINE-1]]:17: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+};
+// Also of a lambda in the initializer of a static data member specialized for
+// an instantiated class.
+template <>
+int TCExplicitMembers<int>::ms_Value = [](int BadName) { return BadName; }(0);
+// CHECK-MESSAGES: :[[@LINE-1]]:47: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+// Also of one in an init capture of a lambda there.
+template <>
+int TCExplicitMembers<int>::ms_Captured = [Value = [](int BadName) { return BadName; }(0)] { return Value; }();
+// CHECK-MESSAGES: :[[@LINE-1]]:59: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+// Also of a member variable template specialized for an instantiated class.
+template <>
+template <typename t_CValue>
+int TCExplicitMembers<int>::ms_Template = [](int BadName) { return BadName; }(0);
+// CHECK-MESSAGES: :[[@LINE-1]]:50: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+// Also of a member template specialized for an instantiated class.
+template <>
+template <typename tf_CValue>
+void TCExplicitMembers<int>::f_Template(tf_CValue BadName) {}
+// CHECK-MESSAGES: :[[@LINE-1]]:51: warning: parameter 'BadName' should have the 'o_' or '_' prefix [malterlib-parameter-naming]
+template <>
+template <typename t_CValue>
+struct TCExplicitMembers<int>::TCInner
+{
+	void f_Run(int BadName);
+// CHECK-MESSAGES: :[[@LINE-1]]:17: warning: parameter 'BadName' should have the '_' prefix [malterlib-parameter-naming]
+};
+
+// An object of a class taken by value can be an output when it can be written
+// through, as a reference wrapper whose const member function gives a non-const
+// reference, and not when none does. As `o_` is only rejected for what
+// definitely can't be written, one of any member function that gives one,
+// whatever its access, also of a private base, hidden, deleted or constrained,
+// makes it possibly writable, and one that is a template can't be told.
+template <typename t_CType>
+struct TCOutputReference
+{
+	t_CType &f_Get() const;
+};
+struct COutputValue
+{
+	int f_Get() const;
+	int const &f_Const() const;
+	int &f_NonConst();
+};
+struct CDerivedOutputReference : TCOutputReference<int>
+{
+};
+struct CUnusableAccessors
+{
+	int &f_Deleted() const = delete;
+private:
+	int &fp_Private() const;
+};
+struct CPrivateWrapper : private TCOutputReference<int>
+{
+};
+struct CHiddenWrapper : TCOutputReference<int>
+{
+	int &f_Get() const = delete;
+};
+template <typename t_CType>
+struct TCNeverWritable
+{
+	t_CType &f_Get() const requires false;
+};
+struct CTemplateAccessor
+{
+	template <typename tf_CType>
+	tf_CType &f_Get() const;
+};
+void fg_ReferenceOutputDefined(TCOutputReference<int> o_Value) {}
+void fg_DerivedOutput(CDerivedOutputReference o_Value);
+void fg_ValueOutput(COutputValue o_Value);
+// CHECK-MESSAGES: :[[@LINE-1]]:34: warning: parameter 'o_Value' has the 'o_' prefix of an output, but can't be written through, being a value or const; name it with the '_' prefix [malterlib-parameter-naming]
+void fg_UnusableOutput(CUnusableAccessors o_Value);
+void fg_PrivateOutput(CPrivateWrapper o_Value);
+void fg_HiddenOutput(CHiddenWrapper o_Value);
+void fg_NeverWritableOutput(TCNeverWritable<int> o_Value) {}
+void fg_TemplateAccessorOutput(CTemplateAccessor o_Value);
+// Of a specialization the declaration doesn't need complete, which clang
+// doesn't instantiate, it can't be told: it can be named either way, whatever
+// its template's member functions give.
+struct COutputSubscription;
+void fg_ReferenceOutput(TCOutputReference<COutputSubscription> o_Subscription);
+void fg_ReferenceConstOutput(TCOutputReference<int const> o_Value);
+void fg_ReferenceConstInput(TCOutputReference<int const> _Value);
+void fg_ReferenceConstReferenceOutput(TCOutputReference<int const &> o_Value);
+template <typename t_CType>
+struct TCPartialReference
+{
+	t_CType const &f_Get() const;
+};
+template <typename t_CType>
+struct TCPartialReference<t_CType *>
+{
+	t_CType &f_Get() const;
+};
+void fg_PartialOutput(TCPartialReference<int *> o_Value);
+void fg_PartialInput(TCPartialReference<int *> _Value);
+template <typename t_CType>
+struct TCNestedReference
+{
+	typename t_CType::CValue &f_Get() const;
+};
+struct CNestedValue
+{
+	using CValue = int const;
+};
+void fg_NestedOutput(TCNestedReference<CNestedValue> o_Value);
+// What an accessor gives is written through as a parameter's type is, also
+// through const pointers, `int *const &f_Get() const`.
+struct CPointerAccessor
+{
+	int *const &f_Get() const;
+};
+struct CConstPointerAccessor
+{
+	int const *const &f_Get() const;
+};
+void fg_PointerAccessorOutput(CPointerAccessor o_Value);
+// A result deduced only when the accessor is used, `decltype(auto)`, isn't
+// known: it can be named either way.
+template <typename t_CType>
+struct TCDeducedReference
+{
+	t_CType *m_pValue;
+	decltype(auto) f_Get() const { return *m_pValue; }
+};
+void fg_DeducedOutput(TCDeducedReference<int> o_Value) {}
+// Also an rvalue reference, an object of a class that refers to what can be
+// written, and an Objective-C object pointer.
+struct CRvalueAccessor
+{
+	int &&f_Get() const;
+};
+struct CWrapperAccessor
+{
+	TCOutputReference<int> f_Get() const;
+};
+void fg_RvalueAccessorOutput(CRvalueAccessor o_Value);
+void fg_WrapperAccessorOutput(CWrapperAccessor o_Value);
+void fg_ConstPointerAccessorOutput(CConstPointerAccessor o_Value);
+// CHECK-MESSAGES: :[[@LINE-1]]:58: warning: parameter 'o_Value' has the 'o_' prefix of an output, but can't be written through, being a value or const; name it with the '_' prefix [malterlib-parameter-naming]
+
+// A name with several problems is reported for each: the prefix of a function
+// template's parameter and the type prefix after it, and the storage prefix of
+// a parameter and its case after it.
+template <typename t_Func>
+void fg_SeveralProblems(int value);
+// CHECK-MESSAGES: :[[@LINE-2]]:20: warning: function template parameter 't_Func' should have the 'tf_' prefix [malterlib-parameter-naming]
+// CHECK-MESSAGES: :[[@LINE-3]]:20: warning: type function template parameter 't_Func' should have a type prefix after 'tf_', like 'tf_C' or 'tf_F' [malterlib-parameter-naming]
+// CHECK-MESSAGES: :[[@LINE-3]]:29: warning: parameter 'value' should be upper camel case after its prefix [malterlib-parameter-naming]
+// CHECK-MESSAGES: :[[@LINE-4]]:29: warning: parameter 'value' should have the '_' prefix [malterlib-parameter-naming]
+
+// A lambda in an enumerator of a member enum specialized for an instantiated
+// class is written as it is, and checked.
+template <typename t_CType>
+struct TCEnumBox
+{
+	enum EMode : int;
+};
+template <>
+enum TCEnumBox<int>::EMode : int
+{
+	EMode_Value = [](int) { return 0; }(0)
+// CHECK-MESSAGES: :[[@LINE-1]]:22: warning: parameter should be named, also when it is unused, so that what it is can be told [malterlib-parameter-naming]
+};
+
+// A requirement in the initializer of a static data member specialized for an
+// instantiated class is written as it is, and checked.
+template <typename t_CType>
+struct TCRequiresBox
+{
+	static bool ms_bValue;
+};
+template <>
+bool TCRequiresBox<int>::ms_bValue = requires(int) { 0; };
+// CHECK-MESSAGES: :[[@LINE-1]]:50: warning: parameter should be named, also when it is unused, so that what it is can be told [malterlib-parameter-naming]

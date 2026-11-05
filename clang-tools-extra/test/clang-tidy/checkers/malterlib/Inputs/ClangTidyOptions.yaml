@@ -184,6 +184,14 @@ FlagTypes:
 # The result of a type trait, which follows `std::integral_constant::value`.
 malterlib-conceptual-prefix.IgnoredNames:
   - mc_Value
+malterlib-conceptual-prefix.NotFunctionTypes:
+  - FNotFunctionStruct
+  - NLibrary::FForeign
+malterlib-conceptual-prefix.NotFunctionObjectTypes:
+  - TCBuilderFunctorHelper
+malterlib-conceptual-prefix.OpaqueHandleTypes:
+  - pthread_t
+  - HANDLE
 
 # The built-in types of Malterlib, as it defines them, like uint32, fp64 and
 # zint96, which the naming checks take as types of the language.

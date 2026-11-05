@@ -1,4 +1,4 @@
-// RUN: %check_clang_tidy -std=c++20-or-later %s malterlib-type-naming %t -- -config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}"
+// RUN: %check_clang_tidy -std=c++20-or-later %s malterlib-type-naming %t -- -config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}" -- -I %S/Inputs
 // A size is a size_t of the target, which wraps at 32 bits on a 32-bit one.
 // RUN: printf 'template <typename t_CType, auto t_Value>\nstruct TCChoice {};\ntemplate <typename t_CType, auto t_Value>\n\trequires ((sizeof(t_CType) + t_Value) == 0)\nstruct TCChoice<t_CType, t_Value> { void operator()(); };\nusing FCallback = TCChoice<int, 0xfffffffcU>;\nFCallback g_Callback;\n' > %t.32.cpp
 // RUN: clang-tidy --config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}" --checks='-*,malterlib-type-naming' %t.32.cpp -- -std=c++20 -target i386-unknown-linux-gnu 2>&1 | FileCheck --check-prefix=CHECK-32 --allow-empty %s
@@ -933,7 +933,7 @@ struct TCRound107Outer
 TCRound107Outer<int>::TCInner<int> g_Round107Inner;
 
 // An alias of a type of the traits a template is given that its
-// instantiations make a function type is named as one.
+// instantiations make a function type is generic: it can be named `C` or `F`.
 struct CRound108Traits
 {
 	using FSignature = void ();
@@ -943,7 +943,6 @@ template <typename t_CTraits>
 struct TCRound108Box
 {
 	using CCallback = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCRound108Box<CRound108Traits>::CCallback *g_pRound108Callback = nullptr;
@@ -986,7 +985,6 @@ template <typename tf_CTraits>
 void fg_Round111Run()
 {
 	using CCallback = typename tf_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 	using FCallback = typename tf_CTraits::FSignature;
 }
 void fg_Round111Use()
@@ -1013,7 +1011,6 @@ namespace NRound115MemberFunctionType {
 struct CTraits { using FSignature = void (); };
 template <typename t_CTraits>
 using TCCallback = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 TCCallback<CTraits> *g_fCallback = nullptr;
 }
 
@@ -1058,7 +1055,6 @@ template <typename t_CTraits>
 struct TCWrap {
   template <typename t_COther>
   using TCCallback = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCWrap<CTraits>::TCCallback<int> *g_fCallback;
@@ -1074,7 +1070,7 @@ using EStateAlias = EState;
 }
 
 // Round 126: an alias of what depends on the parameters computed by decltype
-// is a function type when each instantiation makes one.
+// is generic, also when each instantiation makes a function type.
 namespace NRound126
 {
 struct CTraits {
@@ -1084,15 +1080,14 @@ struct CTraits {
 template <typename t_CTraits>
 struct TCBox {
   using CCallback = decltype(t_CTraits::fs_Run);
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCBox<CTraits>::CCallback *g_fCallback;
 }
 
 // Round 128: an alias template of what an expression that depends on its
-// parameters is, `decltype(t_CTraits::fs_Run)`, is a function type when each
-// use makes one.
+// parameters is, `decltype(t_CTraits::fs_Run)`, is generic, also when each
+// use makes a function type.
 namespace NRound128
 {
 struct CTraits {
@@ -1101,7 +1096,6 @@ struct CTraits {
 
 template <typename t_CTraits>
 using TCCallback = decltype(t_CTraits::fs_Run);
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 
 TCCallback<CTraits> *g_fCallback = nullptr;
 }
@@ -1119,7 +1113,6 @@ template <typename t_CType>
 struct TCChild : TCParent<t_CType> {
   using typename TCParent<t_CType>::FSignature;
   using CCallback = FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCChild<int>::CCallback *g_fCallback = nullptr;
@@ -1155,7 +1148,6 @@ struct CTraits {
 template <typename t_CTraits>
 struct TCBox {
   using CCallback = TCIdentity<typename t_CTraits::FSignature>;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCBox<CTraits> g_Box;
@@ -1187,14 +1179,12 @@ struct CTraits {
 
 template <typename t_CTraits>
 using TCSignature = TCIdentity<typename t_CTraits::FSignature>;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 
 using FUse = TCSignature<CTraits>;
 
 template <typename t_CTraits>
 struct TCBox {
   using CState = typename t_CTraits::EState;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: enum type alias 'CState' should have the 'E' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCBox<CTraits> g_Box;
@@ -1219,7 +1209,6 @@ struct CTraits {
 
 template <typename t_CTraits>
 using TCState = typename t_CTraits::EState;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: enum type alias 'TCState' should have the 'E' prefix followed by upper camel case [malterlib-type-naming]
 
 TCState<CTraits> g_State = CTraits::EState_Ready;
 }
@@ -1233,7 +1222,6 @@ template <typename t_CTraits>
 struct TCBox {
   using FSignature = typename t_CTraits::FSignature;
   using CCallback = FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
   using FCallback = FSignature;
 };
 
@@ -1250,7 +1238,6 @@ template <typename t_CTraits>
 struct TCBox {
   friend void fg_Use(TCBox _Box) {
     using CSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:11: warning: function type alias 'CSignature' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
     using FSignature = typename t_CTraits::FSignature;
   }
 };
@@ -1283,7 +1270,6 @@ struct CTraits {
 template <typename t_CTraits>
 struct TCBox {
   using CCallback = __remove_reference_t(typename t_CTraits::FSignature);
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 template <typename t_CType>
@@ -1303,7 +1289,6 @@ struct CTraits {
 // An alias template of a transformation of what depends on its parameters.
 template <typename t_CTraits>
 using TCSignature = __remove_reference_t(typename t_CTraits::FSignature);
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 
 TCSignature<CTraits> fg_Run;
 }
@@ -1319,7 +1304,6 @@ struct TCBox {
   using FSignature = typename t_CTraits::FSignature;
   template <typename t_CUnused>
   using TCCallback = FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 using FUse = TCBox<CTraits>::TCCallback<int>;
@@ -1337,7 +1321,6 @@ template <typename t_CTraits>
 struct TCBox
 {
 	typedef typename t_CTraits::FSignature (CCallback);
-// CHECK-MESSAGES: :[[@LINE-1]]:42: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 
 TCBox<CTraits> g_Box;
@@ -1412,7 +1395,6 @@ struct TCTraits {
 };
 template <typename t_CType>
 using TCCallback = typename TCTraits<t_CType>::type;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 TCCallback<int> *g_fCallback;
 }
 
@@ -1438,7 +1420,6 @@ template <typename t_CUnused>
 struct TCTraits : CSignature {};
 template <typename t_CUnused>
 using TCCallback = typename TCTraits<t_CUnused>::type;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 TCCallback<int> *g_fCallback = nullptr;
 }
 
@@ -1498,7 +1479,6 @@ struct CStateTraits {
 template <typename t_CTraits>
 struct TCTraitsStorage {
   using CValue = typename TCMap<int, typename t_CTraits::EValue>::CValue;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: enum type alias 'CValue' should have the 'E' prefix followed by upper camel case [malterlib-type-naming]
 };
 TCTraitsStorage<CStateTraits> g_TraitsStorage;
 template <typename t_CType>
@@ -1511,7 +1491,6 @@ struct CSignatureTraits {
 template <typename t_CTraits>
 struct TCBox {
   using CCallback = typename TCIdentity<typename t_CTraits::FSignature>::CType;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 };
 TCBox<CSignatureTraits> g_Box;
 template <typename t_CType>
@@ -1582,7 +1561,6 @@ struct CTraits {
 template <typename t_CTraits>
 struct TCUser {
   using CState = typename t_CTraits::EState;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: enum type alias 'CState' should have the 'E' prefix followed by upper camel case [malterlib-type-naming]
 };
 TCUser<CTraits> g_User;
 // What the type of a parameter is made into, `decltype(_Value)`, is generic.
@@ -1663,7 +1641,6 @@ template <typename t_CType>
 struct TCTraits : TCProvider<t_CType> {};
 template <typename t_CType>
 using TCCallback = typename TCTraits<t_CType>::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:7: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 TCCallback<int> fg_Run;
 }
 
@@ -1702,7 +1679,6 @@ namespace NRound208
 	struct TCBox
 	{
 		using CSignature = typename t_CTraits::template TCResult<t_CValue>::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CSignature' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 		using CValue = typename t_CTraits::template TCIdentity<t_CValue>::CType;
 	};
 	TCBox<CTraits, int> g_Box;
@@ -1750,7 +1726,6 @@ namespace NRound220
 	void fg_Test()
 	{
 		using CCallback = typename TCAdapter<tf_CTraits>::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: function type alias 'CCallback' should have the 'F' prefix followed by upper camel case [malterlib-type-naming]
 	}
 	void fg_Run()
 	{
@@ -1822,7 +1797,6 @@ namespace NRound228
 	void fg_State(typename tf_CTraits::EState _State)
 	{
 		using CState = decltype(_State);
-// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: enum type alias 'CState' should have the 'E' prefix followed by upper camel case [malterlib-type-naming]
 		CState Copy = _State;
 		(void)Copy;
 	}
@@ -1901,7 +1875,6 @@ namespace NRound243
 	// call that leaves it out makes of it.
 	template <typename t_CTraits>
 	using TCSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 	template <typename tf_CTraits, typename tf_CSignature = TCSignature<tf_CTraits>>
 	void fg_Run()
 	{
@@ -1923,7 +1896,6 @@ namespace NRound331
 	// `tf_CData &_Value`.
 	template <typename t_CTraits>
 	using TCSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 	template <typename tf_CTraits, typename tf_CData, typename tf_CSignature = TCSignature<tf_CTraits>>
 	void fg_Run(tf_CData &_Value)
 	{
@@ -1965,7 +1937,6 @@ namespace NRound332
 	// to its default, which deduces nothing.
 	template <typename t_CTraits>
 	using TCSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 	template <typename tf_CTraits, typename tf_FSignature = TCSignature<tf_CTraits>>
 	void fg_Run(tf_FSignature *_fCallback = nullptr)
 	{
@@ -2016,7 +1987,6 @@ struct CTraits {
   using FSignature = void();
 };
 template <typename t_CTraits> using TCCallback = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:37: warning: function type alias 'TCCallback' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 template <typename tf_CTraits, typename tf_FCallback = TCCallback<tf_CTraits>>
 void fg_Run(typename TCIdentity<tf_FCallback>::CType *_fCallback) {}
 void fg_Test() { fg_Run<CTraits>(nullptr); }
@@ -2099,7 +2069,6 @@ namespace NRound340NestedDefault {
 // An alias nested in a default.
 struct CTraits { using FSignature = void(); };
 template <typename t_CTraits> using TCSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:37: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 template <typename t_FSignature> struct TCFunction {};
 template <typename tf_CTraits, typename tf_FCallback = TCFunction<TCSignature<tf_CTraits>>>
 void fg_Run(tf_FCallback _fCallback = {}) {}
@@ -2111,7 +2080,6 @@ namespace NRound340NestedAlias {
 struct CTraits { using FSignature = void (); };
 template<typename t_FSignature> struct TCFunction {};
 template<typename t_CTraits> using TCSignature = typename t_CTraits::FSignature;
-// CHECK-MESSAGES: :[[@LINE-1]]:36: warning: function type alias 'TCSignature' should have the 'TF' prefix followed by upper camel case [malterlib-type-naming]
 template<typename t_CTraits> using TCCallback = TCFunction<TCSignature<t_CTraits>>;
 TCCallback<CTraits> g_fCallback;
 }
@@ -2152,3 +2120,71 @@ struct own_c_struct { int m_Value; };
 }
 struct opaque_cpp_st;
 // CHECK-MESSAGES: :[[@LINE-1]]:8: warning: class 'opaque_cpp_st' should have the 'C' or 'IC' prefix followed by upper camel case [malterlib-type-naming]
+// Also one that the library's header, a system header, defines in the same
+// translation unit, as libdbus defines the types its callers allocate.
+extern "C" {
+typedef struct DBusMessageIter DBusMessageIter;
+typedef struct DBusError DBusError;
+typedef struct DBusMessage DBusMessage;
+}
+#include "type-naming-c-library-system.h"
+// A typedef there that gives such a type its own name has the type's name,
+// also when the library's header isn't a system header, where the type is
+// checked.
+extern "C" {
+typedef struct DBusPendingCall DBusPendingCall;
+}
+#include "type-naming-c-library-user.h"
+// But not one that gives it another name.
+extern "C" {
+typedef struct DBusPendingCall dbus_pending_call;
+// CHECK-MESSAGES: :[[@LINE-1]]:32: warning: type alias 'dbus_pending_call' should have the 'C', 'IC', 'F' or 'E' prefix followed by upper camel case [malterlib-type-naming]
+}
+
+// A group after the enum's name can be a built-in type of Malterlib, like any
+// group.
+enum EResultDataType
+{
+	EResultDataType_fp64
+	, EResultDataType_uint64
+	, EResultDataType_Int32_fp32
+	, EResultDataType_notbuiltin
+// CHECK-MESSAGES: :[[@LINE-1]]:4: warning: enumerator 'EResultDataType_notbuiltin' should have the name of its enum followed by an underscore, 'EResultDataType_', and upper camel case [malterlib-type-naming]
+};
+
+// A member alias of a class template of what depends on its parameters,
+// computed from a member of one, is generic: named `C`, also when each
+// instantiation of the translation unit makes it an enum, like Container's
+// `CUserData` of `TCSet<ECompiledBinaryFormat>`.
+namespace NGenericUserData
+{
+template <bool t_bCondition, typename t_CTrue, typename t_CFalse>
+struct TCConditionalImpl
+{
+	using CType = t_CTrue;
+};
+template <typename t_CTrue, typename t_CFalse>
+struct TCConditionalImpl<false, t_CTrue, t_CFalse>
+{
+	using CType = t_CFalse;
+};
+template <bool t_bCondition, typename t_CTrue, typename t_CFalse>
+using TCConditional = typename TCConditionalImpl<t_bCondition, t_CTrue, t_CFalse>::CType;
+enum EFormat
+{
+	EFormat_Binary
+};
+template <typename t_CKey>
+struct TCSetLike
+{
+	using CUserData = t_CKey;
+};
+template <typename t_CMap, int t_Access>
+struct TCIterator
+{
+	using CUserData = TCConditional<t_Access == 0, typename t_CMap::CUserData, typename t_CMap::CUserData const>;
+	using EUserData = TCConditional<t_Access == 0, typename t_CMap::CUserData, typename t_CMap::CUserData const>;
+};
+TCIterator<TCSetLike<EFormat>, 0> g_Iterator;
+TCIterator<TCSetLike<EFormat>, 1> g_ConstIterator;
+}

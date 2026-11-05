@@ -70,7 +70,13 @@ ConceptualPrefixCheck::ConceptualPrefixCheck(StringRef Name,
           listOption("ValueWrapperTypes", BuiltInValueWrapperTypes))),
       FlagTypes(utils::options::parseStringList(listOption("FlagTypes", ""))),
       IgnoredNames(
-          utils::options::parseStringList(listOption("IgnoredNames", ""))) {}
+          utils::options::parseStringList(listOption("IgnoredNames", ""))),
+      NotFunctionTypes(utils::options::parseStringList(
+          listOption("NotFunctionTypes", ""))),
+      NotFunctionObjectTypes(utils::options::parseStringList(
+          listOption("NotFunctionObjectTypes", ""))),
+      OpaqueHandleTypes(utils::options::parseStringList(
+          listOption("OpaqueHandleTypes", ""))) {}
 
 void ConceptualPrefixCheck::storeCheckOptions(
     ClangTidyOptions::OptionMap &Opts) {
@@ -88,6 +94,12 @@ void ConceptualPrefixCheck::storeCheckOptions(
                 utils::options::serializeStringList(FlagTypes));
   Options.store(Opts, "IgnoredNames",
                 utils::options::serializeStringList(IgnoredNames));
+  Options.store(Opts, "NotFunctionTypes",
+                utils::options::serializeStringList(NotFunctionTypes));
+  Options.store(Opts, "NotFunctionObjectTypes",
+                utils::options::serializeStringList(NotFunctionObjectTypes));
+  Options.store(Opts, "OpaqueHandleTypes",
+                utils::options::serializeStringList(OpaqueHandleTypes));
 }
 
 void ConceptualPrefixCheck::registerMatchers(MatchFinder *Finder) {
@@ -200,6 +212,23 @@ static bool dependsAsMember(const clang::Type *Written) {
           Written->isDependentType());
 }
 
+/// Whether the declared type \p Declaration, an alias or a class, is named as
+/// a function type by its `F` or `TF` type prefix: one declared in a system
+/// header has a name of its own library, like Windows' `FILETIME` or macOS'
+/// `FSRef`, nor is one NotFunctionTypes lists.
+bool ConceptualPrefixCheck::declaredAsFunctionType(
+    const NamedDecl *Declaration) const {
+  if (!Declaration || !Declaration->getIdentifier() ||
+      !hasTypePrefix(Declaration->getName(), {"F", "TF"}))
+    return false;
+  const SourceManager &SM = Declaration->getASTContext().getSourceManager();
+  if (SM.isInSystemHeader(SM.getExpansionLoc(Declaration->getLocation())))
+    return false;
+  return llvm::none_of(NotFunctionTypes, [&](StringRef Pattern) {
+    return matchesName(Declaration, Pattern);
+  });
+}
+
 /// Whether \p Type, as it is written, is named as a function type, with the
 /// `F` or `TF` type prefix after its storage prefix: a template parameter,
 /// `tf_FFunction`, also as instantiated, a dependent member type or member
@@ -207,7 +236,8 @@ static bool dependsAsMember(const clang::Type *Written) {
 /// `typename t_CTraits::FCallback`, or an alias, `FCallback`, also through
 /// what only forwards one, `TCRemoveReference<tf_FAction>` or `typename
 /// TCIdentity<tf_FAction>::CType`.
-static bool namedAsFunctionType(QualType Type, int Depth = 0) {
+bool ConceptualPrefixCheck::namedAsFunctionType(QualType Type,
+                                                int Depth) const {
   if (Depth > 8)
     return false;
   // Of the type arguments of what forwards one, each of them: of several,
@@ -314,8 +344,7 @@ static bool namedAsFunctionType(QualType Type, int Depth = 0) {
            OnlyArgumentNamed(Forwarder->template_arguments());
   }
   if (const auto *Typedef = dyn_cast<TypedefType>(Written))
-    return Typedef->getDecl()->getIdentifier() &&
-           Named(Typedef->getDecl()->getName());
+    return declaredAsFunctionType(Typedef->getDecl());
   // Also brought in from what depends on the parameters, `using typename
   // TCParent<t_CType>::FCallback;`.
   if (const auto *Unresolved = dyn_cast<UnresolvedUsingType>(Written))
@@ -334,7 +363,7 @@ static bool namedAsFunctionType(QualType Type, int Depth = 0) {
       if (const auto *Alias = dyn_cast_or_null<TypeAliasTemplateDecl>(
               Template.getAsTemplateDecl());
           Alias && Alias->getIdentifier())
-        return Named(Alias->getName()) ||
+        return declaredAsFunctionType(Alias) ||
                namedAsFunctionType(Specialization->getAliasedType(),
                                    Depth + 1) ||
                (givesParameter(Alias->getTemplatedDecl()->getUnderlyingType(),
@@ -410,6 +439,77 @@ static const TemplateTypeParmType *writtenTemplateParameter(QualType Type) {
     else
       break;
   return dyn_cast<TemplateTypeParmType>(Type.getTypePtr());
+}
+
+/// Whether what \p Record is made of can't be told from what clang
+/// instantiated: it, or a class it derives from, isn't defined in the
+/// translation unit, also a specialization nothing completes or a template
+/// only declared, or has a base that depends on the parameters of its
+/// template.
+static bool hasUnknownBases(const CXXRecordDecl *Record) {
+  llvm::SmallPtrSet<const CXXRecordDecl *, 8> Visited;
+  llvm::SmallVector<const CXXRecordDecl *, 8> Worklist{Record};
+  while (!Worklist.empty()) {
+    const CXXRecordDecl *Current = Worklist.pop_back_val();
+    if (!Current)
+      return true;
+    const CXXRecordDecl *Definition = Current->getDefinition();
+    // Nor of a template's own declaration that isn't defined, a forward
+    // declared one, `template <typename t_CType> struct TCActorFunctor;`,
+    // unless it has partial specializations, which are what anything made
+    // of it is made of, and are looked at themselves.
+    if (!Definition) {
+      llvm::SmallVector<ClassTemplatePartialSpecializationDecl *, 4> Partials;
+      if (ClassTemplateDecl *Template = Current->getDescribedClassTemplate())
+        Template->getPartialSpecializations(Partials);
+      if (!Partials.empty())
+        continue;
+      return true;
+    }
+    if (!Visited.insert(Definition).second)
+      continue;
+    for (const CXXBaseSpecifier &Base : Definition->bases()) {
+      if (Base.getType()->isDependentType())
+        return true;
+      Worklist.push_back(Base.getType()->getAsCXXRecordDecl());
+    }
+  }
+  return false;
+}
+
+std::optional<bool> ConceptualPrefixCheck::isFunctionObject(
+    const CXXRecordDecl *Record) const {
+  // Not one NotFunctionObjectTypes lists, also through a base, whose call
+  // operator only binds and gives a builder, like `g_ActorFunctor`.
+  if (!NotFunctionObjectTypes.empty() &&
+      isRecordInList(Record, NotFunctionObjectTypes))
+    return false;
+  if (!isRecordInList(Record, FunctionObjectTypes, {OO_Call}))
+    return false;
+  // One whose bases can't be told, with one that depends on the parameters,
+  // `struct TCAdapterFunctor : t_CBase`, which an instantiation can make one
+  // of those, or not defined in the translation unit, a specialization
+  // nothing completes, `TCAdapterFunctor<CBuilder>`, isn't known.
+  if (!NotFunctionObjectTypes.empty() && hasUnknownBases(Record))
+    return std::nullopt;
+  return true;
+}
+
+bool ConceptualPrefixCheck::isOpaqueHandle(QualType Type,
+                                           const ASTContext &Context) const {
+  if (OpaqueHandleTypes.empty() || Type.isNull())
+    return false;
+  for (QualType Level = Type;;) {
+    if (const auto *Typedef = dyn_cast<TypedefType>(Level.getTypePtr());
+        Typedef && llvm::any_of(OpaqueHandleTypes, [&](StringRef Pattern) {
+          return matchesName(Typedef->getDecl(), Pattern);
+        }))
+      return true;
+    const QualType Next = Level.getSingleStepDesugaredType(Context);
+    if (Next == Level)
+      return false;
+    Level = Next;
+  }
 }
 
 bool ConceptualPrefixCheck::isValueWrapper(const NamedDecl *Template) const {
@@ -496,8 +596,15 @@ bool ConceptualPrefixCheck::isRecordInList(
 }
 
 std::optional<char>
-ConceptualPrefixCheck::expectedConcept(QualType Type,
-                                       const ASTContext &Context) const {
+ConceptualPrefixCheck::expectedConcept(QualType Type, const ASTContext &Context,
+                                       bool *PointerAllowed,
+                                       bool *IteratorAllowed,
+                                       bool *OpaqueHandle) const {
+  auto Opaque = [&] {
+    if (OpaqueHandle)
+      *OpaqueHandle = true;
+    return std::nullopt;
+  };
   // A reference to an alias of a reference, `CSubscription &` of `using
   // CSubscription = TCSharedPointer<int> &`, collapses to the alias.
   for (int Depth = 0; !Type.isNull() && Depth < 8; ++Depth) {
@@ -525,6 +632,154 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
              return matchesName(Named, Name);
            });
   };
+  // A class derived from a handle is a handle too, like
+  // `TCActorSubscriptionWithID`, which only adds an ID to the
+  // `CActorSubscription` it derives from. Each base once, at the least depth
+  // it is reached at, as one that several paths lead to, of a diamond, would
+  // otherwise be gone through for each path: what it is then is kept, for
+  // those paths and for the other records that are asked about, which can
+  // share it, the primary template and a partial specialization.
+  // None when it can be one, which isn't known: a class with a base that
+  // depends on the parameters, `struct TCAdapter : t_CBase`, which its
+  // instantiations can make a handle, and one whose bases go deeper than they
+  // are followed. So the generic form can be named either way, and the
+  // instantiations only exclude what is wrong in them. Without
+  // SmartPointerHandleTypes nothing is one, and the bases aren't gone through.
+  llvm::DenseMap<const CXXRecordDecl *, std::pair<int, std::optional<bool>>>
+      ExploredAt;
+  std::function<std::optional<bool>(const CXXRecordDecl *, int)>
+      DerivesFromHandle;
+  std::function<std::optional<bool>(const CXXRecordDecl *, int)> Explore =
+      [&](const CXXRecordDecl *Derived, int Depth) -> std::optional<bool> {
+    bool Unknown = false;
+    // Whether \p Base of an instantiation is one its pattern has of the
+    // parameters, `t_CBase`.
+    const CXXRecordDecl *Pattern = Derived->getTemplateInstantiationPattern();
+    // Written as what a parameter is: the parameter, `t_CBase`, or a member of
+    // one, `typename t_CTraits::CBase`, not a template given them,
+    // `TCUniquePointer<t_CType>`, which is what it names.
+    auto GivenWhole = [](QualType Type) {
+      Type = Type.getCanonicalType();
+      if (const auto *Expansion = Type->getAs<PackExpansionType>())
+        Type = Expansion->getPattern().getCanonicalType();
+      return isa<TemplateTypeParmType, DependentNameType>(Type.getTypePtr());
+    };
+    // The base of the pattern \p Base is of: of one with a pack of them,
+    // `tp_CBases...`, those before the pack and after it one to one, and
+    // those between of the pack, `struct TCAdapter : TCPointer<int>,
+    // tp_CBases...`. Of one with several packs, which aren't told apart, any
+    // can be when any is written so.
+    auto FromParameter = [&](const CXXBaseSpecifier &Base) {
+      if (!Pattern)
+        return false;
+      const size_t Index = &Base - Derived->bases_begin();
+      const size_t Count = Derived->getNumBases();
+      const size_t PatternCount = Pattern->getNumBases();
+      const CXXBaseSpecifier *Pack = nullptr;
+      for (const CXXBaseSpecifier &Other : Pattern->bases()) {
+        if (!Other.isPackExpansion())
+          continue;
+        if (Pack)
+          return llvm::any_of(Pattern->bases(),
+                              [&](const CXXBaseSpecifier &Any) {
+                                return GivenWhole(Any.getType());
+                              });
+        Pack = &Other;
+      }
+      if (!Pack)
+        return Index < PatternCount &&
+               GivenWhole(Pattern->bases_begin()[Index].getType());
+      const size_t Before = Pack - Pattern->bases_begin();
+      const size_t After = PatternCount - Before - 1;
+      const CXXBaseSpecifier *Of =
+          Index < Before ? Pattern->bases_begin() + Index
+          : Index + After >= Count
+              ? Pattern->bases_begin() + (PatternCount - (Count - Index))
+              : Pack;
+      return GivenWhole(Of->getType());
+    };
+    for (const CXXBaseSpecifier &Base : Derived->bases()) {
+      for (QualType Level = Base.getType();;) {
+        if (IsHandle(Level.getTypePtr()))
+          return true;
+        const QualType Next = Level.getSingleStepDesugaredType(Context);
+        if (Next == Level)
+          break;
+        Level = Next;
+      }
+      // A base an instantiation is given, `TCAdapter<CActorSubscription>` of
+      // `struct TCAdapter : t_CBase`, which clang keeps without the alias, and
+      // that the same specialization has whether the alias or what it is an
+      // alias of was given, `TCAdapter<TCUniquePointer<...>>`: when it is
+      // what a handle is an alias of, which it is isn't known.
+      if (FromParameter(Base) &&
+          !handleAliasOf(Base.getType(), Context).isNull()) {
+        Unknown = true;
+        continue;
+      }
+      const CXXRecordDecl *BaseRecord = Base.getType()->getAsCXXRecordDecl();
+      if (Base.getType()->isDependentType() &&
+          (!BaseRecord || !BaseRecord->hasDefinition())) {
+        Unknown = true;
+        continue;
+      }
+      const std::optional<bool> Inherited =
+          DerivesFromHandle(BaseRecord, Depth + 1);
+      if (Inherited.value_or(false))
+        return true;
+      Unknown |= !Inherited;
+    }
+    if (Unknown)
+      return std::nullopt;
+    return false;
+  };
+  DerivesFromHandle = [&](const CXXRecordDecl *Derived,
+                          int Depth) -> std::optional<bool> {
+    if (!Derived || SmartPointerHandleTypes.empty())
+      return false;
+    // One not defined in the translation unit, also a specialization nothing
+    // completes, whose bases can't be told, isn't known.
+    Derived = Derived->getDefinition();
+    if (!Derived)
+      return std::nullopt;
+    if (Depth > 8)
+      return std::nullopt;
+    // Reached deeper than before, which follows no more of its bases.
+    if (const auto It = ExploredAt.find(Derived);
+        It != ExploredAt.end() && It->second.first <= Depth)
+      return It->second.second;
+    const std::optional<bool> Handle = Explore(Derived, Depth);
+    ExploredAt[Derived] = {Depth, Handle};
+    return Handle;
+  };
+  // A smart pointer that isn't known to be a handle or not is named either
+  // way: no concept, and `p` allowed.
+  bool HandleUnknown = false;
+  auto PointerUnlessHandle =
+      [&](bool ThroughHandle,
+          llvm::ArrayRef<const CXXRecordDecl *> Records) -> std::optional<char> {
+    if (ThroughHandle)
+      return std::nullopt;
+    // A handle when what it can be made of all are, a pointer when none
+    // are; when one isn't known, or they disagree, unknown.
+    bool Handles = false;
+    bool NotHandles = false;
+    bool Unknown = false;
+    for (const CXXRecordDecl *Record : Records) {
+      const std::optional<bool> Handle = DerivesFromHandle(Record, 0);
+      Unknown |= !Handle;
+      Handles |= Handle.value_or(false);
+      NotHandles |= Handle == std::optional<bool>(false);
+    }
+    if (!Unknown && !NotHandles)
+      return std::nullopt;
+    if (!Unknown && !Handles)
+      return 'p';
+    HandleUnknown = true;
+    if (PointerAllowed)
+      *PointerAllowed = true;
+    return std::nullopt;
+  };
   // An alias of a reference, `using CSubscription = TCSharedPointer<int> &`,
   // names what it refers to like an alias of it.
   bool ReferenceThroughHandle = false;
@@ -547,6 +802,12 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
       Type = Pack->getPattern().getNonReferenceType();
   if (Type.isNull() || Type->isUndeducedAutoType())
     return std::nullopt;
+  // An opaque handle of a system, which is a pointer on some targets and an
+  // integer, an array or a structure on others, like `pthread_t` and
+  // `va_list`, takes no concept prefix, as none would fit every target: one
+  // OpaqueHandleTypes lists, also through an alias of it, `CMibArgList`.
+  if (isOpaqueHandle(Type, Context))
+    return Opaque();
   // A type named as a function type, a template parameter, `tf_FFunction`, a
   // dependent member type or alias template, `typename t_CTraits::FCallback`,
   // or an alias, `FCallback`, is a function object, as its name says.
@@ -680,23 +941,55 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
             Records.push_back(Declared);
         auto All = [&](auto &&Is) { return llvm::all_of(Records, Is); };
         if (All([&](const CXXRecordDecl *Record) {
-              return isRecordInList(Record, FunctionObjectTypes, {OO_Call});
+              return isFunctionObject(Record) == std::optional<bool>(true);
             }))
           return 'f';
+        // One whose being a function object isn't known can be named as one,
+        // or as anything else it can be, or neither: also when what it can be
+        // made of disagree, a primary template that is one and a partial
+        // specialization that a base of NotFunctionObjectTypes excludes.
+        if (llvm::any_of(Records,
+                         [&](const CXXRecordDecl *Record) {
+                           return !isFunctionObject(Record);
+                         }) ||
+            llvm::any_of(Records, [&](const CXXRecordDecl *Record) {
+              return isFunctionObject(Record) == std::optional<bool>(true);
+            })) {
+          for (const CXXRecordDecl *Record : Records) {
+            if (IteratorAllowed &&
+                isRecordInList(Record, IteratorTypes, IteratorOperators))
+              *IteratorAllowed = true;
+            if (PointerAllowed &&
+                isRecordInList(Record, SmartPointerTypes, PointerOperators,
+                               /*OrConvertsToBool=*/true))
+              *PointerAllowed = true;
+          }
+          return std::nullopt;
+        }
+        // A smart pointer, unless a handle, before an iterator, as of what
+        // doesn't depend on parameters: one that isn't known to be a handle,
+        // which would be named as the iterator it is, or not, a pointer, can
+        // be named either, or neither.
+        if (All([&](const CXXRecordDecl *Record) {
+              return isRecordInList(Record, SmartPointerTypes,
+                                    PointerOperators, /*OrConvertsToBool=*/true);
+            })) {
+          if (const std::optional<char> Pointer =
+                  PointerUnlessHandle(ThroughHandle, Records))
+            return Pointer;
+          if (HandleUnknown) {
+            if (IteratorAllowed && All([&](const CXXRecordDecl *Record) {
+                  return isRecordInList(Record, IteratorTypes,
+                                        IteratorOperators);
+                }))
+              *IteratorAllowed = true;
+            return std::nullopt;
+          }
+        }
         if (All([&](const CXXRecordDecl *Record) {
               return isRecordInList(Record, IteratorTypes, IteratorOperators);
             }))
           return 'i';
-        // A boolean that clears itself, also given what depends on them,
-        // `TCAutoClearInt<bool, t_bInitial>`.
-        if (isValueWrapper(Template) &&
-            !Specialization->template_arguments().empty() &&
-            Specialization->template_arguments()[0].getKind() ==
-                TemplateArgument::Type &&
-            Specialization->template_arguments()[0]
-                .getAsType()
-                ->isBooleanType())
-          return 'b';
         // An atomic pointer or function, `TCAtomic<t_CType *>`, also one
         // that clears itself.
         if (isValueWrapper(Template) &&
@@ -705,6 +998,14 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
                 TemplateArgument::Type) {
           const QualType Held =
               Specialization->template_arguments()[0].getAsType();
+          // Of an opaque handle, `TCAtomic<pthread_t>`, which is one too, also
+          // one that is a boolean on this target.
+          if (isOpaqueHandle(Held, Context))
+            return Opaque();
+          // A boolean that clears itself, also given what depends on them,
+          // `TCAutoClearInt<bool, t_bInitial>`.
+          if (Held->isBooleanType())
+            return 'b';
           if (Held->isFunctionPointerType() ||
               Held->isMemberFunctionPointerType())
             return 'f';
@@ -723,11 +1024,6 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
           if (Held->isPointerType() || Held->isMemberDataPointerType())
             return 'p';
         }
-        if (All([&](const CXXRecordDecl *Record) {
-              return isRecordInList(Record, SmartPointerTypes,
-                                    PointerOperators, /*OrConvertsToBool=*/true);
-            }))
-          return ThroughHandle ? std::nullopt : std::optional<char>('p');
         if (Records.size() > 1)
           return std::nullopt;
       }
@@ -776,8 +1072,7 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
       // And an alias template named as one, `FCallback<tf_CType> *`.
       if (const TemplateDecl *Alias =
               Specialization->getTemplateName().getAsTemplateDecl();
-          Specialization->isTypeAlias() && Alias && Alias->getIdentifier() &&
-          hasTypePrefix(Alias->getName(), {"F", "TF"}))
+          Specialization->isTypeAlias() && declaredAsFunctionType(Alias))
         return 'x';
       // And a template template parameter named as one, `tf_TFCallback<int>
       // *`.
@@ -792,8 +1087,7 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
     }
     // And an alias named as one, `using FCallback = tf_CType;`.
     if (const auto *Typedef = Pointee->getAs<TypedefType>();
-        Typedef && Typedef->getDecl()->getIdentifier() &&
-        hasTypePrefix(Typedef->getDecl()->getName(), {"F", "TF"}))
+        Typedef && declaredAsFunctionType(Typedef->getDecl()))
       return 'x';
     // A pointer to what depends on them and can be a function type, `typename
     // TCIdentity<tf_FSignature>::CType *` or `decltype(tf_CTraits::fs_Run) *`,
@@ -821,12 +1115,23 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
         return 'i';
       ThroughHandle |= IsHandle(Typedef);
       // Also a smart pointer named as one, `using CExceptionPointer =
-      // std::exception_ptr` of `*Pointer`, not a handle.
+      // std::exception_ptr` of `*Pointer`, not a handle, also not a class
+      // derived from one, `using CSubscriptionPointer = CSubscriptionWithID`,
+      // nor one that isn't known not to be one.
       if (!ThroughHandle && llvm::any_of(SmartPointerTypes, [&](StringRef Pattern) {
             return matchesName(Typedef->getDecl(), Pattern) &&
                    modelsPointer(Pattern, Typedef->desugar());
-          }))
-        return 'p';
+          })) {
+        // Of a handle, what else it is, like an iterator, as of the class
+        // spelled itself, after; of what isn't known to be one, that too.
+        const CXXRecordDecl *Named = Typedef->desugar()->getAsCXXRecordDecl();
+        if (!Named)
+          return 'p';
+        if (const std::optional<char> Pointer =
+                PointerUnlessHandle(false, Named))
+          return Pointer;
+        ThroughHandle = true;
+      }
     }
     if (const auto *Specialization =
             dyn_cast<TemplateSpecializationType>(Level.getTypePtr());
@@ -856,15 +1161,6 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
     return 'p';
   if (Type->isBooleanType())
     return 'b';
-  // A boolean that clears itself, Malterlib's `zbool`, a `TCAutoClear<bool>`,
-  // also `TCAutoClearInt<bool>`, or an atomic one, `TCAtomic<bool>`.
-  if (const auto *AutoClear = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
-          Type->getAsCXXRecordDecl());
-      AutoClear && isValueWrapper(AutoClear) &&
-      AutoClear->getTemplateArgs().size() >= 1 &&
-      AutoClear->getTemplateArgs()[0].getKind() == TemplateArgument::Type &&
-      AutoClear->getTemplateArgs()[0].getAsType()->isBooleanType())
-    return 'b';
   // An atomic pointer or function, `TCAtomic<int *>`, also one that clears
   // itself.
   if (const auto *Holder = dyn_cast_or_null<ClassTemplateSpecializationDecl>(
@@ -872,7 +1168,51 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
       Holder && isValueWrapper(Holder) &&
       Holder->getTemplateArgs().size() >= 1 &&
       Holder->getTemplateArgs()[0].getKind() == TemplateArgument::Type) {
-    const QualType Held = Holder->getTemplateArgs()[0].getAsType();
+    QualType Held = Holder->getTemplateArgs()[0].getAsType();
+    // What it holds as written, which keeps the alias of an opaque handle,
+    // `TCAtomic<pthread_t>`, that the specialization's arguments drop, also
+    // through an alias template, `TCWrapped<pthread_t>` of `using TCWrapped =
+    // TCAtomic<t_CType>`, whose aliased type keeps what it is given.
+    for (QualType Level = Type; !Level.isNull();) {
+      // Of the template however it was declared, also forward, `template
+      // <typename t_CType> struct TCAtomic;` before its definition.
+      const auto *Written = Level->getAs<TemplateSpecializationType>();
+      const TemplateDecl *WrittenTemplate =
+          Written ? Written->getTemplateName().getAsTemplateDecl() : nullptr;
+      if (WrittenTemplate &&
+          WrittenTemplate->getCanonicalDecl() ==
+              Holder->getSpecializedTemplate()->getCanonicalDecl()) {
+        if (!Written->template_arguments().empty() &&
+            Written->template_arguments()[0].getKind() ==
+                TemplateArgument::Type)
+          Held = Written->template_arguments()[0].getAsType();
+        // Also a default argument of the wrapper, `TCAtomic<>` of `template
+        // <typename t_CType = pthread_t>`, as it is written there: of the
+        // declaration the use names, which has the defaults of those before
+        // it, not the first one, which a forward declaration can be.
+        else if (const auto *Parameter = dyn_cast<TemplateTypeParmDecl>(
+                     WrittenTemplate->getTemplateParameters()->getParam(0));
+                 Written->template_arguments().empty() && Parameter &&
+                 Parameter->hasDefaultArgument() &&
+                 !Parameter->getDefaultArgument()
+                      .getArgument()
+                      .getAsType()
+                      ->isDependentType())
+          Held = Parameter->getDefaultArgument().getArgument().getAsType();
+        break;
+      }
+      const QualType Next = Level.getSingleStepDesugaredType(Context);
+      if (Next == Level)
+        break;
+      Level = Next;
+    }
+    if (isOpaqueHandle(Held, Context))
+      return Opaque();
+    // A boolean that clears itself, Malterlib's `zbool`, a
+    // `TCAutoClear<bool>`, also `TCAutoClearInt<bool>`, or an atomic one,
+    // `TCAtomic<bool>`, unless an opaque handle, as written, is one here.
+    if (Held->isBooleanType())
+      return 'b';
     if (Held->isFunctionPointerType() || Held->isMemberFunctionPointerType())
       return 'f';
     if (Held->isPointerType() || Held->isMemberDataPointerType())
@@ -882,15 +1222,40 @@ ConceptualPrefixCheck::expectedConcept(QualType Type,
   const CXXRecordDecl *Record = Type->getAsCXXRecordDecl();
   if (!Record)
     return std::nullopt;
-  if (Record->isLambda() ||
-      isRecordInList(Record, FunctionObjectTypes, {OO_Call}))
+  if (Record->isLambda())
     return 'f';
-  if (!ThroughHandle && isRecordInList(Record, SmartPointerTypes,
-                                       PointerOperators,
-                                       /*OrConvertsToBool=*/true))
-    return 'p';
-  if (isRecordInList(Record, IteratorTypes, IteratorOperators))
+  // One whose being a function object isn't known can be named as one, or as
+  // anything else it can be, or neither.
+  if (const std::optional<bool> Function = isFunctionObject(Record)) {
+    if (*Function)
+      return 'f';
+  } else {
+    if (IteratorAllowed &&
+        isRecordInList(Record, IteratorTypes, IteratorOperators))
+      *IteratorAllowed = true;
+    if (PointerAllowed &&
+        isRecordInList(Record, SmartPointerTypes, PointerOperators,
+                       /*OrConvertsToBool=*/true))
+      *PointerAllowed = true;
+    return std::nullopt;
+  }
+  if (isRecordInList(Record, SmartPointerTypes, PointerOperators,
+                     /*OrConvertsToBool=*/true)) {
+    // A handle, or what isn't known to be one, can still be an iterator.
+    if (const std::optional<char> Pointer =
+            PointerUnlessHandle(ThroughHandle, Record))
+      return Pointer;
+  }
+  if (isRecordInList(Record, IteratorTypes, IteratorOperators)) {
+    // Of what isn't known to be a handle, which is an iterator, or not, a
+    // pointer: either, also `i`.
+    if (HandleUnknown) {
+      if (IteratorAllowed)
+        *IteratorAllowed = true;
+      return std::nullopt;
+    }
     return 'i';
+  }
   return std::nullopt;
 }
 
@@ -1019,7 +1384,7 @@ bindPartial(llvm::ArrayRef<TemplateArgument> Taken,
 /// arguments, or none. A handle names a type of its own, which nothing names
 /// otherwise.
 QualType ConceptualPrefixCheck::handleAliasOf(QualType Type,
-                                              const ASTContext &Context) {
+                                              const ASTContext &Context) const {
   const QualType Canonical =
       Type.getNonReferenceType().getCanonicalType().getUnqualifiedType();
   const auto *Specialization =
@@ -1070,8 +1435,11 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
     return;
   const SourceManager &SM = *Result.SourceManager;
   const auto *Declaration = Result.Nodes.getNodeAs<ValueDecl>("declaration");
+  // Nor the placeholder of what is ignored, C++26 `bool _ = ...` or `auto
+  // [Ticket, _] = ...`, which is no name.
   if (!Declaration->getIdentifier() || Declaration->isImplicit() ||
       Declaration->isInvalidDecl() ||
+      Declaration->isPlaceholderVar(Result.Context->getLangOpts()) ||
       isInExternalSpecialization(Declaration, SM))
     return;
   // Not what an instantiation of a variable template makes, in a lambda of
@@ -1115,18 +1483,14 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
       return;
     if (Result.Context->getLangOpts().CPlusPlus && Variable->isExternC())
       return;
+    // The parameters of a function with C linkage are checked like any
+    // other: their names are neither its symbol nor its ABI, and only the
+    // sources of checked repositories are, so a system's declarations aren't.
     if (const auto *Function =
             dyn_cast_or_null<FunctionDecl>(Variable->getDeclContext());
-        Function && isa<ParmVarDecl>(Variable)) {
-      if (Function->isTemplateInstantiation())
-        return;
-      // The parameters of C functions declared in C++ are named by the C
-      // declarations they are copied from.
-      if (Result.Context->getLangOpts().CPlusPlus &&
-          (Function->isExternC() ||
-         (Function->isInExternCContext() && !isa<CXXMethodDecl>(Function))))
-        return;
-    }
+        Function && isa<ParmVarDecl>(Variable) &&
+        Function->isTemplateInstantiation())
+      return;
   }
 
   if (llvm::is_contained(IgnoredNames, Declaration->getName()))
@@ -2062,8 +2426,21 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
   // m_pStore`.
   const auto *Field = dyn_cast<FieldDecl>(Declaration);
   const bool EmptyAllowed = Field && Field->hasAttr<NoUniqueAddressAttr>();
+  bool OpaqueHandle = false;
   auto Contradicts = [&](QualType Of, bool Generic = false) {
     Of = InstanceAs(Of);
+    bool PointerAllowed = false;
+    bool IteratorAllowed = false;
+    bool Opaque = false;
+    const std::optional<char> Expected = expectedConcept(
+        Of, *Result.Context, &PointerAllowed, &IteratorAllowed, &Opaque);
+    // An opaque handle, `pthread_t`, also one a value wrapper holds,
+    // `TCAtomic<pthread_t>`, takes no concept prefix, on any target, whatever
+    // it is on this one.
+    if (llvm::is_contained({'b', 'f', 'i', 'p'}, Rest[0]) && Opaque) {
+      OpaqueHandle = true;
+      return true;
+    }
     if (const QualType Pointer = Of.getNonReferenceType().getCanonicalType();
         Generic && Rest[0] == 'i' && Pointer->isPointerType() &&
         !Pointer->isFunctionPointerType())
@@ -2074,7 +2451,6 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
       return false;
     // Not of what is the concept, like a listed function object template,
     // `TCFunction<void (bool)>`, whatever it declares.
-    const std::optional<char> Expected = expectedConcept(Of, *Result.Context);
     if (Expected == std::optional<char>(Rest[0]))
       return false;
     // But of another concept, like a pointer, `int const *`, named as an
@@ -2147,16 +2523,25 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
     // one of SmartPointerTypes, of which that it is the concept is told above,
     // not a handle, a smart pointer through an alias of
     // SmartPointerHandleTypes, `COnScopeExitShared`, which takes none.
+    // Nor of a class whose bases can't be told, not defined in the
+    // translation unit or with one that depends on parameters, which can
+    // make it what the prefix is for: unknown, so allowed.
+    if (Record && llvm::is_contained({'b', 'i', 'p'}, Rest[0]) &&
+        hasUnknownBases(Record))
+      return false;
     switch (Rest[0]) {
     case 'b':
       // Also a class that is a flag, FlagTypes, like `CAtomicFlag`.
       return !IntegerLike(Of, 0) && !(Record && isRecordInList(Record, FlagTypes));
     case 'i':
-      return !IntegerLike(Of, 0);
+      // Also one that is an iterator if it is a handle, which isn't known.
+      return !IteratorAllowed && !IntegerLike(Of, 0);
     case 'f':
       return Number || NotCallable;
     case 'p':
-      return true;
+      // Not one that can be a smart pointer or a handle, which can be named
+      // either way.
+      return !PointerAllowed;
     default:
       return false;
     }
@@ -2188,7 +2573,11 @@ void ConceptualPrefixCheck::check(const MatchFinder::MatchResult &Result) {
       }
     if (Known && Any) {
       const SourceLocation Loc = nameLocation(Declaration, SM);
-      if (Loc.isValid())
+      if (Loc.isValid() && OpaqueHandle)
+        diag(Loc, "%0 has the '%1' concept prefix of %2, but is an opaque "
+                  "handle, which takes none, as it isn't one on every target")
+            << Declaration << std::string(1, Rest[0]) << conceptName(Rest[0]);
+      else if (Loc.isValid())
         diag(Loc, "%0 has the '%1' concept prefix of %2, but is not one")
             << Declaration << std::string(1, Rest[0]) << conceptName(Rest[0]);
       return;

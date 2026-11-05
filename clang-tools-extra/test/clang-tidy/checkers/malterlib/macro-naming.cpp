@@ -3,11 +3,28 @@
 #define DMacro 1
 #define DFunctionLike(d_Value, d_bFlag, d_CType, ...) d_Value
 #define inline_always inline
+// A name in capitals is no upper camel case, also of one that configures
+// external code, which has a NOLINT, nor after the prefix, nor are its
+// parameters.
 #define NOMINMAX
+// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro 'NOMINMAX' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]
+#define NOMINMAX_ALLOWED // NOLINT(malterlib-macro-naming)
 #define identity(value) (value)
 // CHECK-MESSAGES: :[[@LINE-1]]:18: warning: parameter 'value' of macro 'identity' should have the 'd_' prefix followed by upper camel case [malterlib-macro-naming]
 #define API_CALL(x) x
+// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro 'API_CALL' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]
+// CHECK-MESSAGES: :[[@LINE-2]]:18: warning: parameter 'x' of macro 'API_CALL' should have the 'd_' prefix followed by upper camel case [malterlib-macro-naming]
 #define _GNU_SOURCE
+// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro '_GNU_SOURCE' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]
+#define AVLKEY(x) (x->m_Data)
+// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro 'AVLKEY' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]
+// CHECK-MESSAGES: :[[@LINE-2]]:16: warning: parameter 'x' of macro 'AVLKEY' should have the 'd_' prefix followed by upper camel case [malterlib-macro-naming]
+#define DESKTOP_ALL 1
+// CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro 'DESKTOP_ALL' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]
+#define DTypeOf(d_TYPE, d_ID) d_TYPE
+// CHECK-MESSAGES: :[[@LINE-1]]:17: warning: parameter 'd_TYPE' of macro 'DTypeOf' should have the 'd_' prefix followed by upper camel case [malterlib-macro-naming]
+#define DMibID 1
+#define DID 1
 
 #define Macro 1
 // CHECK-MESSAGES: :[[@LINE-1]]:9: warning: macro 'Macro' should have the 'D' prefix followed by upper camel case [malterlib-macro-naming]

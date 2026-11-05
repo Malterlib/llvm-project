@@ -227,48 +227,135 @@ void ParameterNamingCheck::checkDeclaration(const NamedDecl *Declaration,
     checkTemplateParameters(Parameters, false, SM);
 }
 
+/// Whether what a reference or a pointer refers to, \p Pointee, can be written
+/// through: what isn't const, also an array of it, an object of a class,
+/// through its const member functions, like a promise given its result through
+/// `TCPromise<tf_CType> const &o_Promise`, and what a pointer reaches through
+/// const pointers, `int *const *o_pValue`, but not a function nor a const
+/// scalar.
+static bool canWriteThrough(QualType Pointee) {
+  if (Pointee->isFunctionType())
+    return false;
+  // Also of an alias of an array made const, `CData const &` of `using
+  // CData = int[4]`, whose elements are.
+  bool Const = Pointee.isConstQualified();
+  while (const ArrayType *Array = Pointee->getAsArrayTypeUnsafe()) {
+    Pointee = Array->getElementType();
+    Const |= Pointee.isConstQualified();
+  }
+  if (Const)
+    Pointee.addConst();
+  if (!Pointee.isConstQualified())
+    return true;
+  // Nor a const vector of scalars, `int __attribute__((ext_vector_type(4)))`,
+  // nor const `void`, nor a const atomic, `_Atomic(int) const`, other than
+  // of a pointer to what can be written, `_Atomic(int *) const`.
+  if (const auto *Atomic = Pointee->getAs<AtomicType>())
+    return Atomic->getValueType()->isPointerType() &&
+           canWriteThrough(Atomic->getValueType()->getPointeeType());
+  if (Pointee->isVectorType() || Pointee->isVoidType())
+    return false;
+  if (!Pointee->isScalarType())
+    return true;
+  // Also through a const Objective-C object pointer, `CObject *const &`.
+  if (Pointee->isObjCObjectPointerType())
+    return true;
+  return Pointee->isPointerType() && canWriteThrough(Pointee->getPointeeType());
+}
+
 /// Whether a parameter of type \p Type can be an output parameter, named
 /// with the `o_` prefix: whether the function can write through it. Whether
 /// it is one is what its author means by it, also of one that the function
 /// writes, so it can be named either way; only what can't be written, a
 /// value or what is const, can't be an output.
+/// Whether an object of \p Record taken by value can be written through: one
+/// of the const member functions of it or of a base, whatever its access,
+/// gives what can be written through, as a parameter of its type can be. As
+/// `o_` is
+/// only rejected for what definitely can't be written, none when that can't
+/// be told from what clang instantiated: a specialization a declaration names
+/// without needing it complete, `TCReference<int const> o_Value`, a result
+/// that depends on what isn't known, or a member function template, which can
+/// be named either way. Each base once, at the least depth it is reached at,
+/// kept in \p Explored, as one that several paths lead to, of a diamond,
+/// would otherwise be gone through for each.
+static std::optional<bool>
+refersToWritable(const CXXRecordDecl *Record, int Depth = 0,
+                 llvm::DenseMap<const CXXRecordDecl *, int> *Explored = nullptr) {
+  if (!Record || Depth > 8)
+    return std::nullopt;
+  llvm::DenseMap<const CXXRecordDecl *, int> Own;
+  if (!Explored)
+    Explored = &Own;
+  if (auto [It, Inserted] = Explored->try_emplace(Record, Depth); !Inserted) {
+    if (It->second <= Depth)
+      return false;
+    It->second = Depth;
+  }
+  Record = Record->getDefinition();
+  if (!Record)
+    return std::nullopt;
+  bool Unknown = false;
+  for (const Decl *Member : Record->decls()) {
+    if (const auto *Template = dyn_cast<FunctionTemplateDecl>(Member)) {
+      // Also one whose explicit object depends on its parameters, `int
+      // &f_Get(this tf_CSelf &&_Self)`, which can be const.
+      if (const auto *Method =
+              dyn_cast<CXXMethodDecl>(Template->getTemplatedDecl());
+          Method && !Method->isStatic() &&
+          (hasConstObject(Method) ||
+           (Method->isExplicitObjectMemberFunction() &&
+            Method->getParamDecl(0)->getType()->isDependentType())))
+        Unknown = true;
+      continue;
+    }
+    // Const, also through an explicit object, `int &f_Get(this CWrapper const
+    // &_Self)`.
+    const auto *Method = dyn_cast<CXXMethodDecl>(Member);
+    if (!Method || Method->isStatic() || !hasConstObject(Method) ||
+        isa<CXXConstructorDecl, CXXDestructorDecl>(Method))
+      continue;
+    // A result that isn't known, also one deduced only when the function is
+    // used, `decltype(auto) f_Get() const`.
+    const QualType Result = Method->getReturnType();
+    if (Result->isDependentType() || Result->isUndeducedType()) {
+      Unknown = true;
+      continue;
+    }
+    // What it gives is written through as a parameter of its type is: an
+    // Objective-C object pointer, what a reference, also an rvalue one, `int
+    // &&f_Get() const`, or a pointer refers to, also through const pointers,
+    // `int *const &f_Get() const`, and an object of a class that refers to
+    // what can be written, `TCReference<int> f_Get() const`.
+    if (Result->isObjCObjectPointerType())
+      return true;
+    if ((Result->isReferenceType() || Result->isPointerType()) &&
+        canWriteThrough(Result->getPointeeType()))
+      return true;
+    if (const CXXRecordDecl *Given = Result->getAsCXXRecordDecl();
+        Given && !Result->isReferenceType()) {
+      const std::optional<bool> Writable =
+          refersToWritable(Given, Depth + 1, Explored);
+      if (Writable.value_or(false))
+        return true;
+      Unknown |= !Writable;
+    }
+  }
+  for (const CXXBaseSpecifier &Base : Record->bases()) {
+    const std::optional<bool> Writable = refersToWritable(
+        Base.getType()->getAsCXXRecordDecl(), Depth + 1, Explored);
+    if (Writable.value_or(false))
+      return true;
+    Unknown |= !Writable;
+  }
+  if (Unknown)
+    return std::nullopt;
+  return false;
+}
+
 static std::optional<bool> canBeOutputType(QualType Type) {
   if (const auto *Expansion = Type->getAs<PackExpansionType>())
     Type = Expansion->getPattern();
-  // What can be written through: what isn't const, also an array of it, an
-  // object of a class, through its const member functions, like a promise
-  // given its result through `TCPromise<tf_CType> const &o_Promise`, and
-  // what a pointer reaches through const pointers, `int *const *o_pValue`,
-  // but not a function nor a const scalar.
-  std::function<bool(QualType)> Writable = [&](QualType Pointee) {
-    if (Pointee->isFunctionType())
-      return false;
-    // Also of an alias of an array made const, `CData const &` of `using
-    // CData = int[4]`, whose elements are.
-    bool Const = Pointee.isConstQualified();
-    while (const ArrayType *Array = Pointee->getAsArrayTypeUnsafe()) {
-      Pointee = Array->getElementType();
-      Const |= Pointee.isConstQualified();
-    }
-    if (Const)
-      Pointee.addConst();
-    if (!Pointee.isConstQualified())
-      return true;
-    // Nor a const vector of scalars, `int __attribute__((ext_vector_type(4)))`,
-    // nor const `void`, nor a const atomic, `_Atomic(int) const`, other than
-    // of a pointer to what can be written, `_Atomic(int *) const`.
-    if (const auto *Atomic = Pointee->getAs<AtomicType>())
-      return Atomic->getValueType()->isPointerType() &&
-             Writable(Atomic->getValueType()->getPointeeType());
-    if (Pointee->isVectorType() || Pointee->isVoidType())
-      return false;
-    if (!Pointee->isScalarType())
-      return true;
-    // Also through a const Objective-C object pointer, `CObject *const &`.
-    if (Pointee->isObjCObjectPointerType())
-      return true;
-    return Pointee->isPointerType() && Writable(Pointee->getPointeeType());
-  };
   // A reference or a pointer to what can be written, `int &o_Value`, `int
   // *const &&o_pValue` or `CStr *o_pError`, but not a value. One to what a
   // template is given, `tf_CType const &o_Value`, can be to a const scalar,
@@ -292,13 +379,57 @@ static std::optional<bool> canBeOutputType(QualType Type) {
       Pointee.addConst();
     if (Pointee->isDependentType())
       return std::nullopt;
-    return Writable(Type->getPointeeType());
+    return canWriteThrough(Type->getPointeeType());
   }
   // What a template is given can be a reference, `typename
   // tf_CTraits::CReference o_Value` or `t_CReference o_Value` of a class
   // template given `int &`.
   if (Type->isDependentType())
     return std::nullopt;
+  // An object of a class that refers to what it can be written through, as a
+  // reference wrapper does, `TCReference<CActorSubscription> o_Subscription`
+  // with `f_Get() const` giving a non-const reference: one of its const
+  // member functions, also of a base, gives a reference or a pointer to what
+  // can be written.
+  if (const CXXRecordDecl *Record = Type->getAsCXXRecordDecl())
+    return refersToWritable(Record);
+  return false;
+}
+
+/// Whether \p Parameter is one of the function an explicit instantiation
+/// names, in the type it is declared with, `template void fg_Function<int>(int);`,
+/// not one of a function type among its template arguments, `template struct
+/// TCFunction<void (int _Value)>;`, which is named like any other.
+static bool isExplicitInstantiationParameter(const ParmVarDecl *Parameter) {
+  ASTContext &Context = Parameter->getASTContext();
+  DynTypedNodeList Parents = Context.getParents(*Parameter);
+  for (int Depth = 0; Depth < 32 && !Parents.empty(); ++Depth) {
+    const DynTypedNode &Parent = Parents[0];
+    if (const auto *Instantiation = Parent.get<ExplicitInstantiationDecl>()) {
+      if (!isa<FunctionDecl>(Instantiation->getSpecialization()))
+        return false;
+      const TypeSourceInfo *Written = Instantiation->getTypeAsWritten();
+      if (!Written)
+        return false;
+      // Past parentheses and attributes, also a calling convention, `template
+      // void __cdecl fg_Function<int>(int);`.
+      TypeLoc Loc = Written->getTypeLoc();
+      for (int Steps = 0; Steps < 16; ++Steps) {
+        Loc = Loc.IgnoreParens();
+        if (const auto Attributed = Loc.getAs<AttributedTypeLoc>())
+          Loc = Attributed.getModifiedLoc();
+        else if (const auto Macro = Loc.getAs<MacroQualifiedTypeLoc>())
+          Loc = Macro.getInnerLoc();
+        else
+          break;
+      }
+      const FunctionTypeLoc Function = Loc.getAs<FunctionTypeLoc>();
+      return Function && llvm::is_contained(Function.getParams(), Parameter);
+    }
+    if (!Parent.get<TypeLoc>())
+      return false;
+    Parents = Context.getParents(Parent);
+  }
   return false;
 }
 
@@ -362,16 +493,126 @@ void ParameterNamingCheck::checkFunctionParameter(const ParmVarDecl *Parameter,
                                                   const SourceManager &SM) {
   if (Parameter->isImplicit())
     return;
+  // An explicit instantiation only names a specialization that exists,
+  // `template TCValue<long>::TCValue(long &&);`, also with `extern`, so the
+  // names of its parameters would tell nothing.
+  if (isExplicitInstantiationParameter(Parameter))
+    return;
+  // One of a function type in an instantiation of a template, also of a class,
+  // `void (tp_CParams ...p_Params)` in a static member, which the pattern
+  // declares and is checked in: there a pack expands to parameters of the
+  // pack's name. Not one of an explicit specialization, also of a member of
+  // an instantiated class, `template <> void TCBox<int>::f_Run(int _Value)`,
+  // which is written as it is.
+  for (const DeclContext *Context = Parameter->getDeclContext(); Context;
+       Context = Context->getParent()) {
+    if (const auto *Function = dyn_cast<FunctionDecl>(Context)) {
+      // Also a member template specialized for an instantiated class,
+      // `template <> template <typename tf_CValue> void
+      // TCBox<int>::f_Run(tf_CValue _Value)`.
+      if (const FunctionTemplateDecl *Template =
+              Function->getDescribedFunctionTemplate();
+          Function->getTemplateSpecializationKind() ==
+              TSK_ExplicitSpecialization ||
+          (Template && Template->isMemberSpecialization()))
+        break;
+      if (Function->isTemplateInstantiation())
+        return;
+    }
+    // Also a requirement in the initializer of a static data member
+    // specialized for an instantiated class, `template <> bool
+    // TCBox<int>::ms_bValue = requires(int _Value) { ... };`, which is
+    // written as it is.
+    if (const auto *Requirement = dyn_cast<RequiresExprBodyDecl>(Context)) {
+      ASTContext &Context = Requirement->getASTContext();
+      DynTypedNode Node = DynTypedNode::create(*Requirement);
+      const VarDecl *Variable = nullptr;
+      for (int Depth = 0; Depth < 64 && !Variable; ++Depth) {
+        const auto Parents = Context.getParents(Node);
+        if (Parents.empty() || Parents[0].get<FunctionDecl>())
+          break;
+        Node = Parents[0];
+        if (const auto *Found = Node.get<VarDecl>();
+            Found && !Found->isInitCapture())
+          Variable = Found;
+      }
+      const VarTemplateDecl *Template =
+          Variable ? Variable->getDescribedVarTemplate() : nullptr;
+      if (Variable && (Variable->getTemplateSpecializationKind() ==
+                           TSK_ExplicitSpecialization ||
+                       (Template && Template->isMemberSpecialization())))
+        break;
+    }
+    // Also a member enum specialized for an instantiated class.
+    if (const auto *Enum = dyn_cast<EnumDecl>(Context);
+        Enum &&
+        Enum->getTemplateSpecializationKind() == TSK_ExplicitSpecialization)
+      break;
+    if (const auto *Record = dyn_cast<CXXRecordDecl>(Context)) {
+      // Also a lambda in the initializer of a static data member specialized
+      // for an instantiated class, `template <> int TCBox<int>::ms_Value =
+      // [](int _Value) { ... }(0);`, which is written as it is.
+      if (Record->isLambda()) {
+        // Also in the initializer of an enumerator of a member enum
+        // specialized for an instantiated class, `template <> enum
+        // TCBox<int>::EMode : int { EMode_Value = [](int _Value) { ... }(0)
+        // };`.
+        if (const auto *Enumerator = dyn_cast_or_null<EnumConstantDecl>(
+                Record->getLambdaContextDecl());
+            Enumerator &&
+            cast<EnumDecl>(Enumerator->getDeclContext())
+                    ->getTemplateSpecializationKind() ==
+                TSK_ExplicitSpecialization)
+          break;
+        // Past the variables of init captures, `[Value = [](int _Value) {
+        // ... }(0)]`, which are the lambda's, to the variable it is made in.
+        const VarDecl *Variable =
+            dyn_cast_or_null<VarDecl>(Record->getLambdaContextDecl());
+        if (Variable && Variable->isInitCapture())
+          Variable = nullptr;
+        ASTContext &Context = Record->getASTContext();
+        DynTypedNode Node = DynTypedNode::create(*Record);
+        for (int Depth = 0; Depth < 64 && !Variable; ++Depth) {
+          const auto Parents = Context.getParents(Node);
+          if (Parents.empty())
+            break;
+          Node = Parents[0];
+          if (const auto *Found = Node.get<VarDecl>();
+              Found && !Found->isInitCapture())
+            Variable = Found;
+          if (Node.get<FunctionDecl>())
+            break;
+        }
+        // Also a member variable template specialized for an instantiated
+        // class, `template <> template <typename t_CValue> int
+        // TCBox<int>::ms_Value = ...;`.
+        const VarTemplateDecl *Template =
+            Variable ? Variable->getDescribedVarTemplate() : nullptr;
+        if (Variable && (Variable->getTemplateSpecializationKind() ==
+                             TSK_ExplicitSpecialization ||
+                         (Template && Template->isMemberSpecialization())))
+          break;
+      }
+      const TemplateSpecializationKind Kind =
+          Record->getTemplateSpecializationKind();
+      if (const ClassTemplateDecl *Template =
+              Record->getDescribedClassTemplate();
+          Kind == TSK_ExplicitSpecialization ||
+          (Template && Template->isMemberSpecialization()))
+        break;
+      if (Kind == TSK_ImplicitInstantiation ||
+          Kind == TSK_ExplicitInstantiationDeclaration ||
+          Kind == TSK_ExplicitInstantiationDefinition)
+        return;
+    }
+  }
   const auto *Function =
       dyn_cast_or_null<FunctionDecl>(Parameter->getDeclContext());
   if (Function) {
+    // Also those of a function with C linkage: their names are neither its
+    // symbol nor its ABI, and only the sources of checked repositories are,
+    // so a system's declarations aren't.
     if (Function->isTemplateInstantiation())
-      return;
-    // The names of the parameters of C functions declared in C++ come with
-    // the C declarations they are copied from.
-    if (Parameter->getASTContext().getLangOpts().CPlusPlus &&
-        (Function->isExternC() ||
-         (Function->isInExternCContext() && !isa<CXXMethodDecl>(Function))))
       return;
   }
   const SourceLocation Loc = nameLocation(Parameter, SM);
@@ -428,7 +669,11 @@ void ParameterNamingCheck::checkFunctionParameter(const ParmVarDecl *Parameter,
       !llvm::is_contained(Expected, Prefix)) {
     diag(Loc, "%0 %1 should have the %2 prefix")
         << Kind << Parameter << quotedList(Expected);
-    return;
+    // The rest of the name is checked too, so a name with several problems is
+    // reported for all of them at once: after the storage prefix it has, or
+    // all of it.
+    if (!splitStoragePrefix(Name, Prefix, Rest))
+      Rest = Name;
   }
   if (const StringRef Wrong = wrongConceptPrefix(Rest); !Wrong.empty())
     diag(Loc, "%0 %1 has %select{the prefix '%2', which isn't a concept prefix; remove "
@@ -471,12 +716,23 @@ void ParameterNamingCheck::checkTemplateParameters(
     const StringRef Name = Parameter->getName();
     StringRef Kind = OfFunction ? "function template parameter"
                                 : "template parameter";
-    if (!Name.starts_with(Prefix)) {
+    StringRef Rest;
+    if (Name.starts_with(Prefix))
+      Rest = Name.drop_front(Prefix.size());
+    else {
       diag(Loc, "%0 %1 should have the '%2' prefix")
           << Kind << Parameter << Prefix;
-      continue;
+      // The rest of the name is checked too, so a name with several problems
+      // is reported for all of them at once, `t_Func` of a function template
+      // for both `tf_` and its type prefix: after the template prefix it
+      // has, or all of it.
+      Rest = Name;
+      for (StringRef Other : {"tfp_", "tp_", "tf_", "t_"})
+        if (Name.starts_with(Other)) {
+          Rest = Name.drop_front(Other.size());
+          break;
+        }
     }
-    const StringRef Rest = Name.drop_front(Prefix.size());
     // The length of the name after a type prefix, the longest that it has.
     auto ShortAfter = [&](llvm::ArrayRef<StringRef> TypePrefixes) {
       size_t Longest = 0;

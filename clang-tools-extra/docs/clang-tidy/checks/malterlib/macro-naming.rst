@@ -14,8 +14,12 @@ followed by upper camel case and optionally concept or type prefixes
 
 Macros without upper case letters emulate language features
 (``inline_always``), so their names are not checked, but their parameters are.
-Macros without lower case letters configure external code (``NOMINMAX``,
-``_GNU_SOURCE``), so they are not checked. A parameter is at least
+A name in capitals, also after the ``D`` prefix, like ``AVLKEY`` or
+``DESKTOP_ALL``, is not upper camel case and is reported, and so is a parameter
+in capitals after its prefixes, ``d_TYPE``; acronyms of up to two capitals,
+``d_ID``, are upper camel case. One that configures external code, like
+``NOMINMAX`` or ``_GNU_SOURCE``, has a ``NOLINT(malterlib-macro-naming)``. A
+parameter is at least
 `MinimumNameLength` characters long after its prefixes, ``d_Value`` but not
 ``d_X``.
 

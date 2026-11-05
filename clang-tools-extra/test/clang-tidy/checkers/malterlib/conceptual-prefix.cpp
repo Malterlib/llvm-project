@@ -123,7 +123,11 @@ void fg_PointerIterator(CPointerIterator _iValue, CPointerIterator *_pIterator);
 // CHECK-MESSAGES: :[[@LINE-1]]:42: warning: '_iValue' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
 void fg_PointerIteratorAsPointer(CPointerIterator _pValue);
 
+// The parameters of a function with C linkage take concept prefixes like any
+// other.
 extern "C" void c_function(bool flag, int *value);
+// CHECK-MESSAGES: :[[@LINE-1]]:33: warning: 'flag' is a boolean and should have the 'b' concept prefix [malterlib-conceptual-prefix]
+// CHECK-MESSAGES: :[[@LINE-2]]:44: warning: 'value' is a pointer and should have the 'p' concept prefix [malterlib-conceptual-prefix]
 
 bool NoLint; // NOLINT(malterlib-conceptual-prefix)
 
@@ -328,8 +332,11 @@ struct TCAutoClearPtr
 {
 	t_CType *m_pPointTo;
 };
-void fg_UseAutoClear(TCAutoClearPtr<int> _Object);
-// CHECK-MESSAGES: :[[@LINE-1]]:42: warning: '_Object' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+TCAutoClearPtr<int> g_UseAutoClear;
+// CHECK-MESSAGES: :[[@LINE-1]]:21: warning: 'g_UseAutoClear' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+// But of one only a declaration names, which nothing completes, whose bases,
+// which can make it a handle, can't be told, it isn't known.
+void fg_UseAutoClear(TCAutoClearPtr<long> _Object);
 
 // A smart pointer or function object whose arguments are template parameters.
 template <typename tf_CType>
@@ -1534,6 +1541,19 @@ struct TCFlags {
 // CHECK-MESSAGES: :[[@LINE-1]]:36: warning: 'm_Enabled' is a boolean and should have the 'b' concept prefix after its storage prefix [malterlib-conceptual-prefix]
 };
 TCFlags<true> g_Flags;
+// Not one of an opaque handle that is a boolean on this target, also given
+// what depends on them.
+typedef bool HANDLE;
+template <bool t_bInitial>
+struct TCHandles {
+  TCAutoClearInt<HANDLE, t_bInitial> m_Handle;
+  TCAutoClearInt<HANDLE, t_bInitial> m_bHandle;
+// CHECK-MESSAGES: :[[@LINE-1]]:38: warning: 'm_bHandle' has the 'b' concept prefix of a boolean, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+};
+TCHandles<true> g_Handles;
+TCAutoClearInt<HANDLE> g_Handle;
+TCAutoClearInt<HANDLE> g_bHandle;
+// CHECK-MESSAGES: :[[@LINE-1]]:24: warning: 'g_bHandle' has the 'b' concept prefix of a boolean, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
 
 struct CTraits {
   using CBoolean = bool;
@@ -5430,4 +5450,523 @@ void fg_WalkBack(tf_CData *_pDest, umint _Len) {
   auto nCount = _pDest - _pDest;
 }
 void fg_Test(int *_pValues) { fg_WalkBack(_pValues, 2); }
+}
+
+// A non-type template parameter of a concept whose type doesn't depend on the
+// template parameters is checked like any other, also a pack.
+template <bool ...tp_bToCheck>
+concept cAllIsTrueChecked = (tp_bToCheck && ...);
+template <bool ...tp_CToCheck>
+concept cAllIsTrueWrong = (tp_CToCheck && ...);
+// CHECK-MESSAGES: :[[@LINE-2]]:19: warning: 'tp_CToCheck' is a boolean and should have the 'b' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+static_assert(cAllIsTrueChecked<true, true> && cAllIsTrueWrong<true>);
+
+// A class derived from a handle is a handle too, also as its own template.
+namespace NDerivedHandle
+{
+	template <typename t_CType>
+	struct TCUniquePointer
+	{
+		t_CType *operator->() const;
+		t_CType &operator*() const;
+		explicit operator bool() const;
+	};
+	using CActorSubscription = TCUniquePointer<int>;
+	template <typename t_CID>
+	struct TCActorSubscriptionWithID : CActorSubscription
+	{
+		TCActorSubscriptionWithID();
+		TCActorSubscriptionWithID(TCActorSubscriptionWithID &&_Other);
+		template <typename tf_CID>
+		void f_Feed(TCActorSubscriptionWithID<tf_CID> &&_Subscription);
+		t_CID m_ID;
+	};
+	struct CSubscriptionWithName : TCActorSubscriptionWithID<int>
+	{
+	};
+	TCActorSubscriptionWithID<int> g_Subscription;
+	CSubscriptionWithName g_Named;
+	void fg_Subscriptions()
+	{
+		auto Subscription = TCActorSubscriptionWithID<long>();
+		(void)Subscription;
+	}
+	// But not one derived from the smart pointer itself.
+	struct CDerivedPointer : TCUniquePointer<int>
+	{
+	};
+	CDerivedPointer g_Pointer;
+// CHECK-MESSAGES: :[[@LINE-1]]:18: warning: 'g_Pointer' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// A base an instantiation is given that a handle is an alias of, which
+	// it keeps without the alias, can be the handle or the smart pointer:
+	// either way.
+	template <typename t_CBase>
+	struct TCHandleAdapter : t_CBase
+	{
+	};
+	TCHandleAdapter<CActorSubscription> g_AdaptedSubscription;
+	TCHandleAdapter<CActorSubscription> g_pAdaptedSubscription;
+	// Also through an alias named as a pointer, of a class derived from a
+	// handle, which is one too; of one that isn't, it is a pointer.
+	using CSubscriptionPointer = CSubscriptionWithName;
+	CSubscriptionPointer g_SubscriptionAlias;
+	// Also of what depends on parameters, a smart pointer that is also an
+	// iterator, whose handle status isn't known: either, also `i`.
+	template <typename t_CBase>
+	struct TCAdapterIterator : TCUniquePointer<int>, t_CBase
+	{
+		TCAdapterIterator &operator++();
+	};
+	template <typename tf_CBase>
+	void fg_TakeAdapterIterator(TCAdapterIterator<tf_CBase> _Value);
+	template <typename tf_CBase>
+	void fg_TakeAdapterIteratorPointer(TCAdapterIterator<tf_CBase> _pValue);
+	template <typename tf_CBase>
+	void fg_TakeAdapterIteratorIterator(TCAdapterIterator<tf_CBase> _iValue);
+	// Also one whose primary template and partial specialization disagree on
+	// being a handle.
+	template <typename t_CType>
+	struct TCAdaptiveIterator : TCUniquePointer<int>
+	{
+		TCAdaptiveIterator &operator++();
+	};
+	template <typename t_CType>
+	struct TCAdaptiveIterator<t_CType *> : CActorSubscription
+	{
+		TCAdaptiveIterator &operator++();
+	};
+	template <typename tf_CType>
+	void fg_TakeAdaptive(TCAdaptiveIterator<tf_CType> _Value);
+	template <typename tf_CType>
+	void fg_TakeAdaptivePointer(TCAdaptiveIterator<tf_CType> _pValue);
+	template <typename tf_CType>
+	void fg_TakeAdaptiveIterator(TCAdaptiveIterator<tf_CType> _iValue);
+	// But one whose primary template and partial specialization derive from the
+	// same handle is a handle, also when it is asked about for the second.
+	struct CSharedHandleBase : CActorSubscription
+	{
+	};
+	template <typename t_CType>
+	struct TCSharedIterator : CSharedHandleBase
+	{
+		TCSharedIterator &operator++();
+	};
+	template <typename t_CType>
+	struct TCSharedIterator<t_CType *> : CSharedHandleBase
+	{
+		TCSharedIterator &operator++();
+	};
+	template <typename tf_CType>
+	void fg_TakeShared(TCSharedIterator<tf_CType> _Value);
+// CHECK-MESSAGES: :[[@LINE-1]]:48: warning: '_Value' is an iterator and should have the 'i' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	template <typename tf_CType>
+	void fg_TakeSharedPointer(TCSharedIterator<tf_CType> _pValue);
+// CHECK-MESSAGES: :[[@LINE-1]]:55: warning: '_pValue' is an iterator and should have the 'i' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	template <typename tf_CType>
+	void fg_TakeSharedIterator(TCSharedIterator<tf_CType> _iValue);
+	// Of a handle that is an iterator, that, as of the class spelled itself.
+	struct CHandleIterator : CActorSubscription
+	{
+		CHandleIterator &operator++();
+	};
+	using CHandleStepPointer = CHandleIterator;
+	CHandleStepPointer g_HandleIteratorAlias;
+// CHECK-MESSAGES: :[[@LINE-1]]:21: warning: 'g_HandleIteratorAlias' is an iterator and should have the 'i' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	CHandleStepPointer g_iHandleIteratorAlias;
+	using CPlainPointer = CDerivedPointer;
+	CPlainPointer g_PlainAlias;
+// CHECK-MESSAGES: :[[@LINE-1]]:16: warning: 'g_PlainAlias' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// But not one written as a template given the parameters, which is what it
+	// names, a smart pointer, also what a handle is an alias of.
+	template <typename t_CType>
+	struct TCWrappedPointer : TCUniquePointer<t_CType>
+	{
+	};
+	TCWrappedPointer<int> g_WrappedHandleTarget;
+// CHECK-MESSAGES: :[[@LINE-1]]:24: warning: 'g_WrappedHandleTarget' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// Also from a pack of bases, whose bases aren't one to one with the
+	// pattern's.
+	template <typename... tp_CBases>
+	struct TCPackAdapter : tp_CBases...
+	{
+	};
+	struct CPackPlain
+	{
+	};
+	TCPackAdapter<CPackPlain, CActorSubscription> g_PackAdapted;
+	TCPackAdapter<CPackPlain, CActorSubscription> g_pPackAdapted;
+	// But a base written before or after the pack is the pattern's, also one a
+	// handle is an alias of, written whole.
+	template <typename... tp_CBases>
+	struct TCFixedPackAdapter : TCUniquePointer<int>, tp_CBases...
+	{
+	};
+	TCFixedPackAdapter<CPackPlain> g_FixedPackAdapted;
+// CHECK-MESSAGES: :[[@LINE-1]]:33: warning: 'g_FixedPackAdapted' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	template <typename... tp_CBases>
+	struct TCPackThenFixed : tp_CBases..., TCUniquePointer<int>
+	{
+	};
+	TCPackThenFixed<CPackPlain> g_PackThenFixed;
+// CHECK-MESSAGES: :[[@LINE-1]]:30: warning: 'g_PackThenFixed' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// Also a specialization of a smart pointer nothing completes, whose bases,
+	// which can be a handle, can't be told, also of a template without partial
+	// specializations.
+	struct CIncompleteThing;
+	void fg_TakeIncompletePointer(TCUniquePointer<CIncompleteThing> _Value);
+	void fg_TakeIncompletePointerNamed(TCUniquePointer<CIncompleteThing> _pValue);
+	// A class with a base that depends on the parameters can be a handle as it
+	// is instantiated: its generic form can be named either way.
+	template <typename t_CBase>
+	struct TCAdapter : TCUniquePointer<char>, t_CBase
+	{
+	};
+	struct CSubscriptionBase : CActorSubscription
+	{
+	};
+	template <typename tf_CBase>
+	void fg_Adapt()
+	{
+		TCAdapter<tf_CBase> Value;
+		(void)Value;
+		TCAdapter<tf_CBase> pValue;
+		(void)pValue;
+	}
+	// And one whose bases go deeper than they are followed isn't known not to
+	// be one.
+	struct CLayer0 : CActorSubscription
+	{
+	};
+	struct CLayer1 : CLayer0
+	{
+	};
+	struct CLayer2 : CLayer1
+	{
+	};
+	struct CLayer3 : CLayer2
+	{
+	};
+	struct CLayer4 : CLayer3
+	{
+	};
+	struct CLayer5 : CLayer4
+	{
+	};
+	struct CLayer6 : CLayer5
+	{
+	};
+	struct CLayer7 : CLayer6
+	{
+	};
+	struct CLayer8 : CLayer7
+	{
+	};
+	struct CLayer9 : CLayer8
+	{
+	};
+	CLayer9 g_Layer;
+	// Also one deeper than followed without a handle in it: either way.
+	struct CDeepPointer0 : TCUniquePointer<int>
+	{
+	};
+	struct CDeepPointer1 : CDeepPointer0
+	{
+	};
+	struct CDeepPointer2 : CDeepPointer1
+	{
+	};
+	struct CDeepPointer3 : CDeepPointer2
+	{
+	};
+	struct CDeepPointer4 : CDeepPointer3
+	{
+	};
+	struct CDeepPointer5 : CDeepPointer4
+	{
+	};
+	struct CDeepPointer6 : CDeepPointer5
+	{
+	};
+	struct CDeepPointer7 : CDeepPointer6
+	{
+	};
+	struct CDeepPointer8 : CDeepPointer7
+	{
+	};
+	struct CDeepPointer9 : CDeepPointer8
+	{
+	};
+	CDeepPointer9 g_pDeep;
+	CDeepPointer9 g_Deep;
+	// Also one that is an iterator, which a handle is named as: either, also
+	// `i`.
+	struct CDeepIterator : CDeepPointer9
+	{
+		CDeepIterator &operator++();
+	};
+	CDeepIterator g_DeepIterator;
+	CDeepIterator g_pDeepIterator;
+	CDeepIterator g_iDeepIterator;
+}
+
+// A class NotFunctionObjectTypes lists isn't a function object, also through a
+// base, though FunctionObjectTypes would match it: its call operator only binds
+// and gives a builder.
+namespace NBuilderFunctor
+{
+	struct CBuilder
+	{
+	};
+	template <bool t_bCoalesced>
+	struct TCBuilderFunctorHelper
+	{
+		CBuilder operator()(int _Actor) const;
+	};
+	struct CBuilderFunctorHelper : TCBuilderFunctorHelper<false>
+	{
+	};
+	extern CBuilderFunctorHelper const &g_BuilderFunctor;
+	extern TCBuilderFunctorHelper<true> const &g_BuilderFunctorCoalesced;
+	struct CRealFunctor
+	{
+		void operator()() const;
+	};
+	extern CRealFunctor const &g_RealFunctor;
+// CHECK-MESSAGES: :[[@LINE-1]]:29: warning: 'g_RealFunctor' is a function object and should have the 'f' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// One with a base that depends on the parameters, which an instantiation
+	// can make one of those, isn't known to be one: either way.
+	template <typename t_CBase>
+	struct TCAdapterFunctor : t_CBase
+	{
+		void operator()() const;
+	};
+	template <typename tf_CBase>
+	void fg_TakeAdapter(TCAdapterFunctor<tf_CBase> const &_Value);
+	template <typename tf_CBase>
+	void fg_TakeAdapterNamed(TCAdapterFunctor<tf_CBase> const &_fValue);
+	// Nor does another concept it has then decide: one that is also an
+	// iterator can be named as either, or neither.
+	struct CAdapterIterator
+	{
+		CAdapterIterator &operator++();
+		int &operator*() const;
+	};
+	template <typename t_CBase>
+	struct TCAdapterFunctorIterator : CAdapterIterator, t_CBase
+	{
+		void operator()() const;
+	};
+	template <typename tf_CBase>
+	void fg_TakeIteratorFunctor(TCAdapterFunctorIterator<tf_CBase> const &_fValue);
+	template <typename tf_CBase>
+	void fg_TakeIteratorFunctorAsIterator(TCAdapterFunctorIterator<tf_CBase> const &_iValue);
+	template <typename tf_CBase>
+	void fg_TakeIteratorFunctorPlain(TCAdapterFunctorIterator<tf_CBase> const &_Value);
+	// Nor one not defined in the translation unit, a specialization nothing
+	// completes, whose bases can't be told.
+	template <typename t_CBase>
+	struct TCActorFunctor : t_CBase
+	{
+		void operator()() const;
+	};
+	// Nor one whose primary template is one and a partial specialization a
+	// base of NotFunctionObjectTypes excludes, which disagree.
+	template <typename t_CType>
+	struct TCMixedFunctorIterator : CAdapterIterator
+	{
+		void operator()() const;
+	};
+	template <typename t_CType>
+	struct TCMixedFunctorIterator<t_CType *> : CAdapterIterator,
+	                                           TCBuilderFunctorHelper<false>
+	{
+		void operator()() const;
+	};
+	template <typename tf_CType>
+	void fg_TakeMixed(TCMixedFunctorIterator<tf_CType> const &_Value);
+	template <typename tf_CType>
+	void fg_TakeMixedNamed(TCMixedFunctorIterator<tf_CType> const &_fValue);
+	void fg_TakeIncompleteFunctor(TCActorFunctor<TCBuilderFunctorHelper<false>> _Value);
+	void fg_TakeIncompleteFunctorNamed(TCActorFunctor<TCBuilderFunctorHelper<true>> _fValue);
+	// Nor is what a prefix needs of a class not defined in the translation
+	// unit known: it can have it, `p`, `i` or `b`.
+	struct CForwardPointer;
+	struct CForwardIterator;
+	struct CForwardFlags;
+	void fg_TakeForwardPointer(CForwardPointer _pValue);
+	void fg_TakeForwardIterator(CForwardIterator _iValue);
+	void fg_TakeForwardFlags(CForwardFlags _bValue);
+}
+
+// An opaque handle of a system that is a pointer on some targets only takes no
+// concept prefix, also through an alias.
+namespace NOpaqueHandles
+{
+	typedef struct _opaque_pthread_t *pthread_t;
+	typedef void *HANDLE;
+	using CThreadID = pthread_t;
+	pthread_t g_Thread;
+	HANDLE g_Handle;
+	CThreadID g_ThreadID;
+	void *g_Pointer;
+// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: 'g_Pointer' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+
+	// Also one that a value wrapper holds, an atomic handle.
+	NMib::NAtomic::TCAtomic<pthread_t> g_AtomicThread;
+	NMib::NAtomic::TCAtomic<CThreadID> g_AtomicThreadID;
+	NMib::NAtomic::TCAtomic<void *> g_AtomicPointer;
+// CHECK-MESSAGES: :[[@LINE-1]]:34: warning: 'g_AtomicPointer' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// Also through an alias template of the wrapper, or of an alias of it.
+	template <typename t_CType>
+	using TCWrapped = NMib::NAtomic::TCAtomic<t_CType>;
+	template <typename t_CType>
+	using TCWrappedTwice = TCWrapped<t_CType>;
+	TCWrapped<pthread_t> g_WrappedThread;
+	TCWrappedTwice<CThreadID> g_WrappedTwiceThread;
+	TCWrapped<void *> g_WrappedPointer;
+// CHECK-MESSAGES: :[[@LINE-1]]:20: warning: 'g_WrappedPointer' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	// Also of a wrapper declared before it is defined, named while only
+	// declared.
+	namespace NForward
+	{
+		template <typename t_CType>
+		struct TCAtomic;
+		void fg_Take(TCAtomic<pthread_t> *_pAtomic);
+		template <typename t_CType>
+		struct TCAtomic
+		{
+			t_CType m_Value;
+		};
+		TCAtomic<pthread_t> g_ForwardThread;
+	}
+	// Also given by a default argument of the wrapper.
+	// Also a default a later declaration of the wrapper gives.
+	namespace NDefaultedLater
+	{
+		template <typename t_CType>
+		struct TCAtomic;
+		void fg_TakeAtomic(TCAtomic<void *> *_pAtomic);
+		template <typename t_CType = pthread_t>
+		struct TCAtomic
+		{
+			t_CType m_Value;
+		};
+		TCAtomic<> g_DefaultedLaterThread;
+	}
+	namespace NDefaulted
+	{
+		template <typename t_CType = pthread_t>
+		struct TCAtomic
+		{
+			t_CType m_Value;
+		};
+		template <typename t_CType = void *>
+		struct TCAutoClear
+		{
+			t_CType m_Value;
+		};
+		TCAtomic<> g_DefaultedThread;
+		TCAutoClear<> g_DefaultedPointer;
+// CHECK-MESSAGES: :[[@LINE-1]]:17: warning: 'g_DefaultedPointer' is a pointer and should have the 'p' concept prefix after its storage prefix [malterlib-conceptual-prefix]
+	}
+
+	template <typename t_CType>
+	struct TCThreadHolder
+	{
+		NMib::NAtomic::TCAtomic<CThreadID> m_OwningThreadID;
+		t_CType m_Value;
+	};
+	TCThreadHolder<int> g_ThreadHolder;
+
+	void fg_UseAtomicThread()
+	{
+		NMib::NAtomic::TCAtomic<pthread_t> RanOnThread;
+		auto &&RanOnThreadReference = RanOnThread;
+		(void)RanOnThreadReference;
+	}
+}
+
+// What a recursive template decides where it stops going through itself isn't
+// kept for what is asked of it elsewhere: `TCNext<tf_FCallback>` is a `bool`.
+namespace NRecursionCache
+{
+template <typename t_CType, int t_Index>
+struct TCStep;
+template <typename t_CType>
+struct TCStep<t_CType, 0>
+{
+	using CType = bool;
+};
+template <typename t_CType, int t_Index>
+struct TCStep
+{
+	using CType = typename TCStep<t_CType, 0>::CType;
+	typename TCStep<t_CType, 1>::CType m_Value;
+	template <typename t_COther>
+	using TCNext = CType;
+	template <typename tf_FCallback>
+	void f_Run(TCNext<tf_FCallback> _Value) {}
+};
+TCStep<int, 1> g_Step;
+}
+
+// A specialization nothing completes, of a template whose definition has a base
+// that NotFunctionObjectTypes lists, isn't known to be a function object: its
+// bases aren't looked at in its template's definition.
+namespace NIncompleteExcluded
+{
+	template <bool t_bCoalesced>
+	struct TCBuilderFunctorHelper
+	{
+		void operator()() const;
+	};
+	template <typename t_CType>
+	struct TCActorFunctor : TCBuilderFunctorHelper<false>
+	{
+		void operator()() const;
+	};
+	void fg_Take(TCActorFunctor<int> _Value);
+	void fg_TakeNamed(TCActorFunctor<long> _fValue);
+}
+
+// Nor is one whose template is only declared, whose bases nothing gives.
+namespace NForwardFunctor
+{
+	template <typename t_CType>
+	struct TCActorFunctor;
+	template <typename tf_CType>
+	void fg_Generic(TCActorFunctor<tf_CType> _Value);
+	template <typename tf_CType>
+	void fg_GenericNamed(TCActorFunctor<tf_CType> _fValue);
+}
+
+// An opaque handle takes no concept prefix, whatever it is on this target, a
+// pointer or an integer.
+namespace NOpaquePrefixes
+{
+	typedef struct _opaque_pthread_t *pthread_t;
+	pthread_t g_pThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:12: warning: 'g_pThread' has the 'p' concept prefix of a pointer, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	pthread_t g_fThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:12: warning: 'g_fThread' has the 'f' concept prefix of a function object, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	// Also one a value wrapper holds.
+	NMib::NAtomic::TCAtomic<pthread_t> g_pAtomicThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:37: warning: 'g_pAtomicThread' has the 'p' concept prefix of a pointer, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+}
+namespace NIntegralOpaque
+{
+	typedef unsigned long pthread_t;
+	// Also one a value wrapper holds, as one.
+	NMib::NAtomic::TCAtomic<pthread_t> g_bAtomicThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:37: warning: 'g_bAtomicThread' has the 'b' concept prefix of a boolean, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	NMib::NAtomic::TCAtomic<pthread_t> g_iAtomicThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:37: warning: 'g_iAtomicThread' has the 'i' concept prefix of an iterator, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	NMib::NAtomic::TCAtomic<pthread_t> g_AtomicThread;
+	pthread_t g_bThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:12: warning: 'g_bThread' has the 'b' concept prefix of a boolean, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	pthread_t g_iThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:12: warning: 'g_iThread' has the 'i' concept prefix of an iterator, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	pthread_t g_fThread;
+// CHECK-MESSAGES: :[[@LINE-1]]:12: warning: 'g_fThread' has the 'f' concept prefix of a function object, but is an opaque handle, which takes none, as it isn't one on every target [malterlib-conceptual-prefix]
+	pthread_t g_Thread;
 }

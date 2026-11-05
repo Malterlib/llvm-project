@@ -31,9 +31,8 @@ public:
   void onStartOfTranslationUnit() override {
     Repeated.invalidate();
     ReportedAliases.clear();
-    MemberAliasUses.clear();
+    CheckedAliasUses.clear();
   }
-  void onEndOfTranslationUnit() override;
   std::optional<TraversalKind> getCheckTraversalKind() const override {
     return TK_IgnoreUnlessSpelledInSource;
   }
@@ -49,16 +48,9 @@ private:
   CRepeatedMatches Repeated;
   /// The alias templates reported by what their uses make of them.
   llvm::SmallPtrSet<const Decl *, 4> ReportedAliases;
-  /// Of each alias template of a member of what depends on its parameters,
-  /// `typename t_CTraits::FSignature`, whether a use makes it a function type,
-  /// an enum or another, with the source manager of the uses.
-  struct CAliasUses {
-    bool Functions = false;
-    bool Enums = false;
-    bool Others = false;
-    const SourceManager *SM = nullptr;
-  };
-  llvm::MapVector<const TypeAliasTemplateDecl *, CAliasUses> MemberAliasUses;
+  /// The pairs of a written type and what it is given that the uses of alias
+  /// templates have checked, with the least depth they were met at.
+  llvm::DenseMap<std::pair<void *, void *>, int> CheckedAliasUses;
 };
 
 } // namespace clang::tidy::malterlib

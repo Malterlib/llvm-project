@@ -312,11 +312,34 @@ instancesOf(const CXXRecordDecl *Pattern, int Depth) {
 /// template, of the member function of each instantiation of the class it is
 /// in, or of a lambda, the call operator of the lambda each instantiation of
 /// the function it is in makes, also of a generic one, its specializations.
+static llvm::SmallVector<const FunctionDecl *, 4>
+functionInstancesUncached(const FunctionDecl *Function, int Depth);
+
 llvm::SmallVector<const FunctionDecl *, 4>
 functionInstances(const FunctionDecl *Function, int Depth) {
-  llvm::SmallVector<const FunctionDecl *, 4> Functions;
   if (!Function || Depth > 8)
-    return Functions;
+    return {};
+  // Found once for each function in a translation unit: each declaration in
+  // it, and each lambda in it, asks for them again, and a lambda's are found
+  // by walking the instantiations of the function it is in.
+  struct CInstances {
+    llvm::DenseMap<std::pair<const FunctionDecl *, int>,
+                   llvm::SmallVector<const FunctionDecl *, 4>>
+        Of;
+  };
+  auto &Of = astCache<CInstances>(Function->getASTContext()).Of;
+  const std::pair<const FunctionDecl *, int> Key{Function, Depth};
+  if (auto It = Of.find(Key); It != Of.end())
+    return It->second;
+  llvm::SmallVector<const FunctionDecl *, 4> Functions =
+      functionInstancesUncached(Function, Depth);
+  Of[Key] = Functions;
+  return Functions;
+}
+
+static llvm::SmallVector<const FunctionDecl *, 4>
+functionInstancesUncached(const FunctionDecl *Function, int Depth) {
+  llvm::SmallVector<const FunctionDecl *, 4> Functions;
   // Of a lambda in a template; one in other code is instantiated by itself.
   const CXXRecordDecl *Class = isLambdaCallOperator(Function)
                                    ? cast<CXXMethodDecl>(Function)->getParent()
@@ -1529,149 +1552,6 @@ bool givesParameter(QualType Type, bool Nested) {
 
 static QualType pastKeepingTransform(QualType Type);
 
-bool isMemberOfGivenParameter(const clang::Type *Written, int Depth) {
-  // Also without its reference, `TCRemoveReference<typename
-  // tf_CMap::CValue>`.
-  for (int Level = 0; Written && Level < 8; ++Level) {
-    const QualType Kept = pastKeepingTransform(QualType(Written, 0));
-    if (Kept.isNull())
-      break;
-    Written = Kept.getNonReferenceType().getTypePtr();
-  }
-  // Also one a class imports from a base, `using typename t_CMap::CValue;`.
-  const clang::Type *Of = nullptr;
-  const IdentifierInfo *Name = nullptr;
-  if (const auto *Member = dyn_cast_or_null<DependentNameType>(Written)) {
-    Of = Member->getQualifier().getAsType();
-    Name = Member->getIdentifier();
-  } else if (const auto *Imported =
-                 dyn_cast_or_null<UnresolvedUsingType>(Written)) {
-    Of = Imported->getDecl()->getQualifier().getAsType();
-    Name = Imported->getDecl()->getIdentifier();
-  }
-  if (!Of || !Name || Depth > 8)
-    return false;
-  if (isa<TemplateTypeParmType>(Of->getCanonicalTypeInternal().getTypePtr()))
-    return true;
-  // Also of a member of one in turn, `typename CNodePublic::CValue` of `using
-  // CNodePublic = typename t_CMap::CNode;`.
-  if (const auto *Outer = dyn_cast<DependentNameType>(
-          Of->getCanonicalTypeInternal().getTypePtr()))
-    return isMemberOfGivenParameter(Outer, Depth + 1);
-  const auto *Specialization = Of->getAs<TemplateSpecializationType>();
-  const auto *Template =
-      Specialization
-          ? dyn_cast_or_null<ClassTemplateDecl>(
-                Specialization->getTemplateName().getAsTemplateDecl())
-          : nullptr;
-  if (!Template)
-    return false;
-  // Not of one that a specialization can define otherwise, `template <>
-  // struct TCTraits<int> { using CType = bool; };`.
-  llvm::SmallVector<ClassTemplatePartialSpecializationDecl *, 2> Partials;
-  const_cast<ClassTemplateDecl *>(Template)->getPartialSpecializations(
-      Partials);
-  if (!Partials.empty() ||
-      llvm::any_of(Template->specializations(),
-                   [](const ClassTemplateSpecializationDecl *Specialized) {
-                     return Specialized->isExplicitSpecialization();
-                   }))
-    return false;
-  const CXXRecordDecl *Pattern = Template->getTemplatedDecl()->getDefinition();
-  if (!Pattern)
-    return false;
-  for (const NamedDecl *Found : Pattern->lookup(Name))
-    if (const auto *Alias = dyn_cast<TypedefNameDecl>(Found)) {
-      // One that is a parameter of the template, `using CValue = t_CValue;`,
-      // is the argument at its place, of a parameter, `t_CValue` of `using
-      // typename TCMap<int, t_CValue>::CValue;` in a class given it, but not
-      // a member of what one is given, `typename t_CTraits::EValue`, which is
-      // what that is.
-      if (const auto *Parameter = dyn_cast<TemplateTypeParmType>(
-              Alias->getUnderlyingType().getCanonicalType().getTypePtr());
-          Parameter &&
-          Parameter->getDepth() ==
-              Template->getTemplateParameters()->getDepth() &&
-          !Parameter->isParameterPack() &&
-          Parameter->getIndex() < Specialization->template_arguments().size()) {
-        const TemplateArgument &Given =
-            Specialization->template_arguments()[Parameter->getIndex()];
-        return Given.getKind() == TemplateArgument::Type &&
-               isa<TemplateTypeParmType>(
-                   Given.getAsType().getCanonicalType().getTypePtr());
-      }
-      return isMemberOfGivenParameter(Alias->getUnderlyingType().getTypePtr(),
-                                      Depth + 1);
-    }
-  return false;
-}
-
-bool forwardsArgument(QualType Type) {
-  const clang::Type *Made = Type.getTypePtr();
-  const Decl *Owner = nullptr;
-  for (int Depth = 0; Made && Depth < 16; ++Depth) {
-    if (const auto *Parens = dyn_cast<ParenType>(Made))
-      Made = Parens->getInnerType().getTypePtr();
-    else if (const auto *Attributed = dyn_cast<AttributedType>(Made))
-      Made = Attributed->getModifiedType().getTypePtr();
-    else if (const auto *Alias = dyn_cast<TemplateSpecializationType>(Made);
-             Alias && Alias->isTypeAlias())
-      Made = Alias->getAliasedType().getTypePtr();
-    // Also without its reference, `__remove_reference_t(...)`.
-    else if (const auto *Transform = dyn_cast<UnaryTransformType>(Made))
-      Made = Transform->getBaseType().getTypePtr();
-    // Also a reference to it, `using CValueRef = t_CValue const &;`.
-    else if (const auto *Reference = dyn_cast<ReferenceType>(Made))
-      Made = Reference->getPointeeTypeAsWritten().getTypePtr();
-    // Also one a class imports, `using typename t_CMap::CValue;`.
-    else if (const auto *Imported = dyn_cast<UsingType>(Made))
-      Made = Imported->desugar().getTypePtr();
-    else if (const auto *Local = dyn_cast<TypedefType>(Made);
-             Local && Local->getDecl()->getDeclContext()->isFunctionOrMethod())
-      // A local alias, `using CValue = typename tf_CMap::CValue;`, is what it
-      // is an alias of.
-      Made = Local->getDecl()->getUnderlyingType().getTypePtr();
-    else if (const auto *Typedef = dyn_cast<TypedefType>(Made)) {
-      // Of a specialization of a template, or of a class in one, `typename
-      // TCMap<bool>::CNode::CValue`, whose template's are the parameters.
-      const auto *Class =
-          dyn_cast<CXXRecordDecl>(Typedef->getDecl()->getDeclContext());
-      const ClassTemplateSpecializationDecl *Specialization = nullptr;
-      for (const DeclContext *In = Class; In && !Specialization;
-           In = In->getParent())
-        Specialization = dyn_cast<ClassTemplateSpecializationDecl>(In);
-      if (!Class || !Specialization)
-        return false;
-      // Its member as the template writes it gives one of its parameters,
-      // also through a trait, `using CValueNoRef =
-      // TCRemoveReference<t_CValue>;`.
-      if (const CXXRecordDecl *Pattern =
-              Class->getTemplateInstantiationPattern())
-        for (const NamedDecl *Found :
-             Pattern->lookup(Typedef->getDecl()->getDeclName()))
-          if (const auto *Member = dyn_cast<TypedefNameDecl>(Found);
-              Member && givesParameter(Member->getUnderlyingType(),
-                                       /*Nested=*/true))
-            return true;
-      Owner = Specialization;
-      Made = Typedef->getDecl()->getUnderlyingType().getTypePtr();
-    } else if (const auto *Substituted =
-                   dyn_cast<SubstTemplateTypeParmType>(Made)) {
-      // What an alias template, `TCRemoveReference<...>`, was given, which is
-      // looked into.
-      if (!Owner) {
-        Made = Substituted->getReplacementType().getTypePtr();
-        continue;
-      }
-      return Substituted->getAssociatedDecl() &&
-             Substituted->getAssociatedDecl()->getCanonicalDecl() ==
-                 Owner->getCanonicalDecl();
-    } else
-      return false;
-  }
-  return false;
-}
-
 bool isTypeOfGivenParameter(const clang::Type *Member, bool Nested) {
   return isTypeOfGivenParameter(Member, Nested, 0);
 }
@@ -1742,10 +1622,61 @@ static const TemplateTypeParmType *builtFromParameter(QualType Type) {
 /// defines it. With \p AnyArgument, whatever it is given, also a member of
 /// what depends on the parameters, `typename tf_CTraits::FSignature` of
 /// `typename TCIdentity<typename tf_CTraits::FSignature>::CType`.
+/// How many times isTypeOfGivenParameterUncached stopped at a template it was
+/// already going through, whose answer then depends on where it was asked
+/// from, not only on what it was asked of.
+static thread_local unsigned s_RecursionStops = 0;
+
+static bool isTypeOfGivenParameterUncached(const clang::Type *Member,
+                                           bool Nested, int Depth,
+                                           const TemplateArgument **Forwarded,
+                                           bool AnyArgument);
+
 static bool isTypeOfGivenParameter(const clang::Type *Member, bool Nested,
                                    int Depth,
                                    const TemplateArgument **Forwarded,
                                    bool AnyArgument) {
+  if (Forwarded)
+    *Forwarded = nullptr;
+  const auto *Dependent = dyn_cast<DependentNameType>(Member);
+  if (!Dependent || !Dependent->getIdentifier())
+    return false;
+  const clang::Type *Of = Dependent->getQualifier().getAsType();
+  const auto *Specialization =
+      Of ? Of->getAs<TemplateSpecializationType>() : nullptr;
+  if (!Specialization)
+    return false;
+  // Decided once for each type in a translation unit, as the parameters of
+  // every instantiation meet the same types again; not with \p Forwarded,
+  // which is told as it is decided.
+  const TemplateDecl *Template =
+      Specialization->getTemplateName().getAsTemplateDecl();
+  if (Forwarded || !Template)
+    return isTypeOfGivenParameterUncached(Member, Nested, Depth, Forwarded,
+                                          AnyArgument);
+  struct CGivenParameters {
+    llvm::DenseMap<std::pair<const clang::Type *, unsigned>, bool> Decided;
+  };
+  const std::pair<const clang::Type *, unsigned> Key{
+      Member, (static_cast<unsigned>(Depth) << 2) | (Nested ? 1u : 0u) |
+                  (AnyArgument ? 2u : 0u)};
+  auto &Decided = astCache<CGivenParameters>(Template->getASTContext()).Decided;
+  if (auto It = Decided.find(Key); It != Decided.end())
+    return It->second;
+  // Not one that a stop of the recursion decided, which another query, not
+  // going through that template, would decide otherwise.
+  const unsigned Stops = s_RecursionStops;
+  const bool Result = isTypeOfGivenParameterUncached(Member, Nested, Depth,
+                                                     nullptr, AnyArgument);
+  if (s_RecursionStops == Stops)
+    Decided[Key] = Result;
+  return Result;
+}
+
+static bool isTypeOfGivenParameterUncached(const clang::Type *Member,
+                                           bool Nested, int Depth,
+                                           const TemplateArgument **Forwarded,
+                                           bool AnyArgument) {
   if (Forwarded)
     *Forwarded = nullptr;
   const auto *Dependent = dyn_cast<DependentNameType>(Member);
@@ -1826,8 +1757,10 @@ static bool isTypeOfGivenParameter(const clang::Type *Member, bool Nested,
     return true;
   static thread_local llvm::SmallPtrSet<const ClassTemplateDecl *, 4>
       s_Visiting;
-  if (!s_Visiting.insert(Template->getCanonicalDecl()).second)
+  if (!s_Visiting.insert(Template->getCanonicalDecl()).second) {
+    ++s_RecursionStops;
     return true;
+  }
   const llvm::scope_exit Done(
       [&] { s_Visiting.erase(Template->getCanonicalDecl()); });
   // The member of the template itself that is one of its parameters,
@@ -2419,6 +2352,125 @@ static bool isTypeOfGivenParameter(const clang::Type *Member, bool Nested,
       });
 }
 
+namespace {
+/// Where a declaration of an instantiation is found, which tells the
+/// patterns it can be the instance of.
+enum class EDeclarationSource : uint8_t {
+  /// Declared in a statement, an instance of a pattern of its kind.
+  Statement,
+  /// A parameter of a requires expression or a lambda, of a parameter.
+  Parameter,
+  /// The variable of a `catch` or an init capture, of any pattern there.
+  Other,
+};
+using CDeclarationsByLocation = llvm::DenseMap<
+    SourceLocation::UIntTy,
+    llvm::SmallVector<std::pair<const Decl *, EDeclarationSource>, 1>>;
+} // namespace
+
+/// The declarations in \p Instance, an instantiation of a function, by the
+/// raw encoding of where they are declared, which is where their pattern is.
+/// Found once per instantiation and translation unit.
+static const CDeclarationsByLocation &
+declarationsByLocation(const FunctionDecl *Instance) {
+  struct CIndexes {
+    llvm::DenseMap<const FunctionDecl *,
+                   std::unique_ptr<CDeclarationsByLocation>>
+        Of;
+  };
+  std::unique_ptr<CDeclarationsByLocation> &Entry =
+      astCache<CIndexes>(Instance->getASTContext()).Of[Instance];
+  if (Entry)
+    return *Entry;
+  Entry = std::make_unique<CDeclarationsByLocation>();
+  CDeclarationsByLocation &Declarations = *Entry;
+  auto Add = [&](const Decl *Declaration, EDeclarationSource Source) {
+    Declarations[Declaration->getLocation().getRawEncoding()].emplace_back(
+        Declaration, Source);
+  };
+  const Stmt *Body = Instance->getBody();
+  // Each statement once: the operand of a co_await is met again in the
+  // expressions that make and call its awaiter.
+  llvm::SmallPtrSet<const Stmt *, 32> Visited;
+  std::function<void(const Stmt *)> Find = [&](const Stmt *S) {
+    if (!S || !Visited.insert(S).second)
+      return;
+    // Also in a local class, the initializers of its members and the
+    // bodies of its member functions, also of a class in it, which are
+    // instantiated with the function.
+    std::function<void(const CXXRecordDecl *)> FindInClass =
+        [&](const CXXRecordDecl *Local) {
+          for (const Decl *Member : Local->decls())
+            if (const auto *Field = dyn_cast<FieldDecl>(Member))
+              Find(Field->getInClassInitializer());
+            else if (const auto *Method = dyn_cast<CXXMethodDecl>(Member))
+              Find(Method->getBody());
+            else if (const auto *Inner = dyn_cast<CXXRecordDecl>(Member);
+                     Inner && Inner->isThisDeclarationADefinition())
+              FindInClass(Inner);
+        };
+    if (const auto *Declaration = dyn_cast<DeclStmt>(S))
+      for (const Decl *D : Declaration->decls()) {
+        Add(D, EDeclarationSource::Statement);
+        // Also in the condition of a static assertion.
+        if (const auto *Assertion = dyn_cast<StaticAssertDecl>(D))
+          Find(Assertion->getAssertExpr());
+        if (const auto *Local = dyn_cast<CXXRecordDecl>(D);
+            Local && Local->isThisDeclarationADefinition())
+          FindInClass(Local);
+      }
+    // Also the variable of a `catch`, `catch (tf_CType *_pValue)`.
+    if (const auto *Catch = dyn_cast<CXXCatchStmt>(S))
+      if (const VarDecl *Caught = Catch->getExceptionDecl())
+        Add(Caught, EDeclarationSource::Other);
+    // Also a parameter of a requires expression.
+    if (const auto *Requires = dyn_cast<RequiresExpr>(S))
+      for (const ParmVarDecl *Parameter : Requires->getLocalParameters())
+        Add(Parameter, EDeclarationSource::Parameter);
+    if (const auto *Lambda = dyn_cast<LambdaExpr>(S)) {
+      // Also a parameter of a lambda.
+      for (const ParmVarDecl *Parameter :
+           Lambda->getCallOperator()->parameters())
+        Add(Parameter, EDeclarationSource::Parameter);
+      // Also an init capture of a lambda, `[Value = _pValue]`.
+      for (const LambdaCapture &Capture : Lambda->captures())
+        if (const auto *Variable =
+                Capture.capturesVariable()
+                    ? dyn_cast<VarDecl>(Capture.getCapturedVar())
+                    : nullptr;
+            Variable && Variable->isInitCapture())
+          Add(Variable, EDeclarationSource::Other);
+    }
+    for (const Stmt *Child : childrenOnce(S))
+      Find(Child);
+  };
+  Find(Body);
+  // Also in its exception specification as it is instantiated,
+  // `noexcept([](...) { ... }(...))`, and in its trailing requires clause
+  // when it is kept instantiated.
+  if (const auto *Prototype = Instance->getType()->getAs<FunctionProtoType>())
+    Find(Prototype->getNoexceptExpr());
+  if (const AssociatedConstraint &Constraint =
+          Instance->getTrailingRequiresClause())
+    Find(Constraint.ConstraintExpr);
+  // Also in its return type, `-> decltype([](...) {})`, as it is
+  // instantiated, also through a pointer or reference to it.
+  for (QualType Returned = Instance->getReturnType(); !Returned.isNull();) {
+    if (const auto *Decltype = Returned->getAs<DecltypeType>()) {
+      Find(Decltype->getUnderlyingExpr());
+      break;
+    }
+    if (!Returned->isPointerType() && !Returned->isReferenceType())
+      break;
+    Returned = Returned->getPointeeType();
+  }
+  // Also in the initializers of a constructor, `m_Value([] { ... }())`.
+  if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(Instance))
+    for (const CXXCtorInitializer *Initializer : Constructor->inits())
+      Find(Initializer->getInit());
+  return Declarations;
+}
+
 llvm::SmallVector<const Decl *, 4> localInstances(const Decl *Pattern) {
   llvm::SmallVector<const Decl *, 4> Instances;
   const auto *Function =
@@ -2684,94 +2736,27 @@ llvm::SmallVector<const Decl *, 4> localInstances(const Decl *Pattern) {
       }
       continue;
     }
-    const Stmt *Body = Instance->getBody();
-    // Each statement once: the operand of a co_await is met again in the
-    // expressions that make and call its awaiter.
-    llvm::SmallPtrSet<const Stmt *, 32> Visited;
-    std::function<void(const Stmt *)> Find = [&](const Stmt *S) {
-      if (!S || !Visited.insert(S).second)
-        return;
-      // Also in a local class, the initializers of its members and the
-      // bodies of its member functions, also of a class in it, which are
-      // instantiated with the function.
-      std::function<void(const CXXRecordDecl *)> FindInClass =
-          [&](const CXXRecordDecl *Local) {
-            for (const Decl *Member : Local->decls())
-              if (const auto *Field = dyn_cast<FieldDecl>(Member))
-                Find(Field->getInClassInitializer());
-              else if (const auto *Method = dyn_cast<CXXMethodDecl>(Member))
-                Find(Method->getBody());
-              else if (const auto *Inner = dyn_cast<CXXRecordDecl>(Member);
-                       Inner && Inner->isThisDeclarationADefinition())
-                FindInClass(Inner);
-          };
-      if (const auto *Declaration = dyn_cast<DeclStmt>(S))
-        for (const Decl *D : Declaration->decls()) {
-          if (D->getKind() == Pattern->getKind() &&
-              D->getLocation() == Pattern->getLocation())
-            Instances.push_back(D);
-          // Also in the condition of a static assertion.
-          if (const auto *Assertion = dyn_cast<StaticAssertDecl>(D))
-            Find(Assertion->getAssertExpr());
-          if (const auto *Local = dyn_cast<CXXRecordDecl>(D);
-              Local && Local->isThisDeclarationADefinition())
-            FindInClass(Local);
-        }
-      // Also the variable of a `catch`, `catch (tf_CType *_pValue)`.
-      if (const auto *Catch = dyn_cast<CXXCatchStmt>(S))
-        if (const VarDecl *Caught = Catch->getExceptionDecl();
-            Caught && Caught->getLocation() == Pattern->getLocation())
-          Instances.push_back(Caught);
-      // Also a parameter of a requires expression.
-      if (const auto *Requires = dyn_cast<RequiresExpr>(S);
-          Requires && isa<ParmVarDecl>(Pattern))
-        for (const ParmVarDecl *Parameter : Requires->getLocalParameters())
-          if (Parameter->getLocation() == Pattern->getLocation())
-            Instances.push_back(Parameter);
-      // Also a parameter of a lambda.
-      if (const auto *Lambda = dyn_cast<LambdaExpr>(S);
-          Lambda && isa<ParmVarDecl>(Pattern))
-        for (const ParmVarDecl *Parameter :
-             Lambda->getCallOperator()->parameters())
-          if (Parameter->getLocation() == Pattern->getLocation())
-            Instances.push_back(Parameter);
-      // Also an init capture of a lambda, `[Value = _pValue]`.
-      if (const auto *Lambda = dyn_cast<LambdaExpr>(S))
-        for (const LambdaCapture &Capture : Lambda->captures())
-          if (const auto *Variable =
-                  Capture.capturesVariable()
-                      ? dyn_cast<VarDecl>(Capture.getCapturedVar())
-                      : nullptr;
-              Variable && Variable->isInitCapture() &&
-              Variable->getLocation() == Pattern->getLocation())
-            Instances.push_back(Variable);
-      for (const Stmt *Child : childrenOnce(S))
-        Find(Child);
-    };
-    Find(Body);
-    // Also in its exception specification as it is instantiated,
-    // `noexcept([](...) { ... }(...))`, and in its trailing requires clause
-    // when it is kept instantiated.
-    if (const auto *Prototype = Instance->getType()->getAs<FunctionProtoType>())
-      Find(Prototype->getNoexceptExpr());
-    if (const AssociatedConstraint &Constraint =
-            Instance->getTrailingRequiresClause())
-      Find(Constraint.ConstraintExpr);
-    // Also in its return type, `-> decltype([](...) {})`, as it is
-    // instantiated, also through a pointer or reference to it.
-    for (QualType Returned = Instance->getReturnType(); !Returned.isNull();) {
-      if (const auto *Decltype = Returned->getAs<DecltypeType>()) {
-        Find(Decltype->getUnderlyingExpr());
+    // The declarations of the instantiation, indexed once by where they are
+    // declared: a function's locals are each looked up in it.
+    const CDeclarationsByLocation &Declarations =
+        declarationsByLocation(Instance);
+    const auto Found = Declarations.find(Pattern->getLocation().getRawEncoding());
+    if (Found == Declarations.end())
+      continue;
+    for (const auto &[Declaration, Source] : Found->second)
+      switch (Source) {
+      case EDeclarationSource::Statement:
+        if (Declaration->getKind() == Pattern->getKind())
+          Instances.push_back(Declaration);
+        break;
+      case EDeclarationSource::Parameter:
+        if (isa<ParmVarDecl>(Pattern))
+          Instances.push_back(Declaration);
+        break;
+      case EDeclarationSource::Other:
+        Instances.push_back(Declaration);
         break;
       }
-      if (!Returned->isPointerType() && !Returned->isReferenceType())
-        break;
-      Returned = Returned->getPointeeType();
-    }
-    // Also in the initializers of a constructor, `m_Value([] { ... }())`.
-    if (const auto *Constructor = dyn_cast<CXXConstructorDecl>(Instance))
-      for (const CXXCtorInitializer *Initializer : Constructor->inits())
-        Find(Initializer->getInit());
   }
   return Instances;
 }

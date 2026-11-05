@@ -37,12 +37,36 @@ public:
   }
 
 private:
-  std::optional<char> expectedConcept(QualType Type,
-                                      const ASTContext &Context) const;
-  QualType handleAliasOf(QualType Type, const ASTContext &Context);
+  /// The concept \p Type is, none when it has none or that can't be told.
+  /// \p IteratorAllowed, when given, is set when it is also an iterator, which
+  /// a handle is named as. \p PointerAllowed, when given, is set when it is a
+  /// smart pointer that
+  /// isn't known not to be a handle, which can be named either way.
+  /// \p OpaqueHandle, when given, is set when it is an opaque handle, also
+  /// one a value wrapper holds, `TCAtomic<pthread_t>`, which takes no concept
+  /// prefix on any target.
+  std::optional<char> expectedConcept(QualType Type, const ASTContext &Context,
+                                      bool *PointerAllowed = nullptr,
+                                      bool *IteratorAllowed = nullptr,
+                                      bool *OpaqueHandle = nullptr) const;
+  QualType handleAliasOf(QualType Type, const ASTContext &Context) const;
+  /// Whether the declared type \p Declaration, an alias or a class, is named
+  /// as a function type by its `F` or `TF` type prefix, and isn't one of
+  /// NotFunctionTypes or of a system header.
+  bool declaredAsFunctionType(const NamedDecl *Declaration) const;
+  /// Whether \p Type, as it is written, is named as a function type.
+  bool namedAsFunctionType(QualType Type, int Depth = 0) const;
+  /// Whether \p Type is one of OpaqueHandleTypes, also through an alias of
+  /// one, `CThreadID` of `pthread_t`.
+  bool isOpaqueHandle(QualType Type, const ASTContext &Context) const;
   /// Whether \p Template, a class template or a specialization of one, is
   /// one of ValueWrapperTypes.
   bool isValueWrapper(const NamedDecl *Template) const;
+  /// Whether \p Record is one of FunctionObjectTypes, and not of
+  /// NotFunctionObjectTypes; none when that isn't known, of one with a base
+  /// that depends on the parameters of its template, which an instantiation
+  /// can make one of NotFunctionObjectTypes.
+  std::optional<bool> isFunctionObject(const CXXRecordDecl *Record) const;
   bool isRecordInList(
       const CXXRecordDecl *Record, llvm::ArrayRef<StringRef> List,
       llvm::ArrayRef<OverloadedOperatorKind> Operators = {},
@@ -61,11 +85,21 @@ private:
   /// can name without requiring it, like `CAtomicFlag`.
   const std::vector<StringRef> FlagTypes;
   const std::vector<StringRef> IgnoredNames;
+  /// The types whose names start with the `F` or `TF` type prefix that
+  /// aren't function types, of a library whose headers aren't system headers.
+  const std::vector<StringRef> NotFunctionTypes;
+  /// The classes that FunctionObjectTypes would match that aren't function
+  /// objects, as their call operator only binds and gives a builder, like the
+  /// type of `g_ActorFunctor`.
+  const std::vector<StringRef> NotFunctionObjectTypes;
+  /// The opaque handles of systems that are pointers on some targets only,
+  /// like `pthread_t`, which take no concept prefix.
+  const std::vector<StringRef> OpaqueHandleTypes;
   /// The nodes checked before in the translation unit.
   CRepeatedMatches Repeated;
   /// The handle aliases found of the types asked about in the translation
   /// unit, or none.
-  llvm::DenseMap<const clang::Type *, QualType> HandleAliases;
+  mutable llvm::DenseMap<const clang::Type *, QualType> HandleAliases;
 };
 
 } // namespace clang::tidy::malterlib

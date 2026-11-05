@@ -17,6 +17,13 @@
 namespace clang::tidy::malterlib {
 namespace {
 
+/// Whether \p Rest is written in capitals: without lower case letters, and
+/// with more capitals than the acronyms of upper camel case, like `ID`.
+static bool inCapitals(StringRef Rest) {
+  return llvm::none_of(Rest, llvm::isLower) &&
+         llvm::count_if(Rest, llvm::isUpper) >= 3;
+}
+
 class MacroNamingCallbacks : public PPCallbacks {
 public:
   MacroNamingCallbacks(MacroNamingCheck &Check, const SourceManager &SM,
@@ -31,12 +38,12 @@ public:
       return;
 
     const StringRef Name = MacroNameTok.getIdentifierInfo()->getName();
-    // Names without lower case letters configure external code (`NOMINMAX`,
-    // `_GNU_SOURCE`). Lower case names emulate language features
-    // (`inline_always`), but their parameters are named like others.
-    if (llvm::none_of(Name, llvm::isLower))
-      return;
-    if (llvm::any_of(Name, llvm::isUpper) && !hasTypePrefix(Name, {"D"}))
+    // Lower case names emulate language features (`inline_always`), but their
+    // parameters are named like others. A name in capitals, also after the
+    // prefix, `AVLKEY` or `DESKTOP_ALL`, is no upper camel case; one that
+    // configures external code, `NOMINMAX` or `_GNU_SOURCE`, has a NOLINT.
+    if (llvm::any_of(Name, llvm::isUpper) &&
+        (!hasTypePrefix(Name, {"D"}) || inCapitals(Name.drop_front(1))))
       Check.diag(Loc, "macro '%0' should have the 'D' prefix followed by upper "
                       "camel case")
           << Name;
@@ -49,15 +56,19 @@ public:
       if (ParameterName == "__VA_ARGS__")
         continue;
       // Type prefixes (`d_CType`) are upper camel case too.
+      // After a concept prefix, or a type prefix, `X` of `d_CX`.
+      StringRef Named = ParameterName.starts_with("d_")
+                            ? withoutConcept(ParameterName.drop_front(2))
+                            : StringRef();
+      for (const StringRef TypePrefix : {"TIC", "TC", "TF", "IC", "C", "F", "E"})
+        if (hasTypePrefix(Named, {TypePrefix})) {
+          Named = Named.drop_front(TypePrefix.size());
+          break;
+        }
+      // But not a name in capitals after them, `d_TYPE`.
       if (ParameterName.starts_with("d_") &&
-          isUpperCamelWithConcepts(ParameterName.drop_front(2))) {
-        // After a concept prefix, or a type prefix, `X` of `d_CX`.
-        StringRef Named = withoutConcept(ParameterName.drop_front(2));
-        for (const StringRef TypePrefix : {"TIC", "TC", "TF", "IC", "C", "F", "E"})
-          if (hasTypePrefix(Named, {TypePrefix})) {
-            Named = Named.drop_front(TypePrefix.size());
-            break;
-          }
+          isUpperCamelWithConcepts(ParameterName.drop_front(2)) &&
+          !inCapitals(Named)) {
         if (Named.size() < Check.MinimumNameLength)
           Check.diag(parameterLocation(Loc, ParameterName),
                      "parameter '%0' of macro '%1' should have at least %2 "

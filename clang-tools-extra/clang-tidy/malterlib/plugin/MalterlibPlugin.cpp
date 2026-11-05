@@ -407,10 +407,17 @@ class MalterlibPluginAction : public PluginASTAction {
       }
       // Also one a precompiled header declared, `TCBox<CTraits> *`, whose
       // definition this compile instantiates.
+      // Also a member class of a specialization a precompiled header made,
+      // `TCOuter<CBase>::CInner`, whose definition this compile instantiates.
       void CompletedTagDefinition(const TagDecl *D) override {
         if (const auto *Specialization =
                 dyn_cast<ClassTemplateSpecializationDecl>(D))
           Definitions.push_back(Specialization);
+        else if (const auto *Member = dyn_cast<CXXRecordDecl>(D);
+                 Member && Member->getInstantiatedFromMemberClass() &&
+                 isTemplateInstantiation(
+                     Member->getTemplateSpecializationKind()))
+          Definitions.push_back(Member);
       }
     };
     CInstantiations Instantiations;
@@ -789,6 +796,12 @@ class MalterlibPluginAction : public PluginASTAction {
                   TSK_ExplicitSpecialization)
             continue;
           Pattern = Class->getTemplateInstantiationPattern();
+        } else if (const auto *Member = dyn_cast<CXXRecordDecl>(Definition)) {
+          // A member class of a specialization, `TCOuter<CBase>::CInner`, as
+          // its class in the template.
+          if (!Member->isCompleteDefinition())
+            continue;
+          Pattern = Member->getTemplateInstantiationPattern();
         }
         // Not what another file instantiates, `extern template`, which is
         // checked there, but the class an explicit instantiation declaration
@@ -814,7 +827,7 @@ class MalterlibPluginAction : public PluginASTAction {
         // its instantiations, also this one, like they do without the
         // precompiled header, so that one of what it is given, `t_CType
         // m_Value`, stays generic.
-        if (isa<ClassTemplateSpecializationDecl>(Definition)) {
+        if (isa<CXXRecordDecl>(Definition)) {
           auto AddFields = [&](auto &Self, const RecordDecl *From) -> void {
             for (const FieldDecl *Field : From->fields()) {
               if (Field->isAnonymousStructOrUnion()) {
@@ -840,7 +853,27 @@ class MalterlibPluginAction : public PluginASTAction {
             // f_Run(t_CType const &_Value)`, or a return type with them,
             // `TCFunction<void (typename t_CTraits::CBool _bReady)> f_Make()`,
             // whose instantiations this one declares.
+            // Also of a class with a base that depends on them, `struct
+            // TCAdapter : t_CBase`, its member functions, whose names its
+            // bases tell, `static void f_Run()` of one that declares it as a
+            // member function.
+            const auto *FromClass = dyn_cast<CXXRecordDecl>(From);
+            const bool DependentBases =
+                FromClass &&
+                llvm::any_of(FromClass->bases(),
+                             [](const CXXBaseSpecifier &Base) {
+                               return Base.getType()->isDependentType();
+                             });
             for (Decl *Member : From->decls()) {
+              // Also a member function template, `template <typename
+              // tf_CValue> static void f_Run()`, of such a class.
+              if (const auto *Template = dyn_cast<FunctionTemplateDecl>(Member);
+                  Template && DependentBases &&
+                  isa<CXXMethodDecl>(Template->getTemplatedDecl()) &&
+                  !Template->isImplicit() && Added.insert(Member).second) {
+                Scope.push_back(Member);
+                continue;
+              }
               QualType Type;
               if (const auto *Alias = dyn_cast<TypedefNameDecl>(Member))
                 Type = Alias->getUnderlyingType();
@@ -849,7 +882,8 @@ class MalterlibPluginAction : public PluginASTAction {
                 Type = Static->getType();
               else if (const auto *Method = dyn_cast<CXXMethodDecl>(Member);
                        Method && !Method->isImplicit() &&
-                       (Method->getReturnType()->isDependentType() ||
+                       (DependentBases ||
+                        Method->getReturnType()->isDependentType() ||
                         llvm::any_of(
                             Method->parameters(),
                             [](const ParmVarDecl *Parameter) {
@@ -880,7 +914,7 @@ class MalterlibPluginAction : public PluginASTAction {
           // instantiates them, `void f_Run(int const &o_Value)`, of those
           // with parameters of what it is instantiated with.
           for (CXXMethodDecl *Method :
-               cast<ClassTemplateSpecializationDecl>(Definition)->methods())
+               cast<CXXRecordDecl>(Definition)->methods())
             if (const auto *From = dyn_cast_or_null<CXXMethodDecl>(
                     Method->getInstantiatedFromMemberFunction());
                 From && !Method->isImplicit() &&

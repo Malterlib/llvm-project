@@ -517,22 +517,6 @@ const clang::TemplateArgument *forwardedArgument(const clang::Type *Member);
 /// Nested.
 bool givesParameter(QualType Type, bool Nested);
 
-/// Whether \p Type, an instantiation of a member of what a parameter is
-/// given, `typename t_CMap::CKey` of `TCMap<EMode, int>`, gives an argument
-/// of that as it is, `using CKey = t_CKey;`, also by reference, `using
-/// CValueRef = t_CValue const &;`, and through members of others that do and
-/// traits, `TCRemoveReference<t_CValue>`, which is generic, whatever it is
-/// given.
-bool forwardsArgument(QualType Type);
-
-/// Whether \p Written is a member of what a parameter is given, `typename
-/// t_CMap::CValue`, also through a template given it that defines its member
-/// as one of that for every argument, `typename TCAdapter<t_CMap>::CValue` of
-/// `using CValue = typename t_CContainer::CValue;`, which what it is given can
-/// define as one of its arguments, as forwardsArgument tells of what an
-/// instantiation makes it.
-bool isMemberOfGivenParameter(const clang::Type *Written, int Depth = 0);
-
 /// Whether the member function \p Method can be seen only to give access to
 /// its object, like `operator[]` that checks the index and returns a reference
 /// into it, or `fp_GetAsStorage()`: its body changes nothing but its own

@@ -22,7 +22,8 @@ Prefix      Name
 
 The name of an enum has no underscore, which separates the names of its
 enumerators from it: an enumerator has the name of its enum, an underscore and
-upper camel case (``EColor_Red`` of ``EColor``). The enumerators of a scoped
+upper camel case (``EColor_Red`` of ``EColor``), or, like any group, a built-in
+type of Malterlib (``EResultDataType_fp64``). The enumerators of a scoped
 enum use the ``mc_`` prefix of the member constants they are used as
 (``EFlag::mc_None``). An unnamed enum is what constants were before
 ``constexpr``: its enumerators are reported, to be ``constexpr`` variables
@@ -66,30 +67,14 @@ through), can take it, and one that declares neither can't. What
 a class is, is told as it is defined in the translation unit: a
 specialization of a template as it is instantiated there, so one that isn't
 instantiated, or that is only declared, or that has a base that depends on
-parameters of a template, can be either. An alias of a template, a member or
-a local, of what depends on its parameters is what its instantiations make
-it: one of a member of what depends on them, ``using CCallback = typename
-t_CTraits::FSignature;``, also one a using declaration brings in from a base
-that depends on them, ``using typename TCParent<t_CType>::FSignature``, also
-through an alias template, ``TCIdentity<typename t_CTraits::FSignature>``, or
-another alias that depends on them, ``using CCallback = FSignature;``, also
-in parentheses, ``typedef typename t_CTraits::FSignature (CCallback);``, also
-of what an expression that depends on them
-is, ``decltype(t_CTraits::fs_Run)``, or a transformation of what depends on
-them, ``std::remove_reference_t<typename t_CTraits::FSignature>``, also of an
-alias template, also through another alias template,
-which each makes a function type, also one used nested in what another
-stands for, ``TCFunction<TCSignature<t_CTraits>>``, or in the default of a
-template parameter, ``typename tf_FCallback =
-TCFunction<TCSignature<tf_CTraits>>``, whose call leaves it out and doesn't
-deduce it, also where a parameter names it only through an alias of a
-qualified type, ``TCIdentity<tf_CValue>``, which doesn't deduce, also a local one of a friend defined in a
-class template, takes
-``F``, but
-not one of a parameter, ``using CValue = t_CType;``, also through the ``type``
-of a template given one, ``typename std::enable_if<true, t_CType>::type``,
-also its ``CType``, ``typename TCIdentity<t_CType>::CType``, when that member
-depends on what it is given, which is generic. ``E`` is for enums, also for an alias, also one that each
+parameters of a template, can be either. An alias of a template, a member, a local or an alias
+template, of what depends on its parameters, also computed from them,
+``TCConditional<..., typename t_CMap::CUserData, CKey const>``, is generic:
+its generic name, ``C``, ``TC`` or ``IC``, is always allowed, also when every
+instantiation of the translation unit makes it a function type or an enum,
+and ``F``, ``TF`` and ``E`` are allowed when each makes it what they are for,
+``using FCallback = typename t_CTraits::FSignature;``; an instantiation only
+excludes what is wrong in it. ``E`` is for enums, also for an alias, also one that each
 instantiation makes an enum, ``using EState = typename t_CTraits::EState;``. The lower case names are of
 classes and aliases, not of namespaces, concepts or enums. Namespace aliases
 are named like namespaces. Groups that underscores separate, like
@@ -98,6 +83,15 @@ like ``DMibPCanDo_fp32``, also one with an underscore, ``DMibPBits_char8_t``, an
 also an enum, is checked at its definition, or at its first declaration when it
 is not defined in the translation unit, and not at all when it is defined in a
 system header.
+
+A type of a C library that the code only declares in ``extern "C"``,
+``struct x509_store_st;``, has the library's name, also when the library's
+header, a system header, defines it in the translation unit, and so does a
+name a typedef in ``extern "C"`` gives it, ``typedef struct x509_store_st
+X509_STORE;``. A typedef in ``extern "C"`` that gives a type declared in
+``extern "C"`` its own name, ``typedef struct DBusError DBusError;``, is named
+by the type, which is checked where it is defined, also when that is a header
+that isn't a system header, like libdbus's found through a search path.
 
 A name is at least `MinimumNameLength` characters long after its prefix,
 ``CNode`` but not ``CX``, except the value of an enumerator after the name of

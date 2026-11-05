@@ -77,7 +77,11 @@ linked into clang: ``-fplugin-arg-malterlib-checks=malterlib-*``. A
 the source file uses it, not one of a parent directory that its own doesn't
 inherit, which isn't printed either. What a precompiled header declares is
 checked when it is built, and in a compile that uses it, the definitions that
-compile instantiates of its templates. An explicit instantiation
+compile instantiates of its templates, also the member functions, and member
+function templates, of a class template with a base that depends on its
+parameters, also of a member class of a specialization the precompiled header
+made, which the compile completes, whose names the bases of
+those instantiations tell. An explicit instantiation
 declaration, ``extern template struct TCBox<int>;``, still instantiates the
 class, whose members, like an alias ``using FValue = t_CType``, tell what the
 template is in this file too. The definitions of its functions, which it says
@@ -87,6 +91,23 @@ headers it doesn't report, which keeps the compile fast, so what is told by
 uses there isn't seen: an alias template of the file used only in such a
 header, ``FValue<int>``, which tells it isn't a function type, is checked by
 clang-tidy, which looks into the whole translation unit.
+
+A static member function that shares its name with the non-static functions of
+the same interface, like the ``f_Alloc`` and ``f_Free`` of Malterlib's
+allocators, which the containers call through their allocator type, can be
+named as if it weren't static when it has the annotation
+``[[clang::annotate("malterlib-named-as-member-function")]]``, which
+Malterlib's ``DMibNamedAsMemberFunction`` writes, or a function of the same
+name in a base has it, also a member template, also where the template a
+base's member is instantiated from has it, also of a member template,
+which a definition after the instantiation can add, and of a base a class
+template is given, ``template <typename t_CBase> struct TCAdapter :
+t_CBase``, also of a partial specialization or a member class of one, as each
+instantiation of it has it: what they tell only excludes what is wrong in
+them, an incomplete one not canceling what a complete one tells, and of one
+nothing instantiates, or only an incomplete specialization of, which can't be
+told, either prefix is
+allowed.
 
 Options
 -------

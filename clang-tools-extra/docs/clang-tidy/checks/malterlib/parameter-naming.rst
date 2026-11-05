@@ -8,7 +8,17 @@ followed by upper camel case and optionally one concept prefix (``_bFlag``).
 Each parameter is named, also one that is unused, and one of a function type,
 like ``TCFunction<void (CStr _Message)>``, so that what it is can be told; only
 the ``int`` that tells a postfix ``operator ++`` or ``--`` apart is left
-unnamed.
+unnamed. An explicit instantiation only names a specialization that exists,
+``template TCValue<long>::TCValue(long &&);``, also with ``extern`` or a
+calling convention, ``template void __cdecl fg_Run<int>(int);``, so the
+parameters of the function it names aren't checked; those of a function type
+among its template arguments are. What an instantiation declares is checked in the
+template; what is specialized for an instantiated class is written as it is
+and checked, also a requirement in the initializer of a static data member
+specialized so, ``requires(int _Value) { ... }``, and a lambda in an
+enumerator of a member enum specialized so,
+``template <> enum TCBox<int>::EMode : int { EMode_Value = [](int _Value) {
+... }(0) };``.
 
 =========== ==============================================================
 Prefix      Parameter
@@ -35,7 +45,23 @@ can't be written through can't be named as an output (``o_`` or ``po_``):
 - A value, like ``int _Value`` or ``CStr _Text``, also of a template
   parameter, ``tf_CType _Value``, which is deduced as a value (but a type a
   template is given that can be a reference, ``typename
-  tf_CTraits::CReference o_Value``, can be an output).
+  tf_CTraits::CReference o_Value``, can be an output, and so can an object of
+  a class that refers to what it can be written through, one of whose const
+  member functions, also const through an explicit object, ``int
+  &f_Get(this CWrapper const &_Self)``, or a base's, gives what can be written through, as a
+  parameter of its type can be: a reference, also an rvalue one, or a pointer
+  to what can be written, also through const pointers, ``int *const &f_Get()
+  const``, an Objective-C object pointer, or an object of such a class, like
+  ``TCReference<CActorSubscription> o_Subscription`` with ``f_Get() const``,
+  whatever its access, also of a private base, hidden, deleted or
+  constrained, as ``o_`` is only rejected for what definitely can't be
+  written; of a specialization the declaration doesn't need complete, which
+  clang doesn't instantiate, ``TCReference<int const> o_Value``, or with a
+  member function template, also one whose explicit object depends on its
+parameters, ``int &f_Get(this tf_CSelf &&_Self)``, or a result that depends
+on what isn't known, or
+  one deduced only when it is used, ``decltype(auto) f_Get() const``, it
+  can't be told from what is instantiated, so it can be named either way).
 - A const reference to a scalar, like ``int const &_Value``, or to an array
   of them, ``int const (&_Values)[2]``.
 - A pointer to const scalars, like ``int const *_pValue``, also through const
@@ -74,7 +100,10 @@ has (``t_TCTemplate``, ``t_TICInterface``, ``t_TFCallback``), not a bare ``T``
   template <typename tf_CType, typename ...tfp_CParams>
   bool fg_Parse(tf_CType const &_Value, umint &o_iPosition, tfp_CParams &&...p_Params);
 
-The parameters of functions with C linkage in C++ are not checked.
+The parameters of functions with C linkage are checked like any other: their
+names are neither the function's symbol nor part of its ABI, and only the
+sources of the repositories the checks are enabled for are checked, so the
+declarations of system headers and libraries aren't.
 
 Options
 -------

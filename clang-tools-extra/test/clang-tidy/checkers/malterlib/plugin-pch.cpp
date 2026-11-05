@@ -15,6 +15,14 @@
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -fsyntax-only -fplugin-arg-malterlib-checks='-*,malterlib-coroutine-reference-parameter,malterlib-conceptual-prefix' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs %s 2>&1 | FileCheck --check-prefix=CHECK-USE --implicit-check-not=warning: --implicit-check-not=error: %s
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -fsyntax-only -DINSTANCE -fplugin-arg-malterlib-checks='-*,malterlib-coroutine-reference-parameter,malterlib-conceptual-prefix' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs -include-pch %t.pch %s 2>&1 | FileCheck --check-prefix=CHECK-INSTANCE --implicit-check-not=warning: --implicit-check-not=error: %s
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -fsyntax-only -DINSTANCE -fplugin-arg-malterlib-checks='-*,malterlib-coroutine-reference-parameter,malterlib-conceptual-prefix' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs %s 2>&1 | FileCheck --check-prefix=CHECK-INSTANCE --implicit-check-not=warning: --implicit-check-not=error: %s
+// Also of the member functions of a class with a base that depends on them,
+// whose names its bases tell.
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -x c++-header -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs %S/Inputs/plugin-pch.h -o %t.naming.pch 2>&1 | count 0
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -fsyntax-only -DNAMING -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs -include-pch %t.naming.pch %s 2>&1 | FileCheck --check-prefix=CHECK-NAMING --implicit-check-not=warning: --implicit-check-not=error: %s
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -std=c++20 -fsyntax-only -DNAMING -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' '-fplugin-arg-malterlib-header-filter=plugin-pch\.h' -I %S/Inputs %s 2>&1 | FileCheck --check-prefix=CHECK-NAMING --implicit-check-not=warning: --implicit-check-not=error: %s
+// CHECK-NAMING-DAG: plugin-pch.h:189:14: warning: static member function 'f_Run' should have the 'fs_' prefix, or not be declared static [malterlib-function-naming]
+// CHECK-NAMING-DAG: plugin-pch.h:191:14: warning: static member function 'f_RunTemplate' should have the 'fs_' prefix, or not be declared static [malterlib-function-naming]
+// CHECK-NAMING-DAG: plugin-pch.h:201:15: warning: static member function 'f_RunInner' should have the 'fs_' prefix, or not be declared static
 
 // CHECK-USE-DAG: plugin-pch.h:7:35: warning: TCFuture coroutine 'fg_PchRead' uses '_Value' after a suspension{{.*}}[malterlib-coroutine-reference-parameter]
 // CHECK-USE-DAG: plugin-pch.h:16:34: warning: TCFuture coroutine 'f_InClass' uses '_Value' after a suspension{{.*}}[malterlib-coroutine-reference-parameter]
@@ -40,7 +48,10 @@
 
 #include "plugin-pch.h"
 
-#ifdef INSTANCE
+#if defined(NAMING)
+TCPchAdapter<CPchPlainBase> g_PchAdapter;
+TCPchOuterAdapter<CPchPlainBase>::CInner g_PchInner;
+#elif defined(INSTANCE)
 template struct TCPchExtern<int &>;
 #else
 TCFuture<int> fg_Use(int &_Value)

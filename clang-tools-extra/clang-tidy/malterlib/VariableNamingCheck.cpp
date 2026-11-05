@@ -38,9 +38,17 @@ static bool isConstexpr(const VarDecl *Variable) {
 /// declaration, `extern const int gc_Value;`, which is constexpr only if that
 /// is, so that its name is checked where the definition is.
 static bool isDefinedElsewhere(const VarDecl *Variable) {
+  // Also a static member declared const in its class without its value,
+  // `static CStr const mc_Prefix;`, whose definition, `constexpr CStr
+  // CKey::mc_Prefix = ...;`, can be in one source only, so the string isn't
+  // made in every translation unit that includes the header.
+  if (Variable->isStaticDataMember())
+    return Variable->getType().isConstQualified() &&
+           !Variable->isConstexpr() && !Variable->hasInit() &&
+           !Variable->isThisDeclarationADefinition() &&
+           !isa<VarTemplateSpecializationDecl>(Variable);
   // Not constexpr itself: also when the definition is, `constexpr int
-  // gc_Value = 42;`. A static member is named in its class, also when only
-  // its definition is constexpr.
+  // gc_Value = 42;`.
   // Also a reference, which is never const itself, `extern int
   // &gc_Reference;`.
   return (Variable->isFileVarDecl() || Variable->isLocalExternDecl()) &&
@@ -132,7 +140,10 @@ void VariableNamingCheck::check(const MatchFinder::MatchResult &Result) {
   }
 
   if (const auto *Binding = Result.Nodes.getNodeAs<BindingDecl>("binding")) {
-    if (!Binding->getIdentifier())
+    // The placeholder of what is ignored, `auto [Ticket, _, _] = ...`, which
+    // C++26 lets repeat, is no name.
+    if (!Binding->getIdentifier() ||
+        Binding->isPlaceholderVar(Binding->getASTContext().getLangOpts()))
       return;
     const auto *Decomposition =
         dyn_cast_or_null<VarDecl>(Binding->getDecomposedDecl());
@@ -160,7 +171,8 @@ void VariableNamingCheck::check(const MatchFinder::MatchResult &Result) {
 
   const auto *Variable = Result.Nodes.getNodeAs<VarDecl>("variable");
   if (!Variable || !Variable->getIdentifier() || Variable->isImplicit() ||
-      isa<DecompositionDecl>(Variable))
+      isa<DecompositionDecl>(Variable) ||
+      Variable->isPlaceholderVar(Variable->getASTContext().getLangOpts()))
     return;
   // Each is named where it is first declared, but one declared const before
   // it is defined, `extern const int gc_Value;`, also where it is defined.
@@ -205,6 +217,16 @@ void VariableNamingCheck::check(const MatchFinder::MatchResult &Result) {
           Locale->isInStdNamespace())
         return;
     const bool Private = isPrivate(Variable->getAccess());
+    // One declared const without its value is constexpr if its definition is,
+    // which is checked where that is.
+    if (isDefinedElsewhere(Variable)) {
+      checkName(Variable, Loc,
+                Private ? "private or protected static member variable"
+                        : "static member variable",
+                Private ? llvm::ArrayRef<StringRef>({"msp_", "mcp_"})
+                        : llvm::ArrayRef<StringRef>({"ms_", "mc_"}));
+      return;
+    }
     checkName(Variable, Loc,
               Private ? "private or protected static member variable"
                       : "static member variable",
@@ -314,6 +336,22 @@ void VariableNamingCheck::checkName(const NamedDecl *Variable,
   else if (withoutConcept(Rest).size() < MinimumNameLength)
     diag(Loc, "%0 %1 should have at least %2 characters after its prefixes")
         << Kind << Variable << MinimumNameLength;
+  // A local has no storage prefix, so one that starts with a type prefix and
+  // a capital reads as a type, `TCPv4` as a class template or
+  // `EJsonUserBlock` as an enum; `Count` and `Entry` don't.
+  else if (!HasPrefix &&
+           (Kind == "local variable" || Kind == "structured binding")) {
+    StringRef TypePrefix;
+    for (StringRef Candidate : {"TIC", "TC", "TF", "IC", "C", "F", "E"})
+      if (hasTypePrefix(Rest, {Candidate})) {
+        TypePrefix = Candidate;
+        break;
+      }
+    if (!TypePrefix.empty())
+      diag(Loc, "%0 %1 starts like the name of a type, with the '%2' type "
+                "prefix followed by a capital; name it without it")
+          << Kind << Variable << TypePrefix;
+  }
 }
 
 } // namespace clang::tidy::malterlib

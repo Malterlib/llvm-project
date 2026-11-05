@@ -38,8 +38,9 @@ struct CStruct
 	bool m_bFlag;
 	static int ms_Static;
 	static constexpr int mc_Constant = 1;
+	// Declared const without its value, it is constexpr if its definition,
+	// which this translation unit doesn't see, is.
 	static int const mc_ConstantDefinedLater;
-// CHECK-MESSAGES: :[[@LINE-1]]:19: warning: static member variable 'mc_ConstantDefinedLater' has the constant prefix 'mc_' but isn't constexpr; declare it constexpr, or use the 'ms_' prefix [malterlib-variable-naming]
 	static int const ms_ConstantDefinedLater;
 	int mp_Public;
 // CHECK-MESSAGES: :[[@LINE-1]]:6: warning: member variable 'mp_Public' should have the 'm_' prefix [malterlib-variable-naming]
@@ -420,3 +421,49 @@ template <> constexpr int TCBox<int>::ms_Value = 2;
 template <> const int TCBox<int>::mc_Other = 2;
 // CHECK-MESSAGES: :[[@LINE-1]]:35: warning: static member variable 'mc_Other' has the constant prefix 'mc_' but isn't constexpr; declare it constexpr, or use the 'ms_' prefix [malterlib-variable-naming]
 }
+
+// A local, which has no storage prefix, doesn't start like the name of a type,
+// with a type prefix followed by a capital, nor does a structured binding.
+struct CTypeLikePair
+{
+	int m_First;
+	int m_Second;
+};
+void fg_TypeLikeLocals(CTypeLikePair const &_Pair)
+{
+	int TCPv4 = 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:6: warning: local variable 'TCPv4' starts like the name of a type, with the 'TC' type prefix followed by a capital; name it without it [malterlib-variable-naming]
+	int EJsonUserBlock = 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:6: warning: local variable 'EJsonUserBlock' starts like the name of a type, with the 'E' type prefix followed by a capital; name it without it [malterlib-variable-naming]
+	int FLen = 0;
+// CHECK-MESSAGES: :[[@LINE-1]]:6: warning: local variable 'FLen' starts like the name of a type, with the 'F' type prefix followed by a capital; name it without it [malterlib-variable-naming]
+	auto [CFirst, Second] = _Pair;
+// CHECK-MESSAGES: :[[@LINE-1]]:8: warning: structured binding 'CFirst' starts like the name of a type, with the 'C' type prefix followed by a capital; name it without it [malterlib-variable-naming]
+	int Count = 0;
+	int Format = 0;
+	int Entry = 0;
+	int Address = 0;
+	(void)TCPv4, (void)EJsonUserBlock, (void)FLen, (void)CFirst, (void)Second, (void)Count, (void)Format, (void)Entry, (void)Address;
+}
+
+// A constant can be declared const without its value and defined constexpr,
+// so what is expensive to make is made in one source, which is checked at the
+// definition: a static member, also private, and an extern global, with the
+// definition here or in another translation unit.
+struct CDatabaseKey
+{
+	static int const mc_Prefix;
+	static int const mc_PrefixElsewhere;
+	static int const mc_NotConstexpr;
+	static int const ms_Plain;
+private:
+	static int const mcp_Private;
+};
+constexpr int CDatabaseKey::mc_Prefix = 1;
+constexpr int CDatabaseKey::mcp_Private = 2;
+int const CDatabaseKey::mc_NotConstexpr = 3;
+// CHECK-MESSAGES: :[[@LINE-1]]:25: warning: static member variable 'mc_NotConstexpr' has the constant prefix 'mc_' but isn't constexpr; declare it constexpr, or use the 'ms_' prefix [malterlib-variable-naming]
+int const CDatabaseKey::ms_Plain = 4;
+extern int const gc_DeclaredConst;
+constexpr int gc_DeclaredConst = 5;
+extern int const gc_DefinedElsewhere;

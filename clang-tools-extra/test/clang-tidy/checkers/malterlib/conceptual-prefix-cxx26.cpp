@@ -1,5 +1,18 @@
 // RUN: %check_clang_tidy -std=c++26-or-later %s malterlib-conceptual-prefix %t -- -config="{CheckOptions: {malterlib.OptionsFile: '%S/Inputs/ClangTidyOptions.yaml'}}"
 
+// The placeholder of what is ignored is no name, also of a structured binding.
+struct CPlaceholderPair
+{
+	bool m_bFirst;
+	int *m_pSecond;
+};
+void fg_Placeholders()
+{
+	bool _ = true;
+	int *_ = nullptr;
+	auto [_, _] = CPlaceholderPair{true, nullptr};
+}
+
 // A pointer to a type of a pack named as functions, `tfp_FCallbacks...[0]`, is
 // a function pointer.
 template <typename ...tfp_FCallbacks>

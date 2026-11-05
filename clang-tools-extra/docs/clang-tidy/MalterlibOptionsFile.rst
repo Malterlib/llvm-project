@@ -87,3 +87,17 @@ check:
 place of the one built in and of the options file when the configuration is
 read again, with ``malterlib.OptionsFile`` and the shared lists, so the checks
 of the configuration it gives find the same.
+
+The version of the checks
+-------------------------
+
+The compiler, clang-tidy and clangd of the fork that has the Malterlib checks
+predefine ``__malterlib_tidy_version__``, the version of the checks, which is
+raised when a check stops reporting what code worked around. Code that works
+around a limit of an older version can tell it is no longer needed:
+
+.. code-block:: c++
+
+  #ifdef __malterlib_tidy_version__
+  #	error "Remove the NOLINTs this file needs only with checks before version 1"
+  #endif
