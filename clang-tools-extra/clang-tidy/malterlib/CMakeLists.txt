@@ -25,6 +25,7 @@ add_clang_library(clangTidyMalterlibModule STATIC
   MalterlibOptions.cpp
   MalterlibTidyModule.cpp
   NamingUtils.cpp
+  MemberOrderCheck.cpp
   NoZeroBitScanCheck.cpp
   ParameterNamingCheck.cpp
   ParameterOwnershipCheck.cpp
