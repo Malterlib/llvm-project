@@ -51,8 +51,10 @@ set(CLANG_TOOLS_TEST_DEPS
 )
 
 # Add lit test dependencies.
+# llvm-config tells lit whether LLVM is built with assertions, the asserts
+# feature of tests that can't run under them.
 set(LLVM_UTILS_DEPS
-  FileCheck count not split-file
+  FileCheck count not split-file llvm-config
 )
 foreach(dep ${LLVM_UTILS_DEPS})
   if(TARGET ${dep})

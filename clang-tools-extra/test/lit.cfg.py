@@ -53,6 +53,9 @@ config.test_exec_root = os.path.join(config.clang_tools_binary_dir, "test")
 # Set up clang for use in tests. Makes %clang substitution available.
 llvm_config.use_clang()
 
+# Whether LLVM is built with assertions, for tests of what clang asserts on.
+llvm_config.feature_config([("--assertion-mode", {"ON": "asserts"})])
+
 if config.clang_tidy_staticanalyzer:
     config.available_features.add("static-analyzer")
 if config.clang_tidy_custom_check:
