@@ -157,6 +157,20 @@ void NoLint(); // NOLINT(malterlib-function-naming)
 // RUN: printf '[{"Location": "%t.canon/Link", "Tidy": {"Enabled": true}}]' > %t.canon/rules.json
 // RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' -fplugin-arg-malterlib-repositories=%t.canon/rules.json %t.canon/source.cpp 2>&1 | FileCheck --check-prefix=CHECK-CANONICAL %s
 // CHECK-CANONICAL: source.cpp:1:6: warning: global function 'BadCanonical' should have the 'fg_' prefix [malterlib-function-naming]
+// Also a location with a `.` in it.
+// RUN: printf '[{"Location": "%t.canon/Link/.", "Tidy": {"Enabled": true}}]' > %t.canon/dotted.json
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' -fplugin-arg-malterlib-repositories=%t.canon/dotted.json %t.canon/Real/source.cpp 2>&1 | FileCheck --check-prefix=CHECK-CANONICAL %s
+// A `..` after a link is the parent of where the link leads, not of the
+// link.
+// RUN: rm -rf %t.updir && mkdir -p %t.updir/A %t.updir/B/Sub
+// RUN: ln -s %t.updir/B/Sub %t.updir/A/Link
+// RUN: echo 'void BadBeside();' > %t.updir/A/source.cpp
+// RUN: echo 'void BadParent();' > %t.updir/B/source.cpp
+// RUN: printf '[{"Location": "%t.updir/A/Link/..", "Tidy": {"Enabled": true}}]' > %t.updir/rules.json
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' -fplugin-arg-malterlib-repositories=%t.updir/rules.json %t.updir/B/source.cpp 2>&1 | FileCheck --check-prefix=CHECK-UPDIR %s
+// RUN: %clang -fplugin-arg-malterlib-options-file=%S/Inputs/ClangTidyOptions.yaml -fsyntax-only -fplugin-arg-malterlib-checks='-*,malterlib-function-naming' -fplugin-arg-malterlib-repositories=%t.updir/rules.json %t.updir/A/source.cpp 2>&1 | FileCheck --check-prefix=CHECK-NOT-UPDIR --allow-empty %s
+// CHECK-UPDIR: source.cpp:1:6: warning: global function 'BadParent' should have the 'fg_' prefix [malterlib-function-naming]
+// CHECK-NOT-UPDIR-NOT: BadBeside
 
 // A setting of another type is an error, not a setting that turns checking
 // off.

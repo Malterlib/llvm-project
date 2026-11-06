@@ -133,8 +133,11 @@ bool matchesWildcard(StringRef String, StringRef WrittenPattern) {
 /// The rules of the repositories, which decide which files are checked.
 class RepositoryRules {
 public:
-  /// Reads the rules from the JSON \p Text, or tells what is wrong with it.
-  static llvm::Expected<RepositoryRules> parse(StringRef Text) {
+  /// Reads the rules from the JSON \p Text, or tells what is wrong with it,
+  /// with the locations past symbolic links as \p FS, the file system of the
+  /// compilation, tells.
+  static llvm::Expected<RepositoryRules> parse(StringRef Text,
+                                               llvm::vfs::FileSystem &FS) {
     llvm::Expected<llvm::json::Value> Json = llvm::json::parse(Text);
     if (!Json)
       return Json.takeError();
@@ -184,16 +187,26 @@ public:
         return llvm::createStringError("expected Tidy of " + Added.Location +
                                        " to be an object");
       // Also where it is past symbolic links, `/private/tmp/Repository` of
-      // `/tmp/Repository`, which the real names of files are compared with.
-      llvm::SmallString<256> Real;
-      if (!llvm::sys::fs::real_path(Added.Location, Real)) {
-        const std::string RealLocation =
-            StringRef(llvm::sys::path::convert_to_slash(Real)).rtrim('/').str();
-        if (RealLocation != Added.Location) {
-          Repository Resolved = Added;
-          Resolved.Location = RealLocation;
-          Rules.Repositories.push_back(std::move(Resolved));
-        }
+      // `/tmp/Repository`, which the real names of files are compared with,
+      // as the file system of the compilation tells, and as it is written
+      // past `.`, `/work/Link` of `/work/Link/.`.
+      llvm::SmallString<256> Written(Added.Location);
+      llvm::sys::path::remove_dots(Written, /*remove_dot_dot=*/false);
+      llvm::SmallVector<std::string, 2> Aliases;
+      auto AddAlias = [&](StringRef Path) {
+        std::string Alias =
+            StringRef(llvm::sys::path::convert_to_slash(Path)).rtrim('/').str();
+        if (!Alias.empty() && Alias != Added.Location &&
+            !llvm::is_contained(Aliases, Alias))
+          Aliases.push_back(std::move(Alias));
+      };
+      AddAlias(Written);
+      if (llvm::SmallString<256> Real; !FS.getRealPath(Added.Location, Real))
+        AddAlias(Real);
+      for (std::string &Alias : Aliases) {
+        Repository Resolved = Added;
+        Resolved.Location = std::move(Alias);
+        Rules.Repositories.push_back(std::move(Resolved));
       }
       Rules.Repositories.push_back(std::move(Added));
     }
@@ -988,7 +1001,7 @@ public:
       llvm::SmallString<256> Absolute(File);
       Compiler.getFileManager().makeAbsolutePath(Absolute);
       llvm::SmallString<256> Real;
-      if (llvm::sys::fs::real_path(Absolute, Real))
+      if (Compiler.getVirtualFileSystem().getRealPath(Absolute, Real))
         Real.clear();
       if (!Rules->isChecked(
               normalizeHeaderName(File, Compiler.getFileManager()), Real)) {
@@ -1053,6 +1066,13 @@ public:
       return false;
 
     DiagnosticsEngine &Diags = Compiler.getDiagnostics();
+    // The files the plugin reads, its configuration, its repositories and the
+    // Malterlib options file, are read like the sources, through the file
+    // system of the compilation, also where it finds them, which LLVM's IO
+    // sandbox and file system overlays require.
+    const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
+        Compiler.hasVirtualFileSystem() ? Compiler.getVirtualFileSystemPtr()
+                                        : llvm::vfs::getRealFileSystem();
     ClangTidyOptions OverrideOptions;
     std::optional<std::string> ConfigFile;
     std::optional<std::string> RepositoriesFile;
@@ -1074,7 +1094,7 @@ public:
       // configuration, relative to the current directory.
       else if (Name == "options-file") {
         SmallString<256> Path(Value);
-        llvm::sys::fs::make_absolute(Path);
+        FS->makeAbsolute(Path);
         // Not `..`, which after a symbolic link is in another directory.
         llvm::sys::path::remove_dots(Path);
         OverrideOptions.CheckOptions[OptionsFileOption] =
@@ -1125,11 +1145,6 @@ public:
     OverrideOptions.Checks =
         OverrideOptions.Checks.value_or("") + ",-clang-analyzer-*";
 
-    // The configuration files are read like the sources, through the file
-    // system of the compilation.
-    const llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS =
-        Compiler.hasVirtualFileSystem() ? Compiler.getVirtualFileSystemPtr()
-                                        : llvm::vfs::getRealFileSystem();
 
     // The header filters name directories absolutely, and headers are often
     // included through relative and `..` paths.
@@ -1156,7 +1171,7 @@ public:
         return false;
       }
       llvm::Expected<RepositoryRules> Parsed =
-          RepositoryRules::parse((*Text)->getBuffer());
+          RepositoryRules::parse((*Text)->getBuffer(), *FS);
       if (!Parsed) {
         Diags.Report(Diags.getCustomDiagID(
             DiagnosticsEngine::Error,
@@ -1174,8 +1189,13 @@ public:
     std::unique_ptr<ClangTidyOptionsProvider> OptionsProvider;
     ReportingFileOptionsProvider *ReportingProvider = nullptr;
     if (ConfigFile) {
+      // By its absolute name, which the relative paths of its options are
+      // resolved from (parseConfiguration).
+      SmallString<256> ConfigPath(*ConfigFile);
+      FS->makeAbsolute(ConfigPath);
+      llvm::sys::path::remove_dots(ConfigPath);
       llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Text =
-          FS->getBufferForFile(*ConfigFile);
+          FS->getBufferForFile(ConfigPath);
       if (!Text) {
         Diags.Report(Diags.getCustomDiagID(
             DiagnosticsEngine::Error,
@@ -1211,6 +1231,9 @@ public:
     if (RepositoriesFile)
       ArgumentFiles.push_back(*RepositoriesFile);
     Context = std::make_unique<ClangTidyContext>(std::move(OptionsProvider));
+    // What the checks read when they are made, before there are sources, like
+    // the Malterlib options file, through the same file system.
+    Context->setFileSystem(FS);
     if (ReportingProvider)
       ReportingProvider->startReporting();
     Context->setEnableProfiling(Profile);

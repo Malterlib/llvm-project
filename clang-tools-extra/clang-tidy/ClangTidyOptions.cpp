@@ -578,7 +578,11 @@ static void resolvePathOptions(ClangTidyOptions &Options,
     if (!Identifier.empty() && Identifier != CommandLineConfigName)
       Path = llvm::sys::path::parent_path(Identifier);
     llvm::sys::path::append(Path, It->second.Value);
-    llvm::sys::fs::make_absolute(Path);
+    // Of a file named absolutely, which the plugin reads its configuration
+    // by, already absolute, without asking for the current directory outside
+    // the file system of the compilation.
+    if (!llvm::sys::path::is_absolute(Path))
+      llvm::sys::fs::make_absolute(Path);
     // Not `..`, which after a symbolic link is in another directory than the
     // one before it.
     llvm::sys::path::remove_dots(Path);
