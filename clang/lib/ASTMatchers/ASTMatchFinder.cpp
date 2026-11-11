@@ -2055,14 +2055,24 @@ private:
 } // end namespace
 } // end namespace internal
 
+/// Gives \p NodeMatch the traversal kind of \p Action. A matcher with a
+/// traversal kind of its own is kept as it is: it is matched in its own kind,
+/// which an outer kind doesn't change. Any other gets the kind on its
+/// implementation, so that each node is matched through one matcher, not
+/// through a `traverse` and then the matcher inside it.
 template <typename T>
 static internal::Matcher<T>
 adjustTraversalKind(const internal::Matcher<T> &NodeMatch,
                     MatchFinder::MatchCallback *Action) {
-  if (Action)
-    if (std::optional<TraversalKind> TK = Action->getCheckTraversalKind())
-      return traverse(*TK, NodeMatch);
-  return NodeMatch;
+  if (!Action)
+    return NodeMatch;
+  const std::optional<TraversalKind> TK = Action->getCheckTraversalKind();
+  if (!TK)
+    return NodeMatch;
+  internal::DynTypedMatcher Matcher(NodeMatch);
+  if (Matcher.getTraversalKind())
+    return NodeMatch;
+  return Matcher.withTraversalKind(*TK).template unconditionalConvertTo<T>();
 }
 
 MatchFinder::MatchResult::MatchResult(const BoundNodes &Nodes,
