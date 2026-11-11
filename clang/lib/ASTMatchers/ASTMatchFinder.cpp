@@ -1721,9 +1721,18 @@ private:
     return Node.getLocation();
   }
 
+  /// Whether \p Loc is in a system header, which is told once for each
+  /// location: nodes of one declaration, and a node and its first child, often
+  /// begin at the same location, and the test of one that is in a precompiled
+  /// header or a macro expansion searches the source locations of the
+  /// precompiled header.
   bool isInSystemHeader(SourceLocation Loc) {
     const SourceManager &SM = getASTContext().getSourceManager();
-    return SM.isInSystemHeader(Loc);
+    const auto [It, Inserted] =
+        SystemHeaderLocations.try_emplace(Loc.getRawEncoding(), false);
+    if (Inserted)
+      It->second = SM.isInSystemHeader(Loc);
+    return It->second;
   }
 
   template <typename T> bool shouldSkipNode(T &Node) {
@@ -1754,6 +1763,10 @@ private:
   /// node.
   /// We precalculate a list of matchers that pass the toplevel restrict check.
   llvm::DenseMap<ASTNodeKind, std::vector<unsigned short>> MatcherFiltersMap;
+
+  /// Whether each location the system header test was made for is in a
+  /// system header, by its raw encoding.
+  llvm::DenseMap<SourceLocation::UIntTy, bool> SystemHeaderLocations;
 
   const MatchFinder::MatchFinderOptions &Options;
   ASTContext *ActiveASTContext;
