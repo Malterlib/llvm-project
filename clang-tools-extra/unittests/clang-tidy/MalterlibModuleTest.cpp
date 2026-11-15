@@ -63,5 +63,19 @@ TEST(MalterlibAstCacheTest, ForgetsAnAstAnotherThreadDestroys) {
   Next->~ASTContext();
 }
 
+// The facts a thread keeps of an AST are gone once it releases them, when it
+// is done with the AST, and what it asks of the AST after that is made again.
+TEST(MalterlibAstCacheTest, ReleasesTheFactsOfAnAst) {
+  CContextParts Parts;
+  alignas(ASTContext) unsigned char Storage[sizeof(ASTContext)];
+  ASTContext *Context = Parts.make(Storage);
+  astCache<CFacts>(*Context).Value = 1;
+  releaseAstFacts();
+  EXPECT_EQ(astCache<CFacts>(*Context).Value, 0);
+  astCache<CFacts>(*Context).Value = 2;
+  EXPECT_EQ(astCache<CFacts>(*Context).Value, 2);
+  Context->~ASTContext();
+}
+
 } // namespace
 } // namespace clang::tidy::malterlib

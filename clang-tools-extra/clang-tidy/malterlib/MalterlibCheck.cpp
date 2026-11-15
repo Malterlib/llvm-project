@@ -110,6 +110,16 @@ private:
   }
 
 public:
+  /// Drops the index (releaseAstFacts).
+  void release() {
+    IndexedAST = 0;
+    References = decltype(References)();
+    First = decltype(First)();
+    Within = decltype(Within)();
+    Traversed = decltype(Traversed)();
+    clearTraversedTypes();
+  }
+
 
   // Each statement once: the operand of a co_await is met again in the
   // expressions that make and call its awaiter, and an initializer list in
@@ -222,7 +232,13 @@ private:
 };
 
 ReferenceIndex &sharedReferenceIndex() {
-  static thread_local ReferenceIndex Index;
+  struct CShared : ReferenceIndex {
+    CShared() {
+      addAstFactsRelease(
+          +[](void *Kept) { static_cast<CShared *>(Kept)->release(); }, this);
+    }
+  };
+  static thread_local CShared Index;
   return Index;
 }
 

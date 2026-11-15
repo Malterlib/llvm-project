@@ -323,6 +323,11 @@ public:
   // Retrieve the diagnostics that were captured.
   std::vector<ClangTidyError> take();
 
+  /// Reports the diagnostic that is held back with its notes to the external
+  /// engine, when no more notes of it can come, like when the checks are done
+  /// with a translation unit.
+  void flushForwardedDiagnostics();
+
 private:
   void finalizeLastError();
   void removeIncompatibleErrors();
@@ -343,7 +348,6 @@ private:
   bool passesLineFilter(StringRef FileName, unsigned LineNumber) const;
 
   void forwardDiagnostic(const Diagnostic &Info);
-  void flushForwardedDiagnostics();
 
   ClangTidyContext &Context;
   DiagnosticsEngine *ExternalDiagEngine;

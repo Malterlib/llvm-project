@@ -99,6 +99,24 @@ uint64_t astIdentity(const ASTContext &Context) {
   return It->second << 32 | workGeneration();
 }
 
+namespace {
+using CAstFactsRelease = std::pair<void (*)(void *), void *>;
+// On the heap: a thread that runs no check keeps no room for them.
+std::vector<CAstFactsRelease> &astFactsReleases() {
+  static thread_local std::vector<CAstFactsRelease> s_Releases;
+  return s_Releases;
+}
+} // namespace
+
+void addAstFactsRelease(void (*Release)(void *), void *Kept) {
+  astFactsReleases().emplace_back(Release, Kept);
+}
+
+void releaseAstFacts() {
+  for (const auto &[Release, Kept] : astFactsReleases())
+    Release(Kept);
+}
+
 bool splitStoragePrefix(StringRef Name, StringRef &Prefix, StringRef &Rest) {
   const size_t Underscore = Name.find('_');
   if (Underscore == StringRef::npos)

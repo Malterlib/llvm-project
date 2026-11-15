@@ -41,12 +41,32 @@ namespace clang::tidy::malterlib {
 /// of this number.
 uint64_t astIdentity(const ASTContext &Context);
 
+/// Makes \p Release run with \p Kept when this thread is done with the AST it
+/// analyzes (releaseAstFacts): it drops what \p Kept, which the thread keeps
+/// for as long as it runs, holds of that AST. What is kept registers itself
+/// where it is made, once for the thread.
+void addAstFactsRelease(void (*Release)(void *), void *Kept);
+
+/// Drops what this thread keeps of the AST it analyzed, once it is done with
+/// it, like the plugin before the compile generates code, which needs the
+/// memory. What is asked of the AST after that is made again.
+void releaseAstFacts();
+
 /// The \p t_CFacts this thread keeps of the AST of \p Context, the one it
 /// analyzes, whose declarations can be at the same addresses in the next one.
 template <typename t_CFacts> t_CFacts &astCache(const ASTContext &Context) {
   struct CCache {
     uint64_t AST = 0;
     std::unique_ptr<t_CFacts> Facts;
+    CCache() {
+      addAstFactsRelease(
+          +[](void *Kept) {
+            auto *Cache = static_cast<CCache *>(Kept);
+            Cache->AST = 0;
+            Cache->Facts.reset();
+          },
+          this);
+    }
   };
   static thread_local CCache s_Cache;
   if (const uint64_t AST = astIdentity(Context); s_Cache.AST != AST) {

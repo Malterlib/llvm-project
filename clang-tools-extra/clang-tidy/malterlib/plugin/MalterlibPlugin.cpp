@@ -341,7 +341,8 @@ private:
 /// -disable-free.
 class SourceFileEnd {
 public:
-  explicit SourceFileEnd(DiagnosticConsumer &Consumer) : Consumer(Consumer) {}
+  explicit SourceFileEnd(ClangTidyDiagnosticConsumer &Consumer)
+      : Consumer(Consumer) {}
 
   void end() {
     if (Ended)
@@ -350,8 +351,16 @@ public:
     Consumer.EndSourceFile();
   }
 
+  /// Reports the diagnostic the consumer holds back, once the checks are done
+  /// with the translation unit: an error of it then stops the compile before
+  /// it generates code.
+  void flush() {
+    if (!Ended)
+      Consumer.flushForwardedDiagnostics();
+  }
+
 private:
-  DiagnosticConsumer &Consumer;
+  ClangTidyDiagnosticConsumer &Consumer;
   bool Ended = false;
 };
 
@@ -479,6 +488,10 @@ class MalterlibPluginAction : public PluginASTAction {
       Ctx.setTraversalScope(reportedDecls(Ctx));
       MultiplexConsumer::HandleTranslationUnit(Ctx);
       Ctx.setTraversalScope(PreviousScope);
+      End->flush();
+      // The checks are done with the translation unit, and the compile
+      // generates its code next, which needs the memory.
+      releaseAstFacts();
     }
 
     ~WrapConsumer() override { End->end(); }
@@ -1013,7 +1026,11 @@ class MalterlibPluginAction : public PluginASTAction {
   };
 
 public:
-  ActionType getActionType() override { return AddAfterMainAction; }
+  // Before the compile generates code: an error of a check then stops the
+  // compile before it does, and clang frees the AST before it generates code
+  // as it does without the plugin, which it keeps for a plugin that runs
+  // after.
+  ActionType getActionType() override { return AddBeforeMainAction; }
 
   std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &Compiler,
                                                  StringRef File) override {

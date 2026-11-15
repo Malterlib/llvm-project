@@ -80,6 +80,11 @@
 #if CLANGD_TIDY_CHECKS
 #define CLANG_TIDY_DISABLE_STATIC_ANALYZER_CHECKS
 #include "../clang-tidy/ClangTidyForceLinker.h"
+
+namespace clang::tidy::malterlib {
+// Drops what the Malterlib checks keep of the AST the thread analyzed.
+void releaseAstFacts();
+} // namespace clang::tidy::malterlib
 #endif
 
 namespace clang {
@@ -778,6 +783,12 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   Clang->getDiagnostics().setClient(new IgnoreDiagnostics);
   // CompilerInstance won't run this callback, do it directly.
   ASTDiags.EndSourceFile();
+#if CLANGD_TIDY_CHECKS
+  // The Malterlib checks are done with this AST. What they keep of it for the
+  // thread is of no use to the next AST the thread builds, and would stay
+  // until then.
+  tidy::malterlib::releaseAstFacts();
+#endif
 
   std::vector<Diag> Diags = CompilerInvocationDiags;
   // FIXME: Also skip generation of diagnostics altogether to speed up ast
