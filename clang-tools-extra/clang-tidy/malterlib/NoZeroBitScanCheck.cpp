@@ -200,6 +200,16 @@ struct CNodeNumbers {
   uint64_t AST = 0;
   llvm::DenseMap<const void *, uint64_t> Of;
   llvm::DenseMap<uint64_t, const void *> Node;
+  CNodeNumbers() {
+    addAstFactsRelease(
+        +[](void *Kept) {
+          auto *Numbers = static_cast<CNodeNumbers *>(Kept);
+          Numbers->AST = 0;
+          Numbers->Of = decltype(Numbers->Of)();
+          Numbers->Node = decltype(Numbers->Node)();
+        },
+        this);
+  }
 };
 static thread_local CNodeNumbers t_NodeNumbers;
 
