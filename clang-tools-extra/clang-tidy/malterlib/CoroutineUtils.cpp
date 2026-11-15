@@ -13849,11 +13849,15 @@ void walkOverrides(llvm::ArrayRef<const Decl *> Roots, bool bInMemory,
     if (const auto *Template = dyn_cast<ClassTemplateDecl>(D)) {
       Entered(Template);
       Add(Template->getTemplatedDecl());
-      if (bInMemory)
-        for (ClassTemplateSpecializationDecl &Specialization :
-             CClassTemplateInMemory::specializations(Template))
-          Add(Specialization.getMostRecentDecl());
-      else
+      if (bInMemory) {
+        // getMostRecentDecl() completes the declarations of a specialization
+        // of a precompiled header, which adds specializations to the list.
+        llvm::SmallVector<ClassTemplateSpecializationDecl *, 16> InMemory(
+            llvm::make_pointer_range(
+                CClassTemplateInMemory::specializations(Template)));
+        for (ClassTemplateSpecializationDecl *Specialization : InMemory)
+          Add(Specialization->getMostRecentDecl());
+      } else
         for (const ClassTemplateSpecializationDecl *Specialization :
              Template->specializations())
           Add(Specialization);
@@ -13862,11 +13866,15 @@ void walkOverrides(llvm::ArrayRef<const Decl *> Roots, bool bInMemory,
       // Also its instantiations, whose local classes, `struct CDerived :
       // t_CBase` in `fg_Make<CApp>()`, are of what they are made with.
       Add(Function->getTemplatedDecl());
-      if (bInMemory)
+      if (bInMemory) {
+        // The same: the list grows while the declarations are completed.
+        llvm::SmallVector<FunctionDecl *, 16> InMemory;
         for (FunctionTemplateSpecializationInfo &Specialization :
              CFunctionTemplateInMemory::specializations(Function))
-          Add(Specialization.getFunction()->getMostRecentDecl());
-      else
+          InMemory.push_back(Specialization.getFunction());
+        for (const FunctionDecl *Specialization : InMemory)
+          Add(Specialization->getMostRecentDecl());
+      } else
         for (const FunctionDecl *Specialization : Function->specializations())
           Add(Specialization);
     }
