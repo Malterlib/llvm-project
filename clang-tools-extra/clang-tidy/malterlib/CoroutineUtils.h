@@ -177,6 +177,15 @@ public:
   /// can be at the address of the one before.
   void invalidate() { IndexedAST = 0; }
 
+  /// Drops the index (releaseAstFacts).
+  void release() {
+    IndexedAST = 0;
+    Lambdas = decltype(Lambdas)();
+    LambdaInstances = decltype(LambdaInstances)();
+    Merged = decltype(Merged)();
+    Instantiations = decltype(Instantiations)();
+  }
+
 private:
   /// The identity of the AST it indexes, astIdentity.
   uint64_t IndexedAST = 0;

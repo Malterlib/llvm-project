@@ -391,6 +391,16 @@ void CFlowCache::check(ASTContext &Context) {
   }
 }
 
+void CFlowCache::release() {
+  IndexedAST = 0;
+  Summaries.reset();
+  Graphs = decltype(Graphs)();
+  Indexes = decltype(Indexes)();
+  Returns = decltype(Returns)();
+  Names = decltype(Names)();
+  WrapperFlows = decltype(WrapperFlows)();
+}
+
 CFlowSummaries &CFlowCache::summaries(ASTContext &Context) {
   check(Context);
   return *Summaries;
@@ -10969,7 +10979,13 @@ summarySetParameters(const FunctionDecl *Function) {
 CFlowCache::~CFlowCache() = default;
 
 CFlowCache &sharedFlowCache() {
-  static thread_local CFlowCache s_Cache;
+  struct CShared : CFlowCache {
+    CShared() {
+      addAstFactsRelease(
+          +[](void *Kept) { static_cast<CShared *>(Kept)->release(); }, this);
+    }
+  };
+  static thread_local CShared s_Cache;
   return s_Cache;
 }
 

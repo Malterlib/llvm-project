@@ -443,6 +443,8 @@ private:
 public:
   // Starts again for another translation unit.
   void check(ASTContext &Context);
+  // Drops what it keeps of the translation unit (releaseAstFacts).
+  void release();
   ~CFlowCache();
 };
 

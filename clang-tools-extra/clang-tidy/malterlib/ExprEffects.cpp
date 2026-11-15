@@ -1580,6 +1580,15 @@ namespace {
 struct CEffectsCache {
   uint64_t AST = 0;
   llvm::DenseMap<const Stmt *, std::unique_ptr<CEffects>> Of;
+  CEffectsCache() {
+    addAstFactsRelease(
+        +[](void *Kept) {
+          auto *Cache = static_cast<CEffectsCache *>(Kept);
+          Cache->AST = 0;
+          Cache->Of = decltype(Cache->Of)();
+        },
+        this);
+  }
 };
 thread_local CEffectsCache s_EffectsCache;
 } // namespace

@@ -5456,7 +5456,13 @@ private:
 } // namespace
 
 InstantiationIndex &sharedInstantiationIndex() {
-  static thread_local InstantiationIndex s_Index;
+  struct CShared : InstantiationIndex {
+    CShared() {
+      addAstFactsRelease(
+          +[](void *Kept) { static_cast<CShared *>(Kept)->release(); }, this);
+    }
+  };
+  static thread_local CShared s_Index;
   return s_Index;
 }
 
