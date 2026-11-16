@@ -714,13 +714,17 @@ TEST(DiagnosticTest, MalterlibOptionsFileChanges) {
   auto Prefix =
       Field(&Diag::Message, ::testing::HasSubstr("should have the 'fg_' "
                                                  "prefix"));
+  auto UpperCamel =
+      Field(&Diag::Message, ::testing::HasSubstr("should be upper camel case "
+                                                 "after its prefix"));
   EXPECT_THAT(TU.build().getDiagnostics(), Contains(Unreadable));
   TU.AdditionalFiles["ClangTidyOptions.yaml"] =
       "LowerCaseFreeFunctions: clear\n";
   EXPECT_THAT(TU.build().getDiagnostics(), IsEmpty());
   TU.AdditionalFiles["ClangTidyOptions.yaml"] =
       "LowerCaseFreeFunctions: '-clear'\n";
-  EXPECT_THAT(TU.build().getDiagnostics(), ElementsAre(Prefix));
+  EXPECT_THAT(TU.build().getDiagnostics(),
+              UnorderedElementsAre(Prefix, UpperCamel));
 }
 
 TEST(DiagnosticTest, ClangTidyEnablesClangWarning) {
